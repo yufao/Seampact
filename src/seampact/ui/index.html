@@ -1,0 +1,83 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>SeamPact · Harness 工作台</title>
+  <link rel="stylesheet" href="/style.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <aside>
+    <a class="brand" href="/"><span class="brand-mark">S</span><span>SeamPact</span></a>
+    <p class="aside-caption">Harness 能力工作台</p>
+    <nav aria-label="工作台导航">
+      <a href="#sources">来源与能力</a>
+      <a href="#analysis">自动拆分</a>
+      <a href="#execution">运行 DEMO</a>
+      <a href="#models">模型接口</a>
+    </nav>
+    <div class="aside-foot"><span class="connection-dot"></span><span id="connection">正在连接</span><div id="version"></div></div>
+  </aside>
+  <main>
+    <header>
+      <div><div class="eyebrow">HARNESS WORKBENCH</div><h1>从完整流程，走到可调用能力。</h1><p class="muted">选一个来源，让 API 分析边界，生成适配草案，再查看它的实际运行。</p></div>
+      <a id="quick-run" class="primary-link" href="#execution">运行 CRAG 示例 <span aria-hidden="true">↗</span></a>
+    </header>
+    <div id="notice" role="status" aria-live="polite" hidden></div>
+
+    <section id="sources" class="source-section">
+      <div class="section-head"><div><div class="eyebrow">01 / SELECT A SOURCE</div><h2>选择 Harness</h2></div><span class="muted small">四类来源，一个接入流程</span></div>
+      <div id="source-cards" class="source-grid"></div>
+    </section>
+
+    <section id="analysis">
+      <div class="section-head"><div><div class="eyebrow">02 / ANALYZE & EXTRACT</div><h2 id="selected-source-title">自动分析与适配</h2></div><span id="source-stage" class="tag">等待选择</span></div>
+      <p id="source-description" class="muted"></p>
+      <div class="workflow" aria-label="接入流程">
+        <div class="workflow-step"><span class="step-number">1</span><div><strong>准备来源</strong><p>固定源码和本次目标</p></div></div>
+        <div class="workflow-step"><span class="step-number">2</span><div><strong>API 分析</strong><p>读源码、提议能力边界</p></div></div>
+        <div class="workflow-step"><span class="step-number">3</span><div><strong>生成适配</strong><p>包装、接线或局部提取</p></div></div>
+      </div>
+      <div class="intake-form">
+        <label class="grow">接入目标与任务要求<textarea id="observation" rows="3">将这个 Harness 中可调度的能力提取为可调用模块。保留原算法、状态和控制流程，明确每个模块的输入、输出、依赖与调用条件。</textarea></label>
+        <div class="start-controls"><label>分析模型<select id="analysis-provider" aria-label="分析模型"></select></label><button id="start-analysis">准备来源并开始分析</button><button id="freeze-source" class="secondary">仅准备来源</button><p id="analysis-start-help" class="muted small"></p></div>
+      </div>
+      <div id="requests"></div>
+      <div id="analysis-cards"></div>
+      <div id="packages"></div>
+      <details id="analysis-detail"><summary>查看完整分析记录</summary><pre id="detail">选择一份分析记录查看源码工具调用和检查结果。</pre></details>
+    </section>
+
+    <section id="execution">
+      <div class="section-head"><div><div class="eyebrow">03 / RUN A WORKFLOW</div><h2>运行 DEMO</h2></div><span id="execution-status" class="tag">读取运行配置</span></div>
+      <p id="execution-help" class="muted">输入问题和资料，通过原 CRAG 工作流查看回答与被激活的能力。</p>
+      <div class="run-layout">
+        <form id="run-form" class="run-input">
+          <label>运行的适配草案<select id="run-package"></select></label>
+          <div class="run-options"><label>运行模式<select id="run-mode"><option value="live">真实模型</option><option value="preview">受控预览 · 不调用模型</option></select></label><label>模型接口<select id="run-provider" aria-label="运行模型"></select></label></div>
+          <label>问题<input id="run-question" type="text" placeholder="输入一个与示例资料有关的问题" required></label>
+          <label>资料<textarea id="run-documents" rows="7" placeholder="每段资料之间留一个空行" required></textarea></label>
+          <p id="run-mode-help" class="muted small">真实模型会调用你配置的接口。资料之间用空行分隔；检索限于这些资料。</p>
+          <button id="run-workflow" type="submit">运行工作流 <span aria-hidden="true">→</span></button>
+        </form>
+        <div id="run-result" class="run-output" aria-live="polite"><div class="empty-result"><span class="empty-icon">↗</span><h3>看见一次完整运行</h3><p>运行后在这里查看回答、被激活的能力和执行顺序。</p></div></div>
+      </div>
+      <details id="run-history"><summary>之前的运行</summary><div id="run-history-list"></div></details>
+    </section>
+
+    <section id="models">
+      <div class="section-head"><div><div class="eyebrow">04 / MODEL CONNECTIONS</div><h2>模型接口</h2></div><span class="tag">不设应用额度上限</span></div>
+      <p class="muted small">DeepSeek 与 GLM 用于分析和任务回答。保留完整上下文，不限制费用、调用次数或分析轮次；模型能力以提供方为准。Kimi 暂不可用。</p>
+      <div id="model-cards" class="cards"></div>
+    </section>
+
+    <details id="technical-details" class="technical-details">
+      <summary>已有运行记录与平台明细</summary>
+      <section id="evidence"><div class="section-head"><h2>已有运行记录</h2><span class="muted small">各项记录有各自的运行范围</span></div><div id="evidence-cards" class="cards"></div></section>
+      <section id="runtime"><div class="section-head"><h2>调度器明细</h2><button id="demo" class="secondary">运行教学流程</button></div><p class="muted small">教学流程只比较两个本地函数调用。上方 DEMO 使用原 CRAG SDK 工作流，两者分别记录。</p><div class="metrics"><div><span>执行槽</span><strong id="quota">—</strong></div><div><span>使用中</span><strong id="used">—</strong></div><div><span>调用记录</span><strong id="calls">—</strong></div><div><span>当前策略</span><strong>FIFO</strong></div></div><div id="demo-results"></div><details><summary>调度事件</summary><pre id="events"></pre></details></section>
+    </details>
+    <footer>草案生成与工作流运行分别展示。新增并行、跨流程组合和远程执行仍需对应的接入实现。</footer>
+  </main>
+</body>
+</html>

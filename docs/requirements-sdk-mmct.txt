@@ -1,0 +1,8 @@
+# Optional CPU mechanism-probe environment only. Core platform uses stdlib.
+autogen-agentchat==0.7.5
+autogen-core==0.7.5
+autogen-ext==0.7.5
+Pillow==12.3.0
+loguru==0.7.3
+python-dotenv==1.2.4
+pydantic==2.14.0

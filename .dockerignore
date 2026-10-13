@@ -1,0 +1,23 @@
+# Build context is an allowlist; never send work state, credentials or caches.
+**
+!src/
+!src/**
+!tests/
+!tests/**
+!tools/
+!tools/*.py
+!docs/
+!docs/requirements-sdk-mmct.txt
+!docs/requirements-sdk-crag.txt
+!deploy/
+!deploy/Dockerfile
+!deploy/*.py
+!README.md
+!pyproject.toml
+!sources/
+!sources/**
+!sources.json
+!release-manifest.json
+!SOURCE-NOTICES.json
+**/__pycache__/**
+**/*.pyc
