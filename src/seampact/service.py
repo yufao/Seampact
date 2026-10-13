@@ -1,136 +1,119 @@
-"""Platform state and job orchestration; source packages are never auto-executed."""
+"""The four-layer research prototype: intake, analysis, Units, RL and chat."""
 
-import asyncio
-import json
-import os
-import threading
 import uuid
 from pathlib import Path
-from . import __version__
 
+from . import __version__
 from .analysis import AnalysisJobs
-from .build import build_package
-from .evidence import collect_evidence
+from .chat import ChatJobs
 from .inspection import Inspector
+from .intake import RepositoryIntake
 from .providers import Profiles
 from .runtime import Coordinator, OwnerRuntime
-from .store import Store, now
-from .tasks import TaskRuns
+from .scheduler import TwoLayerScheduler
+from .store import Store
+from .units import UnitCatalog
+
+RULESET = dict(id="native-entry-whR-prototype/1", confirmed=True,
+    source="用户确认的首版执行判断",
+    rules=["真实源码入口、参数、初始化和资源绑定", "缺失依赖或参数明确保留为MISSING",
+           "内部W/H/R保留原controller与owner", "有限R沿用现有循环规则",
+           "粗细方案互斥", "不依据模型自述开放并行或远程"],
+    parallel=False, remote=False)
 
 
 class Platform:
-    def __init__(self, home, sources=None, legacy=None, evidence_root=None, artifact_root=None):
+    def __init__(self, home, legacy=None):
         self.home = Path(home).resolve()
         self.home.mkdir(parents=True, exist_ok=True)
         self.store = Store(self.home / "platform.sqlite3")
         self.profiles = Profiles(self.home / "config", legacy)
-        self.analysis = AnalysisJobs(self.store, self.profiles)
-        self.tasks = TaskRuns(self.store, self.profiles, self.home, artifact_root)
-        self.sources = sources or {}
-        self.evidence_root = Path(evidence_root).resolve() if evidence_root is not None else None
+        self.scheduler = TwoLayerScheduler(self.home / "policy")
+        self.runtime = OwnerRuntime(Coordinator(self.store, policy=self.scheduler))
+        self.intake = RepositoryIntake(self.home / "sources")
+        self.catalog = UnitCatalog(self.home, self.store, self.runtime)
+        self.analysis = AnalysisJobs(self.store, self.profiles, on_complete=self._connect_units,
+                                     check_entries=self.catalog.inspect_candidate)
+        self.chat = ChatJobs(self.store, self.profiles, self.catalog, self.runtime, self.scheduler)
         self.inspectors = {}
-        self.lock = threading.RLock()
-        self.runtime = OwnerRuntime(Coordinator(self.store))
-        for request in self.store.list("request"):
-            source = self.sources.get(request["source_id"])
+        for job in self.store.list("analysis"):
+            if job.get("status") != "COMPLETED" or not job.get("submitted"):
+                continue
+            request = self.store.get("request", job["request_id"])
+            if not request:
+                continue
+            source = self.store.get("harness", request.get("source_id"))
             if source:
-                self.inspectors[request["id"]] = Inspector(source["root"], self.home / "snapshots", request)
+                inspector = Inspector(source["root"], self.home / "snapshots", request)
+                self.inspectors[request["id"]] = inspector
+                self.catalog.install(inspector, job["submitted"]["candidate"], job["id"])
 
     def state(self):
-        jobs = [{k:v for k,v in j.items() if k != "messages"} for j in self.store.list("analysis")]
-        return dict(schema="platform-state/1", version=__version__, sources=[
-            dict(id=i, **{k:v for k,v in s.items() if k != "root"},
-                 native="NOT_RUN", adapted="NOT_RUN", parallel="NOT_RUN", deployment="NOT_RUN")
-            for i,s in self.sources.items()], requests=self.store.list("request"), analyses=jobs,
-            packages=self.store.list("package"), demos=self.store.list("demo"),
-            runs=self.tasks.list(), execution=self.tasks.availability(),
-            runtime=self.runtime.snapshot(), evidence=collect_evidence(self.evidence_root),
-            profiles=[dict(profile,credential_mode="windows_dpapi" if os.name=="nt" else "private_environment")
-                      for profile in self.profiles.public()])
+        snapshot = self.runtime.snapshot()
+        active = [call for call in snapshot["calls"].values() if call["physical"] in {"AUTHORIZED", "STARTED"}]
+        waiting = [call for call in snapshot["calls"].values() if call["physical"] in {"ENABLED", "RESERVED"}]
+        tasks = self.store.list("task")
+        for task in tasks:
+            task["calls"] = [call for call in snapshot["calls"].values() if call.get("task_id") == task["id"]]
+        harnesses = []
+        for source in self.store.list("harness"):
+            harnesses.append({name: source.get(name) for name in
+                ("id", "name", "address", "revision", "status", "error", "analysis_id", "entry", "resources")})
+            harnesses[-1]["files"] = len(source.get("files", []))
+            harnesses[-1]["inventory_count"] = len(source.get("inventory", []))
+            job = self.store.get("analysis", source.get("analysis_id"))
+            if job and job["status"] in {"FAILED", "INTERRUPTED", "CANCELLED"}:
+                harnesses[-1].update(status=job["status"], error=job.get("error"))
+        jobs = [{name: value for name, value in job.items() if name not in {"messages", "provider_profile"}}
+                for job in self.store.list("analysis")]
+        return dict(version=__version__, models=self.profiles.public_roles(), harnesses=harnesses,
+            analyses=jobs, units=self.catalog.public(), tasks=tasks, rules=RULESET,
+            scheduler=dict(status="RUNNING", policy="two-layer-tabular-q-learning", active=active, waiting=waiting,
+                used=snapshot["used"], quota=snapshot["quota"], theory_pending=False,
+                learning=self.scheduler.snapshot(), reward="success(+1)/failure(-1) - seconds/(1+seconds)"))
 
-    def freeze(self, source_id, observation):
-        source = self.sources[source_id]
-        identity = uuid.uuid4().hex
-        inspector = Inspector.freeze(source["root"], self.home / "snapshots", identity,
-                                     source["files"], source["entry"], observation)
-        inspector.request["source_id"] = source_id
-        inspector.request["source_revision"] = source.get("revision")
-        self.store.save("request", identity, inspector.request, "scope_frozen")
-        with self.lock:
-            self.inspectors[identity] = inspector
-        return inspector.request
+    def add_harness(self, body):
+        source = self.intake.prepare(body.get("address", ""), body.get("revision"),
+                                    body.get("entry") or None, body.get("resources") or None)
+        source["status"] = "CONNECTED"
+        self.store.save("harness", source["id"], source)
+        print("[SeamPact] source_connected " + source["id"], flush=True)
+        return dict(id=source["id"], files=len(source["files"]))
 
-    def start_analysis(self, request_id, provider):
-        with self.lock:
-            # The source version belongs to one analysis loop until it submits.
-            if any(j["request_id"] == request_id and j["status"] in {"RUNNING", "CANCELLING"}
-                   for j in self.store.list("analysis")):
-                raise ValueError("this frozen request already has an analysis loop")
-            return self.analysis.start(self.inspectors[request_id], provider)
-
-    def build(self, analysis_id):
-        job = self.store.get("analysis", analysis_id)
-        if not job or job["status"] != "COMPLETED" or not job["submitted"]:
-            raise ValueError("completed structured analysis required")
-        inspector = self.inspectors[job["request_id"]]
-        identity = uuid.uuid4().hex
-        package = build_package(inspector, job["submitted"]["candidate"], self.home / "packages", identity)
-        package["analysis_id"] = analysis_id
-        self.store.save("package", identity, package, "package_built")
-        return package
-
-    def demo(self):
-        identity = uuid.uuid4().hex
-        status = dict(id=identity, status="RUNNING", kind="TEACHING_PROTOCOL_ONLY", started_at=now())
-        self.store.save("demo", identity, status, "demo_started")
-        threading.Thread(target=self._demo, args=(status,), daemon=True).start()
-        return identity
-
-    def _demo(self, status):
-        """Original controller awaits its two tools; gate keeps actual start back."""
-        prefix = status["id"][:12]
-        gate, owner = "demo-"+prefix, "teaching-native-owner-"+prefix
-        native = []
-        async def original_tool(value):
-            native.append(["tool_enter", value])
-            await asyncio.sleep(0.05)
-            native.append(["tool_exit", value])
-            return {"value": value * 2}
-        async def controller(tool):
-            first = await tool(3)
-            native.append(["controller_continue", first["value"]])
-            second = await tool(first["value"])
-            native.append(["controller_return", second["value"]])
-            return second
+    def analyze(self, identity):
+        source = self.store.get("harness", identity)
+        if not source:
+            raise ValueError("Harness地址尚未接入")
+        if any(job["status"] == "RUNNING" and job.get("request_id") == source.get("request_id")
+               for job in self.store.list("analysis")):
+            raise ValueError("这个来源正在分析")
+        request_id = uuid.uuid4().hex
+        inspector = Inspector.freeze_repository(source, self.home / "snapshots", request_id,
+            "保留原算法、原生状态、初始化及控制/返回关系，按已确认RuleSet寻找真实可接入入口和有限W/H/R边界。")
+        inspector.request["rules"] = RULESET
+        self.store.save("request", request_id, inspector.request)
+        self.inspectors[request_id] = inspector
+        analysis_id = uuid.uuid4().hex
+        source.update(status="ANALYZING", analysis_id=analysis_id, request_id=request_id, error=None)
+        self.store.save("harness", identity, source)
         try:
-            reference_events = []
-            reference = asyncio.run(controller(original_tool))
-            reference_events.extend(native)
-            native.clear()
-            self.runtime.call("register", gate, owner)
-            adapted = asyncio.run(controller(self.runtime.wrap(original_tool, gate, owner)))
-            calls = [c for c in self.runtime.snapshot()["calls"].values() if c["gate"] == gate]
-            status.update(status="PASS" if reference == adapted and reference_events == native
-                          and len(calls) == 2 and all(c["starts"] == 1 and c["physical"] == "RETIRED" for c in calls)
-                          else "FAIL", reference=reference, adapted=adapted,
-                          native_trace=reference_events, adapted_trace=native, calls=calls,
-                          scope="two controlled local callable occurrences; not a four-source result")
+            self.analysis.start(inspector, self.profiles.role_identity("analysis"), identity=analysis_id)
         except Exception as error:
-            status.update(status="FAIL", error=type(error).__name__)
-        status["finished_at"] = now()
-        self.store.save("demo", status["id"], status, "demo_finished")
+            source.update(status="FAILED", error=str(error))
+            self.store.save("harness", identity, source)
+            raise
+        return dict(analysis_id=analysis_id)
+
+    def _connect_units(self, inspector, job):
+        units = self.catalog.install(inspector, job["submitted"]["candidate"], job["id"])
+        source = self.store.get("harness", inspector.request["source_id"])
+        source.update(status="ANALYZED", analysis_id=job["id"], error=None)
+        self.store.save("harness", source["id"], source)
+        print("[SeamPact] units_connected " + str(len(units)), flush=True)
+        return [unit["id"] for unit in units]
 
     def close(self):
-        self.tasks.close()
+        self.analysis.close()
+        self.chat.close()
         self.runtime.close()
         self.store.close()
-
-
-def load_sources(path):
-    if path is None:
-        return {}
-    path = Path(path).resolve()
-    sources = json.loads(path.read_text(encoding="utf-8"))
-    for value in sources.values():
-        value["root"] = str((path.parent / value["root"]).resolve())
-    return sources

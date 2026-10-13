@@ -1,4 +1,4 @@
-"""Atomic checkpoints and an ordered event journal; never store credentials here."""
+"""Core source, analysis, Unit and task state for the live observation panel."""
 
 import json
 import sqlite3
@@ -23,9 +23,6 @@ class Store:
             CREATE TABLE IF NOT EXISTS documents (
               kind TEXT NOT NULL, id TEXT NOT NULL, data TEXT NOT NULL,
               PRIMARY KEY(kind,id));
-            CREATE TABLE IF NOT EXISTS events (
-              seq INTEGER PRIMARY KEY AUTOINCREMENT, at TEXT NOT NULL,
-              kind TEXT NOT NULL, entity TEXT NOT NULL, data TEXT NOT NULL);
         """)
 
     def save(self, kind, identity, data, event=None):
@@ -33,9 +30,8 @@ class Store:
         with self.lock, self.db:
             self.db.execute("INSERT OR REPLACE INTO documents VALUES (?,?,?)",
                             (kind, identity, encoded))
-            if event:
-                self.db.execute("INSERT INTO events(at,kind,entity,data) VALUES(?,?,?,?)",
-                                (now(), event, identity, encoded))
+        if event in {"analysis_started", "analysis_finished", "call_enabled", "started", "physically_retired"}:
+            print(f"[SeamPact] {event} {identity}", flush=True)
 
     def get(self, kind, identity):
         with self.lock:
@@ -50,11 +46,7 @@ class Store:
         return [json.loads(row[0]) for row in rows]
 
     def events(self, after=0):
-        with self.lock:
-            rows = self.db.execute("SELECT seq,at,kind,entity,data FROM events WHERE seq>? ORDER BY seq",
-                                   (after,)).fetchall()
-        return [dict(seq=r[0], at=r[1], kind=r[2], entity=r[3], data=json.loads(r[4]))
-                for r in rows]
+        return []
 
     def close(self):
         with self.lock:

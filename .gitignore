@@ -6,6 +6,7 @@ secrets/
 models/
 datasets/
 sources/
+harnesses/
 sources.json
 release-manifest.json
 SOURCE-NOTICES.json

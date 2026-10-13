@@ -8,6 +8,7 @@ import asyncio
 import contextvars
 import functools
 import inspect
+import time
 import threading
 import uuid
 from concurrent.futures import TimeoutError as FutureTimeout
@@ -18,27 +19,19 @@ class ProtocolError(RuntimeError):
 
 
 _native_gate = contextvars.ContextVar("seampact_native_gate", default=None)
+_task_context = contextvars.ContextVar("seampact_task", default=None)
 
 
 class Coordinator:
-    def __init__(self, store, quota=1, automatic=True):
+    def __init__(self, store, quota=1, automatic=True, policy=None):
         if type(quota) is not int or quota < 1:
             raise ValueError("positive managed slot quota required")
         self.store, self.automatic = store, automatic
+        self.policy = policy
+        self.decisions = {}
         self.waiters = {}
         self.failed = False
-        old = store.get("runtime", "local")
-        self.state = old or dict(schema="runtime/1", quota=quota, gates={}, calls={})
-        if old:
-            # No recovered process can certify the death of another native owner.
-            for gate in self.state["gates"].values():
-                gate["active"] = False
-            for call in self.state["calls"].values():
-                if call["physical"] in {"AUTHORIZED", "STARTED", "UNKNOWN"}:
-                    call.update(physical="UNKNOWN", logical="INTERRUPTED")
-                elif call["physical"] in {"ENABLED", "RESERVED"}:
-                    call.update(physical="RETIRED", logical="INTERRUPTED")
-            self._persist("recovery")
+        self.state = dict(schema="runtime/2", quota=quota, gates={}, calls={})
 
     def _persist(self, event):
         if self.failed:
@@ -58,7 +51,7 @@ class Coordinator:
                                   and value["gates"][c["gate"]]["active"]
                                   and not self.owner_busy(c["owner"])
                                   and self.used() + c["slots"] <= value["quota"]]
-        value["policy"] = "fifo" if self.automatic else "manual"
+        value["policy"] = "tabular-q-learning" if self.policy else ("fifo" if self.automatic else "manual")
         return value
 
     def used(self):
@@ -69,7 +62,7 @@ class Coordinator:
         return any(c["owner"] == owner and c["physical"] in {"RESERVED", "AUTHORIZED", "STARTED", "UNKNOWN"}
                    for c in self.state["calls"].values())
 
-    async def register(self, identity, owner, generation=1, slots=1):
+    async def register(self, identity, owner, generation=1, slots=1, unit=None):
         if not identity or not owner or type(generation) is not int or generation < 1:
             raise ValueError("gate and native-owner generation required")
         if type(slots) is not int or not 1 <= slots <= self.state["quota"]:
@@ -77,17 +70,23 @@ class Coordinator:
         if identity in self.state["gates"]:
             raise ProtocolError("use a new gate identity for a new immutable version")
         self.state["gates"][identity] = dict(id=identity, owner=owner,
-            generation=generation, slots=slots, active=True, scope="trusted-local-callable")
+            generation=generation, slots=slots, active=True, scope="native-boundary", unit=unit)
         self._persist("gate_registered")
 
-    async def enable(self, gate, owner, generation=1):
+    async def label(self, identity, unit):
+        self.state["gates"][identity]["unit"] = unit
+
+    async def enable(self, gate, owner, generation=1, task_id=None):
         g = self.state["gates"].get(gate)
         if not g or not g["active"] or (owner, generation) != (g["owner"], g["generation"]):
             raise ProtocolError("inactive gate or stale native-owner generation")
         identity = uuid.uuid4().hex
         self.state["calls"][identity] = dict(id=identity, gate=gate, owner=owner,
             generation=generation, slots=g["slots"], physical="ENABLED",
-            logical="WAITING", starts=0, receipt=None, permit=None)
+            logical="WAITING", starts=0, receipt=None, permit=None,
+            task_id=task_id, unit=g.get("unit"), semantic_key=(g.get("unit") or {}).get("semantic_key") or
+                (g.get("unit") or {}).get("id", gate.rsplit(":",1)[-1]),
+            enabled_at=time.time(), started_at=None, latency_ms=None)
         self.waiters[identity] = asyncio.get_running_loop().create_future()
         self._persist("call_enabled")
         await self.pump()
@@ -129,7 +128,7 @@ class Coordinator:
             raise ProtocolError("permit already consumed, cancelled or absent")
         if (owner, generation) != (c["owner"], c["generation"]):
             raise ProtocolError("stale owner cannot consume a permit")
-        c.update(physical="STARTED", starts=1)
+        c.update(physical="STARTED", starts=1, started_at=time.time())
         self._persist("started")
 
     async def finish(self, identity, permit, receipt):
@@ -142,6 +141,11 @@ class Coordinator:
         if c["logical"] == "WAITING":
             c["logical"] = "COMPLETED"
         c["receipt"] = receipt
+        c["latency_ms"] = (time.time() - c["enabled_at"]) * 1000
+        token = self.decisions.pop(identity, None)
+        if self.policy and token:
+            following = self._ready()
+            self.policy.feedback(token, receipt == "RETURN", c["latency_ms"], following, self._observation())
         self._persist("physically_retired")
         await self.pump()
         return True
@@ -176,10 +180,27 @@ class Coordinator:
     async def pump(self):
         if not self.automatic:
             return
-        for c in list(self.state["calls"].values()):
-            if c["physical"] == "ENABLED" and self.state["gates"][c["gate"]]["active"]:
-                if not self.owner_busy(c["owner"]) and self.used() + c["slots"] <= self.state["quota"]:
-                    await self.authorize(c["id"])
+        ready = self._ready()
+        while ready:
+            if self.policy:
+                call, token = self.policy.select_ready(ready, self._observation())
+                self.decisions[call["id"]] = token
+            else:
+                call = ready[0]
+            await self.authorize(call["id"])
+            ready = self._ready()
+
+    def _ready(self):
+        return [c for c in self.state["calls"].values() if c["physical"] == "ENABLED"
+                and self.state["gates"][c["gate"]]["active"] and not self.owner_busy(c["owner"])
+                and self.used() + c["slots"] <= self.state["quota"]]
+
+    def _observation(self):
+        ready = self._ready()
+        return dict(waiting=len(ready), used=self.used(), quota=self.state["quota"],
+                    wait_ms=max(((time.time() - c["enabled_at"]) * 1000 for c in ready), default=0),
+                    busy_owners=len({c["owner"] for c in self.state["calls"].values()
+                                     if c["physical"] in {"AUTHORIZED", "STARTED"}}))
 
 
 class OwnerRuntime:
@@ -215,6 +236,17 @@ class OwnerRuntime:
             return self.coordinator.snapshot()
         return asyncio.run_coroutine_threadsafe(read(), self.loop).result()
 
+    def context(self, task_id):
+        from contextlib import contextmanager
+        @contextmanager
+        def scope():
+            token = _task_context.set(task_id)
+            try:
+                yield
+            finally:
+                _task_context.reset(token)
+        return scope()
+
     def wrap(self, original, gate, owner, generation=1):
         if getattr(original,"__seampact_gate__",None) is not None:
             raise ProtocolError("callable already has a gate; nested wrapping is unsupported")
@@ -226,7 +258,7 @@ class OwnerRuntime:
                 if _native_gate.get() is not None:
                     raise ProtocolError("nested controlled calls require a verified parent/child resource rule")
                 # Waiter creation is shielded so cancellation cannot lose its identity.
-                enable = self.submit("enable", gate, owner, generation)
+                enable = self.submit("enable", gate, owner, generation, _task_context.get())
                 identity = None
                 permit = None
                 consumed = False
@@ -269,7 +301,7 @@ class OwnerRuntime:
         def synchronous(*args, **kwargs):
             if _native_gate.get() is not None:
                 raise ProtocolError("nested controlled calls require a verified parent/child resource rule")
-            identity = self.call("enable", gate, owner, generation)
+            identity = self.call("enable", gate, owner, generation, _task_context.get())
             permit = self.call("wait", identity)
             self.call("consume", identity, permit, owner, generation)
             token = _native_gate.set(gate)

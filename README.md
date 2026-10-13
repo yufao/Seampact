@@ -1,52 +1,43 @@
 # SeamPact
 
-异构 Harness 接入与任务工作台。当前 DEMO 主线是 **来源 → API 自动分析 → 能力包 → CRAG 文档问答 → 答案与调用轨迹**。
+0.6.0：异构 Harness 自动接入、有限拆分与两层 RL 调度的学术原型。首页是正常 AI 对话；配置中填写 Harness 仓库 URL／本地目录，以及独立的对话模型和分析模型。右侧显示实际能力池、分析结果、Unit 调用与调度状态。
 
-想先操作，读[手动启动与演示](docs/手动启动与演示.md)；准备组会，读[组会报告](docs/组会报告.md)，其中集中解释研究问题、当前机制、实际进展与候选创新。
+核心链路是 **地址 → 全目录解析 → API 工具分析 → 源码检查与原生绑定 → Unit 能力池 → 对话提出可执行方案 → 两层 RL → 原 Harness 执行 → 对话结果**。没有可用 Unit 时，仍可正常对话。
 
-源码、配置模板、来源清单和有效设计由 GitHub 管理；模型、数据、密钥、第三方快照、API 对话、数据库和运行产物留在 Git 忽略目录，按需通过 SFTP 交付。
+## 启动
 
-## 快速启动
+平台核心只需 Python 3.11 或以上；接入远程仓库还需 Git。Harness 自身的依赖需要装在实际运行它的 Python 环境中。
 
-```bash
-git clone git@github.com:yufao/Seampact.git
-cd Seampact
-python -B tools/fetch_sources.py
-python -m venv .venv
-```
-
-Linux 激活 `.venv/bin/activate`，Windows PowerShell 激活 `.venv/Scripts/Activate.ps1`。在这个项目环境安装 CRAG 运行依赖，再启动工作台：
+Linux，在仓库根目录执行：
 
 ```bash
-python -m pip install -r docs/requirements-sdk-crag.txt
-python -m pip install -e .
-python -B -m seampact serve --home var/platform --sources sources.json
+PYTHONPATH=src python -B -m seampact serve --home var/prototype --port 8880
 ```
 
-打开 http://127.0.0.1:8874 。Linux 使用终端显示的本次登录链接；服务器通过 SSH 端口转发访问。[服务器 Docker 启动](docs/Docker部署.md)只构建并启动一个 DEMO 服务，不要求先跑实验矩阵。
+Windows PowerShell：
 
-## 在页面里完成一个任务
+```powershell
+$env:PYTHONPATH = 'src'
+python -B -m seampact serve --home var/prototype --port 8880
+```
 
-1. 在接口设置中配置 DeepSeek 或 GLM。Windows Key 使用当前用户 DPAPI；Linux 使用项目私有环境／秘密文件，见[服务器说明](docs/服务器部署.md)。费用、次数和分析轮次不设应用上限，保留完整上下文与提供方最大输出设置。
-2. 选择 CRAG，写下希望提取的能力和任务要求，创建来源快照并启动 API 分析。
-3. 分析完成后生成能力包。引擎独立检查源码锚点与支持的接线／局部重构；页面显示实际生成的能力。
-4. 选择这个包，输入问题和文本资料，选择真实模型运行。得到答案、实际激活的能力、模型调用用量和执行轨迹。
+打开 http://127.0.0.1:8880。配置两个模型角色，保存后直接发送消息。对话模型支持本地或云端的 OpenAI 兼容接口；分析模型使用云端接口。接口地址填基础路径，如本地 `/v1`；平台追加 `/chat/completions`。
 
-也可使用以前真实 API 生成的 CRAG 包：将原包 ZIP 与 `crag-text.json` 放进私有 `artifacts/`，启动时添加 `--artifacts artifacts`。页面明确显示“已有 API 能力包”；新生成的包不会被替换。受控预览是独立可选模式，不发送模型请求。
+接入 Harness 后，在配置中点击“分析”。分析器使用通用源码工具读取整仓，并按确认的 RuleSet 提出入口、初始化、资源绑定及 W／H／R 边界。引擎核对实际源码和支持规则，结果进入能力池。`READY` 表示静态绑定准备完成，原生初始化在真正调用时发生；缺依赖或参数的 Unit 保留为 `MISSING`，显示具体原因。
 
-当前 CRAG 任务保留冻结版本的原 Workflow 方法与事件控制，采用用户提供资料的本地文本检索／搜索端点，以及实际 DeepSeek／GLM 调用。支持的局部循环可通过生成 adapter 门控。搜索范围仅是输入资料；尚未接入在线搜索或完整向量模型。SDK 的无效果 StartEvent 分支与真正处理资料的能力分开记录。
+## 当前实现范围
 
-## 代码与交付
-
-| 目录 | 内容 |
+| 层 | 实际功能 |
 |---|---|
-| `src/seampact/` | 来源分析、包生成、运行门控、HTTP 服务和原生前端 |
-| `tools/` | 固定来源获取、CRAG 任务宿主及可选研究工具 |
-| `config/source-spec.json` | 四源固定修订、选定工件和摘要；不包含第三方源码 |
-| `deploy/` | 单 DEMO 服务及可选实验 profile |
-| `docs/` | 当前设计、任务运行和部署说明 |
-| `sources/`、`var/`、`artifacts/` | 本地生成／下载内容，Git 忽略 |
+| 前端 | 标准对话、模型与 Harness 配置、实际运行观察 |
+| 分析器 | URL／目录接入，全目录清单，工具分析，源码锚点检查，原生入口与有限 W／H／R 接线 |
+| 调度器 | 上层选择同一要求下的可执行完整方案；下层选择原 controller 已使能、owner 与资源条件允许的调用；两层在线表格 Q-learning |
+| 模型适配 | 对话角色支持本地／云端 API；分析角色支持云端 API；独立配置，保留完整上下文，无应用费用或轮次上限 |
 
-四个来源可以登记和分析；当前可交互任务宿主支持指定修订的 CRAG 包。MMCT、ABC、DiSP 的真实任务接入继续实现。调度目前释放原控制流已经启用的调用，采用 FIFO；并行、跨源组合、K8S 和两层 RL 为后续功能。
+支持的是有限原生绑定，并非任意仓库均可执行。复杂 Model／Context 参数、动态 SDK 接线、生成器和未满足的资源条件会明确报缺失。原 controller 与 owner 保留；单个方案按步骤顺序执行；未开放模型自述的并行或远程派发。初版奖励使用调用成功和时延，不代表已衡量最终答案质量或证明 RL 效果。
 
-[手动启动与演示](docs/手动启动与演示.md) · [组会报告](docs/组会报告.md) · [设计与实现路线](docs/设计与实现路线.md) · [原生接线与有限重构](docs/原生接线与有限重构.md) · [任务 DEMO](docs/任务DEMO.md)
+## 文档与部署
+
+[手动启动与演示](docs/手动启动与演示.md) · [当前实现](docs/当前实现.md) · [设计与实现路线](docs/设计与实现路线.md) · [原生接线与有限重构](docs/原生接线与有限重构.md) · [组会报告](docs/组会报告.md) · [Docker 部署](docs/Docker部署.md)
+
+`src/seampact/` 是四层核心实现；`deploy/` 是一个平台容器。代码与当前文档由 [GitHub](https://github.com/yufao/Seampact) 管理；模型、数据、密钥、下载的第三方仓库和 `var/` 运行状态保留本地，按需 SFTP。旧 0.5 文档分类归档于 `docs/历史草案/0.5/`。

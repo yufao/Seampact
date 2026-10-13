@@ -1,7 +1,7 @@
 [project]
 name = "seampact-core"
-version = "0.5.0"
-description = "Source-grounded integration and native-owner admission runtime"
+version = "0.6.0"
+description = "Heterogeneous Harness intake, native Units and two-layer RL chat prototype"
 requires-python = ">=3.11"
 dependencies = []
 

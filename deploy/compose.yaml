@@ -1,138 +1,21 @@
-# Main Demo service; optional research profiles run only when requested.
-name: seampact-demo
-
-x-isolation: &isolation
-  user: "${SEAMPACT_UID:?set your numeric UID}:${SEAMPACT_GID:?set your numeric GID}"
-  read_only: true
-  cap_drop: [ALL]
-  security_opt: ["no-new-privileges:true"]
-  init: true
-  restart: "no"
-  tmpfs:
-    - /tmp:rw,nosuid,nodev,noexec,size=128m,mode=1777
-  logging:
-    driver: local
-    options:
-      max-size: "10m"
-      max-file: "3"
-
-x-control-image: &control-image
-  image: seampact-core:0.5.0
-  build:
-    context: ..
-    dockerfile: deploy/Dockerfile
-    target: demo
-
-x-input: &input
-  type: bind
-  source: "${SEAMPACT_RELEASE_ROOT:?set verified portable release root}"
-  target: /input
-  read_only: true
-  bind:
-    create_host_path: false
-
-x-reports: &reports
-  type: bind
-  source: "${SEAMPACT_REPORT_DIR:?set a private pre-created report directory}"
-  target: /reports
-  bind:
-    create_host_path: false
+name: seampact-prototype
 
 services:
-  control:
-    <<: [*isolation, *control-image]
-    command: [serve]
+  platform:
+    image: seampact-core:0.6.0
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    user: "${SEAMPACT_UID:-1000}:${SEAMPACT_GID:-1000}"
+    init: true
+    command: [serve, --home, /data, --host, 0.0.0.0, --port, "8880", --public-port, "${SEAMPACT_PORT:-8880}"]
     environment:
-      SEAMPACT_PORT: "${SEAMPACT_PORT:-8875}"
-    volumes:
-      - *input
-      - <<: *reports
-        read_only: true
-      - type: bind
-        source: "${SEAMPACT_DATA_DIR:?set a private pre-created state directory}"
-        target: /data
-        bind:
-          create_host_path: false
-      - type: bind
-        source: "${SEAMPACT_SECRET_DIR:?set a private pre-created secret directory}"
-        target: /run/seampact-secrets
-        read_only: true
-        bind:
-          create_host_path: false
+      DEEPSEEK_API_KEY: "${DEEPSEEK_API_KEY:-}"
+      GLM_API_KEY: "${GLM_API_KEY:-}"
+      SEAMPACT_CHAT_API_KEY: "${SEAMPACT_CHAT_API_KEY:-}"
+      SEAMPACT_ANALYSIS_API_KEY: "${SEAMPACT_ANALYSIS_API_KEY:-}"
     ports:
-      - "127.0.0.1:${SEAMPACT_PORT:-8875}:8874"
-    healthcheck:
-      # Only HTTP listener health; it is not a Harness or API quality check.
-      test: [CMD, python, -B, /app/deploy/container_entry.py, health]
-      interval: 20s
-      timeout: 5s
-      retries: 3
-      start_period: 10s
-
-  core-check:
-    <<: [*isolation, *control-image]
-    profiles: [checks]
-    network_mode: none
-    command: [check]
+      - "127.0.0.1:${SEAMPACT_PORT:-8880}:8880"
     volumes:
-      - *reports
-
-  probe-crag:
-    <<: [*isolation, *control-image]
-    profiles: [probes]
-    network_mode: none
-    command: [probe-crag]
-    volumes:
-      - *input
-      - *reports
-
-  probe-crag-sdk:
-    <<: *isolation
-    profiles: [sdk-workflow]
-    image: seampact-core-crag-sdk-probe:0.5.0
-    build:
-      context: ..
-      dockerfile: deploy/Dockerfile
-      target: crag-sdk-probe
-    network_mode: none
-    command: [probe-crag-sdk]
-    volumes:
-      - *input
-      - *reports
-
-  probe-mmct:
-    <<: *isolation
-    profiles: [probes]
-    image: seampact-core-sdk-probe:0.5.0
-    build:
-      context: ..
-      dockerfile: deploy/Dockerfile
-      target: sdk-probe
-    network_mode: none
-    command: [probe-mmct]
-    volumes:
-      - *input
-      - *reports
-
-  eval-crag-api:
-    <<: *isolation
-    profiles: [api-profile]
-    image: seampact-core-crag-sdk-probe:0.5.0
-    build:
-      context: ..
-      dockerfile: deploy/Dockerfile
-      target: crag-sdk-probe
-    network_mode: none
-    command: [eval-crag-api]
-    environment:
-      SEAMPACT_API_PACKAGE: "${SEAMPACT_API_PACKAGE:-unconfigured.zip}"
-      SEAMPACT_API_RECORD: "${SEAMPACT_API_RECORD:-unconfigured.json}"
-    volumes:
-      - *input
-      - *reports
-      - type: bind
-        source: "${SEAMPACT_API_INPUT_DIR:-${SEAMPACT_REPORT_DIR}}"
-        target: /api-input
-        read_only: true
-        bind:
-          create_host_path: false
+      - "${SEAMPACT_DATA_DIR:-../var/prototype}:/data"
+      - "${SEAMPACT_HARNESS_DIR:-../harnesses}:/harnesses"

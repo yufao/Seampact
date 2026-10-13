@@ -1,13 +1,84 @@
 """Frozen, paginated source evidence. Source imports are never executed."""
 
 import ast
+import codecs
+import configparser
 import hashlib
+import io
 import json
+import os
+import re
+import tokenize
+import tomllib
 from pathlib import Path, PurePosixPath
 
-EXCLUDED = {".git", ".venv", "node_modules", "__pycache__", "var", ".env"}
-TEXT_SUFFIXES = {".py", ".ipynb", ".md", ".toml", ".yaml", ".yml", ".co", ".json", ".txt",
-                 ".sh", ".bash", ".cfg", ".ini", ".csv", ".tsv"}
+EXCLUDED = {".git", ".venv", "venv", "node_modules", "__pycache__", ".env",
+            ".cache", ".pytest_cache", ".mypy_cache", ".ruff_cache", ".tox", ".aws", ".ssh"}
+SOURCE_SUFFIXES = {".py", ".pyi", ".ipynb", ".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx",
+                   ".java", ".kt", ".kts", ".go", ".rs", ".c", ".cc", ".cpp", ".h", ".hpp",
+                   ".cs", ".rb", ".php", ".lua", ".r", ".jl", ".sh", ".bash", ".zsh",
+                   ".ps1", ".bat", ".cmd", ".sql", ".co", ".html", ".css", ".scss", ".vue"}
+CONFIG_SUFFIXES = {".toml", ".yaml", ".yml", ".json", ".cfg", ".ini", ".xml", ".conf", ".properties"}
+TEXT_SUFFIXES = SOURCE_SUFFIXES | CONFIG_SUFFIXES | {".md", ".rst", ".txt", ".csv", ".tsv", ".jsonl", ".log"}
+MODEL_SUFFIXES = {".safetensors", ".pt", ".pth", ".ckpt", ".onnx", ".pb", ".h5", ".hdf5", ".gguf"}
+DATA_SUFFIXES = {".npy", ".npz", ".pkl", ".pickle", ".parquet", ".arrow", ".feather", ".avro",
+                 ".db", ".sqlite", ".sqlite3", ".dat"}
+BINARY_SUFFIXES = MODEL_SUFFIXES | DATA_SUFFIXES | {
+    ".bin", ".zip", ".tar", ".gz", ".7z", ".bz2", ".xz", ".rar", ".png", ".jpg", ".jpeg",
+    ".gif", ".bmp", ".tif", ".tiff", ".webp", ".ico", ".pdf", ".docx", ".xlsx", ".pptx",
+    ".mp3", ".wav", ".flac", ".aac", ".ogg", ".mp4", ".avi", ".mov", ".mkv", ".webm",
+    ".so", ".dll", ".exe", ".class", ".pyc", ".o", ".a", ".wasm", ".ttf", ".woff", ".woff2"}
+
+
+def excluded(parts):
+    return any(part.lower() in EXCLUDED or part.lower().startswith(".env")
+        or "credential" in part.lower() or part.lower().endswith((".pem", ".key"))
+        or part.lower() in {"id_rsa", "id_dsa", "id_ecdsa", "id_ed25519"} for part in parts)
+
+
+def decode_text(path, data):
+    """Decode source without evaluating it; preserve its bytes in the snapshot."""
+    if data.startswith((codecs.BOM_UTF32_LE, codecs.BOM_UTF32_BE)):
+        encoding = "utf-32"
+    elif data.startswith((codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE)):
+        encoding = "utf-16"
+    else:
+        if b"\x00" in data:
+            raise ValueError("binary resource is not readable source")
+        encoding = "utf-8-sig"
+        if str(path).lower().endswith((".py", ".pyi")):
+            try:
+                encoding, _ = tokenize.detect_encoding(io.BytesIO(data).readline)
+            except SyntaxError:
+                # An invalid coding cookie is still source text for inspection.
+                pass
+    try:
+        text = data.decode(encoding)
+    except UnicodeDecodeError:
+        if Path(path).suffix.lower() not in TEXT_SUFFIXES:
+            raise
+        try:
+            text, encoding = data.decode("gb18030"), "gb18030"
+        except UnicodeDecodeError:
+            text, encoding = data.decode("cp1252"), "cp1252"
+    if any(ord(character) < 32 and character not in "\t\n\r\f" for character in text):
+        raise ValueError("binary resource is not readable source")
+    return text, encoding
+
+
+def file_kind(path):
+    suffix = Path(path).suffix.lower()
+    if suffix in MODEL_SUFFIXES:
+        return "model"
+    if suffix in DATA_SUFFIXES:
+        return "data"
+    if suffix in BINARY_SUFFIXES:
+        return "binary"
+    if suffix in SOURCE_SUFFIXES or Path(path).name in {"Dockerfile", "Makefile", "CMakeLists.txt"}:
+        return "source"
+    if suffix in CONFIG_SUFFIXES:
+        return "config"
+    return "text"
 
 
 def digest(data):
@@ -18,8 +89,7 @@ def safe_path(root, relative):
     p = PurePosixPath(relative.replace("\\", "/"))
     if p.is_absolute() or not p.parts or ".." in p.parts or ":" in relative:
         raise ValueError("relative source path required")
-    if any(part in EXCLUDED or part.startswith(".env") or "credential" in part.lower()
-           or part.lower().endswith((".pem", ".key")) for part in p.parts):
+    if excluded(p.parts):
         raise ValueError("configuration secrets and excluded directories are not source evidence")
     root = Path(root).resolve()
     result = root.joinpath(*p.parts).resolve()
@@ -29,8 +99,8 @@ def safe_path(root, relative):
 
 
 def units(path, data):
-    text = data.decode("utf-8-sig")
-    if path.endswith(".ipynb"):
+    text, _ = decode_text(path, data)
+    if path.lower().endswith(".ipynb"):
         book = json.loads(text)
         return [(f"cell:{i}", "".join(cell.get("source", [])))
                 for i, cell in enumerate(book.get("cells", []))
@@ -41,7 +111,7 @@ def units(path, data):
 def symbols(path, data):
     result, unknown = [], []
     for unit, source in units(path, data):
-        if not path.endswith((".py", ".ipynb")):
+        if not path.lower().endswith((".py", ".ipynb")):
             continue
         try:
             tree = ast.parse(source)
@@ -67,6 +137,146 @@ def symbols(path, data):
     return dict(symbols=result, unknown=unknown, closure="UNKNOWN")
 
 
+def source_facts(path, data):
+    """Static imports and entry anchors are evidence candidates, not bindings."""
+    imports, entries, unknown = [], [], []
+    suffix = Path(path).suffix.lower()
+    try:
+        available = units(path, data)
+    except (ValueError, TypeError, AttributeError, SyntaxError, UnicodeError):
+        return dict(imports=[], entry_candidates=[],
+            unknown=[dict(path=path, kind="SOURCE_STRUCTURE_PARSE_UNSUPPORTED")], dependency_closure="UNKNOWN")
+    for unit, source in available:
+        if suffix in {".py", ".pyi", ".ipynb"}:
+            try:
+                tree = ast.parse(source)
+            except SyntaxError as error:
+                unknown.append(dict(path=path, unit=unit, kind="PARSE_UNSUPPORTED", line=error.lineno))
+                continue
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Import):
+                    for name in node.names:
+                        imports.append(dict(path=path, unit=unit, line=node.lineno, module=name.name,
+                                            names=[], level=0, kind="import"))
+                elif isinstance(node, ast.ImportFrom):
+                    imports.append(dict(path=path, unit=unit, line=node.lineno, module=node.module,
+                        names=[name.name for name in node.names], level=node.level, kind="from"))
+                elif isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "__import__":
+                    unknown.append(dict(path=path, unit=unit, line=node.lineno, kind="DYNAMIC_IMPORT"))
+            for node in tree.body:
+                if isinstance(node, ast.If) and isinstance(node.test, ast.Compare):
+                    expression = node.test
+                    parts = [expression.left, *expression.comparators]
+                    if (len(parts) == 2 and len(expression.ops) == 1 and isinstance(expression.ops[0], ast.Eq)
+                        and any(isinstance(item, ast.Name) and item.id == "__name__" for item in parts)
+                        and any(isinstance(item, ast.Constant) and item.value == "__main__" for item in parts)):
+                        entries.append(dict(path=path, unit=unit, line=node.lineno, kind="python_main_guard", symbol="__main__"))
+                elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == "main":
+                    entries.append(dict(path=path, unit=unit, line=node.lineno, kind="main_callable", symbol=node.name))
+                elif isinstance(node, ast.Expr):
+                    call = node.value.value if isinstance(node.value, ast.Await) else node.value
+                    if isinstance(call, ast.Call):
+                        entries.append(dict(path=path, unit=unit, line=node.lineno, kind="top_level_call", symbol=ast.unparse(call.func)))
+            if Path(path).name == "__main__.py":
+                entries.append(dict(path=path, unit=unit, line=1, kind="python_module_entry", symbol="__main__"))
+        else:
+            patterns = []
+            if suffix in {".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx", ".vue"}:
+                patterns = [r"\b(?:import|export)\s+(?:[^;\n]*?\s+from\s+)?['\"]([^'\"]+)['\"]",
+                            r"\brequire\s*\(\s*['\"]([^'\"]+)['\"]\s*\)"]
+            elif suffix in {".c", ".cc", ".cpp", ".h", ".hpp"}:
+                patterns = [r"^\s*#\s*include\s*[<\"]([^>\"]+)[>\"]"]
+            elif suffix in {".java", ".kt", ".kts", ".cs"}:
+                patterns = [r"^\s*(?:import|using)\s+(?:static\s+)?([\w.*]+)"]
+            elif suffix in {".sh", ".bash", ".zsh"}:
+                patterns = [r"^\s*(?:source|\.)\s+['\"]?([^\s'\";]+)"]
+            for pattern in patterns:
+                for match in re.finditer(pattern, source, re.MULTILINE):
+                    imports.append(dict(path=path, unit=unit, line=source.count("\n", 0, match.start()) + 1,
+                                        module=match.group(1), names=[], level=0, kind="textual_static_import"))
+            if suffix in SOURCE_SUFFIXES and not patterns:
+                unknown.append(dict(path=path, unit=unit, kind="STATIC_IMPORT_PARSER_UNSUPPORTED"))
+            if suffix in {".sh", ".bash", ".zsh", ".ps1", ".bat", ".cmd"}:
+                entries.append(dict(path=path, unit=unit, line=1, kind="script", symbol=None))
+            try:
+                if Path(path).name == "pyproject.toml":
+                    project = tomllib.loads(source)
+                    tables = [project.get("project", {}).get("scripts", {}),
+                              project.get("project", {}).get("gui-scripts", {}),
+                              project.get("tool", {}).get("poetry", {}).get("scripts", {})]
+                    for table in tables:
+                        for name, command in table.items():
+                            entries.append(dict(path=path, unit=unit, kind="declared_script", name=name, symbol=command))
+                elif Path(path).name == "package.json":
+                    package = json.loads(source)
+                    for name, command in package.get("scripts", {}).items():
+                        entries.append(dict(path=path, unit=unit, kind="declared_script", name=name, symbol=command))
+                    if package.get("bin"):
+                        entries.append(dict(path=path, unit=unit, kind="declared_binary_entry", symbol=package["bin"]))
+                elif Path(path).name == "setup.cfg":
+                    config = configparser.ConfigParser(interpolation=None)
+                    config.read_string(source)
+                    if config.has_section("options.entry_points"):
+                        for group, commands in config.items("options.entry_points"):
+                            entries.extend(dict(path=path, unit=unit, kind="declared_script", group=group, symbol=command.strip())
+                                           for command in commands.splitlines() if command.strip())
+            except (ValueError, TypeError, AttributeError, configparser.Error):
+                unknown.append(dict(path=path, unit=unit, kind="ENTRY_DECLARATION_PARSE_UNSUPPORTED"))
+            if Path(path).name == "Dockerfile":
+                for line, command in enumerate(source.splitlines(), 1):
+                    if re.match(r"\s*(?:ENTRYPOINT|CMD)\s", command, re.IGNORECASE):
+                        entries.append(dict(path=path, unit=unit, line=line, kind="container_entry", symbol=command.strip()))
+    return dict(imports=imports, entry_candidates=entries, unknown=unknown, dependency_closure="UNKNOWN")
+
+
+def inventory_repository(root, excluded_roots=()):
+    """Inventory every non-excluded path; only decodable text enters files."""
+    root = Path(root).resolve()
+    excluded_roots = {Path(path).resolve() for path in excluded_roots if Path(path).resolve() != root}
+    inventory, files, resources, entries = [], [], [], []
+    def unreadable(error):
+        raise ValueError("repository directory is unreadable") from error
+    for directory, children, names in os.walk(root, onerror=unreadable):
+        base = Path(directory)
+        children[:] = sorted(name for name in children
+            if not excluded((name,)) and (base / name).resolve() not in excluded_roots)
+        for name in list(children):
+            path = base / name
+            relative = path.relative_to(root).as_posix()
+            if path.is_symlink() or not path.resolve().is_relative_to(root):
+                children.remove(name)
+                inventory.append(dict(path=relative, kind="symlink", readable=False, bytes=path.lstat().st_size))
+            else:
+                inventory.append(dict(path=relative, kind="directory", readable=False, bytes=None))
+        for name in sorted(names):
+            if excluded((name,)):
+                continue
+            path = base / name
+            relative = path.relative_to(root).as_posix()
+            if path.is_symlink() or not path.resolve().is_relative_to(root) or not path.is_file():
+                inventory.append(dict(path=relative, kind="symlink" if path.is_symlink() else "special",
+                                      readable=False, bytes=path.lstat().st_size))
+                continue
+            record = dict(path=relative, kind=file_kind(relative), bytes=path.stat().st_size, readable=False)
+            if path.suffix.lower() not in BINARY_SUFFIXES:
+                data = path.read_bytes()
+                try:
+                    _, encoding = decode_text(relative, data)
+                except (UnicodeError, ValueError, SyntaxError):
+                    record["kind"] = "binary"
+                else:
+                    record.update(readable=True, encoding=encoding)
+                    files.append(relative)
+                    try:
+                        entries.extend(source_facts(relative, data)["entry_candidates"])
+                    except (ValueError, TypeError, AttributeError):
+                        record["structure"] = "PARSE_UNSUPPORTED"
+            inventory.append(record)
+            if not record["readable"]:
+                resources.append({key: record[key] for key in ("path", "kind", "bytes")})
+    return dict(files=files, inventory=inventory, resources=resources, entry_candidates=entries)
+
+
 class Inspector:
     def __init__(self, root, snapshots, request):
         self.root = Path(root).resolve()
@@ -83,9 +293,10 @@ class Inspector:
         records = []
         for relative in dict.fromkeys(paths):
             path = safe_path(root, relative)
-            if path.suffix not in TEXT_SUFFIXES or not path.is_file():
+            if path.suffix.lower() in BINARY_SUFFIXES or not path.is_file():
                 raise ValueError(f"not a supported source artifact: {relative}")
             data = path.read_bytes()
+            decode_text(relative, data)
             sha = digest(data)
             destination = snapshots / sha
             if not destination.exists():
@@ -97,6 +308,15 @@ class Inspector:
                        resources=[], missing=["native run", "dependency closure", "owner/effect summaries"])
         request["source_version"] = digest(json.dumps(records, sort_keys=True).encode())
         return cls(root, snapshots, request)
+
+    @classmethod
+    def freeze_repository(cls, source, snapshots, identity, observation):
+        """Freeze the entire text scope produced by RepositoryIntake.prepare."""
+        inspector = cls.freeze(source["root"], snapshots, identity, source["files"], source["entry"], observation)
+        inspector.request.update(source_id=source["id"], source_name=source["name"],
+            source_address=source["address"], source_revision=source.get("revision"),
+            inventory=source["inventory"], resources=source.get("resources", []))
+        return inspector
 
     def list_source(self, offset=0, count=100):
         if type(offset) is not int or offset < 0 or type(count) is not int or count < 1:
@@ -127,11 +347,52 @@ class Inspector:
     def inspect_symbols(self, path):
         return dict(path=path, sha256=self.files[path]["sha256"], **symbols(path, self.data(path)))
 
+    def list_structure(self, path="", recursive=True):
+        """Return directory and file categories, without resource contents."""
+        if not isinstance(path, str) or type(recursive) is not bool:
+            raise ValueError("structure path and recursive flag required")
+        prefix = path.replace("\\", "/").strip("/")
+        if prefix:
+            safe_path(self.root, prefix)
+        inventory = self.request.get("inventory")
+        if inventory is None:
+            inventory = [dict(path=item["path"], kind=file_kind(item["path"]),
+                              bytes=item["bytes"], readable=True) for item in self.files.values()]
+        selected = []
+        for item in inventory:
+            relative = item["path"]
+            if prefix and relative != prefix and not relative.startswith(prefix + "/"):
+                continue
+            remainder = relative[len(prefix):].lstrip("/") if prefix else relative
+            if recursive or "/" not in remainder:
+                selected.append(item)
+        return dict(path=prefix, inventory=selected, total=len(selected), dependency_closure="UNKNOWN")
+
+    def inspect_imports(self, path=None, unit=None):
+        """Query static imports from frozen text; dynamic closure stays unknown."""
+        paths = [path] if path is not None else list(self.files)
+        imports, unknown = [], []
+        for relative in paths:
+            facts = source_facts(relative, self.data(relative))
+            imports.extend(item for item in facts["imports"] if unit is None or item.get("unit") == unit)
+            unknown.extend(item for item in facts["unknown"] if unit is None or item.get("unit") == unit)
+        return dict(paths=paths, imports=imports, unknown=unknown, dependency_closure="UNKNOWN")
+
+    def entry_candidates(self):
+        """Expose source entry anchors without selecting an execution host."""
+        candidates, unknown = [], []
+        for path in self.files:
+            facts = source_facts(path, self.data(path))
+            candidates.extend(facts["entry_candidates"])
+            unknown.extend(facts["unknown"])
+        return dict(candidates=candidates, unknown=unknown, selected=None, execution="NOT_RUN")
+
     def add_source(self, path):
         """Explicit dependency extension makes a new version; never silently mutates a freeze."""
-        data = safe_path(self.root, path).read_bytes()
-        if Path(path).suffix not in TEXT_SUFFIXES:
+        if Path(path).suffix.lower() in BINARY_SUFFIXES:
             raise ValueError("unsupported source type")
+        data = safe_path(self.root, path).read_bytes()
+        _, encoding = decode_text(path, data)
         sha = digest(data)
         dest = self.snapshots / sha
         if not dest.exists():
@@ -142,5 +403,8 @@ class Inspector:
             raise ValueError("already frozen; use the existing immutable artifact")
         self.request["files"].append(record)
         self.files[record["path"]] = record
+        if "inventory" in self.request:
+            self.request["inventory"].append(dict(path=record["path"], kind=file_kind(path),
+                bytes=len(data), readable=True, encoding=encoding))
         self.request["source_version"] = digest(json.dumps(self.request["files"], sort_keys=True).encode())
         return record

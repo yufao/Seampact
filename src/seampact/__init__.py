@@ -1,3 +1,3 @@
-"""Independent implementation of the current SeamPact protocol."""
+"""SeamPact Harness intake and two-layer scheduling prototype."""
 
-__version__ = "0.5.0"
+__version__ = "0.6.0"

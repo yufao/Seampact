@@ -1,23 +1,8 @@
-# Build context is an allowlist; never send work state, credentials or caches.
+# Only platform source enters the image. User repositories and state are mounted.
 **
 !src/
 !src/**
-!tests/
-!tests/**
-!tools/
-!tools/*.py
-!docs/
-!docs/requirements-sdk-mmct.txt
-!docs/requirements-sdk-crag.txt
 !deploy/
 !deploy/Dockerfile
-!deploy/*.py
-!README.md
-!pyproject.toml
-!sources/
-!sources/**
-!sources.json
-!release-manifest.json
-!SOURCE-NOTICES.json
-**/__pycache__/**
+**/__pycache__/
 **/*.pyc

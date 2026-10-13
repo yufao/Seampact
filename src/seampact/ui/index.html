@@ -3,81 +3,85 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>SeamPact · Harness 工作台</title>
+  <title>SeamPact · 对话</title>
   <link rel="stylesheet" href="/style.css">
   <script src="/app.js" defer></script>
 </head>
 <body>
-  <aside>
-    <a class="brand" href="/"><span class="brand-mark">S</span><span>SeamPact</span></a>
-    <p class="aside-caption">Harness 能力工作台</p>
-    <nav aria-label="工作台导航">
-      <a href="#sources">来源与能力</a>
-      <a href="#analysis">自动拆分</a>
-      <a href="#execution">运行 DEMO</a>
-      <a href="#models">模型接口</a>
-    </nav>
-    <div class="aside-foot"><span class="connection-dot"></span><span id="connection">正在连接</span><div id="version"></div></div>
-  </aside>
-  <main>
-    <header>
-      <div><div class="eyebrow">HARNESS WORKBENCH</div><h1>从完整流程，走到可调用能力。</h1><p class="muted">选一个来源，让 API 分析边界，生成适配草案，再查看它的实际运行。</p></div>
-      <a id="quick-run" class="primary-link" href="#execution">运行 CRAG 示例 <span aria-hidden="true">↗</span></a>
-    </header>
-    <div id="notice" role="status" aria-live="polite" hidden></div>
-
-    <section id="sources" class="source-section">
-      <div class="section-head"><div><div class="eyebrow">01 / SELECT A SOURCE</div><h2>选择 Harness</h2></div><span class="muted small">四类来源，一个接入流程</span></div>
-      <div id="source-cards" class="source-grid"></div>
-    </section>
-
-    <section id="analysis">
-      <div class="section-head"><div><div class="eyebrow">02 / ANALYZE & EXTRACT</div><h2 id="selected-source-title">自动分析与适配</h2></div><span id="source-stage" class="tag">等待选择</span></div>
-      <p id="source-description" class="muted"></p>
-      <div class="workflow" aria-label="接入流程">
-        <div class="workflow-step"><span class="step-number">1</span><div><strong>准备来源</strong><p>固定源码和本次目标</p></div></div>
-        <div class="workflow-step"><span class="step-number">2</span><div><strong>API 分析</strong><p>读源码、提议能力边界</p></div></div>
-        <div class="workflow-step"><span class="step-number">3</span><div><strong>生成适配</strong><p>包装、接线或局部提取</p></div></div>
+  <div class="app-shell">
+    <aside class="app-rail" aria-label="应用">
+      <a class="brand" href="/" aria-label="SeamPact"><span class="brand-mark">S</span><span>SeamPact</span></a>
+      <p class="rail-caption">异构 Harness · 对话</p>
+      <div class="rail-actions">
+        <button id="open-configuration" class="rail-button" type="button"><span aria-hidden="true">⚙</span> 配置</button>
+        <button id="open-observer" class="rail-button" type="button" aria-controls="observer" aria-expanded="false"><span aria-hidden="true">◉</span> 运行状态</button>
       </div>
-      <div class="intake-form">
-        <label class="grow">接入目标与任务要求<textarea id="observation" rows="3">将这个 Harness 中可调度的能力提取为可调用模块。保留原算法、状态和控制流程，明确每个模块的输入、输出、依赖与调用条件。</textarea></label>
-        <div class="start-controls"><label>分析模型<select id="analysis-provider" aria-label="分析模型"></select></label><button id="start-analysis">准备来源并开始分析</button><button id="freeze-source" class="secondary">仅准备来源</button><p id="analysis-start-help" class="muted small"></p></div>
-      </div>
-      <div id="requests"></div>
-      <div id="analysis-cards"></div>
-      <div id="packages"></div>
-      <details id="analysis-detail"><summary>查看完整分析记录</summary><pre id="detail">选择一份分析记录查看源码工具调用和检查结果。</pre></details>
-    </section>
-
-    <section id="execution">
-      <div class="section-head"><div><div class="eyebrow">03 / RUN A WORKFLOW</div><h2>运行 DEMO</h2></div><span id="execution-status" class="tag">读取运行配置</span></div>
-      <p id="execution-help" class="muted">输入问题和资料，通过原 CRAG 工作流查看回答与被激活的能力。</p>
-      <div class="run-layout">
-        <form id="run-form" class="run-input">
-          <label>运行的适配草案<select id="run-package"></select></label>
-          <div class="run-options"><label>运行模式<select id="run-mode"><option value="live">真实模型</option><option value="preview">受控预览 · 不调用模型</option></select></label><label>模型接口<select id="run-provider" aria-label="运行模型"></select></label></div>
-          <label>问题<input id="run-question" type="text" placeholder="输入一个与示例资料有关的问题" required></label>
-          <label>资料<textarea id="run-documents" rows="7" placeholder="每段资料之间留一个空行" required></textarea></label>
-          <p id="run-mode-help" class="muted small">真实模型会调用你配置的接口。资料之间用空行分隔；检索限于这些资料。</p>
-          <button id="run-workflow" type="submit">运行工作流 <span aria-hidden="true">→</span></button>
+      <div class="rail-foot"><span class="connection-dot" aria-hidden="true"></span><span id="connection">正在连接</span><span id="version"></span></div>
+    </aside>
+    <main class="chat-shell">
+      <header class="chat-header">
+        <div class="chat-heading"><div class="eyebrow">SEAMPACT</div><h1>对话</h1></div>
+        <div class="header-actions"><span id="chat-model-name" class="status-pill pending">对话模型未配置</span></div>
+      </header>
+      <div id="notice" class="notice" role="status" aria-live="polite" hidden></div>
+      <section id="conversation" class="conversation" role="log" aria-label="对话内容" aria-live="polite" aria-relevant="additions text">
+        <div class="welcome"><div class="welcome-mark" aria-hidden="true">S</div><h2>有什么想一起完成的？</h2><p>直接发送任务。Harness 的分析与调用状态会显示在右侧。</p><p id="welcome-context" class="context-note">正在读取模型与能力池。</p></div>
+      </section>
+      <div class="composer-area">
+        <form id="chat-form" class="composer">
+          <label class="visually-hidden" for="chat-input">消息</label>
+          <textarea id="chat-input" rows="1" placeholder="发送消息…" aria-describedby="composer-hint" required></textarea>
+          <div class="composer-footer"><span id="composer-hint" class="composer-hint">Enter 发送 · Shift + Enter 换行</span><button id="send-message" class="primary-button" type="submit" disabled><span class="send-label">发送</span><span aria-hidden="true">↑</span></button></div>
         </form>
-        <div id="run-result" class="run-output" aria-live="polite"><div class="empty-result"><span class="empty-icon">↗</span><h3>看见一次完整运行</h3><p>运行后在这里查看回答、被激活的能力和执行顺序。</p></div></div>
+        <p id="chat-readiness" class="chat-footnote">正在连接平台。</p>
       </div>
-      <details id="run-history"><summary>之前的运行</summary><div id="run-history-list"></div></details>
-    </section>
-
-    <section id="models">
-      <div class="section-head"><div><div class="eyebrow">04 / MODEL CONNECTIONS</div><h2>模型接口</h2></div><span class="tag">不设应用额度上限</span></div>
-      <p class="muted small">DeepSeek 与 GLM 用于分析和任务回答。保留完整上下文，不限制费用、调用次数或分析轮次；模型能力以提供方为准。Kimi 暂不可用。</p>
-      <div id="model-cards" class="cards"></div>
-    </section>
-
-    <details id="technical-details" class="technical-details">
-      <summary>已有运行记录与平台明细</summary>
-      <section id="evidence"><div class="section-head"><h2>已有运行记录</h2><span class="muted small">各项记录有各自的运行范围</span></div><div id="evidence-cards" class="cards"></div></section>
-      <section id="runtime"><div class="section-head"><h2>调度器明细</h2><button id="demo" class="secondary">运行教学流程</button></div><p class="muted small">教学流程只比较两个本地函数调用。上方 DEMO 使用原 CRAG SDK 工作流，两者分别记录。</p><div class="metrics"><div><span>执行槽</span><strong id="quota">—</strong></div><div><span>使用中</span><strong id="used">—</strong></div><div><span>调用记录</span><strong id="calls">—</strong></div><div><span>当前策略</span><strong>FIFO</strong></div></div><div id="demo-results"></div><details><summary>调度事件</summary><pre id="events"></pre></details></section>
-    </details>
-    <footer>草案生成与工作流运行分别展示。新增并行、跨流程组合和远程执行仍需对应的接入实现。</footer>
-  </main>
+    </main>
+    <aside id="observer" class="observer" aria-label="运行状态">
+      <header class="observer-header"><h2>运行状态</h2><button id="close-observer" class="icon-button" type="button" aria-label="关闭运行状态">×</button></header>
+      <div class="observer-scroll">
+        <section class="panel-section"><div class="panel-heading"><h3>调度器</h3><span id="scheduler-status" class="status-pill pending">正在读取</span></div><div id="scheduler-summary" class="scheduler-summary"></div></section>
+        <section class="panel-section"><div class="panel-heading"><h3>真实任务</h3><span id="task-count" class="count-badge">0</span></div><div id="task-list" class="status-list"><p class="empty-note">尚无任务。</p></div></section>
+        <section class="panel-section"><div class="panel-heading"><h3>能力池</h3><span id="unit-count" class="count-badge">0</span></div><div id="unit-list" class="unit-list"><p class="empty-note">尚无可用的 Harness Unit。</p></div></section>
+        <section class="panel-section"><div class="panel-heading"><h3>来源与分析</h3><span id="analysis-count" class="count-badge">0</span></div><div id="analysis-list" class="status-list"><p class="empty-note">配置 Harness 地址后可开始分析。</p></div></section>
+      </div>
+    </aside>
+  </div>
+  <div id="drawer-shade" class="drawer-shade" hidden></div>
+  <dialog id="configuration" class="configuration" aria-labelledby="configuration-title">
+    <header class="config-header"><div><div class="eyebrow">CONFIGURATION</div><h2 id="configuration-title">配置</h2></div><button id="close-configuration" class="icon-button" type="button" aria-label="关闭配置">×</button></header>
+    <div class="config-body">
+      <section class="config-section">
+        <h3>模型</h3><p class="form-note">对话模型与分析模型分别保存。分析器使用云端接口。</p>
+        <div class="model-grid">
+          <form id="chat-model-form" class="model-form" data-role="chat">
+            <h4>对话模型</h4><p class="form-note">支持本地部署 API 与云端 API。</p><p id="chat-model-readiness" class="form-note">正在读取配置。</p>
+            <label>接口地址<input name="base_url" type="url" placeholder="http://localhost:8000/v1" required></label>
+            <label>模型 ID<input name="model" type="text" placeholder="填写部署或提供方的模型 ID" required></label>
+            <label>API Key<input name="api_key" type="password" autocomplete="new-password" placeholder="本地可留空；同一接口留空保持已有密钥"></label>
+            <label>最大输出 token（可选）<input name="max_output_tokens" type="number" min="1" step="1" placeholder="按模型能力填写"></label>
+            <div class="form-actions"><button class="primary-button" type="submit">保存对话模型</button><span class="form-status" role="status"></span></div>
+          </form>
+          <form id="analysis-model-form" class="model-form" data-role="analysis">
+            <h4>分析模型</h4><p class="form-note">使用云端 API 分析 Harness 源码。</p><p id="analysis-model-readiness" class="form-note">正在读取配置。</p>
+            <label>接口地址<input name="base_url" type="url" placeholder="https://提供方地址/v1" required></label>
+            <label>模型 ID<input name="model" type="text" placeholder="填写分析模型 ID" required></label>
+            <label>API Key<input name="api_key" type="password" autocomplete="new-password" placeholder="已有密钥留空保持"></label>
+            <label>最大输出 token（可选）<input name="max_output_tokens" type="number" min="1" step="1" placeholder="按模型能力填写"></label>
+            <div class="form-actions"><button class="primary-button" type="submit">保存分析模型</button><span class="form-status" role="status"></span></div>
+          </form>
+        </div>
+      </section>
+      <section class="config-section">
+        <h3>Harness</h3><p class="form-note">填入远程仓库 URL 或本地目录路径，由分析器读取来源并发现能力。</p>
+        <form id="harness-form">
+          <label>模块地址<input id="harness-address" name="address" type="text" placeholder="https://github.com/组织/仓库 或 C:\Harness\目录" required></label>
+          <details class="harness-options"><summary>版本、入口与资源（可选）</summary><div class="optional-grid"><label>版本<input name="revision" type="text" placeholder="分支、标签或提交 ID"></label><label>原生入口<input name="entry" type="text" placeholder="已知入口可填写"></label></div><label>资源路径（JSON 列表）<textarea name="resources" rows="3" placeholder='["/path/to/model", {"path":"/path/to/data"}]'></textarea></label><p class="form-note">每项填写路径字符串，或包含 path 的资源对象。</p></details>
+          <div class="form-actions"><button id="add-harness" class="primary-button" type="submit">接入 Harness</button><span id="harness-form-status" class="form-status" role="status"></span></div>
+        </form>
+        <div id="harness-list" class="status-list"><p class="empty-note">尚未配置 Harness 来源。</p></div>
+      </section>
+    </div>
+    <footer class="dialog-footer">配置完成后可回到对话。运行状态始终以平台实际返回为准。</footer>
+  </dialog>
 </body>
 </html>

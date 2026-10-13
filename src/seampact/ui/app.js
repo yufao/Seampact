@@ -1,375 +1,498 @@
 const $ = id => document.getElementById(id);
-const el = (name, text, className) => {
-  const node = document.createElement(name);
-  if (text !== undefined && text !== null) node.textContent = String(text);
-  if (className) node.className = className;
-  return node;
+const node = (name, text, className) => {
+  const element = document.createElement(name);
+  if (text !== undefined && text !== null) element.textContent = String(text);
+  if (className) element.className = className;
+  return element;
 };
-let state, selectedSource = null, selectedDetail = null, selectedRun = null;
-let refreshing = false, starting = false, runSubmitting = false, inputsInitialized = false;
-const sourceInfo = {
-  'mmct-image': {icon:'IMG', title:'MMCT ImageAgent', note:'图像检查与工具调用', description:'从图像 Agent、模型接口和检查工具中发现能力。完整图像任务的运行接入仍待完成。'},
-  'crag-text': {icon:'RAG', title:'LlamaIndex CRAG', note:'检索、评价与回答', description:'从原 CRAG 工作流中发现检索、文档评价、查询改写和回答能力。已提供可运行的 CRAG 任务示例。'},
-  'abc-policy': {icon:'ABC', title:'NeMo ABC Bot', note:'政策、门控与知识库', description:'一起分析配置、规则、提示词与知识库，追踪它们依赖的原生方法。完整机器人运行接入仍待完成。'},
-  'disp-offline': {icon:'DiSP', title:'DiSP', note:'数据净化与离线作业', description:'分析净化、训练和评估脚本中的能力，以及模型和数据依赖。真实离线作业的运行接入仍待完成。'}
+
+const messages = [];
+let state = null;
+let pendingTask = null;
+let refreshing = false;
+let connected = false;
+const analysisSubmitting = new Set();
+const terminalStatuses = new Set(['COMPLETED', 'SUCCEEDED', 'FAILED', 'CANCELLED', 'INTERRUPTED', 'BLOCKED']);
+const statusNames = {
+  RUNNING: '运行中', QUEUED: '排队中', WAITING: '等待中', COMPLETED: '已完成',
+  SUCCEEDED: '已完成', FAILED: '失败', CANCELLED: '已取消', INTERRUPTED: '已中断',
+  READY: '可用', AVAILABLE: '可用', BLOCKED: '待接入', PENDING: '待确认',
+  THEORY_PENDING: '理论待确认', IDLE: '空闲', ANALYZING: '分析中', ANALYZED: '已分析',
+  REGISTERED: '已登记', CONNECTED: '已接入', MISSING: '待接入', NOT_CONFIGURED: '未配置', ENABLED: '已使能',
+  AUTHORIZED: '已派发', RESERVED: '已占槽', UNKNOWN: '状态未知',
+  STARTED: '执行中', RETIRED: '已结束', BUILT_DRAFT: '适配已生成'
 };
-const statusText = {
-  RUNNING:'运行中', COMPLETED:'已完成', CANCELLING:'正在停止', CANCELLED:'已停止',
-  INTERRUPTED:'已中断', FAILED:'未完成', PASS:'通过', FAIL:'未通过', NOT_RUN:'尚未运行',
-  INVALID:'记录无效', BUILT_DRAFT:'已生成草案'
-};
-const modeText = {W:'包装原方法',H:'原生接线',R:'局部提取'};
-function notice(text) { $('notice').textContent = text; $('notice').hidden = false; }
+
 async function api(path, body) {
   const response = await fetch(path, body === undefined ? {} : {
-    method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)
+    method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)
   });
-  const data = await response.json();
-  if (!response.ok) throw Error(data.error || '操作未完成');
-  return data;
+  const result = await response.json();
+  if (!response.ok) throw new Error(result.error || '请求未完成');
+  return result;
 }
-function button(text, action, secondary = false) {
-  const node = el('button', text, secondary ? 'secondary' : '');
-  node.type = 'button';
-  node.onclick = async () => {
-    node.disabled = true;
-    try { await action(); await refresh(); } catch (error) { notice(error.message); }
-    finally { if (node.isConnected) node.disabled = false; }
-  };
-  return node;
+
+function textValue(value) {
+  if (value === undefined || value === null) return '';
+  return typeof value === 'string' ? value : JSON.stringify(value, null, 2);
 }
-function tag(text, style = '') { return el('span', text, 'tag ' + style); }
-function statusStyle(status) {
-  return ['PASS','COMPLETED','BUILT_DRAFT'].includes(status) ? 'pass' :
-    ['FAILED','FAIL','INVALID'].includes(status) ? 'fail' :
-    ['RUNNING','CANCELLING'].includes(status) ? 'running' : 'draft';
+
+function showNotice(text) {
+  $('notice').textContent = text;
+  $('notice').hidden = !text;
 }
-function newest(items) { return [...(items || [])].sort((a,b) => (b.started_at || b.created_at || '').localeCompare(a.started_at || a.created_at || '')); }
-function sourceForAnalysis(job) { return (state.requests || []).find(request => request.id === job.request_id)?.source_id; }
-function jobsForSource() { return newest(state.analyses).filter(job => sourceForAnalysis(job) === selectedSource); }
-function packagesForSource() {
-  const jobIds = new Set(jobsForSource().map(job => job.id));
-  return (state.packages || []).filter(pkg => jobIds.has(pkg.analysis_id));
+
+function statusClass(value) {
+  const status = String(value || '').toUpperCase();
+  if (['RUNNING', 'STARTED', 'ANALYZING', 'QUEUED'].includes(status)) return 'running';
+  if (['FAILED', 'INTERRUPTED'].includes(status)) return 'error';
+  if (['COMPLETED', 'SUCCEEDED', 'READY', 'AVAILABLE', 'ANALYZED', 'RETIRED', 'BUILT_DRAFT'].includes(status)) return 'ready';
+  return 'pending';
 }
-function readyProfiles() { return (state.profiles || []).filter(profile => profile.key_usable && profile.model); }
-function fillProviderSelect(node, disabledUnavailable = true) {
-  const previous = node.value;
-  node.replaceChildren();
-  for (const profile of state.profiles || []) {
-    const option = el('option', profile.provider.toUpperCase() + (profile.key_usable && profile.model ? '' : ' · 未配置'));
-    option.value = profile.provider;
-    option.disabled = disabledUnavailable && (!profile.key_usable || !profile.model);
-    node.append(option);
+
+function statusLabel(value) {
+  return statusNames[String(value || '').toUpperCase()] || value || '未提供状态';
+}
+
+function pill(status) {
+  return node('span', statusLabel(status), 'status-pill ' + statusClass(status));
+}
+
+function isReady(profile) {
+  return Boolean(profile?.base_url && profile?.model && profile.ready !== false && profile.configured !== false);
+}
+
+function latency(value) {
+  return typeof value === 'number' && Number.isFinite(value) ? value.toLocaleString('zh-CN', {maximumFractionDigits: 1}) + ' ms' : null;
+}
+
+function entryCount(value) {
+  if (typeof value === 'number') return value;
+  if (Array.isArray(value)) return value.length;
+  if (value && typeof value === 'object') return Object.keys(value).length;
+  return null;
+}
+
+function entries(value) {
+  if (Array.isArray(value)) return value;
+  if (value && typeof value === 'object') return Object.values(value);
+  return [];
+}
+
+function empty(root, text) {
+  root.append(node('p', text, 'empty-note'));
+}
+
+function responseText(response) {
+  if (typeof response === 'string') return response;
+  if (Array.isArray(response)) return response.map(item => typeof item === 'string' ? item : item.text ?? textValue(item)).join('\n');
+  if (response?.content !== undefined) return responseText(response.content);
+  if (response?.message !== undefined) return responseText(response.message);
+  return textValue(response);
+}
+
+function appendMessage(role, text) {
+  const welcome = $('conversation').querySelector('.welcome');
+  if (welcome) welcome.remove();
+  const item = node('article', undefined, 'chat-message ' + role);
+  const content = node('div', undefined, 'message-content');
+  const body = node('div', text, 'message-body');
+  const meta = node('div', undefined, 'message-meta');
+  content.append(node('div', role === 'user' ? '你' : 'SeamPact', 'message-role'), body, meta);
+  item.append(node('div', role === 'user' ? '你' : 'S', 'message-avatar'), content);
+  $('conversation').append(item);
+  item.scrollIntoView({block: 'end', behavior: 'auto'});
+  return {item, body, meta};
+}
+
+function updateComposer() {
+  const ready = connected && isReady(state?.models?.chat);
+  $('send-message').disabled = !ready || Boolean(pendingTask) || !$('chat-input').value.trim();
+  $('send-message').querySelector('.send-label').textContent = pendingTask ? '运行中' : '发送';
+  $('chat-model-name').textContent = isReady(state?.models?.chat) ? state.models.chat.model : '对话模型未配置';
+  $('chat-model-name').className = 'status-pill ' + (isReady(state?.models?.chat) ? 'ready' : 'pending');
+  const units = state?.units || [];
+  const available = units.filter(unit => ['READY', 'AVAILABLE'].includes(String(unit.status).toUpperCase())).length;
+  const hint = !connected ? '平台未连接。' : !isReady(state?.models?.chat) ?
+    '先在配置中填写对话模型接口。' : available ?
+    '对话已就绪 · 能力池中有 ' + available + ' 个可用 Unit。' :
+    '对话已就绪 · 当前没有可调用 Unit；Harness 状态见右侧。';
+  $('chat-readiness').textContent = hint;
+  if ($('welcome-context')) $('welcome-context').textContent = hint;
+}
+
+async function sendMessage(event) {
+  event.preventDefault();
+  const content = $('chat-input').value.trim();
+  if (!content || pendingTask || !connected || !isReady(state?.models?.chat)) return;
+  messages.push({role: 'user', content});
+  appendMessage('user', content);
+  $('chat-input').value = '';
+  resizeComposer();
+  const output = appendMessage('assistant', '正在提交任务…');
+  output.item.classList.add('message-pending');
+  pendingTask = {id: null, output};
+  updateComposer();
+  showNotice('');
+  try {
+    const result = await api('/api/chat', {messages});
+    if (!result.task_id) throw new Error('平台未返回任务 ID');
+    pendingTask.id = result.task_id;
+    output.body.textContent = '正在运行…';
+    await refresh();
+  } catch (error) {
+    output.body.textContent = error.message;
+    output.item.classList.remove('message-pending');
+    output.item.classList.add('message-error');
+    pendingTask = null;
+    updateComposer();
   }
-  node.value = readyProfiles().some(profile => profile.provider === previous) ?
-    previous : readyProfiles()[0]?.provider || 'deepseek';
 }
-function sourceCards() {
-  const root = $('source-cards'); root.replaceChildren();
-  for (const source of state.sources || []) {
-    const info = sourceInfo[source.id] || {icon:'SRC', title:source.name || source.id, note:'完整 Harness 来源', description:source.entry};
-    const card = el('button', undefined, 'card source-card' + (source.id === selectedSource ? ' selected' : ''));
-    card.type = 'button'; card.dataset.source = source.id;
-    card.setAttribute('aria-pressed', String(source.id === selectedSource));
-    card.append(el('span', info.icon, 'source-icon'), el('span', info.title, 'source-name'), el('p', info.note));
-    const ownJobs = (state.analyses || []).filter(job => sourceForAnalysis(job) === source.id);
-    const ownPackages = (state.packages || []).filter(pkg => ownJobs.some(job => job.id === pkg.analysis_id));
-    card.append(tag((source.files || []).length + ' 份源码'));
-    if (ownPackages.length) card.append(tag(ownPackages.length + ' 份适配草案', 'pass'));
-    else if (ownJobs.some(job => job.status === 'RUNNING')) card.append(tag('分析中', 'running'));
-    else if (ownJobs.length) card.append(tag('已分析', 'draft'));
-    card.onclick = () => { selectedSource = source.id; renderWorkbench(); renderExecution(); sourceCards(); };
+
+function synchronizeTask() {
+  if (!pendingTask?.id) return;
+  const task = (state.tasks || []).find(item => item.id === pendingTask.id);
+  if (!task) return;
+  const status = String(task.status || '').toUpperCase();
+  const {output} = pendingTask;
+  const text = responseText(task.response);
+  const nearBottom = $('conversation').scrollHeight - $('conversation').scrollTop - $('conversation').clientHeight < 100;
+  output.body.textContent = text || (task.error ? textValue(task.error) : statusLabel(task.status) + '…');
+  const duration = latency(task.latency_ms);
+  output.meta.textContent = [statusLabel(task.status), duration].filter(Boolean).join(' · ');
+  if (terminalStatuses.has(status)) {
+    output.item.classList.remove('message-pending');
+    if (['COMPLETED', 'SUCCEEDED'].includes(status)) {
+      if (text) messages.push({role: 'assistant', content: text});
+      else output.body.textContent = '任务已完成，平台未返回对话内容。';
+    } else {
+      output.item.classList.add('message-error');
+      if (text && task.error) output.meta.textContent += ' · ' + textValue(task.error);
+    }
+    pendingTask = null;
+    updateComposer();
+  }
+  if (nearBottom) output.item.scrollIntoView({block: 'end', behavior: 'auto'});
+}
+
+function renderScheduler() {
+  const scheduler = state.scheduler;
+  const badge = $('scheduler-status');
+  const root = $('scheduler-summary');
+  root.replaceChildren();
+  if (!scheduler) {
+    badge.textContent = '未提供状态';
+    badge.className = 'status-pill pending';
+    empty(root, '平台尚未返回调度状态。');
+    return;
+  }
+  badge.textContent = statusLabel(scheduler.status);
+  badge.className = 'status-pill ' + statusClass(scheduler.status);
+  root.append(node('p', scheduler.policy ? '策略：' + scheduler.policy : '策略尚未提供', 'card-meta'));
+  const grid = node('div', undefined, 'state-grid');
+  for (const [label, value] of [['执行中', scheduler.active], ['等待中', scheduler.waiting]]) {
+    const count = entryCount(value);
+    const stat = node('div', undefined, 'state-stat');
+    stat.append(node('label', label), node('strong', count === null ? '—' : count));
+    grid.append(stat);
+  }
+  root.append(grid);
+  if (typeof scheduler.used === 'number' && typeof scheduler.quota === 'number') {
+    root.append(node('p', '执行槽：' + scheduler.used + ' / ' + scheduler.quota, 'card-meta'));
+  }
+  if (scheduler.learning) {
+    root.append(node('p', '原型使用两层表格 Q-learning，只选合法候选并按真实反馈更新。单候选执行不代表学到选择优势。', 'card-note'));
+    const layers = node('div', undefined, 'rl-layers');
+    for (const [key, label] of [['upper', '上层 · 方案选择'], ['lower', '下层 · 调用调度']]) {
+      const learning = scheduler.learning[key];
+      if (!learning) continue;
+      const card = node('div', undefined, 'status-card');
+      card.append(node('strong', label));
+      const count = learning.candidate_count;
+      card.append(node('p', '最近候选：' + (count === null || count === undefined ? '尚未选择' : count) + ' · 累计更新：' + (learning.updates ?? '—'), 'card-meta'));
+      if (learning.action_key) {
+        const selected = node('details');
+        selected.append(node('summary', '最近选择'), node('pre', learning.action_key));
+        card.append(selected);
+      }
+      layers.append(card);
+    }
+    root.append(layers);
+  }
+  if (scheduler.theory_pending) root.append(node('p', scheduler.theory_pending === true ?
+    'RL 调度理论待确认。当前显示平台返回的执行状态。' : textValue(scheduler.theory_pending), 'theory-note'));
+  for (const [label, value] of [['执行中', scheduler.active], ['等待中', scheduler.waiting]]) {
+    const calls = entries(value);
+    if (!calls.length) continue;
+    const detail = node('details');
+    detail.append(node('summary', label + '调用'), node('pre', textValue(calls)));
+    root.append(detail);
+  }
+}
+
+function callDetails(calls) {
+  const values = entries(calls);
+  if (!values.length) return null;
+  const detail = node('details', undefined, 'call-list');
+  detail.append(node('summary', 'Unit 调用 · ' + values.length));
+  for (const call of values) {
+    const row = node('div', undefined, 'call-row');
+    if (typeof call === 'string') row.append(node('span', call));
+    else {
+      const title = call.unit?.name || call.unit_id || call.unit?.id || call.unit || call.name || call.gate || call.id || 'Unit 调用';
+      row.append(node('strong', textValue(title)));
+      if (call.status || call.physical) row.append(pill(call.status || call.physical));
+      if (latency(call.latency_ms)) row.append(node('span', latency(call.latency_ms), 'card-meta'));
+      row.append(node('pre', textValue(call)));
+    }
+    detail.append(row);
+  }
+  return detail;
+}
+
+function renderTasks() {
+  const tasks = state.tasks || [];
+  const root = $('task-list');
+  root.replaceChildren();
+  $('task-count').textContent = tasks.length;
+  if (!tasks.length) return empty(root, '尚无任务。发送消息后在这里观察真实调用。');
+  for (const task of [...tasks].sort((a, b) => String(b.started_at || b.created_at || '').localeCompare(String(a.started_at || a.created_at || '')))) {
+    const card = node('article', undefined, 'status-card');
+    const head = node('div', undefined, 'card-heading');
+    head.append(node('strong', '任务 ' + task.id), pill(task.status));
+    card.append(head);
+    if (task.phase) card.append(node('p', ({conversation: '对话模型', harness_execution: 'Harness 执行'})[task.phase] || task.phase, 'card-meta'));
+    if (typeof task.model_calls === 'number') card.append(node('p', '模型调用：' + task.model_calls + ' 次', 'card-meta'));
+    if (latency(task.latency_ms)) card.append(node('p', '任务时延：' + latency(task.latency_ms), 'card-meta'));
+    if (task.error) card.append(node('p', textValue(task.error), 'card-note message-error'));
+    if (task.plan) {
+      const plan = node('details');
+      plan.append(node('summary', '本次上层方案'), node('pre', textValue(task.plan)));
+      card.append(plan);
+    }
+    const detail = callDetails(task.calls);
+    if (detail) card.append(detail);
+    else card.append(node('p', '暂无 Unit 调用记录。', 'card-meta'));
     root.append(card);
   }
-  if (!root.children.length) root.append(el('p', '尚未登记来源。启动服务时指定 sources.json 即可加载。', 'empty-note'));
 }
-function renderWorkbench() {
-  const source = (state.sources || []).find(item => item.id === selectedSource);
-  const jobs = jobsForSource();
-  const packages = packagesForSource();
-  $('selected-source-title').textContent = source ? (sourceInfo[source.id]?.title || source.name || source.id) + ' · 自动拆分' : '自动分析与适配';
-  $('source-description').textContent = sourceInfo[source?.id]?.description || source?.entry || '选择来源后准备源码并开始分析。';
-  const stage = packages.length ? '适配草案已生成' : jobs.some(job => job.status === 'RUNNING') ? 'API 正在分析' : jobs.length ? '查看分析结果' : '等待开始';
-  $('source-stage').textContent = stage;
-  $('source-stage').className = 'tag ' + (packages.length ? 'pass' : jobs.some(job => job.status === 'RUNNING') ? 'running' : '');
-  fillProviderSelect($('analysis-provider'));
-  const busy = starting || jobs.some(job => ['RUNNING','CANCELLING'].includes(job.status));
-  $('start-analysis').disabled = !source || !readyProfiles().length || busy;
-  $('freeze-source').disabled = !source || starting;
-  $('start-analysis').textContent = starting ? '正在准备…' : '准备来源并开始分析';
-  $('analysis-start-help').textContent = !readyProfiles().length ? '先在下方配置一个模型接口；也可以先运行受控预览。' : busy ? '分析会持续读取源码并检查候选。进度在下方更新。' : '开始后会调用所选 API，沿用提供方的模型能力。';
 
-  const requests = $('requests'); requests.replaceChildren();
-  const ownRequests = (state.requests || []).filter(request => request.source_id === selectedSource);
-  for (const request of ownRequests.slice(0,3)) {
-    const row = el('div', undefined, 'row');
-    row.append(el('span', '已准备源码 · ' + request.id.slice(0,8) + ' · ' + request.files.length + ' 份文件', 'muted small'));
-    if (!(state.analyses || []).some(job => job.request_id === request.id && ['RUNNING','CANCELLING'].includes(job.status))) {
-      const start = button('从这份源码开始', async () => {
-        await api('/api/analyze', {request_id:request.id, provider:$('analysis-provider').value});
-        notice('分析已开始，页面会自动更新。');
-      }, true);
-      start.disabled = !readyProfiles().length;
-      row.append(start);
+function renderUnits() {
+  const units = state.units || [];
+  const root = $('unit-list');
+  root.replaceChildren();
+  $('unit-count').textContent = units.length;
+  if (!units.length) return empty(root, '能力池为空。分析 Harness 后，以实际接入结果显示 Unit。');
+  for (const unit of units) {
+    const card = node('article', undefined, 'unit-card');
+    const head = node('div', undefined, 'card-heading');
+    head.append(node('strong', unit.name || unit.id), pill(unit.status));
+    card.append(head);
+    const sourceId = unit.harness_id || unit.source_id;
+    const source = (state.harnesses || []).find(item => item.id === sourceId);
+    card.append(node('p', [unit.mode || unit.kind, source?.name || sourceId].filter(Boolean).join(' · '), 'card-meta'));
+    if (unit.description) card.append(node('p', unit.description, 'card-note'));
+    if (unit.reason) card.append(node('p', textValue(unit.reason), 'card-note'));
+    if (unit.input_schema) {
+      const schema = node('details', undefined, 'schema-note');
+      schema.append(node('summary', '调用输入'), node('pre', textValue(unit.input_schema)));
+      card.append(schema);
     }
-    requests.append(row);
+    root.append(card);
   }
-  analysisCards(jobs, packages);
 }
-function analysisCards(jobs, packages) {
-  const root = $('analysis-cards'); root.replaceChildren();
-  for (const job of jobs) {
-    const card = el('div', undefined, 'card analysis-card');
-    const head = el('div', undefined, 'section-head');
-    const title = el('div'); title.append(el('h3', job.provider.toUpperCase() + ' 分析 · ' + job.id.slice(0,8)), el('p', (job.rounds || 0) + ' 轮模型响应', 'muted small'));
-    head.append(title, tag(statusText[job.status] || job.status, statusStyle(job.status))); card.append(head);
-    if (job.error) card.append(el('p', job.error, 'muted small'));
-    const candidate = job.submitted?.candidate;
-    const report = job.submitted?.report;
-    if (candidate?.boundaries?.length) {
-      const list = el('div', undefined, 'candidate-list');
-      for (const boundary of candidate.boundaries) {
-        const checked = (report?.boundaries || []).find(item => item.id === boundary.id);
-        const row = el('div', undefined, 'candidate-row');
-        const name = el('div'); name.append(el('strong', boundary.id, 'candidate-name'), el('div', boundary.symbol || boundary.rationale, 'muted'));
-        row.append(name, tag(modeText[boundary.mode] || boundary.mode), tag(checked?.buildable ? '可生成适配' : '需要补充接线', checked?.buildable ? 'pass' : 'draft'));
-        list.append(row);
-      }
-      card.append(list);
+
+function renderAnalyses() {
+  const harnesses = state.harnesses || [];
+  const analyses = state.analyses || [];
+  const root = $('analysis-list');
+  root.replaceChildren();
+  $('analysis-count').textContent = analyses.length;
+  if (!harnesses.length) return empty(root, '配置 Harness 地址后可开始分析。');
+  for (const harness of harnesses) {
+    const job = analyses.find(item => item.id === harness.analysis_id) ||
+      [...analyses].reverse().find(item => item.harness_id === harness.id);
+    const card = node('article', undefined, 'status-card');
+    const head = node('div', undefined, 'card-heading');
+    head.append(node('strong', harness.name || harness.address), pill(job?.status || harness.status));
+    card.append(head, node('p', harness.address, 'card-meta'));
+    const files = entryCount(harness.files);
+    if (files !== null) card.append(node('p', files + ' 份可读文件' + (typeof harness.inventory_count === 'number' ? ' · 仓库共 ' + harness.inventory_count + ' 项文件' : ''), 'card-meta'));
+    if (job?.rounds !== undefined) card.append(node('p', '分析模型响应 ' + job.rounds + ' 轮', 'card-meta'));
+    const error = job?.error || harness.error;
+    if (error) card.append(node('p', textValue(error), 'card-note message-error'));
+    const boundaries = job?.submitted?.candidate?.boundaries || job?.boundaries || [];
+    if (boundaries.length) {
+      const detail = node('details');
+      detail.append(node('summary', '拆分结果 · ' + boundaries.length + ' 个边界'), node('pre', textValue(boundaries)));
+      card.append(detail);
     }
-    const actions = el('div', undefined, 'actions');
-    actions.append(button('查看分析记录', async () => {
-      selectedDetail = job.id;
-      $('detail').textContent = JSON.stringify(await api('/api/analysis/' + job.id), null, 2);
-      $('analysis-detail').open = true;
-    }, true));
-    if (job.status === 'RUNNING') actions.append(button('停止分析', async () => {
-      await api('/api/cancel', {id:job.id}); notice('当前请求结束后停止，不再发起下一轮。');
-    }, true));
-    if (job.status === 'COMPLETED' && candidate?.boundaries?.length) {
-      const existing = packages.find(pkg => pkg.analysis_id === job.id);
-      if (!existing) {
-        const build = button('生成适配草案', async () => {
-          await api('/api/build', {id:job.id}); notice('适配草案已生成，可以下载或在已支持的宿主中运行。');
-        });
-        const buildable = report?.boundaries?.length && report.boundaries.every(boundary => boundary.buildable);
-        build.disabled = !buildable; actions.append(build);
-        if (!buildable) card.append(el('p', '部分候选仍缺少可实现的接线信息。完整记录保留了检查原因。', 'muted small'));
-      }
+    const entryList = job?.submitted?.candidate?.entries || [];
+    if (entryList.length) {
+      const detail = node('details');
+      detail.append(node('summary', '接入入口 · ' + entryList.length), node('pre', textValue(entryList)));
+      card.append(detail);
     }
-    card.append(actions); root.append(card);
+    root.append(card);
   }
-  if (!jobs.length) root.append(el('p', 'API 会根据准则读取源码和相关依赖，提出能力边界；无需手工预填拆分方案。', 'empty-note'));
-  const packageRoot = $('packages'); packageRoot.replaceChildren();
-  for (const pkg of packages) {
-    const row = el('div', undefined, 'row');
-    const description = el('div');
-    description.append(el('strong', pkg.candidate.boundaries.length + ' 个能力 · 适配草案'), el('p', pkg.id.slice(0,8) + ' · 包含原始源码、适配代码和检查记录', 'muted small'));
-    const actions = el('div', undefined, 'actions');
-    const link = el('a', '下载 ZIP', 'download'); link.href = '/api/package/' + pkg.id; link.download = pkg.archive; actions.append(link);
-    if (selectedSource === 'crag-text') actions.append(button('使用这份草案运行', () => {
-      renderExecution(); $('run-package').value = 'package:' + pkg.id;
-      $('execution').scrollIntoView({behavior:'smooth',block:'start'});
-    }, true));
-    row.append(description, actions); packageRoot.append(row);
-  }
+  if (state.rules?.theory_pending) root.append(node('p', state.rules.theory_pending === true ?
+    '分析准则待确认。' : textValue(state.rules.theory_pending), 'theory-note'));
 }
-async function startSource(analysis) {
-  if (starting || !selectedSource) return;
-  starting = true; renderWorkbench();
-  try {
-    const request = await api('/api/freeze', {source_id:selectedSource, observation:$('observation').value});
-    if (analysis) {
-      await api('/api/analyze', {request_id:request.id, provider:$('analysis-provider').value});
-      notice('源码已准备，API 正在分析能力边界。');
-    } else notice('源码已准备，可以从这份源码开始分析。');
-  } catch (error) { notice(error.message); }
-  finally { starting = false; await refresh(); }
-}
-function executionProfile() {
-  return (state.execution?.profiles || []).find(profile => profile.source_id === selectedSource);
-}
-function executionReason(profile) {
-  const reason = profile?.reason || '';
-  if (reason.includes('install the optional CRAG SDK')) return '当前应用环境尚未安装 CRAG 运行依赖，请按部署说明启用 CRAG 任务环境。';
-  if (reason.includes('--artifacts') || reason.includes('artifact is missing')) return '当前服务尚未加载已有 CRAG 适配草案。也可以在此平台分析源码，生成并选用新的草案。';
-  return reason ? '运行环境或草案尚未就绪，请核对部署配置。' : '当前服务还未配置 CRAG 运行环境和适配草案。';
-}
-function renderExecution() {
-  const profile = executionProfile();
-  const previous = $('run-package').value;
-  const select = $('run-package'); select.replaceChildren();
-  if (profile?.ready) {
-    const preset = el('option', '已提供的 CRAG API 适配草案'); preset.value = 'preset:' + profile.id; select.append(preset);
-  }
-  if (selectedSource === 'crag-text') for (const pkg of packagesForSource()) {
-    const option = el('option', pkg.id.slice(0,8) + ' · ' + pkg.candidate.boundaries.length + ' 个能力'); option.value = 'package:' + pkg.id; select.append(option);
-  }
-  if ([...select.options].some(option => option.value === previous)) select.value = previous;
-  fillProviderSelect($('run-provider'));
-  const mode = $('run-mode').value;
-  $('run-provider').disabled = mode !== 'live';
-  $('run-mode-help').textContent = mode === 'live' ? '真实模型会调用你配置的接口。资料之间用空行分隔；检索限于这些资料，不接入外部搜索。' : '受控预览不调用模型、不需要 GPU；用于查看接线和执行，预览回答不代表真实模型效果。';
-  const hostReady = Boolean(profile?.ready || (select.value.startsWith('package:') && state.execution?.sdk_available));
-  const enabled = Boolean(hostReady && select.options.length && (mode === 'preview' || readyProfiles().length));
-  $('run-workflow').disabled = !enabled || runSubmitting || (state.runs || []).some(run => run.status === 'RUNNING');
-  $('run-workflow').textContent = runSubmitting ? '正在启动…' : '运行工作流 →';
-  $('execution-status').textContent = hostReady ? 'CRAG 运行宿主已就绪' : '运行接入待完成';
-  $('execution-status').className = 'tag ' + (hostReady ? 'pass' : 'draft');
-  $('execution-help').textContent = !profile ? '当前来源可以分析与生成草案，任务运行宿主仍待接入。选择 CRAG 查看已实现的任务示例。' : !hostReady ? executionReason(profile) : '沿用原 CRAG SDK 的流程与能力接线。当前调度保留原流程依赖，检索范围为本次提供的资料。';
-  if (!inputsInitialized && profile?.input_defaults) {
-    $('run-question').value = profile.input_defaults.question || '';
-    $('run-documents').value = (profile.input_defaults.documents || []).join('\n\n');
-    inputsInitialized = true;
-  }
-  const runs = newest(state.runs);
-  const run = runs.find(item => item.id === selectedRun) || runs[0];
-  if (run && selectedSource === 'crag-text') renderRun(run);
-  else if (selectedSource !== 'crag-text') {
-    const output = $('run-result'); output.replaceChildren();
-    const empty = el('div', undefined, 'empty-result'); empty.append(el('span','↗','empty-icon'),el('h3','这个来源的运行宿主待接入'),el('p','源码分析与适配生成可以继续使用。CRAG 已提供可运行任务示例。')); output.append(empty);
-  } else if (!run) {
-    const output = $('run-result'); output.replaceChildren();
-    const empty = el('div', undefined, 'empty-result'); empty.append(el('span','↗','empty-icon'),el('h3','看见一次完整运行'),el('p','运行后在这里查看回答、被激活的能力和执行顺序。')); output.append(empty);
-  }
-  const history = $('run-history-list'); history.replaceChildren();
-  for (const item of runs.slice(0,10)) {
-    const row = el('div', undefined, 'row'); row.append(el('span',item.id.slice(0,8) + ' · ' + (item.mode === 'preview' ? '受控预览' : '真实模型')), tag(statusText[item.status] || item.status,statusStyle(item.status)));
-    row.append(button('查看', () => { selectedRun = item.id; renderRun(item); }, true)); history.append(row);
-  }
-  $('run-history').hidden = !runs.length;
-}
-function renderRun(run) {
-  const root = $('run-result'); root.replaceChildren();
-  const report = run.report || run.result || {};
-  const head = el('div', undefined, 'result-head');
-  head.append(el('h3', run.mode === 'preview' ? '受控预览结果' : '任务回答'),tag(statusText[run.status] || run.status,statusStyle(run.status))); root.append(head);
-  if (run.question) root.append(el('p', run.question, 'run-scope'));
-  if (run.status === 'RUNNING') {
-    const progress = run.progress || {};
-    const phases = {native_setup:'准备原生工作流',native_dispatch:'调度原生调用',relevance:'判断资料相关性',query_transform:'改写检索问题',answer:'生成回答',completed:'完成'};
-    const text = (phases[progress.phase] || '正在执行原 CRAG 工作流') + ' · 已完成模型调用 ' + (progress.completed_model_calls || 0) + ' 次';
-    const note = el('p', undefined, 'muted'); note.append(el('span',undefined,'spinner'),document.createTextNode(text)); root.append(note);
-  }
-  if (run.error) root.append(el('p', typeof run.error === 'string' ? run.error : JSON.stringify(run.error), 'muted'));
-  if (report.answer !== undefined) root.append(el('div', typeof report.answer === 'string' ? report.answer : JSON.stringify(report.answer,null,2), 'answer'));
-  const modules = report.activated_modules || [];
-  if (modules.length) {
-    root.append(el('p','本次激活的能力','module-caption'));
-    const path = el('div', undefined, 'module-path');
-    for (const module of modules) {
-      const noop = typeof module === 'object' && module.native_branch === 'NOOP_START_EVENT_BRANCH';
-      const chip = el('span', typeof module === 'string' ? module : module.id + (module.calls ? ' ×' + module.calls : '') + (noop ? '（空分支）' : ''), 'module-chip');
-      if (typeof module === 'object') chip.title = module.symbol || module.id;
-      path.append(chip);
+
+function hydrateModels() {
+  for (const role of ['chat', 'analysis']) {
+    const form = $(role + '-model-form');
+    const profile = state.models?.[role];
+    if (!form.dataset.hydrated) {
+      form.elements.base_url.value = profile?.base_url || '';
+      form.elements.model.value = profile?.model || '';
+      form.elements.max_output_tokens.value = profile?.max_output_tokens || '';
+      form.dataset.hydrated = 'true';
     }
-    root.append(path);
-  }
-  const scheduler = report.scheduler || {};
-  if (run.status === 'COMPLETED') root.append(el('p', '调度：' + (scheduler.policy || 'FIFO').toUpperCase() + ' · ' + (scheduler.parallel ? '并行已启用' : '沿用原流程依赖顺序'), 'run-scope'));
-  if (report.model_calls !== undefined) {
-    const count = Array.isArray(report.model_calls) ? report.model_calls.length : report.model_calls;
-    root.append(el('p', '本次模型调用 ' + count + ' 次 · 检索限于输入资料', 'run-scope'));
-  }
-  if (run.mode === 'preview') root.append(el('p', '模型和检索响应受控，仅用于展示流程。', 'run-scope'));
-  const detail = el('details'); detail.append(el('summary','本次执行明细'),el('pre',JSON.stringify(run,null,2))); root.append(detail);
-}
-function evidenceCards() {
-  const root = $('evidence-cards'); root.replaceChildren();
-  const names = {'mmct-sdk':'MMCT 原生 SDK','crag-fragment':'CRAG 局部提取','crag-sdk':'CRAG 原生 SDK','docker':'Docker 部署','crag-api':'CRAG API 草案运行'};
-  for (const record of state.evidence?.records || []) {
-    if (!names[record.id]) continue;
-    const card = el('div',undefined,'card evidence-card'); card.dataset.evidence = record.id;
-    card.append(el('h3',names[record.id]),tag(statusText[record.status] || record.status,statusStyle(record.status)));
-    if (record.cases) card.append(el('p',record.cases + ' 个受控案例' + (record.boundary_count ? ' · '+record.boundary_count+' 个边界' : ''),'muted small'));
-    const versions = Object.entries(record.sdk || {}).map(([name,version]) => name+' '+version);
-    if (versions.length) card.append(el('p',versions.join(' · '),'sdk-versions'));
-    card.append(el('p',record.id === 'docker' ? '范围以容器记录为准。' : '受控机制运行；真实模型效果另外记录。','muted small'));
-    const details = el('details'); details.append(el('summary','查看记录'),el('pre',JSON.stringify(record,null,2))); card.append(details); root.append(card);
+    form.elements.api_key.placeholder = profile?.key_present ? '同一接口留空保持；更换地址填写新 Key' :
+      role === 'chat' ? '本地接口可留空' : '填写云端 API Key';
+    const readiness = $(role + '-model-readiness');
+    readiness.textContent = profile?.credential_error || (isReady(profile) ?
+      '已配置 · ' + (profile.key_present ? '密钥已配置' : '未配置 Key') :
+      profile?.configured ? '地址与模型已保存，请填写云端 API Key。' : '尚未配置');
+    readiness.classList.toggle('message-error', Boolean(profile?.credential_error));
   }
 }
-function models() {
-  const root = $('model-cards');
-  for (const profile of state.profiles || []) {
-    let card = [...root.children].find(item => item.dataset.provider === profile.provider);
-    if (card) { card.updateProfile(profile); continue; }
-    card = el('form',undefined,'card'); card.dataset.provider = profile.provider; card.append(el('h3',profile.provider.toUpperCase()));
-    const help = el('p',undefined,'muted credential-help'); card.append(help);
-    function field(label,type,value) {
-      const wrapper = el('label',label), input = el('input');
-      input.type = type; input.value = value || ''; wrapper.append(input); card.append(wrapper); return input;
-    }
-    const base = field('接口地址','url',profile.base_url), model = field('模型 ID','text',profile.model);
-    const key = field('API Key','password',''), max = field('最大输出能力（可选；优先自动发现）','number',profile.declared_max_output_tokens);
-    key.autocomplete = 'new-password';
-    const capabilities = el('p',undefined,'muted'); card.append(capabilities);
-    const save = button('保存接口',async () => {
-      const body = {provider:profile.provider,base_url:base.value,model:model.value,max_output_tokens:max.value ? Number(max.value) : null};
-      if (!key.disabled) body.api_key = key.value;
-      await api('/api/profile',body); key.value = ''; notice('接口已保存。');
-    },true);
-    const discover = button('发现模型能力',async () => {
-      const data = await api('/api/discover',{provider:profile.provider});
-      capabilities.textContent = JSON.stringify(data.selected || {note:'接口未提供选定模型的能力信息'});
-    },true);
-    card.append(save,document.createTextNode(' '),discover);
-    card.updateProfile = latest => {
-      const localInput = latest.credential_mode === 'windows_dpapi'; key.disabled = !localInput;
-      if (!localInput) {
-        key.value = ''; key.placeholder = latest.key_usable ? '已通过私有配置加载' : '尚未通过私有配置加载';
-        help.textContent = '服务器使用私有密钥文件配置 Key。本页保存接口地址和模型参数；密钥配置方法见部署说明。';
-      } else {
-        key.placeholder = latest.key_usable ? '已配置，留空保持' : '填写后按当前 Windows 用户加密保存';
-        help.textContent = latest.credential_error || 'Key 按当前 Windows 用户加密保存，留空保留已有凭据。';
-      }
-      discover.disabled = !latest.key_usable;
-      const selected = latest.capabilities?.selected;
-      capabilities.textContent = selected ? '上下文 '+(selected.context_window ?? '未知')+' / 最大输出 '+(selected.max_output_tokens ?? '未知') :
-        latest.provider === 'glm' ? '填入你的 GLM 模型 ID 后可发现接口能力。' : '配置凭据后可发现接口能力。';
+
+function renderHarnesses() {
+  const root = $('harness-list');
+  root.replaceChildren();
+  if (!(state.harnesses || []).length) return empty(root, '尚未配置 Harness 来源。');
+  for (const harness of state.harnesses) {
+    const card = node('article', undefined, 'harness-card');
+    const head = node('div', undefined, 'card-heading');
+    head.append(node('strong', harness.name || harness.address), pill(harness.status));
+    card.append(head, node('p', harness.address, 'card-note'));
+    if (harness.error) card.append(node('p', textValue(harness.error), 'card-note message-error'));
+    const job = (state.analyses || []).find(item => item.id === harness.analysis_id);
+    const busy = analysisSubmitting.has(harness.id) || ['RUNNING', 'QUEUED', 'ANALYZING'].includes(String(job?.status || harness.status).toUpperCase());
+    const action = node('button', busy ? '分析中…' : '分析 Harness', 'secondary-button');
+    action.type = 'button';
+    action.disabled = busy || !isReady(state.models?.analysis);
+    action.onclick = async () => {
+      analysisSubmitting.add(harness.id);
+      action.disabled = true;
+      action.textContent = '正在提交…';
+      try {
+        await api('/api/analyze', {harness_id: harness.id});
+        showNotice('Harness 分析已开始，来源与分析状态会持续更新。');
+      } catch (error) { showNotice(error.message); }
+      finally { analysisSubmitting.delete(harness.id); await refresh(); }
     };
-    card.updateProfile(profile); card.onsubmit = event => event.preventDefault(); root.append(card);
+    const actions = node('div', undefined, 'harness-actions');
+    actions.append(action);
+    if (!isReady(state.models?.analysis)) actions.append(node('span', '先配置分析模型', 'form-note'));
+    card.append(actions);
+    root.append(card);
   }
 }
-function renderRuntime() {
-  $('quota').textContent = state.runtime?.quota ?? '—'; $('used').textContent = state.runtime?.used ?? '—';
-  $('calls').textContent = Object.keys(state.runtime?.calls || {}).length;
-  const root = $('demo-results'); root.replaceChildren();
-  for (const demo of (state.demos || []).slice(0,3)) {
-    const row = el('div',undefined,'row'); row.append(el('span','教学流程 '+demo.id.slice(0,8)),tag(statusText[demo.status] || demo.status,statusStyle(demo.status))); root.append(row);
-  }
+
+async function saveModel(event) {
+  event.preventDefault();
+  const form = event.currentTarget;
+  const button = form.querySelector('button[type="submit"]');
+  const status = form.querySelector('.form-status');
+  const body = {role: form.dataset.role, base_url: form.elements.base_url.value.trim(), model: form.elements.model.value.trim()};
+  if (form.elements.api_key.value.trim()) body.api_key = form.elements.api_key.value.trim();
+  body.max_output_tokens = form.elements.max_output_tokens.value ? Number(form.elements.max_output_tokens.value) : null;
+  button.disabled = true;
+  status.textContent = '正在保存…';
+  try {
+    await api('/api/models', body);
+    form.elements.api_key.value = '';
+    status.textContent = '已保存';
+    await refresh();
+  } catch (error) { status.textContent = error.message; }
+  finally { button.disabled = false; }
 }
+
+async function addHarness(event) {
+  event.preventDefault();
+  const form = event.currentTarget;
+  const body = {address: form.elements.address.value.trim()};
+  for (const key of ['revision', 'entry']) if (form.elements[key].value.trim()) body[key] = form.elements[key].value.trim();
+  const status = $('harness-form-status');
+  $('add-harness').disabled = true;
+  status.textContent = '正在接入…';
+  try {
+    if (form.elements.resources.value.trim()) {
+      body.resources = JSON.parse(form.elements.resources.value);
+      if (!Array.isArray(body.resources)) throw new Error('资源配置需要是 JSON 列表');
+      if (body.resources.some(item => typeof item !== 'string' && (!item || typeof item !== 'object' || Array.isArray(item) || typeof item.path !== 'string'))) {
+        throw new Error('每项资源需要路径字符串，或包含 path 的对象');
+      }
+    }
+    await api('/api/harnesses', body);
+    form.reset();
+    status.textContent = '已接入，可开始分析';
+    await refresh();
+  } catch (error) { status.textContent = error.message; }
+  finally { $('add-harness').disabled = false; }
+}
+
 async function refresh() {
-  if (refreshing) return; refreshing = true;
+  if (refreshing) return;
+  refreshing = true;
   try {
     state = await api('/api/state');
-    if (!(state.sources || []).some(source => source.id === selectedSource)) selectedSource = (state.sources || []).some(source => source.id === 'crag-text') ? 'crag-text' : state.sources?.[0]?.id;
-    $('connection').textContent = '已连接'; $('version').textContent = '核心 '+state.version;
-    sourceCards(); renderWorkbench(); renderExecution(); evidenceCards(); models(); renderRuntime();
-    if ($('events').parentElement.open) $('events').textContent = JSON.stringify(await api('/api/events'),null,2);
-    if (selectedDetail && $('analysis-detail').open) $('detail').textContent = JSON.stringify(await api('/api/analysis/'+selectedDetail),null,2);
-  } catch (error) { $('connection').textContent = '连接中断'; notice(error.message); }
-  finally { refreshing = false; }
+    connected = true;
+    $('connection').textContent = '已连接';
+    $('version').textContent = state.version ? '核心 ' + state.version : '';
+    document.querySelector('.connection-dot').classList.remove('disconnected');
+    hydrateModels();
+    synchronizeTask();
+    renderScheduler();
+    renderTasks();
+    renderUnits();
+    renderAnalyses();
+    renderHarnesses();
+  } catch (error) {
+    connected = false;
+    $('connection').textContent = '连接中断';
+    document.querySelector('.connection-dot').classList.add('disconnected');
+    showNotice(error.message);
+  } finally {
+    refreshing = false;
+    updateComposer();
+  }
 }
-$('start-analysis').onclick = () => startSource(true);
-$('freeze-source').onclick = () => startSource(false);
-$('quick-run').onclick = () => {
-  if ((state?.sources || []).some(source => source.id === 'crag-text')) {
-    selectedSource = 'crag-text'; sourceCards(); renderWorkbench(); renderExecution();
+
+function resizeComposer() {
+  const input = $('chat-input');
+  input.style.height = 'auto';
+  input.style.height = Math.min(input.scrollHeight, 220) + 'px';
+  updateComposer();
+}
+
+function observerOpen(open) {
+  document.body.classList.toggle('observer-open', open);
+  $('drawer-shade').hidden = !open;
+  $('open-observer').setAttribute('aria-expanded', String(open));
+}
+
+$('chat-form').onsubmit = sendMessage;
+$('chat-input').oninput = resizeComposer;
+$('chat-input').onkeydown = event => {
+  if (event.key === 'Enter' && !event.shiftKey && !event.isComposing) {
+    event.preventDefault();
+    if (!$('send-message').disabled) $('chat-form').requestSubmit();
   }
 };
-$('run-mode').onchange = renderExecution;
-$('run-package').onchange = renderExecution;
-$('run-form').onsubmit = async event => {
-  event.preventDefault(); if (runSubmitting) return;
-  runSubmitting = true; renderExecution();
-  try {
-    const selection = $('run-package').value, source = selection.startsWith('package:') ? {package_id:selection.slice(8)} : {preset:selection.slice(7)};
-    const response = await api('/api/run',{...source,mode:$('run-mode').value,provider:$('run-provider').value,
-      question:$('run-question').value,documents:$('run-documents').value.split(/\n\s*\n/).map(text => text.trim()).filter(Boolean)});
-    selectedRun = response.id; notice('工作流已开始。回答和实际能力调用会在右侧更新。');
-  } catch (error) { notice(error.message); }
-  finally { runSubmitting = false; await refresh(); }
-};
-$('demo').onclick = async () => { try { await api('/api/demo',{}); await refresh(); } catch (error) { notice(error.message); } };
-$('events').parentElement.addEventListener('toggle',refresh);
-refresh(); setInterval(refresh,3000);
+$('chat-model-form').onsubmit = saveModel;
+$('analysis-model-form').onsubmit = saveModel;
+$('harness-form').onsubmit = addHarness;
+$('open-configuration').onclick = () => $('configuration').showModal();
+$('close-configuration').onclick = () => $('configuration').close();
+$('open-observer').onclick = () => observerOpen(!document.body.classList.contains('observer-open'));
+$('close-observer').onclick = () => observerOpen(false);
+$('drawer-shade').onclick = () => observerOpen(false);
+document.addEventListener('keydown', event => {
+  if (event.key === 'Escape') observerOpen(false);
+});
+refresh();
+setInterval(refresh, 1500);
