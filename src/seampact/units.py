@@ -340,6 +340,8 @@ class NativeBindings:
         self.active_owner = contextvars.ContextVar("seampact_native_binding_owner", default=None)
         self.loop, self.thread = None, None
         self.lock = threading.RLock()
+        self.detached = False
+        self.active_calls = 0
         for path in self.inspector.files:
             if not path.endswith(".py"):
                 continue
@@ -1256,11 +1258,15 @@ class NativeBindings:
         return helpers
 
     def _register(self, gate, owner, unit):
-        self.runtime.call("register", gate, owner, unit=unit)
+        if self.detached:
+            raise MissingBinding("Harness source is detached")
+        self.runtime.call("register", gate, owner,
+            unit=dict(unit, source_id=self.inspector.request.get("source_id")))
 
     def _boundary_unit(self, boundary):
         return dict(id=self.inspector.request["source_version"][:16] + ":" + boundary["id"],
-                    name=boundary["id"], symbol=boundary["symbol"], path=boundary["path"])
+                    name=boundary["id"], symbol=boundary["symbol"], path=boundary["path"],
+                    source_id=self.inspector.request.get("source_id"))
 
     def _assert_callable(self, callable_, symbol, path):
         original = inspect.unwrap(callable_)
@@ -1420,9 +1426,12 @@ class NativeBindings:
             record["boundaries"].add(boundary["id"])
         for (initializer, attribute, policy), selectors in groups.items():
             hook = ToolListHandoff(self.runtime, owner, selectors, initializer, attribute,
-                                   owner_id=owner_id, schema_policy=policy)
+                                   owner_id=owner_id, schema_policy=policy,
+                                   source_id=self.inspector.request.get("source_id"))
             original_bind = hook.bind_current_tools
             async def bind_verified(hook=hook, original_bind=original_bind, selectors=selectors, attribute=attribute):
+                if self.detached:
+                    raise MissingBinding("Harness source is detached")
                 tools = getattr(owner, attribute)
                 for identity, symbol in selectors.items():
                     originals = [tool for tool in tools if getattr(tool, "__qualname__", None) == symbol]
@@ -1462,6 +1471,8 @@ class NativeBindings:
         return callable_
 
     async def _invoke(self, entry, unit, arguments):
+        if self.detached:
+            raise MissingBinding("Harness source is detached")
         with self._context():
             construction = self._construct(entry, arguments) if entry.get("binding_program") is not None else None
             try:
@@ -1484,6 +1495,8 @@ class NativeBindings:
                         values.pop(exported, None)
                 values.update({parameter: construction[reference] for parameter, reference in program.get("argument_refs", {}).items()})
             positional, keyword = _actual_arguments(callable_, values)
+            if self.detached:
+                raise MissingBinding("Harness source is detached")
             active = self.active_owner.set(self.entry_owner_ids.get(unit["id"]))
             try:
                 result = callable_(*positional, **keyword)
@@ -1500,7 +1513,11 @@ class NativeBindings:
                     self.loop.run_forever()
                 self.thread = threading.Thread(target=run, daemon=True, name="seampact-native-owner")
                 self.thread.start()
-            return asyncio.run_coroutine_threadsafe(self._invoke(entry, unit, arguments), self.loop).result()
+            self.active_calls += 1
+            try:
+                return asyncio.run_coroutine_threadsafe(self._invoke(entry, unit, arguments), self.loop).result()
+            finally:
+                self.active_calls -= 1
 
 
 class UnitCatalog:
@@ -1509,9 +1526,31 @@ class UnitCatalog:
         self.bindings, self.entry_specs = {}, {}
         self.lock = threading.RLock()
 
-    def install(self, inspector, candidate, analysis_id):
+    def install(self, inspector, candidate, analysis_id, installation_id=None):
         with self.lock:
-            return self._install(inspector, candidate, analysis_id)
+            return self._install(inspector, candidate, analysis_id, installation_id or analysis_id)
+
+    def detach(self, source_id):
+        with self.lock:
+            count = 0
+            for unit in self.store.list("unit"):
+                if unit.get("source_id") != source_id:
+                    continue
+                binding = self.bindings.get(unit["id"])
+                if binding:
+                    binding.detached = True
+                if unit.get("status") in {"SUPERSEDED", "DETACHED"}:
+                    continue
+                unit.update(status="DETACHED", detached_at=now())
+                self.store.save("unit", unit["id"], unit)
+                count += 1
+            self.runtime.call("detach_source", source_id)
+            return count
+
+    def source_running(self, source_id):
+        with self.lock:
+            return any(binding.active_calls for binding in self.bindings.values()
+                       if binding.inspector.request.get("source_id") == source_id)
 
     def _candidate_binding(self, inspector, candidate):
         if not isinstance(candidate, dict) or "entries" not in candidate or not isinstance(candidate["entries"], list):
@@ -1605,18 +1644,18 @@ class UnitCatalog:
                     row["check"].update(status="MISSING", reason=str(error))
         return binding, duplicates, rows
 
-    def _install(self, inspector, candidate, analysis_id):
+    def _install(self, inspector, candidate, analysis_id, installation_id):
         binding, duplicates, rows = self._candidate_checks(inspector, candidate)
         source_id = inspector.request.get("source_id")
         if source_id:
             for previous in self.store.list("unit"):
-                if previous.get("source_id") == source_id and previous.get("analysis_id") != analysis_id:
+                if previous.get("source_id") == source_id and previous.get("installation_id", previous.get("analysis_id")) != installation_id:
                     previous.update(status="SUPERSEDED", superseded_by=analysis_id)
                     self.store.save("unit", previous["id"], previous, "unit_superseded")
         result = []
         for row in rows:
             index, entry, source_id, checked = row["index"], row["entry"], row["entry_id"], row["check"]
-            identity = str(analysis_id) + ":" + str(source_id)
+            identity = str(installation_id) + ":" + str(source_id)
             if isinstance(source_id, str) and source_id in duplicates:
                 identity += ":" + str(index)
             unit = dict(schema="native-unit/1", id=identity, entry_id=source_id,
@@ -1625,7 +1664,7 @@ class UnitCatalog:
                 kind=entry.get("kind"), description=entry.get("description") or entry.get("symbol") or "Native entry",
                 source_id=inspector.request.get("source_id"), source_version=inspector.request["source_version"],
                 semantic_key=inspector.request["source_version"][:16] + ":" + str(source_id),
-                analysis_id=analysis_id, installed_at=now(), status="MISSING", reason=None,
+                analysis_id=analysis_id, installation_id=installation_id, installed_at=now(), status="MISSING", reason=None,
                 parameters=None, input_schema=None, initialization="NOT_RUN", result_type=None,
                 parallel=False, remote=False, boundary_ids=entry.get("boundary_ids", []))
             unit.update(checked)
@@ -1650,7 +1689,7 @@ class UnitCatalog:
         with self.lock:
             result = []
             for unit in self.store.list("unit"):
-                if unit.get("status") == "SUPERSEDED":
+                if unit.get("status") in {"SUPERSEDED", "DETACHED"}:
                     continue
                 if unit["status"] == "READY" and unit["id"] not in self.bindings:
                     unit.update(status="MISSING", reason="native binding is not loaded in this process")
@@ -1709,16 +1748,18 @@ class UnitCatalog:
         try:
             result = self.bindings[unit_id].invoke(entry, unit, arguments)
         except (MissingBinding, ImportError, ModuleNotFoundError, FileNotFoundError, NameError, AttributeError, ProtocolError) as error:
-            binding = self.bindings[unit_id]
-            for identity, related in self.entry_specs.items():
-                if self.bindings[identity] is binding and binding._owner_key(related) == binding._owner_key(entry):
-                    item = self.store.get("unit", identity)
-                    if item.get("status") != "SUPERSEDED":
-                        item["status"] = "MISSING"
-                    item["reason"] = str(error)
-                    self.store.save("unit", identity, item, "unit_binding_missing")
+            with self.lock:
+                binding = self.bindings[unit_id]
+                for identity, related in self.entry_specs.items():
+                    if self.bindings[identity] is binding and binding._owner_key(related) == binding._owner_key(entry):
+                        item = self.store.get("unit", identity)
+                        if item.get("status") not in {"SUPERSEDED", "DETACHED"}:
+                            item["status"] = "MISSING"
+                        item["reason"] = str(error)
+                        self.store.save("unit", identity, item, "unit_binding_missing")
             raise
-        unit = self.store.get("unit", unit_id)
-        unit.update(initialization="BOUND", result_type=type(result).__module__ + "." + type(result).__qualname__)
-        self.store.save("unit", unit_id, unit, "unit_returned")
+        with self.lock:
+            unit = self.store.get("unit", unit_id)
+            unit.update(initialization="BOUND", result_type=type(result).__module__ + "." + type(result).__qualname__)
+            self.store.save("unit", unit_id, unit, "unit_returned")
         return result

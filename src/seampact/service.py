@@ -1,6 +1,7 @@
 """The four-layer research prototype: intake, analysis, Units, RL and chat."""
 
 import uuid
+import threading
 from pathlib import Path
 
 from . import __version__
@@ -11,7 +12,7 @@ from .intake import RepositoryIntake
 from .providers import Profiles
 from .runtime import Coordinator, OwnerRuntime
 from .scheduler import TwoLayerScheduler
-from .store import Store
+from .store import Store, now
 from .units import UnitCatalog
 
 NATIVE_PROFILE = dict(id="python311-local-explicit-lifetime/1", confirmed=True,
@@ -32,6 +33,7 @@ class Platform:
     def __init__(self, home, legacy=None):
         self.home = Path(home).resolve()
         self.home.mkdir(parents=True, exist_ok=True)
+        self.source_lock = threading.RLock()
         self.store = Store(self.home / "platform.sqlite3")
         self.profiles = Profiles(self.home / "config", legacy)
         self.scheduler = TwoLayerScheduler(self.home / "policy")
@@ -42,6 +44,9 @@ class Platform:
                                      check_entries=self.catalog.inspect_candidate)
         self.chat = ChatJobs(self.store, self.profiles, self.catalog, self.runtime, self.scheduler)
         self.inspectors = {}
+        for source in self.store.list("harness"):
+            if source.get("status") == "DETACHED":
+                self.catalog.detach(source["id"])
         for job in self.store.list("analysis"):
             if job.get("status") != "COMPLETED" or not job.get("submitted"):
                 continue
@@ -49,10 +54,10 @@ class Platform:
             if not request:
                 continue
             source = self.store.get("harness", request.get("source_id"))
-            if source and source.get("analysis_id") == job["id"]:
+            if source and source.get("status") != "DETACHED" and source.get("analysis_id") == job["id"]:
                 inspector = Inspector(source["root"], self.home / "snapshots", request)
                 self.inspectors[request["id"]] = inspector
-                self.catalog.install(inspector, job["submitted"]["candidate"], job["id"])
+                self.catalog.install(inspector, job["submitted"]["candidate"], job["id"], source.get("installation_id"))
 
     def state(self):
         snapshot = self.runtime.snapshot()
@@ -60,18 +65,24 @@ class Platform:
         waiting = [call for call in snapshot["calls"].values() if call["physical"] in {"ENABLED", "RESERVED"}]
         tasks = self.store.list("task")
         for task in tasks:
-            task["calls"] = [call for call in snapshot["calls"].values() if call.get("task_id") == task["id"]]
+            calls = [call for call in snapshot["calls"].values() if call.get("task_id") == task["id"]]
+            if calls or task.get("status") == "RUNNING":
+                task["calls"] = calls
         harnesses = []
         for source in self.store.list("harness"):
             harnesses.append({name: source.get(name) for name in
-                ("id", "name", "address", "revision", "status", "error", "analysis_id", "entry", "resources")})
+                ("id", "name", "address", "revision", "status", "error", "analysis_id", "entry", "resources", "detached_at")})
             harnesses[-1]["files"] = len(source.get("files", []))
             harnesses[-1]["inventory_count"] = len(source.get("inventory", []))
             job = self.store.get("analysis", source.get("analysis_id"))
-            if job and job["status"] in {"FAILED", "INTERRUPTED", "CANCELLED"}:
+            if source.get("status") != "DETACHED" and job and job["status"] in {"FAILED", "INTERRUPTED", "CANCELLED"}:
                 harnesses[-1].update(status=job["status"], error=job.get("error"))
         jobs = [{name: value for name, value in job.items() if name not in {"messages", "provider_profile"}}
                 for job in self.store.list("analysis")]
+        for job in jobs:
+            if not job.get("harness_id"):
+                request = self.store.get("request", job.get("request_id"))
+                job["harness_id"] = (request or {}).get("source_id")
         return dict(version=__version__, models=self.profiles.public_roles(), harnesses=harnesses,
             analyses=jobs, units=self.catalog.public(), tasks=tasks, rules=RULESET, entry_profile=NATIVE_PROFILE,
             scheduler=dict(status="RUNNING", policy="two-layer-tabular-q-learning", active=active, waiting=waiting,
@@ -100,9 +111,15 @@ class Platform:
         return dict(id=source["id"], files=len(source["files"]))
 
     def analyze(self, identity):
+        with self.source_lock:
+            return self._analyze(identity)
+
+    def _analyze(self, identity):
         source = self.store.get("harness", identity)
         if not source:
             raise ValueError("Harness地址尚未接入")
+        if source.get("status") == "DETACHED":
+            raise ValueError("来源已摘除，请先重新接入")
         if any(job["status"] == "RUNNING" and job.get("request_id") == source.get("request_id")
                for job in self.store.list("analysis")):
             raise ValueError("这个来源正在分析")
@@ -126,12 +143,59 @@ class Platform:
         return dict(analysis_id=analysis_id)
 
     def _connect_units(self, inspector, job):
-        units = self.catalog.install(inspector, job["submitted"]["candidate"], job["id"])
-        source = self.store.get("harness", inspector.request["source_id"])
-        source.update(status="ANALYZED", analysis_id=job["id"], error=None)
-        self.store.save("harness", source["id"], source)
+        with self.source_lock:
+            source = self.store.get("harness", inspector.request["source_id"])
+            if not source or source.get("status") == "DETACHED" or source.get("analysis_id") != job["id"]:
+                job["status"] = "CANCELLED"
+                return []
+            units = self.catalog.install(inspector, job["submitted"]["candidate"], job["id"])
+            source.update(status="ANALYZED", analysis_id=job["id"], installation_id=job["id"], error=None)
+            self.store.save("harness", source["id"], source)
         print("[SeamPact] units_connected " + str(len(units)), flush=True)
         return [unit["id"] for unit in units]
+
+    def detach_harness(self, identity):
+        with self.source_lock:
+            source = self.store.get("harness", identity)
+            if not source:
+                raise ValueError("没有这个Harness来源")
+            source.update(status="DETACHED", detached_at=now(), error=None)
+            self.store.save("harness", identity, source)
+            self.analysis.cancel(source.get("analysis_id"))
+            count = self.catalog.detach(identity)
+        print("[SeamPact] source_detached " + identity, flush=True)
+        return dict(harness_id=identity, status="DETACHED", detached_units=count,
+                    history="RETAINED", started_calls="ALLOW_FINISH")
+
+    def restore_harness(self, identity):
+        with self.source_lock:
+            source = self.store.get("harness", identity)
+            if not source:
+                raise ValueError("没有这个Harness来源")
+            if source.get("status") != "DETACHED":
+                return dict(harness_id=identity, status=source["status"])
+            if self.catalog.source_running(identity):
+                raise ValueError("已开始的原调用仍在收尾，结束后可重新接入")
+            job = next((item for item in self.store.list("analysis")
+                        if item.get("status") == "COMPLETED" and item.get("submitted")
+                        and (self.store.get("request", item["request_id"]) or {}).get("source_id") == identity), None)
+            self.runtime.call("restore_source", identity)
+            try:
+                if job:
+                    request = self.store.get("request", job["request_id"])
+                    inspector = Inspector(source["root"], self.home / "snapshots", request)
+                    installation_id = uuid.uuid4().hex
+                    self.catalog.install(inspector, job["submitted"]["candidate"], job["id"], installation_id)
+                    source.update(status="ANALYZED", analysis_id=job["id"], installation_id=installation_id)
+                else:
+                    source.update(status="CONNECTED", analysis_id=None)
+                source.update(detached_at=None, error=None)
+                self.store.save("harness", identity, source)
+            except Exception:
+                self.catalog.detach(identity)
+                raise
+        print("[SeamPact] source_restored " + identity, flush=True)
+        return dict(harness_id=identity, status=source["status"], model_api_calls=0)
 
     def close(self):
         self.analysis.close()

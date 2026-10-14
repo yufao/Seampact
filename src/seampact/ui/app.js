@@ -12,6 +12,14 @@ let pendingTask = null;
 let refreshing = false;
 let connected = false;
 const analysisSubmitting = new Set();
+const sourceUpdating = new Set();
+const inspectPage = location.pathname === '/inspect';
+let inspectQuery = new URLSearchParams(location.search);
+let inspectView = inspectQuery.get('view') || 'analyses';
+const viewNames = {analyses: '来源与分析', units: '能力池', tasks: '任务详情', scheduler: '调度器'};
+if (!viewNames[inspectView]) inspectView = 'analyses';
+const renderedSections = new Map();
+const detailStates = new Map();
 const terminalStatuses = new Set(['COMPLETED', 'SUCCEEDED', 'FAILED', 'CANCELLED', 'INTERRUPTED', 'BLOCKED']);
 const statusNames = {
   RUNNING: '运行中', QUEUED: '排队中', WAITING: '等待中', COMPLETED: '已完成',
@@ -23,8 +31,130 @@ const statusNames = {
   STARTED: '执行中', RETIRED: '已结束', BUILT_DRAFT: '适配已生成',
   SOURCE_BOUND: '源码绑定已核对', ADMITTED: '操作条件成立', NOT_RUN: '尚未运行', BOUND: '原生绑定已执行',
   UNRESOLVED: '语义条件未决', RETURNED: '正常返回', STOPPED_AT_NON_SUCCESS_EXIT: '后继已停止',
-  CHECKED_WITH_RUNTIME_VALUE_CONDITIONS: '结构已核对 · 按实际值检查输入', SOURCE_CHECKED: '源码已核对'
+  CHECKED_WITH_RUNTIME_VALUE_CONDITIONS: '结构已核对 · 按实际值检查输入', SOURCE_CHECKED: '源码已核对',
+  DETACHED: '已摘除', SUPERSEDED: '已替换'
 };
+
+function inspectLink(view, parameters = {}) {
+  const query = new URLSearchParams({view, ...parameters});
+  const link = node('a', '查看完整详情', 'detail-link');
+  link.href = '/inspect?' + query;
+  link.target = '_blank';
+  link.rel = 'noopener';
+  return link;
+}
+
+function detailKey(detail, root) {
+  const owner = detail.closest('[data-item-id]')?.dataset.itemId || root.id;
+  const labels = [];
+  for (let current = detail; current && current !== root; current = current.parentElement) {
+    if (current.tagName === 'DETAILS') labels.unshift(current.querySelector(':scope > summary')?.textContent.split(' · ')[0] || '详情');
+  }
+  return root.id + '/' + owner + '/' + labels.join('/');
+}
+
+function renderSection(key, value, render, roots) {
+  const signature = JSON.stringify(value);
+  if (renderedSections.get(key) === signature) return;
+  const focus = document.activeElement;
+  let focusedKey = null;
+  for (const id of roots) {
+    const root = $(id);
+    for (const detail of root.querySelectorAll('details')) {
+      const identity = detailKey(detail, root);
+      detailStates.set(identity, detail.open);
+      if (focus === detail.querySelector(':scope > summary')) focusedKey = identity;
+    }
+  }
+  const scroller = document.querySelector('.observer-scroll');
+  const scrollTop = scroller.scrollTop;
+  const configScroll = document.querySelector('.config-body').scrollTop;
+  render();
+  for (const id of roots) {
+    const root = $(id);
+    for (const detail of root.querySelectorAll('details')) {
+      const identity = detailKey(detail, root);
+      if (detailStates.has(identity)) detail.open = detailStates.get(identity);
+      if (identity === focusedKey) detail.querySelector(':scope > summary')?.focus({preventScroll: true});
+    }
+  }
+  scroller.scrollTop = scrollTop;
+  document.querySelector('.config-body').scrollTop = configScroll;
+  renderedSections.set(key, signature);
+}
+
+function selectedSource() { return inspectPage ? inspectQuery.get('harness') || '' : ''; }
+function visibleUnits() {
+  return (state.units || []).filter(unit => (!selectedSource() || unit.source_id === selectedSource()) &&
+    (!inspectPage || !inspectQuery.get('unit') || unit.id === inspectQuery.get('unit')));
+}
+function visibleTasks() {
+  const source = selectedSource();
+  const sourceAnalyses = new Set((state.analyses || []).filter(job => job.harness_id === source).map(job => job.id));
+  const sourceUnits = new Set((state.units || []).filter(unit => unit.source_id === source).map(unit => unit.id));
+  return (state.tasks || []).filter(task =>
+    (!inspectPage || !inspectQuery.get('task') || task.id === inspectQuery.get('task')) &&
+    (!source || (task.calls || []).some(call => call.unit?.source_id === source) ||
+      (task.plan?.units || []).some(id => sourceUnits.has(id) || sourceAnalyses.has(id.split(':')[0]))));
+}
+
+async function changeSource(harness) {
+  if (sourceUpdating.has(harness.id)) return;
+  const detached = harness.status === 'DETACHED';
+  sourceUpdating.add(harness.id);
+  try {
+    await api('/api/harnesses/' + (detached ? 'restore' : 'detach'), {harness_id: harness.id});
+    showNotice(detached ? '来源已重新接入，沿用已有分析，不调用分析模型。' :
+      '来源已摘除，后续调用已停止；已开始的原调用可收尾，分析历史保留。');
+  } catch (error) { showNotice(error.message); }
+  finally { sourceUpdating.delete(harness.id); await refresh(); }
+}
+
+function sourceButton(harness) {
+  const button = node('button', sourceUpdating.has(harness.id) ? '处理中…' :
+    harness.status === 'DETACHED' ? '重新接入' : '摘除来源', 'secondary-button');
+  button.type = 'button';
+  button.disabled = sourceUpdating.has(harness.id) || analysisSubmitting.has(harness.id);
+  button.onclick = () => {
+    button.disabled = true;
+    button.textContent = '处理中…';
+    changeSource(harness);
+  };
+  return button;
+}
+
+function updateInspectPage() {
+  if (!inspectPage) return;
+  document.body.classList.add('inspect-page');
+  document.title = 'SeamPact · ' + viewNames[inspectView];
+  $('observer-title').textContent = viewNames[inspectView];
+  $('inspect-description').hidden = false;
+  $('inspect-filter').hidden = inspectView === 'scheduler';
+  document.querySelector('.chat-shell').setAttribute('aria-hidden', 'true');
+  document.querySelector('.rail-caption').textContent = '异构 Harness · 详情';
+  for (const section of document.querySelectorAll('.observer-scroll > .panel-section')) section.hidden = section.dataset.view !== inspectView;
+  for (const link of document.querySelectorAll('.rail-actions a[href^="/inspect"]')) {
+    const view = new URL(link.href).searchParams.get('view');
+    const query = new URLSearchParams({view});
+    if (selectedSource() && view !== 'scheduler') query.set('harness', selectedSource());
+    link.href = '/inspect?' + query;
+    link.removeAttribute('target');
+    link.classList.toggle('selected', view === inspectView);
+  }
+  const options = (state.harnesses || []).map(source => [source.id, source.name || source.address, source.status]);
+  const selector = $('inspect-source');
+  if (selector.dataset.options !== JSON.stringify(options)) {
+    selector.replaceChildren(node('option', '全部来源'));
+    selector.firstChild.value = '';
+    for (const [id, name, status] of options) {
+      const option = node('option', name + (status === 'DETACHED' ? ' · 已摘除' : ''));
+      option.value = id;
+      selector.append(option);
+    }
+    selector.dataset.options = JSON.stringify(options);
+  }
+  selector.value = selectedSource();
+}
 
 async function api(path, body) {
   const response = await fetch(path, body === undefined ? {} : {
@@ -41,8 +171,9 @@ function textValue(value) {
 }
 
 function showNotice(text) {
-  $('notice').textContent = text;
-  $('notice').hidden = !text;
+  const notice = $(inspectPage ? 'inspect-notice' : 'notice');
+  notice.textContent = text;
+  notice.hidden = !text;
 }
 
 function statusClass(value) {
@@ -237,6 +368,7 @@ function renderScheduler() {
       const learning = scheduler.learning[key];
       if (!learning) continue;
       const card = node('div', undefined, 'status-card');
+      card.dataset.itemId = key;
       card.append(node('strong', label));
       const count = learning.candidate_count;
       card.append(node('p', '最近候选：' + (count === null || count === undefined ? '尚未选择' : count) + ' · 累计更新：' + (learning.updates ?? '—'), 'card-meta'));
@@ -313,13 +445,14 @@ function planDetails(task) {
 }
 
 function renderTasks() {
-  const tasks = state.tasks || [];
+  const tasks = visibleTasks();
   const root = $('task-list');
   root.replaceChildren();
   $('task-count').textContent = tasks.length;
   if (!tasks.length) return empty(root, '尚无任务。发送消息后在这里观察真实调用。');
   for (const task of [...tasks].sort((a, b) => String(b.started_at || b.created_at || '').localeCompare(String(a.started_at || a.created_at || '')))) {
     const card = node('article', undefined, 'status-card');
+    card.dataset.itemId = task.id;
     const head = node('div', undefined, 'card-heading');
     head.append(node('strong', '任务 ' + task.id), pill(task.status));
     card.append(head);
@@ -332,19 +465,21 @@ function renderTasks() {
     const detail = callDetails(task.calls);
     if (detail) card.append(detail);
     else card.append(node('p', '暂无 Unit 调用记录。', 'card-meta'));
+    if (!inspectPage) card.append(inspectLink('tasks', {task: task.id}));
     root.append(card);
   }
 }
 
 function renderUnits() {
-  const units = state.units || [];
+  const units = visibleUnits();
   const root = $('unit-list');
   root.replaceChildren();
   $('unit-count').textContent = units.length;
-  if (!units.length) return empty(root, '能力池为空。分析 Harness 后，以实际接入结果显示 Unit。');
+  if (!units.length) return empty(root, selectedSource() ? '这个来源当前没有接入能力。已摘除来源的历史结果仍在“来源与分析”页面。' : '能力池为空。分析 Harness 后，以实际接入结果显示 Unit。');
   root.append(node('p', '源码绑定、实际初始化和逐操作条件分别显示。', 'card-note'));
   for (const unit of units) {
     const card = node('article', undefined, 'unit-card');
+    card.dataset.itemId = unit.id;
     const head = node('div', undefined, 'card-heading');
     head.append(node('strong', unit.name || unit.id), pill(unit.status));
     card.append(head);
@@ -375,27 +510,42 @@ function renderUnits() {
     if (unit.native_input_schemas && Object.keys(unit.native_input_schemas).length) detailValue(card, '原对象输入端口', unit.native_input_schemas);
     detailValue(card, '缺失条件', unit.missing);
     detailValue(card, '入口范围', unit.entry_profile || unit.profile);
+    if (!inspectPage) card.append(inspectLink('units', {harness: sourceId, unit: unit.id}));
     root.append(card);
   }
 }
 
 function renderAnalyses() {
-  const harnesses = state.harnesses || [];
+  const harnesses = (state.harnesses || []).filter(source => !selectedSource() || source.id === selectedSource());
   const analyses = state.analyses || [];
   const root = $('analysis-list');
   root.replaceChildren();
-  $('analysis-count').textContent = analyses.length;
+  $('analysis-count').textContent = analyses.filter(job => harnesses.some(source => source.id === job.harness_id)).length;
   if (!harnesses.length) return empty(root, '配置 Harness 地址后可开始分析。');
   for (const harness of harnesses) {
-    const job = analyses.find(item => item.id === harness.analysis_id) ||
-      [...analyses].reverse().find(item => item.harness_id === harness.id);
+    const history = analyses.filter(item => item.harness_id === harness.id);
+    const jobs = inspectPage ? history.length ? history : [null] :
+      [analyses.find(item => item.id === harness.analysis_id) || history[0] || null];
+    for (const job of jobs) {
     const card = node('article', undefined, 'status-card');
+    card.dataset.itemId = harness.id + ':' + (job?.id || 'source');
     const head = node('div', undefined, 'card-heading');
-    head.append(node('strong', harness.name || harness.address), pill(job?.status || harness.status));
+    head.append(node('strong', harness.name || harness.address), pill(harness.status === 'DETACHED' ? 'DETACHED' : job?.status || harness.status));
     card.append(head, node('p', harness.address, 'card-meta'));
     const files = entryCount(harness.files);
     if (files !== null) card.append(node('p', files + ' 份可读文件' + (typeof harness.inventory_count === 'number' ? ' · 仓库共 ' + harness.inventory_count + ' 项文件' : ''), 'card-meta'));
     if (job?.rounds !== undefined) card.append(node('p', '分析模型响应 ' + job.rounds + ' 轮', 'card-meta'));
+    if (inspectPage) {
+      card.append(node('p', '源码版本：' + (harness.revision || '本地内容版本'), 'card-meta'));
+      if (job) {
+        card.append(node('p', '分析 ' + job.id + ' · ' + statusLabel(job.status) +
+          (job.id === harness.analysis_id ? ' · 当前记录' : ' · 历史记录'), 'card-meta'));
+        if (job.started_at) card.append(node('p', '开始：' + job.started_at, 'card-meta'));
+        if (job.refinement_of) card.append(node('p', '沿用分析上下文：' + job.refinement_of, 'card-meta'));
+        detailValue(card, '实际模型用量', job.usage);
+      }
+    }
+    if (harness.status === 'DETACHED') card.append(node('p', '来源已退出当前能力池。源码和分析历史保留，可重新接入。', 'card-note'));
     const error = job?.error || harness.error;
     if (error) card.append(node('p', textValue(error), 'card-note message-error'));
     const boundaries = job?.submitted?.candidate?.boundaries || job?.boundaries || [];
@@ -412,7 +562,13 @@ function renderAnalyses() {
     }
     const entryReport = job?.submitted?.report?.entry_bindings;
     if (entryReport) detailValue(card, '入口绑定与缺失判断', entryReport);
+    if (inspectPage && job?.submitted?.report) detailValue(card, '边界检查完整报告', job.submitted.report);
+    const actions = node('div', undefined, 'harness-actions');
+    if (!inspectPage) actions.append(inspectLink('analyses', {harness: harness.id}));
+    actions.append(sourceButton(harness));
+    card.append(actions);
     root.append(card);
+    }
   }
   if (state.rules?.theory_pending) root.append(node('p', state.rules.theory_pending === true ?
     '分析准则待确认。' : textValue(state.rules.theory_pending), 'theory-note'));
@@ -444,15 +600,17 @@ function renderHarnesses() {
   if (!(state.harnesses || []).length) return empty(root, '尚未配置 Harness 来源。');
   for (const harness of state.harnesses) {
     const card = node('article', undefined, 'harness-card');
+    card.dataset.itemId = harness.id;
     const head = node('div', undefined, 'card-heading');
     head.append(node('strong', harness.name || harness.address), pill(harness.status));
     card.append(head, node('p', harness.address, 'card-note'));
     if (harness.error) card.append(node('p', textValue(harness.error), 'card-note message-error'));
     const job = (state.analyses || []).find(item => item.id === harness.analysis_id);
+    const detached = harness.status === 'DETACHED';
     const busy = analysisSubmitting.has(harness.id) || ['RUNNING', 'QUEUED', 'ANALYZING'].includes(String(job?.status || harness.status).toUpperCase());
     const action = node('button', busy ? '分析中…' : '分析 Harness', 'secondary-button');
     action.type = 'button';
-    action.disabled = busy || !isReady(state.models?.analysis);
+    action.disabled = detached || busy || sourceUpdating.has(harness.id) || !isReady(state.models?.analysis);
     action.onclick = async () => {
       analysisSubmitting.add(harness.id);
       action.disabled = true;
@@ -465,6 +623,8 @@ function renderHarnesses() {
     };
     const actions = node('div', undefined, 'harness-actions');
     actions.append(action);
+    actions.append(inspectLink('analyses', {harness: harness.id}), sourceButton(harness));
+    if (detached) card.append(node('p', '已摘除；重新接入会使用已有分析，不重复调用分析模型。', 'card-note'));
     if (!isReady(state.models?.analysis)) actions.append(node('span', '先配置分析模型', 'form-note'));
     card.append(actions);
     root.append(card);
@@ -549,13 +709,14 @@ async function refresh() {
     $('version').textContent = state.version ? '核心 ' + state.version : '';
     document.querySelector('.connection-dot').classList.remove('disconnected');
     hydrateModels();
-    renderProfile();
+    updateInspectPage();
+    renderSection('profile', state.entry_profile, renderProfile, ['entry-profile-summary', 'config-entry-profile']);
     synchronizeTask();
-    renderScheduler();
-    renderTasks();
-    renderUnits();
-    renderAnalyses();
-    renderHarnesses();
+    renderSection('scheduler', state.scheduler, renderScheduler, ['scheduler-summary']);
+    renderSection('tasks', visibleTasks(), renderTasks, ['task-list']);
+    renderSection('units', [visibleUnits(), state.harnesses, selectedSource()], renderUnits, ['unit-list']);
+    renderSection('analyses', [state.analyses, state.harnesses, selectedSource(), [...sourceUpdating]], renderAnalyses, ['analysis-list']);
+    renderSection('harnesses', [state.harnesses, state.analyses, state.models?.analysis, [...analysisSubmitting], [...sourceUpdating]], renderHarnesses, ['harness-list']);
   } catch (error) {
     connected = false;
     $('connection').textContent = '连接中断';
@@ -596,6 +757,15 @@ $('close-configuration').onclick = () => $('configuration').close();
 $('open-observer').onclick = () => observerOpen(!document.body.classList.contains('observer-open'));
 $('close-observer').onclick = () => observerOpen(false);
 $('drawer-shade').onclick = () => observerOpen(false);
+$('inspect-source').onchange = async event => {
+  const query = new URLSearchParams({view: inspectView});
+  if (event.target.value) query.set('harness', event.target.value);
+  inspectQuery = query;
+  history.replaceState(null, '', '/inspect?' + query);
+  renderedSections.clear();
+  document.querySelector('.observer-scroll').scrollTop = 0;
+  await refresh();
+};
 document.addEventListener('keydown', event => {
   if (event.key === 'Escape') observerOpen(false);
 });

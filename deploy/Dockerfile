@@ -9,7 +9,7 @@ RUN apt-get update \
 COPY src ./src
 RUN chmod -R a+rX /app/src
 ENV PYTHONPATH=/app/src PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1
-LABEL org.opencontainers.image.version="0.7.0"
+LABEL org.opencontainers.image.version="0.7.1"
 EXPOSE 8880
 ENTRYPOINT ["python", "-B", "-m", "seampact"]
 CMD ["serve", "--home", "/data", "--host", "0.0.0.0", "--port", "8880"]

@@ -32,6 +32,8 @@ button, input, select, textarea { -webkit-tap-highlight-color: transparent; }
 .rail-actions { display: grid; gap: 7px; margin-top: 34px; }
 .rail-button { display: flex; align-items: center; gap: 10px; width: 100%; padding: 11px 12px; border: 1px solid transparent; border-radius: 8px; background: transparent; color: #4f5b54; text-align: left; font-size: 12px; }
 .rail-button:hover { background: #ecf0ed; }
+.rail-button { text-decoration: none; }
+.chat-navigation { display: none; }
 .rail-button:first-child { color: var(--accent); background: #eaf0ec; }
 .rail-foot { margin-top: auto; color: var(--muted); font-size: 10px; line-height: 1.8; padding: 0 10px; }
 .connection-dot { display: inline-block; width: 6px; height: 6px; margin-right: 6px; border-radius: 50%; background: #4b8564; }
@@ -88,6 +90,9 @@ button, input, select, textarea { -webkit-tap-highlight-color: transparent; }
 .panel-section:last-child { border-bottom: 0; }
 .panel-heading { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 12px; }
 .panel-heading h3 { font-size: 11px; font-weight: 650; color: #626f66; }
+.panel-heading > a, .detail-link { font-size: 11px; text-decoration: none; }
+.panel-heading > a { margin-left: auto; }
+.detail-link { display: inline-block; margin-top: 10px; }
 .count-badge { display: inline-flex; align-items: center; justify-content: center; min-width: 20px; height: 19px; padding: 0 6px; border-radius: 5px; background: #edf0ed; color: #7b877e; font-size: 10px; }
 .status-pill { display: inline-flex; align-items: center; padding: 2px 7px; border-radius: 5px; background: #eef1ee; color: #6a786e; font-size: 10px; font-weight: 500; white-space: nowrap; }
 .status-pill.running { background: #e8f1eb; color: #316b49; }
@@ -156,6 +161,25 @@ pre { margin: 10px 0 0; padding: 11px; border-radius: 6px; background: #f3f5f3; 
 .harness-actions .secondary-button { padding: 5px 10px; font-size: 10px; }
 .dialog-footer { padding: 13px 26px; border-top: 1px solid var(--line); color: #8a958e; font-size: 10px; }
 
+body.inspect-page .app-shell { grid-template-columns: 180px minmax(0, 1fr); }
+body.inspect-page .chat-shell, body.inspect-page #open-observer, body.inspect-page #close-observer { display: none; }
+body.inspect-page .chat-navigation { display: flex; }
+body.inspect-page .observer { display: flex; position: static; width: auto; border-left: 0; box-shadow: none; }
+body.inspect-page .observer-header { padding: 24px 36px; }
+body.inspect-page .observer-header h2 { font-size: 20px; }
+body.inspect-page .observer-scroll { padding: 0 36px 32px; overflow-anchor: none; }
+body.inspect-page .panel-section { max-width: 1200px; width: 100%; margin: 0 auto; }
+body.inspect-page .panel-heading h3 { font-size: 14px; }
+body.inspect-page .panel-heading > a { display: none; }
+body.inspect-page .status-card, body.inspect-page .unit-card { padding: 20px 24px; }
+body.inspect-page .card-heading strong { font-size: 15px; }
+body.inspect-page .card-meta, body.inspect-page .card-note, body.inspect-page summary { font-size: 12px; }
+body.inspect-page pre { font-size: 12px; max-height: none; line-height: 1.8; }
+body.inspect-page .status-list, body.inspect-page .unit-list { gap: 16px; }
+body.inspect-page .rail-button.selected { background: #eaf0ec; color: var(--accent); }
+#inspect-filter { color: var(--muted); font-size: 12px; }
+#inspect-source { margin-left: 10px; max-width: 280px; padding: 8px 10px; border: 1px solid var(--line); border-radius: 7px; background: white; color: var(--ink); }
+
 @keyframes pulse { 50% { opacity: .3; } }
 @media (prefers-reduced-motion: reduce) { .message-pending::after { animation: none; } }
 @media (max-width: 1380px) {
@@ -206,4 +230,10 @@ pre { margin: 10px 0 0; padding: 11px; border-radius: 6px; background: #f3f5f3; 
   .model-grid, .optional-grid { grid-template-columns: minmax(0, 1fr); }
   .model-grid { gap: 12px; }
   .dialog-footer { padding: 12px 18px; }
+  body.inspect-page .app-shell { grid-template-columns: minmax(0, 1fr); }
+  body.inspect-page .rail-actions { flex-wrap: wrap; justify-content: flex-end; }
+  body.inspect-page .observer-header { padding: 16px 18px; flex-wrap: wrap; }
+  body.inspect-page .observer-scroll { padding: 0 16px 20px; }
+  body.inspect-page .status-card, body.inspect-page .unit-card { padding: 16px; }
+  #inspect-source { max-width: 190px; }
 }

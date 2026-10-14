@@ -161,6 +161,9 @@ class AnalysisJobs:
                 job["messages"].append(message)
                 job["last_finish_reason"] = choice.get("finish_reason")
                 self.store.save("analysis", job["id"], job, "provider_response")
+                if cancellation.is_set() or self.closed:
+                    job["status"] = "CANCELLED"
+                    break
                 calls = message.get("tool_calls", [])
                 if choice.get("finish_reason") not in {"stop", "tool_calls"}:
                     raise ProviderError("模型响应未完成：" + str(choice.get("finish_reason")))
@@ -195,6 +198,9 @@ class AnalysisJobs:
                     job["messages"].append(dict(role="tool", tool_call_id=call["id"],
                                                 content=json.dumps(result, ensure_ascii=False)))
                     self.store.save("analysis", job["id"], job, "source_tool_result")
+                if cancellation.is_set() or self.closed:
+                    job["status"] = "CANCELLED"
+                    break
                 if submitted:
                     job["status"] = "COMPLETED"
                     if self.on_complete:
@@ -210,6 +216,14 @@ class AnalysisJobs:
                 self.store.save("analysis", job["id"], job, "analysis_finished")
             with self.lock:
                 self.cancels.pop(job["id"], None)
+
+    def cancel(self, identity):
+        with self.lock:
+            cancellation = self.cancels.get(identity)
+            if cancellation:
+                cancellation.set()
+                return True
+            return False
 
     def close(self):
         self.closed = True

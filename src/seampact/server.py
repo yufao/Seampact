@@ -31,7 +31,7 @@ def make_server(platform, port=8880, host="127.0.0.1", public_port=None):
                     return self.send(200, platform.state())
                 if path.startswith("/api/analysis/"):
                     return self.send(200, platform.store.get("analysis", path.rsplit("/", 1)[1]))
-                filename = {"/": "index.html", "/app.js": "app.js", "/style.css": "style.css"}.get(path)
+                filename = {"/": "index.html", "/inspect": "index.html", "/app.js": "app.js", "/style.css": "style.css"}.get(path)
                 if not filename:
                     return self.send(404, dict(error="没有这个接口"))
                 mime = {"index.html": "text/html", "app.js": "text/javascript", "style.css": "text/css"}[filename]
@@ -50,6 +50,10 @@ def make_server(platform, port=8880, host="127.0.0.1", public_port=None):
                     result = platform.add_harness(body)
                 elif path == "/api/analyze":
                     result = platform.analyze(body["harness_id"])
+                elif path == "/api/harnesses/detach":
+                    result = platform.detach_harness(body["harness_id"])
+                elif path == "/api/harnesses/restore":
+                    result = platform.restore_harness(body["harness_id"])
                 elif path == "/api/chat":
                     result = platform.chat.start(body)
                 else:

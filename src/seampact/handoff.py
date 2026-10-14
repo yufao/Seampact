@@ -55,7 +55,7 @@ def install_method_proxy(owner, name, proxy):
 
 class ToolListHandoff:
     def __init__(self, runtime, owner, selectors, initializer, tools_attribute,
-                 owner_id=None, schema_policy="native"):
+                 owner_id=None, schema_policy="native", source_id=None):
         if not selectors or len(set(selectors.values())) != len(selectors):
             raise ValueError("unique candidate IDs and original callable names required")
         if schema_policy not in {"native", "resolved-types"}:
@@ -64,6 +64,7 @@ class ToolListHandoff:
         self.initializer, self.tools_attribute = initializer, tools_attribute
         self.owner_id = owner_id or "owner-" + uuid.uuid4().hex
         self.schema_policy = schema_policy
+        self.source_id = source_id
         self.prefix = uuid.uuid4().hex
         self.bindings, self.round = [], 0
         self.installed = False
@@ -127,7 +128,8 @@ class ToolListHandoff:
                     return_annotation=annotations.get("return",signature.return_annotation))
             prepared.append((identity,index,original,proxy,gate))
         for identity,index,original,proxy,gate in prepared:
-            await self.runtime.acall("register",gate,self.owner_id)
+            await self.runtime.acall("register",gate,self.owner_id,
+                                     unit=dict(id=identity, source_id=self.source_id))
             replacements[index] = proxy
             self.bindings.append(dict(id=identity,gate=gate,initialization_round=self.round,
                 callable=original.__qualname__,owner=self.owner_id,

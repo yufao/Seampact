@@ -181,6 +181,11 @@ class TwoLayerScheduler:
                                         ensure_ascii=False, indent=2), encoding="utf-8")
         temporary.replace(self.file)
 
+    def discard(self, token):
+        """A revoked pre-start decision has no execution outcome to learn from."""
+        with self.lock:
+            self.pending.pop(token, None)
+
     def snapshot(self):
         with self.lock:
             value = dict(status="READY", policy="TWO_LAYER_TABULAR_Q_LEARNING",

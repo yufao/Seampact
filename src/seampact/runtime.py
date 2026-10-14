@@ -31,6 +31,7 @@ class Coordinator:
         self.decisions = {}
         self.waiters = {}
         self.failed = False
+        self.detached_sources = set()
         self.state = dict(schema="runtime/2", quota=quota, gates={}, calls={})
 
     def _persist(self, event):
@@ -63,6 +64,8 @@ class Coordinator:
                    for c in self.state["calls"].values())
 
     async def register(self, identity, owner, generation=1, slots=1, unit=None):
+        if (unit or {}).get("source_id") in self.detached_sources:
+            raise ProtocolError("Harness source is detached")
         if not identity or not owner or type(generation) is not int or generation < 1:
             raise ValueError("gate and native-owner generation required")
         if type(slots) is not int or not 1 <= slots <= self.state["quota"]:
@@ -176,6 +179,28 @@ class Coordinator:
                     w.set_exception(ProtocolError("gate invalidated"))
         self._persist("catalog_invalidated")
         await self.pump()
+
+    async def detach_source(self, source_id):
+        self.detached_sources.add(source_id)
+        for gate in self.state["gates"].values():
+            if (gate.get("unit") or {}).get("source_id") != source_id:
+                continue
+            gate["active"] = False
+            for call in self.state["calls"].values():
+                if call["gate"] == gate["id"] and call["physical"] in {"ENABLED", "RESERVED", "AUTHORIZED"}:
+                    call.update(physical="RETIRED", logical="REJECTED", receipt="SOURCE_DETACHED")
+                    token = self.decisions.pop(call["id"], None)
+                    if token and self.policy:
+                        self.policy.discard(token)
+                    waiter = self.waiters.get(call["id"])
+                    if waiter and not waiter.done():
+                        waiter.set_exception(ProtocolError("Harness source is detached"))
+        self._persist("source_detached")
+        await self.pump()
+
+    async def restore_source(self, source_id):
+        # Prior gates remain inactive; the catalog creates a fresh binding generation.
+        self.detached_sources.discard(source_id)
 
     async def pump(self):
         if not self.automatic:
