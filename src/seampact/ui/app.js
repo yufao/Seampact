@@ -16,11 +16,14 @@ const terminalStatuses = new Set(['COMPLETED', 'SUCCEEDED', 'FAILED', 'CANCELLED
 const statusNames = {
   RUNNING: '运行中', QUEUED: '排队中', WAITING: '等待中', COMPLETED: '已完成',
   SUCCEEDED: '已完成', FAILED: '失败', CANCELLED: '已取消', INTERRUPTED: '已中断',
-  READY: '可用', AVAILABLE: '可用', BLOCKED: '待接入', PENDING: '待确认',
+  READY: '源码已绑定', AVAILABLE: '可用', BLOCKED: '待接入', PENDING: '待确认',
   THEORY_PENDING: '理论待确认', IDLE: '空闲', ANALYZING: '分析中', ANALYZED: '已分析',
   REGISTERED: '已登记', CONNECTED: '已接入', MISSING: '待接入', NOT_CONFIGURED: '未配置', ENABLED: '已使能',
   AUTHORIZED: '已派发', RESERVED: '已占槽', UNKNOWN: '状态未知',
-  STARTED: '执行中', RETIRED: '已结束', BUILT_DRAFT: '适配已生成'
+  STARTED: '执行中', RETIRED: '已结束', BUILT_DRAFT: '适配已生成',
+  SOURCE_BOUND: '源码绑定已核对', ADMITTED: '操作条件成立', NOT_RUN: '尚未运行', BOUND: '原生绑定已执行',
+  UNRESOLVED: '语义条件未决', RETURNED: '正常返回', STOPPED_AT_NON_SUCCESS_EXIT: '后继已停止',
+  CHECKED_WITH_RUNTIME_VALUE_CONDITIONS: '结构已核对 · 按实际值检查输入', SOURCE_CHECKED: '源码已核对'
 };
 
 async function api(path, body) {
@@ -83,6 +86,33 @@ function empty(root, text) {
   root.append(node('p', text, 'empty-note'));
 }
 
+function detailValue(root, label, value, open = false) {
+  if (value === undefined || value === null) return;
+  const detail = node('details', undefined, 'schema-note');
+  detail.open = open;
+  detail.append(node('summary', label), node('pre', textValue(value)));
+  root.append(detail);
+  return detail;
+}
+
+function renderProfile() {
+  const profile = state.entry_profile;
+  for (const id of ['entry-profile-summary', 'config-entry-profile']) {
+    const root = $(id);
+    if (!root) continue;
+    root.replaceChildren();
+    if (!profile) {
+      empty(root, '平台尚未提供入口支持范围。');
+      continue;
+    }
+    root.append(node('p', [profile.interpreter, profile.host === 'local-native-process' ? '本地原生进程' : profile.host,
+      profile.explicit_lifetime ? '显式生命周期' : null,
+      profile.frame_observation_excluded ? '不使用栈 / frame 反射' : null].filter(Boolean).join(' · '), 'card-note'));
+    root.append(node('p', (profile.confirmed ? '已确认范围：' : '范围待确认：') + profile.id, 'card-meta'));
+    detailValue(root, '宿主范围说明', profile);
+  }
+}
+
 function responseText(response) {
   if (typeof response === 'string') return response;
   if (Array.isArray(response)) return response.map(item => typeof item === 'string' ? item : item.text ?? textValue(item)).join('\n');
@@ -115,7 +145,7 @@ function updateComposer() {
   const available = units.filter(unit => ['READY', 'AVAILABLE'].includes(String(unit.status).toUpperCase())).length;
   const hint = !connected ? '平台未连接。' : !isReady(state?.models?.chat) ?
     '先在配置中填写对话模型接口。' : available ?
-    '对话已就绪 · 能力池中有 ' + available + ' 个可用 Unit。' :
+    '对话已就绪 · 能力池中有 ' + available + ' 个源码已绑定入口。' :
     '对话已就绪 · 当前没有可调用 Unit；Harness 状态见右侧。';
   $('chat-readiness').textContent = hint;
   if ($('welcome-context')) $('welcome-context').textContent = hint;
@@ -250,6 +280,38 @@ function callDetails(calls) {
   return detail;
 }
 
+function planDetails(task) {
+  const plan = task.plan;
+  if (!plan) return null;
+  const detail = node('details', undefined, 'plan-details');
+  detail.open = true;
+  detail.append(node('summary', 'TaskPlan · ' + (plan.id || '本次方案')));
+  const states = node('div', undefined, 'operation-states');
+  if (plan.execution_status) states.append(pill(plan.execution_status));
+  if (plan.semantic_status) states.append(pill(plan.semantic_status));
+  detail.append(states);
+  if (plan.binding_status) detail.append(node('p', statusLabel(plan.binding_status), 'card-meta'));
+  if (typeof plan.candidate_count === 'number') detail.append(node('p', '上层方案候选：' + plan.candidate_count, 'card-meta'));
+  const dataEdges = entries(plan.data_edges);
+  const controlEdges = entries(plan.control_edges);
+  const edges = node('div', undefined, 'plan-edges');
+  edges.append(node('strong', '数据边 · ' + dataEdges.length));
+  for (const edge of dataEdges) {
+    const sourcePath = (edge.result_path || []).map(part => '[' + textValue(part) + ']').join('');
+    const targetPath = (edge.argument_path || []).map(part => '[' + textValue(part) + ']').join('');
+    edges.append(node('p', edge.source_step + sourcePath + ' → ' + edge.target_step + '.' + edge.argument + targetPath, 'edge-row'));
+  }
+  if (!dataEdges.length) edges.append(node('p', '本方案没有前项结果绑定。', 'card-meta'));
+  edges.append(node('strong', '控制边 · ' + controlEdges.length));
+  for (const edge of controlEdges) edges.append(node('p', edge.source_step + ' · ' + (edge.exit || 'RETURN') + ' → ' + edge.target_step, 'edge-row'));
+  if (!controlEdges.length) edges.append(node('p', '当前只有单个入口或未形成后继控制边。', 'card-meta'));
+  detail.append(edges);
+  const results = plan.actual_results ?? plan.results ?? task.actual_results;
+  if (results !== undefined && results !== null) detailValue(detail, '实际结果', results, true);
+  detailValue(detail, '方案完整字段', plan);
+  return detail;
+}
+
 function renderTasks() {
   const tasks = state.tasks || [];
   const root = $('task-list');
@@ -265,11 +327,8 @@ function renderTasks() {
     if (typeof task.model_calls === 'number') card.append(node('p', '模型调用：' + task.model_calls + ' 次', 'card-meta'));
     if (latency(task.latency_ms)) card.append(node('p', '任务时延：' + latency(task.latency_ms), 'card-meta'));
     if (task.error) card.append(node('p', textValue(task.error), 'card-note message-error'));
-    if (task.plan) {
-      const plan = node('details');
-      plan.append(node('summary', '本次上层方案'), node('pre', textValue(task.plan)));
-      card.append(plan);
-    }
+    const plan = planDetails(task);
+    if (plan) card.append(plan);
     const detail = callDetails(task.calls);
     if (detail) card.append(detail);
     else card.append(node('p', '暂无 Unit 调用记录。', 'card-meta'));
@@ -283,6 +342,7 @@ function renderUnits() {
   root.replaceChildren();
   $('unit-count').textContent = units.length;
   if (!units.length) return empty(root, '能力池为空。分析 Harness 后，以实际接入结果显示 Unit。');
+  root.append(node('p', '源码绑定、实际初始化和逐操作条件分别显示。', 'card-note'));
   for (const unit of units) {
     const card = node('article', undefined, 'unit-card');
     const head = node('div', undefined, 'card-heading');
@@ -293,11 +353,28 @@ function renderUnits() {
     card.append(node('p', [unit.mode || unit.kind, source?.name || sourceId].filter(Boolean).join(' · '), 'card-meta'));
     if (unit.description) card.append(node('p', unit.description, 'card-note'));
     if (unit.reason) card.append(node('p', textValue(unit.reason), 'card-note'));
-    if (unit.input_schema) {
-      const schema = node('details', undefined, 'schema-note');
-      schema.append(node('summary', '调用输入'), node('pre', textValue(unit.input_schema)));
-      card.append(schema);
+    card.append(node('p', '初始化：' + statusLabel(unit.initialization), 'card-meta'));
+    if (unit.operations) {
+      const operationList = node('div', undefined, 'operation-list');
+      for (const [name, operation] of Object.entries(unit.operations)) {
+        const item = node('div', undefined, 'operation-row');
+        item.append(node('span', ({export_entry: '独立入口', schedule: '原位排期', parallel: '并行', remote: '远程'})[name] || name),
+          pill(operation?.status));
+        operationList.append(item);
+        if (operation?.formal_proof === false) operationList.append(node('p', '此项未完成完整语义证明。', 'card-meta'));
+        if (operation?.reason) operationList.append(node('p', textValue(operation.reason), 'card-note'));
+      }
+      card.append(operationList);
+      detailValue(card, '逐操作依据', unit.operations);
     }
+    detailValue(card, '调用输入', unit.input_schema);
+    detailValue(card, unit.result_schema && Object.keys(unit.result_schema).length ? '原结果端口' : '原结果端口 · 类型未解析', unit.result_schema);
+    if (unit.result_type) card.append(node('p', '实际返回类型：' + unit.result_type, 'card-meta'));
+    if (unit.construction) detailValue(card, '原生构造与绑定', unit.construction);
+    else card.append(node('p', unit.kind === 'function' ? '构造：原函数入口。' : '构造说明：见入口绑定依据。', 'card-meta'));
+    if (unit.native_input_schemas && Object.keys(unit.native_input_schemas).length) detailValue(card, '原对象输入端口', unit.native_input_schemas);
+    detailValue(card, '缺失条件', unit.missing);
+    detailValue(card, '入口范围', unit.entry_profile || unit.profile);
     root.append(card);
   }
 }
@@ -333,6 +410,8 @@ function renderAnalyses() {
       detail.append(node('summary', '接入入口 · ' + entryList.length), node('pre', textValue(entryList)));
       card.append(detail);
     }
+    const entryReport = job?.submitted?.report?.entry_bindings;
+    if (entryReport) detailValue(card, '入口绑定与缺失判断', entryReport);
     root.append(card);
   }
   if (state.rules?.theory_pending) root.append(node('p', state.rules.theory_pending === true ?
@@ -427,6 +506,31 @@ async function addHarness(event) {
         throw new Error('每项资源需要路径字符串，或包含 path 的对象');
       }
     }
+    if (form.elements.configuration.value.trim()) {
+      const configuration = JSON.parse(form.elements.configuration.value);
+      const object = value => value && typeof value === 'object' && !Array.isArray(value);
+      if (!object(configuration) || Object.keys(configuration).some(key => key !== 'entries') ||
+          (configuration.entries !== undefined && !object(configuration.entries))) {
+        throw new Error('初始化配置需要 {"entries":{"入口ID":{...}}} 对象');
+      }
+      const rejectApiKey = value => {
+        if (Array.isArray(value)) { value.forEach(rejectApiKey); return; }
+        if (!object(value)) return;
+        for (const [key, item] of Object.entries(value)) {
+          if (key.replace(/[_\-\s]/g, '').toLowerCase() === 'apikey') throw new Error('初始化配置不接受 API Key，请使用模型配置或原项目环境变量');
+          rejectApiKey(item);
+        }
+      };
+      for (const entry of Object.values(configuration.entries || {})) {
+        if (!object(entry) || Object.keys(entry).some(key => !['fixed_arguments', 'constructor_arguments', 'initializers', 'binding_arguments'].includes(key)) ||
+            Object.values(entry).some(value => !object(value)) ||
+            (entry.initializers && Object.values(entry.initializers).some(value => !object(value)))) {
+          throw new Error('入口配置需要参数对象；initializers 按原初始化方法名填写参数对象');
+        }
+      }
+      rejectApiKey(configuration);
+      body.configuration = configuration;
+    }
     await api('/api/harnesses', body);
     form.reset();
     status.textContent = '已接入，可开始分析';
@@ -445,6 +549,7 @@ async function refresh() {
     $('version').textContent = state.version ? '核心 ' + state.version : '';
     document.querySelector('.connection-dot').classList.remove('disconnected');
     hydrateModels();
+    renderProfile();
     synchronizeTask();
     renderScheduler();
     renderTasks();

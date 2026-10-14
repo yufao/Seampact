@@ -39,6 +39,7 @@
     <aside id="observer" class="observer" aria-label="运行状态">
       <header class="observer-header"><h2>运行状态</h2><button id="close-observer" class="icon-button" type="button" aria-label="关闭运行状态">×</button></header>
       <div class="observer-scroll">
+        <section class="panel-section"><div class="panel-heading"><h3>入口支持范围</h3></div><div id="entry-profile-summary"></div></section>
         <section class="panel-section"><div class="panel-heading"><h3>调度器</h3><span id="scheduler-status" class="status-pill pending">正在读取</span></div><div id="scheduler-summary" class="scheduler-summary"></div></section>
         <section class="panel-section"><div class="panel-heading"><h3>真实任务</h3><span id="task-count" class="count-badge">0</span></div><div id="task-list" class="status-list"><p class="empty-note">尚无任务。</p></div></section>
         <section class="panel-section"><div class="panel-heading"><h3>能力池</h3><span id="unit-count" class="count-badge">0</span></div><div id="unit-list" class="unit-list"><p class="empty-note">尚无可用的 Harness Unit。</p></div></section>
@@ -50,6 +51,7 @@
   <dialog id="configuration" class="configuration" aria-labelledby="configuration-title">
     <header class="config-header"><div><div class="eyebrow">CONFIGURATION</div><h2 id="configuration-title">配置</h2></div><button id="close-configuration" class="icon-button" type="button" aria-label="关闭配置">×</button></header>
     <div class="config-body">
+      <section class="config-section"><h3>当前入口范围</h3><div id="config-entry-profile"><p class="form-note">正在读取已确认的宿主范围。</p></div></section>
       <section class="config-section">
         <h3>模型</h3><p class="form-note">对话模型与分析模型分别保存。分析器使用云端接口。</p>
         <div class="model-grid">
@@ -75,7 +77,7 @@
         <h3>Harness</h3><p class="form-note">填入远程仓库 URL 或本地目录路径，由分析器读取来源并发现能力。</p>
         <form id="harness-form">
           <label>模块地址<input id="harness-address" name="address" type="text" placeholder="https://github.com/组织/仓库 或 C:\Harness\目录" required></label>
-          <details class="harness-options"><summary>版本、入口与资源（可选）</summary><div class="optional-grid"><label>版本<input name="revision" type="text" placeholder="分支、标签或提交 ID"></label><label>原生入口<input name="entry" type="text" placeholder="已知入口可填写"></label></div><label>资源路径（JSON 列表）<textarea name="resources" rows="3" placeholder='["/path/to/model", {"path":"/path/to/data"}]'></textarea></label><p class="form-note">每项填写路径字符串，或包含 path 的资源对象。</p></details>
+          <details class="harness-options"><summary>版本、入口、资源与配置（可选）</summary><div class="optional-grid"><label>版本<input name="revision" type="text" placeholder="分支、标签或提交 ID"></label><label>原生入口<input name="entry" type="text" placeholder="已知入口可填写"></label></div><label>资源路径（JSON 列表）<textarea name="resources" rows="3" placeholder='["/path/to/model", {"path":"/path/to/data"}]'></textarea></label><p class="form-note">每项填写路径字符串，或包含 path 的资源对象。</p><label>非敏感初始化配置（JSON 对象）<textarea name="configuration" rows="4" placeholder='{"entries":{}}'></textarea></label><p class="form-note">按入口 ID 填写 fixed_arguments、constructor_arguments、initializers 或 binding_arguments。配置可留空，分析器不能自行编造这些值。此处不接受 API Key；凭据使用模型配置或原项目环境变量。</p></details>
           <div class="form-actions"><button id="add-harness" class="primary-button" type="submit">接入 Harness</button><span id="harness-form-status" class="form-status" role="status"></span></div>
         </form>
         <div id="harness-list" class="status-list"><p class="empty-note">尚未配置 Harness 来源。</p></div>

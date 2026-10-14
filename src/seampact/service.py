@@ -14,10 +14,16 @@ from .scheduler import TwoLayerScheduler
 from .store import Store
 from .units import UnitCatalog
 
-RULESET = dict(id="native-entry-whR-prototype/1", confirmed=True,
+NATIVE_PROFILE = dict(id="python311-local-explicit-lifetime/1", confirmed=True,
+    interpreter="Python 3.11", host="local-native-process",
+    frame_observation_excluded=True, explicit_lifetime=True,
+    source="用户2026-10-14确认的有限宿主范围")
+
+RULESET = dict(id="native-entry-construction-inplace/2", confirmed=True,
     source="用户确认的首版执行判断",
     rules=["真实源码入口、参数、初始化和资源绑定", "缺失依赖或参数明确保留为MISSING",
-           "内部W/H/R保留原controller与owner", "有限R沿用现有循环规则",
+           "内部W/H/R保留原controller与owner", "B-CALL原位置构造与原对象引用",
+           "有限R提取及原位调用规则", "真实结果数据边及原顺序控制边",
            "粗细方案互斥", "不依据模型自述开放并行或远程"],
     parallel=False, remote=False)
 
@@ -43,7 +49,7 @@ class Platform:
             if not request:
                 continue
             source = self.store.get("harness", request.get("source_id"))
-            if source:
+            if source and source.get("analysis_id") == job["id"]:
                 inspector = Inspector(source["root"], self.home / "snapshots", request)
                 self.inspectors[request["id"]] = inspector
                 self.catalog.install(inspector, job["submitted"]["candidate"], job["id"])
@@ -67,7 +73,7 @@ class Platform:
         jobs = [{name: value for name, value in job.items() if name not in {"messages", "provider_profile"}}
                 for job in self.store.list("analysis")]
         return dict(version=__version__, models=self.profiles.public_roles(), harnesses=harnesses,
-            analyses=jobs, units=self.catalog.public(), tasks=tasks, rules=RULESET,
+            analyses=jobs, units=self.catalog.public(), tasks=tasks, rules=RULESET, entry_profile=NATIVE_PROFILE,
             scheduler=dict(status="RUNNING", policy="two-layer-tabular-q-learning", active=active, waiting=waiting,
                 used=snapshot["used"], quota=snapshot["quota"], theory_pending=False,
                 learning=self.scheduler.snapshot(), reward="success(+1)/failure(-1) - seconds/(1+seconds)"))
@@ -75,6 +81,19 @@ class Platform:
     def add_harness(self, body):
         source = self.intake.prepare(body.get("address", ""), body.get("revision"),
                                     body.get("entry") or None, body.get("resources") or None)
+        source["entry_profile"] = dict(NATIVE_PROFILE)
+        configuration = body.get("configuration") or {}
+        if not isinstance(configuration, dict):
+            raise ValueError("初始化配置需要JSON对象")
+        def contains_api_key(value):
+            if isinstance(value, dict):
+                return any(str(key).lower().replace("-", "").replace("_", "") == "apikey"
+                           or contains_api_key(item) for key, item in value.items())
+            return isinstance(value, list) and any(contains_api_key(item) for item in value)
+        if contains_api_key(configuration):
+            raise ValueError("初始化配置不接收API密钥，请使用模型配置或原生环境变量")
+        source["configuration"] = configuration
+        source["user_resources"] = body.get("resources") or []
         source["status"] = "CONNECTED"
         self.store.save("harness", source["id"], source)
         print("[SeamPact] source_connected " + source["id"], flush=True)
@@ -88,6 +107,8 @@ class Platform:
                for job in self.store.list("analysis")):
             raise ValueError("这个来源正在分析")
         request_id = uuid.uuid4().hex
+        previous = self.store.get("analysis", source.get("analysis_id"))
+        source["entry_profile"] = dict(NATIVE_PROFILE)
         inspector = Inspector.freeze_repository(source, self.home / "snapshots", request_id,
             "保留原算法、原生状态、初始化及控制/返回关系，按已确认RuleSet寻找真实可接入入口和有限W/H/R边界。")
         inspector.request["rules"] = RULESET
@@ -97,7 +118,7 @@ class Platform:
         source.update(status="ANALYZING", analysis_id=analysis_id, request_id=request_id, error=None)
         self.store.save("harness", identity, source)
         try:
-            self.analysis.start(inspector, self.profiles.role_identity("analysis"), identity=analysis_id)
+            self.analysis.start(inspector, self.profiles.role_identity("analysis"), identity=analysis_id, previous=previous)
         except Exception as error:
             source.update(status="FAILED", error=str(error))
             self.store.save("harness", identity, source)

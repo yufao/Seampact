@@ -8,6 +8,8 @@ import ast
 import asyncio
 import builtins
 import contextlib
+import contextvars
+import copy
 import importlib
 import importlib.abc
 import importlib.util
@@ -24,6 +26,7 @@ import uuid
 from pathlib import Path
 
 from .handoff import ToolListHandoff, install_method_proxy
+from .callsite import lower_callsites
 from .inspection import Inspector, digest, units
 from .lowering import lower_loop
 from .runtime import ProtocolError
@@ -106,6 +109,8 @@ def _type_schema(annotation):
 def _matches(value, schema):
     if not schema:
         return True
+    if "x-native-type" in schema:
+        return False
     if "anyOf" in schema:
         return any(_matches(value, branch) for branch in schema["anyOf"])
     if "enum" in schema:
@@ -123,7 +128,35 @@ def _matches(value, schema):
     return True
 
 
-def _interface(node, fixed=None, receiver=False, require_all=False):
+def _same_literal(left, right):
+    if type(left) is not type(right):
+        return False
+    if isinstance(left, dict):
+        return left.keys() == right.keys() and all(_same_literal(left[name], right[name]) for name in left)
+    if isinstance(left, (list, tuple)):
+        return len(left) == len(right) and all(_same_literal(a, b) for a, b in zip(left, right))
+    return left == right
+
+
+def _literal_defaults(node, receiver=False):
+    parameters = list(node.args.posonlyargs) + list(node.args.args)
+    defaults = [None] * (len(parameters) - len(node.args.defaults)) + list(node.args.defaults)
+    if receiver:
+        parameters, defaults = parameters[1:], defaults[1:]
+    parameters += list(node.args.kwonlyargs)
+    defaults += list(node.args.kw_defaults)
+    result = {}
+    for parameter, expression in zip(parameters, defaults):
+        if expression is not None:
+            try:
+                result[parameter.arg] = dict(value=ast.literal_eval(expression), line=expression.lineno,
+                    ast_sha256=digest(ast.dump(expression, include_attributes=False).encode()))
+            except (ValueError, TypeError):
+                pass
+    return result
+
+
+def _interface(node, fixed=None, receiver=False, require_all=False, native_schemas=None, bound_refs=()):
     fixed = fixed or {}
     if not isinstance(fixed, dict):
         raise MissingBinding("native arguments must be a JSON object")
@@ -135,6 +168,7 @@ def _interface(node, fixed=None, receiver=False, require_all=False):
         parameters, defaults = parameters[1:], defaults[1:]
     parameters += list(node.args.kwonlyargs)
     defaults += list(node.args.kw_defaults)
+    native_schemas, bound_refs = native_schemas or {}, set(bound_refs)
     known = {parameter.arg for parameter in parameters}
     if node.args.vararg:
         known.add(node.args.vararg.arg)
@@ -143,8 +177,12 @@ def _interface(node, fixed=None, receiver=False, require_all=False):
     properties, required, omitted = {}, [], []
     for parameter, default in zip(parameters, defaults):
         schema = _type_schema(parameter.annotation)
+        if parameter.arg in bound_refs:
+            continue
+        if schema is None:
+            schema = native_schemas.get(parameter.arg) or None
         if parameter.arg in fixed:
-            if schema is None or not _matches(fixed[parameter.arg], schema):
+            if schema is None or "x-native-type" in schema or not _matches(fixed[parameter.arg], schema):
                 raise MissingBinding("original object or parameter type is missing: " + parameter.arg)
             continue
         if require_all:
@@ -226,9 +264,9 @@ def _definition_cells(inspector, path, unit, patches):
     return result
 
 
-def _notebook_definitions(inspector, path, unit, patches):
+def _notebook_definitions(inspector, path, unit, patches, injected=()):
     cells = _definition_cells(inspector, path, unit, patches)
-    known, referenced = set(dir(builtins)), set()
+    known, referenced = set(dir(builtins)) | set(injected), set()
     for _, tree in cells:
         table = symtable.symtable(ast.unparse(tree), path, "exec")
         known.update(symbol.get_name() for symbol in table.get_symbols()
@@ -258,6 +296,7 @@ class _FrozenLoader(importlib.abc.Loader):
         if self.package:
             module.__path__ = [str(Path(filename).parent)]
         source = self.binding.patches.get((self.path, "file"), source_unit(self.binding.inspector, self.path))
+        self.binding._inject_callsites(module.__dict__, self.path, "file")
         exec(compile(source, filename, "exec"), module.__dict__)
 
 
@@ -295,6 +334,10 @@ class NativeBindings:
         self.patches, self.recipes, self.module_paths = {}, {}, {}
         self.modules, self.notebooks, self.owners, self.entries = {}, {}, {}, {}
         self.approved_entries, self.function_owners, self.owner_keys = {}, {}, {}
+        self.programs, self.program_helpers = {}, {}
+        self.fixed_value_bindings = {}
+        self.callsite_gates, self.entry_owner_ids = {}, {}
+        self.active_owner = contextvars.ContextVar("seampact_native_binding_owner", default=None)
         self.loop, self.thread = None, None
         self.lock = threading.RLock()
         for path in self.inspector.files:
@@ -311,11 +354,24 @@ class NativeBindings:
 
     def prepare_transformations(self):
         selected = {name for entry in self.approved_entries.values() for name in entry.get("boundary_ids", [])}
+        callsites = {}
+        for identity in selected:
+            boundary = self.boundaries[identity]
+            if boundary.get("rule") == "inplace-callsite/1":
+                key = (boundary["path"], boundary.get("unit", "file"))
+                callsites.setdefault(key, []).append(boundary)
+        for key, boundaries in callsites.items():
+            original = source_unit(self.inspector, *key)
+            lowered = lower_callsites(original, [dict(symbol=boundary["symbol"], callsite=boundary["callsite"])
+                                                 for boundary in boundaries])
+            self.patches[key] = lowered["source"]
+            for boundary, recipe in zip(boundaries, lowered["recipes"]):
+                self.recipes[boundary["id"]] = recipe
         for identity in self.boundaries:
             if identity not in selected:
                 continue
             boundary = self.boundaries[identity]
-            if boundary["mode"] == "R":
+            if boundary["mode"] == "R" and boundary.get("rule") != "inplace-callsite/1":
                 key = (boundary["path"], boundary.get("unit", "file"))
                 original = self.patches.get(key, source_unit(self.inspector, *key))
                 lowered = lower_loop(original, boundary["symbol"], boundary.get("loop_index", 0))
@@ -377,6 +433,466 @@ class NativeBindings:
                 location = self.inspector.root / location
             if not location.exists():
                 raise MissingBinding("native resource is missing: " + path)
+
+    def _fixed_values(self, entry, node, values, location, receiver=False, call_literals=None, allow_resources=False):
+        """Check value origin at this parameter anchor, not string occurrence."""
+        if not isinstance(values, dict):
+            raise MissingBinding(location + " must be a parameter mapping")
+        defaults = _literal_defaults(node, receiver) if node is not None else {}
+        configuration = self.inspector.request.get("configuration") or {}
+        user_entries = configuration.get("entries", {}) if isinstance(configuration, dict) else {}
+        if not isinstance(user_entries, dict):
+            raise MissingBinding("user configuration.entries must be an entry-ID mapping")
+        user_entry = user_entries.get(entry.get("id"), {})
+        if not isinstance(user_entry, dict):
+            raise MissingBinding("user entry configuration must be a binding mapping")
+        if location.startswith("initializers."):
+            initializers = user_entry.get("initializers", {})
+            if not isinstance(initializers, dict):
+                raise MissingBinding("user configuration initializers must be a symbol mapping")
+            configured = initializers.get(location[len("initializers."):], {})
+        else:
+            field = {"entry.fixed_arguments": "fixed_arguments", "constructor.arguments": "constructor_arguments",
+                     "binding_program.arguments": "binding_arguments"}.get(location)
+            configured = user_entry.get(field, {}) if field else {}
+        rows = self.fixed_value_bindings.setdefault(entry.get("id"), [])
+        for parameter, value in values.items():
+            source, evidence = None, None
+            if isinstance(configured, dict) and parameter in configured and _same_literal(value, configured[parameter]):
+                source, evidence = "USER_CONFIGURATION", "configuration.entries." + str(entry.get("id")) + "." + location + "." + parameter
+            elif parameter in (call_literals or {}) and _same_literal(value, call_literals[parameter]["value"]):
+                source, evidence = "ORIGINAL_REQUEST_LITERAL", call_literals[parameter]["line"]
+            elif parameter in defaults and _same_literal(value, defaults[parameter]["value"]):
+                source, evidence = "SIGNATURE_LITERAL_DEFAULT", defaults[parameter]["line"]
+            elif allow_resources and isinstance(value, str):
+                for resource in self.inspector.request.get("user_resources", []):
+                    path = resource if isinstance(resource, str) else resource.get("path") if isinstance(resource, dict) else None
+                    if isinstance(path, str) and _same_literal(value, path):
+                        source, evidence = "USER_INITIALIZATION_RESOURCE", "user_resources"
+                        break
+            if source is None:
+                raise MissingBinding(location + "." + parameter + " lacks an original literal default, anchored request literal, or user configuration; "
+                                     "remove the fixed value and expose the task parameter, or provide the real initialization configuration")
+            row = dict(location=location, parameter=parameter, status="VALUE_ORIGIN_CHECKED", source=source, evidence=evidence,
+                       scope="individual fixed value origin; not complete configuration equivalence")
+            if row not in rows:
+                rows.append(row)
+
+    def _original_defaults(self, entry, location, values):
+        original = {row["parameter"] for row in self.fixed_value_bindings.get(entry.get("id"), [])
+                    if row["location"] == location and row["source"] == "SIGNATURE_LITERAL_DEFAULT"}
+        # Omitting the copied JSON value reuses the actual original default
+        # object, including mutable defaults and their alias relationships.
+        return {name: value for name, value in values.items() if name not in original}
+
+    def _port_schema(self, annotation, path, cell="file"):
+        """Resolve object ports from frozen annotations, without importing code."""
+        primitive = _type_schema(annotation)
+        if primitive is not None:
+            return primitive
+        if isinstance(annotation, ast.Constant) and isinstance(annotation.value, str):
+            try:
+                annotation = ast.parse(annotation.value, mode="eval").body
+            except SyntaxError:
+                return {}
+        if isinstance(annotation, ast.BinOp) and isinstance(annotation.op, ast.BitOr):
+            return {"anyOf": [self._port_schema(annotation.left, path, cell), self._port_schema(annotation.right, path, cell)]}
+        if isinstance(annotation, ast.Subscript):
+            name = ast.unparse(annotation.value).split(".")[-1]
+            items = list(annotation.slice.elts) if isinstance(annotation.slice, ast.Tuple) else [annotation.slice]
+            if name in {"list", "List", "Sequence"}:
+                return {"type": "array", "items": self._port_schema(items[0], path, cell)}
+            if name in {"dict", "Dict", "Mapping"} and len(items) == 2 and _type_schema(items[0]) == {"type": "string"}:
+                return {"type": "object", "additionalProperties": self._port_schema(items[1], path, cell)}
+            if name == "Annotated":
+                return self._port_schema(items[0], path, cell)
+            if name in {"Optional", "Union"}:
+                branches = [self._port_schema(item, path, cell) for item in items]
+                if name == "Optional":
+                    branches.append({"type": "null"})
+                return {"anyOf": branches}
+            return {}
+        if not isinstance(annotation, (ast.Name, ast.Attribute)):
+            return {}
+        name = ast.unparse(annotation)
+        tree = ast.parse(source_unit(self.inspector, path, cell))
+        local = next((node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == name), None)
+        if local is not None:
+            return {"x-native-type": {"source_version": self.inspector.request["source_version"], "path": path, "symbol": name}}
+        module = next((name for name, record in self.module_paths.items() if record[0] == path), "")
+        package = module if path.endswith("/__init__.py") else module.rpartition(".")[0]
+        for node in tree.body:
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    prefix = alias.asname or alias.name.split(".")[0]
+                    if name.startswith(prefix + "."):
+                        qualified = (alias.name if alias.asname else prefix) + name[len(prefix):]
+                        return self._qualified_port(qualified)
+            elif isinstance(node, ast.ImportFrom):
+                imported = node.module or ""
+                if node.level:
+                    try:
+                        imported = importlib.util.resolve_name("." * node.level + imported, package)
+                    except (ValueError, ImportError):
+                        continue
+                for alias in node.names:
+                    prefix = alias.asname or alias.name
+                    if name == prefix or name.startswith(prefix + "."):
+                        return self._qualified_port(imported + "." + alias.name + name[len(prefix):])
+        return {}
+
+    def _qualified_port(self, qualified):
+        for module in sorted(self.module_paths, key=len, reverse=True):
+            if qualified.startswith(module + "."):
+                path, _ = self.module_paths[module]
+                symbol = qualified[len(module) + 1:]
+                tree = ast.parse(source_unit(self.inspector, path))
+                if any(isinstance(node, ast.ClassDef) and node.name == symbol for node in tree.body):
+                    return {"x-native-type": {"source_version": self.inspector.request["source_version"], "path": path, "symbol": symbol}}
+                return {}
+        module, _, symbol = qualified.rpartition(".")
+        return {"x-native-type": {"module": module, "symbol": symbol}} if module and symbol else {}
+
+    def entry_ports(self, entry):
+        if entry["kind"] == "cli":
+            return {}, {"x-native-type": {"module": "subprocess", "symbol": "CompletedProcess"}}
+        path, cell = entry["path"], entry.get("unit", "file")
+        node, _ = _anchor(source_unit(self.inspector, path, cell), entry["symbol"])
+        arguments = list(node.args.posonlyargs) + list(node.args.args) + list(node.args.kwonlyargs)
+        return {arg.arg: self._port_schema(arg.annotation, path, cell) for arg in arguments}, self._port_schema(node.returns, path, cell)
+
+    def native_matches(self, value, schema):
+        if "anyOf" in schema:
+            return any(self.native_matches(value, branch) for branch in schema["anyOf"])
+        reference = schema.get("x-native-type")
+        if reference:
+            for class_ in type(value).__mro__:
+                name = type.__getattribute__(class_, "__qualname__")
+                module = type.__getattribute__(class_, "__module__")
+                if name != reference.get("symbol"):
+                    continue
+                if "path" not in reference:
+                    if module == reference.get("module"):
+                        return True
+                    continue
+                if reference.get("source_version") != self.inspector.request["source_version"]:
+                    continue
+                if reference["path"].endswith(".ipynb"):
+                    definitions = []
+                    for cell, source in units(reference["path"], self.inspector.data(reference["path"])):
+                        try:
+                            tree = ast.parse(source)
+                        except SyntaxError:
+                            continue
+                        if any(isinstance(node, ast.ClassDef) and node.name == name for node in tree.body):
+                            definitions.append(cell)
+                    if len(definitions) == 1:
+                        namespace = self.notebooks.get((reference["path"], definitions[0]))
+                        if namespace is not None and namespace.get("__name__") == module and namespace.get(name) is class_:
+                            return True
+                    # Distinct notebook-prefix namespaces are distinct class
+                    # creation occurrences, even when the source name matches.
+                    continue
+                module_record = self.module_paths.get(module)
+                if not module_record or module_record[0] != reference["path"]:
+                    continue
+                loaded = self.modules.get(module)
+                if loaded is not None and loaded.__dict__.get(name) is class_:
+                    return True
+            return False
+        if schema.get("type") == "array" and isinstance(value, list):
+            return all(self.native_matches(item, schema.get("items", {})) for item in value)
+        if schema.get("type") == "object" and type(value) is dict:
+            properties, additional = schema.get("properties", {}), schema.get("additionalProperties", {})
+            return all(self.native_matches(item, properties.get(name, additional if isinstance(additional, dict) else {}))
+                       for name, item in value.items())
+        return _matches(value, schema)
+
+    @staticmethod
+    def _source_call_arguments(node, call, receiver):
+        parameters = list(node.args.posonlyargs) + list(node.args.args)
+        if receiver:
+            parameters = parameters[1:]
+        if any(isinstance(value, ast.Starred) for value in call.args) or any(keyword.arg is None for keyword in call.keywords):
+            raise MissingBinding("construction request argument unpacking requires its own binding rule")
+        if len(call.args) > len(parameters):
+            raise MissingBinding("construction request variadic arguments are not supported")
+        values = {parameter.arg: value for parameter, value in zip(parameters, call.args)}
+        for keyword in call.keywords:
+            if keyword.arg in values:
+                raise MissingBinding("original construction request duplicates a parameter")
+            values[keyword.arg] = keyword.value
+        return values
+
+    def _global_targets(self, path, cell):
+        tree = ast.parse(source_unit(self.inspector, path, cell))
+        module = next((name for name, record in self.module_paths.items() if record[0] == path), "")
+        package = module if path.endswith("/__init__.py") else module.rpartition(".")[0]
+        targets = {name: {"kind": "builtin", "symbol": name} for name in dir(builtins)}
+        for node in tree.body:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                targets[node.name] = {"kind": "class" if isinstance(node, ast.ClassDef) else "function",
+                                      "path": path, "unit": cell, "symbol": node.name}
+            elif isinstance(node, (ast.Import, ast.ImportFrom)):
+                self._import_targets(node, targets, package)
+            elif isinstance(node, (ast.Assign, ast.AnnAssign)):
+                assigned = node.targets if isinstance(node, ast.Assign) else [node.target]
+                for target in assigned:
+                    if isinstance(target, ast.Name):
+                        targets.pop(target.id, None)
+        return targets, package
+
+    def _import_targets(self, node, targets, package):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                targets[alias.asname or alias.name.split(".")[0]] = {"kind": "module", "module": alias.name if alias.asname else alias.name.split(".")[0]}
+            return
+        module = node.module or ""
+        if node.level:
+            try:
+                module = importlib.util.resolve_name("." * node.level + module, package)
+            except (ValueError, ImportError):
+                return
+        for alias in node.names:
+            target = self._qualified_target(module + "." + alias.name)
+            if target:
+                targets[alias.asname or alias.name] = target
+
+    def _qualified_target(self, qualified):
+        if qualified in self.module_paths:
+            return {"kind": "module", "module": qualified}
+        for module in sorted(self.module_paths, key=len, reverse=True):
+            if qualified.startswith(module + "."):
+                path, _ = self.module_paths[module]
+                symbol = qualified[len(module) + 1:]
+                try:
+                    node, _ = _anchor(source_unit(self.inspector, path), symbol)
+                except (ValueError, SyntaxError):
+                    return None
+                return {"kind": "class" if isinstance(node, ast.ClassDef) else "function",
+                        "path": path, "unit": "file", "symbol": symbol}
+        top = qualified.split(".")[0]
+        if top in getattr(sys, "stdlib_module_names", set()):
+            return {"kind": "stdlib", "symbol": qualified}
+        return None
+
+    def _resolve_target(self, expression, targets):
+        if isinstance(expression, ast.Name):
+            return targets.get(expression.id)
+        if isinstance(expression, ast.Attribute):
+            parent = self._resolve_target(expression.value, targets)
+            if parent and parent["kind"] == "module":
+                return self._qualified_target(parent["module"] + "." + expression.attr)
+            if parent and parent["kind"] in {"class", "object"}:
+                try:
+                    node, _ = _anchor(source_unit(self.inspector, parent["path"], parent.get("unit", "file")), parent["symbol"] + "." + expression.attr)
+                except (ValueError, SyntaxError):
+                    return None
+                return {"kind": "function", "path": parent["path"], "unit": parent.get("unit", "file"), "symbol": parent["symbol"] + "." + expression.attr}
+        return None
+
+    def _factory_object(self, target, call, targets):
+        if not target:
+            return None
+        if target["kind"] == "class":
+            return dict(target, kind="object")
+        if target.get("symbol") == "dataclasses.replace" and call.args:
+            original = self._resolve_target(call.args[0], targets)
+            return original if original and original["kind"] == "object" else None
+        if target["kind"] != "function":
+            return None
+        node, _ = _anchor(source_unit(self.inspector, target["path"], target.get("unit", "file")), target["symbol"])
+        result = self._port_schema(node.returns, target["path"], target.get("unit", "file")).get("x-native-type", {})
+        if result.get("path"):
+            return {"kind": "object", "path": result["path"], "unit": "file", "symbol": result["symbol"]}
+        local, _ = self._global_targets(target["path"], target.get("unit", "file"))
+        candidates = []
+        for statement in node.body:
+            if isinstance(statement, (ast.Assign, ast.AnnAssign)):
+                expression = statement.value
+                constructor = self._resolve_target(expression.func, local) if isinstance(expression, ast.Call) else None
+                object_ = dict(constructor, kind="object") if constructor and constructor["kind"] == "class" else None
+                assigned = statement.targets if isinstance(statement, ast.Assign) else [statement.target]
+                for name in assigned:
+                    if isinstance(name, ast.Name):
+                        if object_:
+                            local[name.id] = object_
+                        else:
+                            local.pop(name.id, None)
+            elif isinstance(statement, ast.Return):
+                if isinstance(statement.value, ast.Call):
+                    constructor = self._resolve_target(statement.value.func, local)
+                    candidates.append(dict(constructor, kind="object") if constructor and constructor["kind"] == "class" else None)
+                else:
+                    object_ = self._resolve_target(statement.value, local)
+                    candidates.append(object_ if object_ and object_["kind"] == "object" else None)
+        return candidates[0] if candidates and all(value == candidates[0] for value in candidates) else None
+
+    def _construction_targets(self, path, cell, prefix):
+        targets, package = self._global_targets(path, cell)
+        facts = []
+        for statement in prefix:
+            if isinstance(statement, (ast.Import, ast.ImportFrom)):
+                self._import_targets(statement, targets, package)
+            for call in (value for value in ast.walk(statement) if isinstance(value, ast.Call)):
+                target = self._resolve_target(call.func, targets)
+                if not target or target["kind"] not in {"class", "function", "builtin", "stdlib"}:
+                    raise MissingBinding("construction call target is dynamic or lacks a frozen/stdlib source binding at line " + str(call.lineno))
+                if target.get("path"):
+                    target_node, _ = _anchor(source_unit(self.inspector, target["path"], target.get("unit", "file")), target["symbol"])
+                    if isinstance(target_node, ast.ClassDef) and any(isinstance(value, (ast.FunctionDef, ast.AsyncFunctionDef))
+                            and value.name == "__del__" for value in target_node.body):
+                        raise MissingBinding("construction target has implicit destruction outside the finite lifetime profile")
+                    for value in ast.walk(target_node):
+                        if isinstance(value, ast.Call) and ((isinstance(value.func, ast.Name) and value.func.id in {"eval", "exec"})
+                                or isinstance(value.func, ast.Attribute) and value.func.attr in {"_getframe", "currentframe", "stack", "getrefcount"}):
+                            raise MissingBinding("construction target observes dynamic execution or the added caller frame")
+                facts.append(dict(line=call.lineno, column=call.col_offset, target=target))
+            if isinstance(statement, (ast.Assign, ast.AnnAssign)):
+                expression = statement.value
+                target = self._factory_object(self._resolve_target(expression.func, targets), expression, targets) if isinstance(expression, ast.Call) else self._resolve_target(expression, targets)
+                assigned = statement.targets if isinstance(statement, ast.Assign) else [statement.target]
+                for name in assigned:
+                    if isinstance(name, ast.Name):
+                        if target:
+                            targets[name.id] = target
+                        else:
+                            targets.pop(name.id, None)
+        return facts, targets
+
+    def _construction(self, entry, node, owner):
+        if sys.version_info[:2] != (3, 11):
+            raise MissingBinding("B-CALL finite native profile requires Python 3.11; current interpreter is " +
+                                 str(sys.version_info.major) + "." + str(sys.version_info.minor))
+        program = entry.get("binding_program")
+        if not isinstance(program, dict):
+            raise MissingBinding("binding_program must describe an anchored original construction prefix")
+        key = entry["id"]
+        if key in self.programs:
+            return self.programs[key]
+        path, cell = program.get("path", entry["path"]), program.get("unit", entry.get("unit", "file"))
+        if path not in self.inspector.files:
+            raise MissingBinding("construction scope is outside frozen source")
+        source = source_unit(self.inspector, path, cell)
+        scope, enclosing = _anchor(source, program.get("scope", ""))
+        if not isinstance(scope, ast.FunctionDef) or enclosing is not None or scope.decorator_list:
+            raise MissingBinding("B-CALL currently requires an undecorated top-level synchronous construction function")
+        if program.get("scope_lifetime", "request") != "request":
+            raise MissingBinding("B-CALL currently preserves request creation occurrences; retained owner scope needs a source lifecycle binding")
+        matches = [(index, statement) for index, statement in enumerate(scope.body) if statement.lineno == program.get("call_line")]
+        if len(matches) != 1:
+            raise MissingBinding("construction request must identify one original top-level statement line")
+        index, statement = matches[0]
+        call = getattr(statement, "value", None)
+        if not isinstance(statement, (ast.Return, ast.Assign, ast.AnnAssign, ast.Expr)) or not isinstance(call, ast.Call):
+            raise MissingBinding("construction request is not a directly evaluated original call")
+        if owner is not None:
+            receiver = program.get("receiver")
+            if not (isinstance(call.func, ast.Attribute) and isinstance(call.func.value, ast.Name)
+                    and call.func.value.id == receiver and call.func.attr == node.name):
+                raise MissingBinding("construction receiver does not match the original request call")
+        prefix = scope.body[:index]
+        allowed = (ast.Import, ast.ImportFrom, ast.Assign, ast.AnnAssign, ast.Expr, ast.Pass)
+        excluded = (ast.Await, ast.Yield, ast.YieldFrom, ast.Lambda, ast.ListComp, ast.SetComp,
+                    ast.DictComp, ast.GeneratorExp, ast.NamedExpr, ast.Global, ast.Nonlocal)
+        reflection = {"locals", "globals", "vars", "eval", "exec", "_getframe", "currentframe", "stack", "getrefcount"}
+        for original in prefix:
+            if not isinstance(original, allowed) or any(isinstance(value, excluded) for value in ast.walk(original)):
+                raise MissingBinding("construction prefix is outside the straight-line B-CALL subset")
+            if any(isinstance(value, ast.Call) and (isinstance(value.func, ast.Name) and value.func.id in reflection
+                    or isinstance(value.func, ast.Attribute) and value.func.attr in reflection) for value in ast.walk(original)):
+                raise MissingBinding("construction prefix observes a frame or object reference count")
+        target_facts, prefix_targets = self._construction_targets(path, cell, prefix)
+        if owner is None:
+            request_target = self._resolve_target(call.func, prefix_targets)
+            if not request_target or (request_target.get("path"), request_target.get("unit", "file"), request_target.get("symbol")) != (
+                    entry["path"], entry.get("unit", "file"), entry["symbol"]):
+                raise MissingBinding("construction request target is not the frozen original function")
+        # A suffix can contain only the direct return of the call's already
+        # produced value. Cleanup and other effects cannot silently be omitted.
+        suffix = scope.body[index + 1:]
+        assigned = (statement.targets[0].id if isinstance(statement, ast.Assign) and len(statement.targets) == 1
+                    and isinstance(statement.targets[0], ast.Name) else statement.target.id
+                    if isinstance(statement, ast.AnnAssign) and isinstance(statement.target, ast.Name) else None)
+        if suffix and not (len(suffix) == 1 and isinstance(suffix[0], ast.Return)
+                           and isinstance(suffix[0].value, ast.Name) and suffix[0].value.id == assigned):
+            raise MissingBinding("construction scope has a post-request effect or cleanup without an export lifecycle rule")
+        if owner is not None and any(isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef)) and member.name == "__del__"
+                                     for member in owner.body):
+            raise MissingBinding("construction receiver has observable implicit destruction without a lifetime rule")
+        profile = self.inspector.request.get("entry_profile") or {}
+        if not (profile.get("confirmed") is True and profile.get("frame_observation_excluded") is True
+                and profile.get("explicit_lifetime") is True):
+            raise MissingBinding("B-CALL requires the user entry_profile: frame_observation_excluded and explicit_lifetime")
+        arguments, tasks, references = program.get("arguments", {}), program.get("task_parameters", {}), program.get("argument_refs", {})
+        if not all(isinstance(value, dict) for value in (arguments, tasks, references)):
+            raise MissingBinding("construction arguments, task_parameters and argument_refs must be mappings")
+        if any(not isinstance(name, str) or not isinstance(value, str) or not value.isidentifier()
+               for mapping in (tasks, references) for name, value in mapping.items()):
+            raise MissingBinding("construction references must name original local bindings")
+        original_values = self._source_call_arguments(node, call, owner is not None)
+        call_literals = {}
+        for parameter, expression in original_values.items():
+            try:
+                call_literals[parameter] = dict(value=ast.literal_eval(expression), line=expression.lineno,
+                    ast_sha256=digest(ast.dump(expression, include_attributes=False).encode()))
+            except (ValueError, TypeError):
+                pass
+        for parameter, reference in references.items():
+            expression = original_values.get(parameter)
+            if not isinstance(expression, ast.Name) or expression.id != reference:
+                raise MissingBinding("native object reference is not the original request argument: " + parameter)
+        fixed = entry.get("fixed_arguments", {})
+        for parameter, expression in original_values.items():
+            if parameter in references:
+                continue
+            if isinstance(expression, ast.Name) and expression.id in tasks and tasks[expression.id] == parameter:
+                continue
+            try:
+                value = ast.literal_eval(expression)
+            except (ValueError, TypeError):
+                raise MissingBinding("original request argument needs its source-bound object reference: " + parameter) from None
+            if parameter not in fixed or fixed[parameter] != value or type(fixed[parameter]) is not type(value):
+                raise MissingBinding("original request literal must retain its fixed binding: " + parameter)
+        scope_parameters = list(scope.args.posonlyargs) + list(scope.args.args) + list(scope.args.kwonlyargs)
+        names = {parameter.arg for parameter in scope_parameters}
+        if set(tasks) - names or set(arguments) - names or set(tasks) & set(arguments):
+            raise MissingBinding("construction inputs do not match the original function interface")
+        self._fixed_values(entry, scope, arguments, "binding_program.arguments", allow_resources=True)
+        _interface(scope, arguments, require_all=True, bound_refs=tasks)
+        source_task_schema, _ = _interface(scope)
+        task_schema = {}
+        task_required = []
+        for original, exported in tasks.items():
+            schema = source_task_schema["properties"].get(original)
+            if schema is None or "x-native-type" in schema:
+                raise MissingBinding("construction task input needs a source-derived JSON parameter: " + original)
+            task_schema[exported] = schema
+            if original in source_task_schema["required"]:
+                task_required.append(exported)
+        produced = set(names)
+        for value in prefix:
+            if isinstance(value, ast.AnnAssign) and value.value is None:
+                continue
+            produced.update(child.id for child in ast.walk(value) if isinstance(child, ast.Name) and isinstance(child.ctx, ast.Store))
+            if isinstance(value, (ast.Import, ast.ImportFrom)):
+                produced.update(alias.asname or alias.name.split(".")[0] for alias in value.names)
+        required_refs = set(references.values()) | ({program["receiver"]} if owner is not None else set())
+        if required_refs - produced:
+            raise MissingBinding("construction object is not produced in the original prefix: " + ", ".join(sorted(required_refs - produced)))
+        facts = dict(rule="B-CALL-straight-prefix/1", status="SOURCE_BOUND", path=path, unit=cell,
+            scope=scope.name, scope_lifetime="request", call_line=statement.lineno,
+            source_sha256=self.inspector.files[path]["sha256"], initialization="NOT_RUN",
+            call_targets=target_facts,
+            nodes=[dict(line=value.lineno, end_line=value.end_lineno, kind=type(value).__name__,
+                        ast_sha256=digest(ast.dump(value, include_attributes=False).encode())) for value in prefix],
+            profile="USER_ENTRY_PROFILE", semantic_guarantee="CONDITIONAL; not a complete export proof")
+        record = dict(spec=program, source=source, scope=scope, prefix=prefix, facts=facts,
+                      task_schema=task_schema, task_required=task_required, references=references, path=path, cell=cell,
+                      call_literals=call_literals)
+        self.programs[key] = record
+        self._dependencies(path, cell)
+        return record
 
     def _direct_reachable(self, source, entry_symbol, boundary_symbol):
         tree = ast.parse(source)
@@ -466,6 +982,7 @@ class NativeBindings:
         if kind == "cli":
             if selected:
                 raise MissingBinding("CLI subprocess cannot bind internal gates to this in-process native owner")
+            self._fixed_values(entry, None, entry.get("fixed_arguments", {}), "entry.fixed_arguments")
             return self._cli_interface(entry)
         if kind not in {"function", "method"}:
             raise MissingBinding("unsupported native entry kind")
@@ -483,8 +1000,28 @@ class NativeBindings:
             raise MissingBinding("streaming/generator lifecycle needs an original host binding")
         if (kind == "method") != (owner is not None):
             raise MissingBinding("entry kind does not match its native source receiver")
-        schema, omitted = _interface(node, entry.get("fixed_arguments", {}), receiver=owner is not None)
-        if owner is not None:
+        if owner is not None and any(ast.unparse(decorator).split(".")[-1] in {"staticmethod", "classmethod", "property"}
+                                     for decorator in node.decorator_list):
+            raise MissingBinding("static/class/property receiver needs a distinct effective native binding")
+        if entry.get("binding_program") and owner is not None and any(isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef))
+                and member.name in {"__getattribute__", "__getattr__", "__setattr__"} for member in owner.body):
+            raise MissingBinding("source construction receiver has dynamic attribute dispatch without its host rule")
+        ports, result_schema = self.entry_ports(entry)
+        program = self._construction(entry, node, owner) if entry.get("binding_program") is not None else None
+        self._fixed_values(entry, node, entry.get("fixed_arguments", {}), "entry.fixed_arguments", receiver=owner is not None,
+                           call_literals=program["call_literals"] if program else None)
+        schema, omitted = _interface(node, entry.get("fixed_arguments", {}), receiver=owner is not None,
+                                     native_schemas=ports, bound_refs=program["references"] if program else ())
+        if program:
+            for name, port in program["task_schema"].items():
+                if name in schema["properties"] and schema["properties"][name] != port:
+                    raise MissingBinding("construction and native entry disagree on task input type: " + name)
+                schema["properties"][name] = port
+                if name in program["task_required"] and name not in schema["required"]:
+                    schema["required"].append(name)
+            if any(isinstance(boundary.get("native_wiring"), dict) for boundary in selected):
+                raise MissingBinding("construction prefix SDK registration needs a before-registration construction hook")
+        if owner is not None and not program:
             constructor = entry.get("constructor")
             if not isinstance(constructor, dict) or constructor.get("symbol") != owner.name:
                 raise MissingBinding("the original owner constructor must be identified")
@@ -501,6 +1038,8 @@ class NativeBindings:
                 if constructor.get("arguments"):
                     raise MissingBinding("native object constructor accepts no supplied arguments")
             else:
+                self._fixed_values(entry, initializer, constructor.get("arguments", {}), "constructor.arguments",
+                                   receiver=True, allow_resources=True)
                 _interface(initializer, constructor.get("arguments", {}), receiver=True, require_all=True)
             for initialization in entry.get("initializers", []):
                 if initialization["symbol"].count(".") > 1 or ("." in initialization["symbol"] and initialization["symbol"].split(".")[0] != owner.name):
@@ -511,9 +1050,14 @@ class NativeBindings:
                     raise MissingBinding("native initialization owner is not identified")
                 if any(isinstance(value, (ast.Yield, ast.YieldFrom)) for value in ast.walk(initial)):
                     raise MissingBinding("generator initialization needs an original lifecycle binding")
+                self._fixed_values(entry, initial, initialization.get("arguments", {}), "initializers." + initialization["symbol"],
+                                   receiver=True, allow_resources=True)
                 _interface(initial, initialization.get("arguments", {}), receiver=True, require_all=True)
             self._owner_initialization(owner, entry,
                 [initialization["symbol"].split(".")[-1] for initialization in entry.get("initializers", [])])
+        elif program:
+            if entry.get("constructor") or entry.get("initializers"):
+                raise MissingBinding("source construction program cannot duplicate its original constructor or initialization")
         elif entry.get("constructor") or entry.get("initializers"):
             raise MissingBinding("function entry cannot invent a native object owner")
         for boundary in selected:
@@ -521,12 +1065,23 @@ class NativeBindings:
             if isinstance(wiring, dict):
                 if owner is None or wiring["controller_path"] != path or wiring["controller_symbol"] != owner.name:
                     raise MissingBinding("native tool-list controller does not match this entry owner")
-                names = [item["symbol"].split(".")[-1] for item in entry.get("initializers", [])]
+                names = ([value.func.attr for original in program["prefix"] for value in ast.walk(original)
+                          if isinstance(value, ast.Call) and isinstance(value.func, ast.Attribute)
+                          and isinstance(value.func.value, ast.Name) and value.func.value.id == program["spec"].get("receiver")]
+                         if program else [item["symbol"].split(".")[-1] for item in entry.get("initializers", [])])
                 if wiring["setup"] not in names:
                     raise MissingBinding("original setup must be supplied before native SDK invocation")
             elif (boundary["path"] != path or boundary.get("unit", "file") != cell
                   or not self._direct_reachable(source, symbol, boundary["symbol"])):
                 raise MissingBinding("native controller-to-boundary binding is not statically identified: " + boundary["id"])
+            if boundary.get("rule") == "inplace-callsite/1":
+                if sys.version_info[:2] != (3, 11):
+                    raise MissingBinding("R-INPLACE finite native profile requires Python 3.11; current interpreter is " +
+                                         str(sys.version_info.major) + "." + str(sys.version_info.minor))
+                profile = self.inspector.request.get("entry_profile") or {}
+                if not (profile.get("confirmed") is True and profile.get("frame_observation_excluded") is True
+                        and profile.get("explicit_lifetime") is True):
+                    raise MissingBinding("R-INPLACE requires the confirmed finite native entry profile")
         self.check_nested(entry, selected)
         self._dependencies(path, cell)
         return schema, omitted
@@ -536,16 +1091,43 @@ class NativeBindings:
         if entry["kind"] == "cli":
             return
         source = source_unit(self.inspector, path, cell)
-        for whole in selected:
-            if whole["mode"] not in {"W", "H"} or isinstance(whole.get("native_wiring"), dict):
+        for region in selected:
+            if region["mode"] != "R" or region.get("rule") == "inplace-callsite/1":
                 continue
+            controller, controller_owner = _anchor(source, region["symbol"])
+            loops = [value for value in controller.body if isinstance(value, ast.For)]
+            loop = loops[region.get("loop_index", 0)]
+            direct = []
+            for value in ast.walk(loop):
+                if not isinstance(value, ast.Call):
+                    continue
+                if (controller_owner is not None and isinstance(value.func, ast.Attribute)
+                        and isinstance(value.func.value, ast.Name) and value.func.value.id == "self"):
+                    direct.append(controller_owner.name + "." + value.func.attr)
+                elif controller_owner is None and isinstance(value.func, ast.Name):
+                    direct.append(value.func.id)
+            for child in selected:
+                if child["id"] == region["id"] or child["path"] != path or child.get("unit", "file") != cell:
+                    continue
+                at = child.get("callsite") or {}
+                inside = (child.get("rule") == "inplace-callsite/1" and child["symbol"] == region["symbol"]
+                          and loop.lineno <= at.get("line", -1) <= loop.end_lineno)
+                reached = any(self._direct_reachable(source, symbol, child["symbol"]) for symbol in direct)
+                if inside or reached:
+                    raise MissingBinding("controlled extraction would hold the resource needed by its nested gate: "
+                                         + region["id"] + " -> " + child["id"])
+        for whole in selected:
+            callsite = whole.get("rule") == "inplace-callsite/1"
+            if (whole["mode"] not in {"W", "H"} and not callsite) or isinstance(whole.get("native_wiring"), dict):
+                continue
+            whole_symbol = (self.checked[whole["id"]].get("lowering") or {}).get("target_symbol", whole["symbol"]) if callsite else whole["symbol"]
             for child in selected:
                 if child["id"] == whole["id"]:
                     continue
                 wiring = child.get("native_wiring")
-                nested = (isinstance(wiring, dict) and self._direct_reachable(source, whole["symbol"], symbol)) or (
+                nested = (isinstance(wiring, dict) and self._direct_reachable(source, whole_symbol, symbol)) or (
                     child["path"] == path and child.get("unit", "file") == cell
-                    and self._direct_reachable(source, whole["symbol"], child["symbol"]))
+                    and self._direct_reachable(source, whole_symbol, child["symbol"]))
                 if nested:
                     raise MissingBinding("nested native gates require the unsupported parent/child resource rule: "
                                          + whole["id"] + " -> " + child["id"])
@@ -636,7 +1218,8 @@ class NativeBindings:
             if key not in self.notebooks:
                 namespace = dict(__name__="_seampact_notebook_" + digest((path + cell).encode())[:16],
                                  __file__=str(self.inspector.root / path), __package__=None, __builtins__=builtins.__dict__)
-                for _, tree in _notebook_definitions(self.inspector, path, cell, self.patches):
+                injected = self._inject_callsites(namespace, path, None)
+                for _, tree in _notebook_definitions(self.inspector, path, cell, self.patches, injected):
                     exec(compile(ast.fix_missing_locations(tree), namespace["__file__"], "exec"), namespace)
                 self.notebooks[key] = namespace
             return self.notebooks[key]
@@ -644,6 +1227,33 @@ class NativeBindings:
         if module is None:
             raise MissingBinding("native Python module path is not importable")
         return importlib.import_module(module).__dict__
+
+    def _callsite_factory(self, identity):
+        def factory(callee):
+            active = self.active_owner.get()
+            gate = self.callsite_gates.get((identity, active))
+            # A different exported entry may execute this same original code
+            # without selecting this cut. Its effective callable stays native.
+            if gate is None:
+                return callee
+            if not (inspect.isfunction(callee) or inspect.ismethod(callee)):
+                raise MissingBinding("original callsite effective callable is outside its source host binding")
+            boundary, recipe = self.boundaries[identity], self.recipes[identity]
+            self._assert_callable(callee, recipe["target_symbol"], boundary["path"])
+            return self.runtime.wrap(callee, gate, active)
+        return factory
+
+    def _inject_callsites(self, namespace, path, cell):
+        helpers = []
+        for identity, recipe in self.recipes.items():
+            boundary = self.boundaries[identity]
+            if recipe.get("rule") != "inplace-callsite/1" or boundary["path"] != path:
+                continue
+            if cell is not None and boundary.get("unit", "file") != cell:
+                continue
+            namespace[recipe["helper"]] = self._callsite_factory(identity)
+            helpers.append(recipe["helper"])
+        return helpers
 
     def _register(self, gate, owner, unit):
         self.runtime.call("register", gate, owner, unit=unit)
@@ -664,13 +1274,59 @@ class NativeBindings:
         # identity remains the original binding, rather than the mutated config.
         identity = id(entry)
         if identity not in self.owner_keys:
+            # Equal constructor values do not identify the same original
+            # creation occurrence. A source-bound entry has its own owner.
             self.owner_keys[identity] = json.dumps([entry["path"], entry.get("unit", "file"),
-                entry.get("constructor"), entry.get("initializers", [])], sort_keys=True)
+                entry.get("id"), entry.get("binding_program"), entry.get("constructor"),
+                entry.get("initializers", [])], sort_keys=True)
         return self.owner_keys[identity]
 
-    async def _load(self, entry, unit):
+    def _construct(self, entry, arguments):
+        program = self.programs[entry["id"]]
+        specification = program["spec"]
+        namespace = self._namespace(dict(path=program["path"], unit=program["cell"]))
+        original = namespace.get(program["scope"].name)
+        self._assert_callable(original, program["scope"].name, program["path"])
+        values = self._original_defaults(entry, "binding_program.arguments", specification.get("arguments", {}))
+        values.update({name: arguments[exported] for name, exported in specification.get("task_parameters", {}).items()
+                       if exported in arguments})
+        positional, keyword = _actual_arguments(original, values)
+        bound = inspect.signature(original).bind(*positional, **keyword)
+        bound.apply_defaults()
+        values = dict(bound.arguments)
+        for parameter in inspect.signature(original).parameters.values():
+            if parameter.kind == inspect.Parameter.VAR_POSITIONAL:
+                values[parameter.name] = list(values[parameter.name])
+            elif parameter.kind == inspect.Parameter.VAR_KEYWORD:
+                extra = values.pop(parameter.name)
+                values.update(extra)
+        helper = self.program_helpers.get(entry["id"])
+        if helper is None:
+            scope = copy.deepcopy(program["scope"])
+            scope.name = "_seampact_construct_" + digest(entry["id"].encode())[:16]
+            scope.decorator_list, scope.returns, scope.type_comment = [], None, None
+            scope.args.defaults = []
+            scope.args.kw_defaults = [None] * len(scope.args.kwonlyargs)
+            for parameter in [*scope.args.posonlyargs, *scope.args.args, *scope.args.kwonlyargs,
+                              *([scope.args.vararg] if scope.args.vararg else []),
+                              *([scope.args.kwarg] if scope.args.kwarg else [])]:
+                parameter.annotation, parameter.type_comment = None, None
+            references = set(program["references"].values())
+            if specification.get("receiver"):
+                references.add(specification["receiver"])
+            expression = ast.Dict(keys=[ast.Constant(value=name) for name in sorted(references)],
+                                  values=[ast.Name(id=name, ctx=ast.Load()) for name in sorted(references)])
+            scope.body = copy.deepcopy(program["prefix"]) + [ast.Return(value=expression)]
+            generated = ast.fix_missing_locations(ast.Module(body=[scope], type_ignores=[]))
+            exec(compile(generated, str(self.inspector.root / program["path"]), "exec"), namespace)
+            helper = namespace.pop(scope.name)
+            self.program_helpers[entry["id"]] = helper
+        positional, keyword = _actual_arguments(helper, values)
+        return helper(*positional, **keyword)
+
+    async def _load(self, entry, unit, construction=None):
         identity = unit["id"]
-        if identity in self.entries:
+        if identity in self.entries and not (construction is not None and entry["kind"] == "method"):
             return self.entries[identity]
         related = [item for item in self.approved_entries.values() if self._owner_key(item) == self._owner_key(entry)]
         selected_ids = list(dict.fromkeys(name for item in related for name in item.get("boundary_ids", [])))
@@ -700,17 +1356,25 @@ class NativeBindings:
             callable_ = self.runtime.wrap(original, gate, owner_id)
             self.entries[identity] = callable_
             return callable_
-        namespace = self._namespace(entry)
+        original_entry = None
+        if construction is not None and entry["kind"] == "method":
+            original_entry = getattr(construction[entry["binding_program"]["receiver"]], entry["symbol"].split(".")[-1])
+            self._assert_callable(original_entry, entry["symbol"], entry["path"])
+            namespace = inspect.unwrap(original_entry).__globals__
+        else:
+            namespace = self._namespace(entry)
         owner, owner_id = None, None
         if entry["kind"] == "method":
-            constructor = entry["constructor"]
             key = self._owner_key(entry)
-            record = self.owners.get(key)
+            constructor = entry.get("constructor")
+            record = (dict(owner=construction[entry["binding_program"]["receiver"]],
+                           id="native-owner-" + uuid.uuid4().hex, boundaries=set(), hooks=[], initialized=True)
+                      if construction is not None else self.owners.get(key))
             if record is None:
                 class_ = namespace[constructor["symbol"]]
                 if not inspect.isclass(class_) or class_.__qualname__ != constructor["symbol"]:
                     raise MissingBinding("source constructor did not resolve to the original native class")
-                positional, keyword = _actual_arguments(class_, constructor.get("arguments", {}))
+                positional, keyword = _actual_arguments(class_, self._original_defaults(entry, "constructor.arguments", constructor.get("arguments", {})))
                 owner = class_(*positional, **keyword)
                 if inspect.isawaitable(owner):
                     owner = await owner
@@ -726,6 +1390,14 @@ class NativeBindings:
         for boundary in selected:
             if boundary["id"] in record["boundaries"]:
                 continue
+            if boundary.get("rule") == "inplace-callsite/1":
+                gate = uuid.uuid4().hex + ":" + boundary["id"]
+                self._register(gate, owner_id, self._boundary_unit(boundary))
+                self.callsite_gates[(boundary["id"], owner_id)] = gate
+                helper = self.recipes[boundary["id"]]["helper"]
+                namespace[helper] = self._callsite_factory(boundary["id"])
+                record["boundaries"].add(boundary["id"])
+                continue
             wiring = boundary.get("native_wiring")
             if isinstance(wiring, dict) and boundary["mode"] != "R":
                 key = (wiring["initializer"], wiring["tools_attribute"], wiring.get("schema_policy", "native"))
@@ -734,13 +1406,15 @@ class NativeBindings:
                 continue
             symbol = self.recipes[boundary["id"]]["helper"] if boundary["mode"] == "R" else boundary["symbol"].split(".")[-1]
             original = getattr(owner, symbol) if owner is not None else namespace[symbol]
-            expected = (entry["constructor"]["symbol"] + "." + symbol) if owner is not None else boundary["symbol"]
+            expected = (entry["symbol"].split(".")[0] + "." + symbol) if owner is not None else boundary["symbol"]
             self._assert_callable(original, expected, boundary["path"])
             gate = uuid.uuid4().hex + ":" + boundary["id"]
             self._register(gate, owner_id, self._boundary_unit(boundary))
             proxy = self.runtime.wrap(original, gate, owner_id)
             if owner is not None:
                 install_method_proxy(owner, symbol, proxy)
+                if boundary["symbol"] == entry["symbol"] and boundary["mode"] != "R":
+                    original_entry = proxy
             else:
                 namespace[symbol] = proxy
             record["boundaries"].add(boundary["id"])
@@ -762,7 +1436,8 @@ class NativeBindings:
         if owner is not None and not record["initialized"]:
             for initialization in entry.get("initializers", []):
                 original = getattr(owner, initialization["symbol"].split(".")[-1])
-                positional, keyword = _actual_arguments(original, initialization.get("arguments", {}))
+                positional, keyword = _actual_arguments(original, self._original_defaults(entry, "initializers." + initialization["symbol"],
+                                                                                        initialization.get("arguments", {})))
                 result = original(*positional, **keyword)
                 if inspect.isawaitable(result):
                     await result
@@ -773,7 +1448,7 @@ class NativeBindings:
                     boundary = self.boundaries[binding["id"]]
                     self.runtime.call("label", binding["gate"], self._boundary_unit(boundary))
             record["initialized"] = True
-        callable_ = getattr(owner, entry["symbol"].split(".")[-1]) if owner is not None else namespace[entry["symbol"]]
+        callable_ = original_entry or (getattr(owner, entry["symbol"].split(".")[-1]) if owner is not None else namespace[entry["symbol"]])
         if not callable(callable_):
             raise MissingBinding("native source symbol did not resolve to a callable")
         self._assert_callable(callable_, entry["symbol"], entry["path"])
@@ -781,22 +1456,40 @@ class NativeBindings:
             gate = uuid.uuid4().hex + ":" + identity
             self._register(gate, owner_id, unit)
             callable_ = self.runtime.wrap(callable_, gate, owner_id)
-        self.entries[identity] = callable_
+        if construction is None or entry["kind"] != "method":
+            self.entries[identity] = callable_
+        self.entry_owner_ids[identity] = owner_id
         return callable_
 
     async def _invoke(self, entry, unit, arguments):
         with self._context():
+            construction = self._construct(entry, arguments) if entry.get("binding_program") is not None else None
             try:
-                callable_ = await self._load(entry, unit)
+                callable_ = await self._load(entry, unit, construction)
             except MissingBinding:
                 raise
             except Exception as error:
                 raise MissingBinding("original native binding/initialization failed: " + str(error)) from error
-            values = dict(entry.get("fixed_arguments", {}))
+            values = self._original_defaults(entry, "entry.fixed_arguments", entry.get("fixed_arguments", {}))
+            if construction is not None:
+                program_record = self.programs[entry["id"]]
+                for row in self.fixed_value_bindings.get(entry["id"], []):
+                    if row["location"] == "entry.fixed_arguments" and row["source"] == "ORIGINAL_REQUEST_LITERAL":
+                        values[row["parameter"]] = copy.deepcopy(program_record["call_literals"][row["parameter"]]["value"])
             values.update(arguments)
+            if construction is not None:
+                program = entry["binding_program"]
+                for exported in program.get("task_parameters", {}).values():
+                    if exported not in inspect.signature(callable_).parameters:
+                        values.pop(exported, None)
+                values.update({parameter: construction[reference] for parameter, reference in program.get("argument_refs", {}).items()})
             positional, keyword = _actual_arguments(callable_, values)
-            result = callable_(*positional, **keyword)
-            return await result if inspect.iscoroutinefunction(callable_) else result
+            active = self.active_owner.set(self.entry_owner_ids.get(unit["id"]))
+            try:
+                result = callable_(*positional, **keyword)
+                return await result if inspect.iscoroutinefunction(callable_) else result
+            finally:
+                self.active_owner.reset(active)
 
     def invoke(self, entry, unit, arguments):
         with self.lock:
@@ -835,7 +1528,9 @@ class UnitCatalog:
 
     @staticmethod
     def _inspect_entry(binding, binding_error, entry, source_id, duplicates, seen):
-        result = dict(status="MISSING", reason=None, parameters=None, input_schema=None)
+        result = dict(status="MISSING", reason=None, parameters=None, input_schema=None,
+                      result_schema={}, native_input_schemas={}, construction=None, fixed_value_bindings=[],
+                      operations={"export_entry": {"status": "UNKNOWN", "formal_proof": False}})
         try:
             if not isinstance(source_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]+", source_id) or source_id in seen or source_id in duplicates:
                 raise MissingBinding("entry IDs must be unique ASCII identifiers")
@@ -846,10 +1541,23 @@ class UnitCatalog:
                 if not isinstance(entry.get(required), str) or not entry[required]:
                     raise MissingBinding("native entry field is missing: " + required)
             parameters, omitted = binding.describe(entry)
+            _, result_schema = binding.entry_ports(entry)
+            construction = binding.programs.get(entry.get("id"))
             result.update(status="READY", parameters=parameters, input_schema=parameters,
-                          omitted_object_parameters=omitted, binding="SOURCE_CHECKED_NATIVE_ENTRY")
+                          omitted_object_parameters=omitted, binding="SOURCE_CHECKED_NATIVE_ENTRY",
+                          result_schema=result_schema,
+                          native_input_schemas={name: port for name, port in parameters["properties"].items()
+                                                if "x-native-type" in port},
+                          construction=construction["facts"] if construction else None,
+                          fixed_value_bindings=binding.fixed_value_bindings.get(entry.get("id"), []),
+                          operations={"export_entry": {"status": "SOURCE_BOUND", "formal_proof": False,
+                                       "scope": "user-confirmed prototype native binding; semantic export obligations remain conditional"}})
         except (ValueError, KeyError, TypeError, SyntaxError, OSError) as error:
             result["reason"] = str(error)
+            if entry.get("binding_program"):
+                result["construction"] = {"rule": "B-CALL-straight-prefix/1", "status": "UNKNOWN", "reason": str(error)}
+            if binding is not None:
+                result["fixed_value_bindings"] = binding.fixed_value_bindings.get(entry.get("id"), [])
         return result
 
     def inspect_candidate(self, inspector, candidate):
@@ -899,6 +1607,12 @@ class UnitCatalog:
 
     def _install(self, inspector, candidate, analysis_id):
         binding, duplicates, rows = self._candidate_checks(inspector, candidate)
+        source_id = inspector.request.get("source_id")
+        if source_id:
+            for previous in self.store.list("unit"):
+                if previous.get("source_id") == source_id and previous.get("analysis_id") != analysis_id:
+                    previous.update(status="SUPERSEDED", superseded_by=analysis_id)
+                    self.store.save("unit", previous["id"], previous, "unit_superseded")
         result = []
         for row in rows:
             index, entry, source_id, checked = row["index"], row["entry"], row["entry_id"], row["check"]
@@ -936,6 +1650,8 @@ class UnitCatalog:
         with self.lock:
             result = []
             for unit in self.store.list("unit"):
+                if unit.get("status") == "SUPERSEDED":
+                    continue
                 if unit["status"] == "READY" and unit["id"] not in self.bindings:
                     unit.update(status="MISSING", reason="native binding is not loaded in this process")
                 result.append(unit)
@@ -951,32 +1667,43 @@ class UnitCatalog:
             raise ValueError("ready native tool name is not found")
         return found[0]
 
-    def validate_arguments(self, unit_id, arguments):
+    def validate_arguments(self, unit_id, arguments, native_arguments=(), deferred_arguments=()):
         """Validate a proposed call before the caller's RL action selection."""
         unit = self.store.get("unit", unit_id)
         if not unit or unit["status"] != "READY" or unit_id not in self.bindings:
             raise ValueError("native Unit is not ready")
         if not isinstance(arguments, dict):
             raise ValueError("native tool arguments must be a JSON object")
-        try:
-            json.dumps(arguments, allow_nan=False)
-        except (ValueError, TypeError) as error:
-            raise ValueError("native tool arguments must contain JSON values") from error
+        native_arguments, deferred_arguments = set(native_arguments), set(deferred_arguments)
+        if (native_arguments | deferred_arguments) - set(arguments):
+            raise ValueError("native/deferred argument names must identify actual supplied parameters")
         schema = unit["parameters"]
         entry = self.entry_specs[unit_id]
-        if set(arguments) & (set(entry.get("fixed_arguments", {})) | set(unit.get("omitted_object_parameters", []))):
+        program = entry.get("binding_program") or {}
+        references = set(program.get("argument_refs", {})) - set(program.get("task_parameters", {}).values())
+        if set(arguments) & (set(entry.get("fixed_arguments", {})) | set(unit.get("omitted_object_parameters", [])) | references):
             raise ValueError("fixed or original-object native arguments cannot be overridden")
         missing = set(schema["required"]) - set(arguments)
         unknown = set(arguments) - set(schema["properties"])
         if missing or (unknown and not schema["additionalProperties"]):
             raise ValueError("native tool arguments do not match the source-derived interface")
         for name, value in arguments.items():
+            if name in deferred_arguments:
+                continue
+            if name in native_arguments:
+                if name not in schema["properties"] or not self.bindings[unit_id].native_matches(value, schema["properties"][name]):
+                    raise ValueError("native result object does not match its source-derived parameter type: " + name)
+                continue
+            try:
+                json.dumps(value, allow_nan=False)
+            except (ValueError, TypeError) as error:
+                raise ValueError("native tool arguments must contain JSON values or established native references") from error
             if name in schema["properties"] and not _matches(value, schema["properties"][name]):
                 raise ValueError("native tool parameter type mismatch: " + name)
         return True
 
-    def invoke(self, unit_id, arguments):
-        self.validate_arguments(unit_id, arguments)
+    def invoke(self, unit_id, arguments, native_arguments=()):
+        self.validate_arguments(unit_id, arguments, native_arguments=native_arguments)
         unit = self.store.get("unit", unit_id)
         entry = self.entry_specs[unit_id]
         try:
@@ -986,9 +1713,12 @@ class UnitCatalog:
             for identity, related in self.entry_specs.items():
                 if self.bindings[identity] is binding and binding._owner_key(related) == binding._owner_key(entry):
                     item = self.store.get("unit", identity)
-                    item.update(status="MISSING", reason=str(error))
+                    if item.get("status") != "SUPERSEDED":
+                        item["status"] = "MISSING"
+                    item["reason"] = str(error)
                     self.store.save("unit", identity, item, "unit_binding_missing")
             raise
+        unit = self.store.get("unit", unit_id)
         unit.update(initialization="BOUND", result_type=type(result).__module__ + "." + type(result).__qualname__)
         self.store.save("unit", unit_id, unit, "unit_returned")
         return result

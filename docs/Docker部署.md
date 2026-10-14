@@ -1,6 +1,6 @@
 # 单服务 Docker 部署
 
-更新：2026-10-13，0.6.0。镜像只包含平台核心、Python 3.11 和 URL 接入所需 Git。没有预制样例、来源专用依赖或额外工作流容器。
+更新：2026-10-14，0.7.0。镜像包含平台核心、Python 3.11 和 URL 接入所需 Git，版本标签为 `seampact-core:0.7.0`。这个 Python 版本与已确认的有限原生宿主范围一致。
 
 ## 在 Linux 仓库目录启动
 
@@ -26,7 +26,7 @@ docker compose -f deploy/compose.yaml logs --tail 80 platform
 | `var/prototype` | `/data` | 接口配置、私有密钥、状态数据库、冻结工件、远程仓库与 Q 表 |
 | `harnesses` | `/harnesses` | 用户通过 SFTP 放入的项目专用 Harness／配置／数据目录 |
 
-页面地址应使用 `/harnesses/my-harness`，不能填写服务器宿主的 `/home/...` 路径。URL 可以直接填写远程 Git HTTPS 地址；私有 Git SSH 连接需要容器中实际可用的 Git 凭据，平台不自动复制服务器 SSH 密钥。
+页面地址使用 `/harnesses/my-harness`。URL 可填写实际 Git 地址；Git SSH 连接需要容器中实际可用的 Git 凭据，平台不自动复制服务器 SSH 密钥。已有完整源码可通过 SFTP 放入挂载目录，再用本地路径接入。
 
 在页面配置 DeepSeek／GLM 等云端模型。密钥保存在 `/data` 私有配置中；不需要为 Docker 再创建旧的 secret handoff 文件。也可以使用 `.env.example` 中列出的环境变量，通过私有文件和 `--env-file` 传给 Compose。
 
@@ -43,11 +43,13 @@ docker compose -f deploy/compose.yaml up -d --build
 
 ## Harness 自身的依赖
 
-核心镜像不包含任何特定 Harness 的运行库。若某入口需要第三方包，它会显示 `MISSING`，直至在实际运行环境中提供依赖。
+核心镜像不包含特定 Harness 的运行库或模型权重。缺库、模型／数据资源或绑定条件的入口显示 `MISSING`，分析已完成也不会消除这些实际缺口。
 
-最直接的做法是用一个独立虚拟环境原生启动平台，并在同一环境安装该 Harness 的已有依赖，见[服务器部署](服务器部署.md)。若选择 Docker，可按接入仓库自己的依赖文件扩展这个 Dockerfile，并重新构建。用户数据和模型权重保持挂载；不要把它们放进 Git 或平台核心镜像。
+原生部署可使用独立 Python 3.11 虚拟环境，并在同一环境安装 Harness 的已有依赖，见[服务器部署](服务器部署.md)。Docker 部署则按实际接入仓库的依赖文件扩展 Dockerfile 后构建。数据与权重保持私有挂载，不放进 Git 或核心镜像。
 
 分析过程只读取来源。真实调用时，原 Harness 可能按原算法写入该项目专用目录，因此保留可写挂载；将输出参数指向自己的项目目录，不挂载其他用户的数据目录。
+
+有限 B-CALL 在容器原生进程中执行原构造前缀，R-INPLACE 留在原调用位置；方案结果引用也在同一进程内保留。当前仍是一个平台服务，尚未实现逐 Unit 镜像、合法并行或 K8S 远程调度。运行记录见[0.7 规则与运行](0.7_规则兑现与实际运行.md)。
 
 ## 更新或停止
 

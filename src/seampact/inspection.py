@@ -61,7 +61,7 @@ def decode_text(path, data):
             text, encoding = data.decode("gb18030"), "gb18030"
         except UnicodeDecodeError:
             text, encoding = data.decode("cp1252"), "cp1252"
-    if any(ord(character) < 32 and character not in "\t\n\r\f" for character in text):
+    if re.search(r"[\x00-\x08\x0b\x0e-\x1f]", text):
         raise ValueError("binary resource is not readable source")
     return text, encoding
 
@@ -315,7 +315,9 @@ class Inspector:
         inspector = cls.freeze(source["root"], snapshots, identity, source["files"], source["entry"], observation)
         inspector.request.update(source_id=source["id"], source_name=source["name"],
             source_address=source["address"], source_revision=source.get("revision"),
-            inventory=source["inventory"], resources=source.get("resources", []))
+            inventory=source["inventory"], resources=source.get("resources", []),
+            entry_profile=source.get("entry_profile", {}), configuration=source.get("configuration", {}),
+            user_resources=source.get("user_resources", []))
         return inspector
 
     def list_source(self, offset=0, count=100):
@@ -346,6 +348,34 @@ class Inspector:
 
     def inspect_symbols(self, path):
         return dict(path=path, sha256=self.files[path]["sha256"], **symbols(path, self.data(path)))
+
+    def inspect_construction(self, path, unit="file"):
+        """Original statement anchors and def-use names; no candidate code is evaluated."""
+        available = dict(units(path, self.data(path)))
+        if unit not in available:
+            raise ValueError("source unit is not frozen")
+        tree = ast.parse(available[unit])
+        scopes = []
+        for node in tree.body:
+            functions = [(node.name, node)] if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) else (
+                [(node.name + "." + member.name, member) for member in node.body
+                 if isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef))] if isinstance(node, ast.ClassDef) else [])
+            for symbol, function in functions:
+                statements = []
+                for statement in function.body:
+                    calls = [dict(target=ast.unparse(call.func), line=call.lineno, column=call.col_offset,
+                                  end_line=call.end_lineno, end_column=call.end_col_offset)
+                             for call in ast.walk(statement) if isinstance(call, ast.Call)]
+                    statements.append(dict(kind=type(statement).__name__, line=statement.lineno,
+                        end_line=statement.end_lineno,
+                        reads=sorted({name.id for name in ast.walk(statement) if isinstance(name, ast.Name) and isinstance(name.ctx, ast.Load)}),
+                        writes=sorted({name.id for name in ast.walk(statement) if isinstance(name, ast.Name) and isinstance(name.ctx, ast.Store)}),
+                        calls=calls))
+                scopes.append(dict(symbol=symbol, asynchronous=isinstance(function, ast.AsyncFunctionDef),
+                    parameters=[argument.arg for argument in [*function.args.posonlyargs, *function.args.args, *function.args.kwonlyargs]],
+                    statements=statements))
+        return dict(path=path, unit=unit, sha256=self.files[path]["sha256"], scopes=scopes,
+                    effects="UNKNOWN", alias_closure="UNKNOWN", execution="NOT_RUN")
 
     def list_structure(self, path="", recursive=True):
         """Return directory and file categories, without resource contents."""
@@ -378,14 +408,28 @@ class Inspector:
             unknown.extend(item for item in facts["unknown"] if unit is None or item.get("unit") == unit)
         return dict(paths=paths, imports=imports, unknown=unknown, dependency_closure="UNKNOWN")
 
-    def entry_candidates(self):
+    def list_resources(self, path="", offset=0, count=100):
+        if not isinstance(path, str) or type(offset) is not int or offset < 0 or type(count) is not int or count < 1:
+            raise ValueError("resource path, nonnegative offset and positive page size required")
+        prefix = path.replace("\\", "/")
+        records = [resource for resource in self.request.get("resources", [])
+                   if resource.get("path", "").replace("\\", "/").startswith(prefix)]
+        return dict(resources=records[offset:offset + count], total=len(records),
+                    next_offset=offset + count if offset + count < len(records) else None,
+                    loading="NOT_RUN", compatibility="UNKNOWN")
+
+    def entry_candidates(self, path=""):
         """Expose source entry anchors without selecting an execution host."""
+        if not isinstance(path, str):
+            raise ValueError("entry path prefix required")
         candidates, unknown = [], []
-        for path in self.files:
-            facts = source_facts(path, self.data(path))
+        for relative in self.files:
+            if not relative.startswith(path):
+                continue
+            facts = source_facts(relative, self.data(relative))
             candidates.extend(facts["entry_candidates"])
             unknown.extend(facts["unknown"])
-        return dict(candidates=candidates, unknown=unknown, selected=None, execution="NOT_RUN")
+        return dict(path=path, candidates=candidates, unknown=unknown, selected=None, execution="NOT_RUN")
 
     def add_source(self, path):
         """Explicit dependency extension makes a new version; never silently mutates a freeze."""

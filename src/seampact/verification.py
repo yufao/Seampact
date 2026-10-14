@@ -5,6 +5,7 @@ import re
 
 from .inspection import units
 from .lowering import lower_loop
+from .callsite import RULE as CALLSITE_RULE, lower_callsite
 
 
 def source_unit(inspector,path,unit="file"):
@@ -76,7 +77,14 @@ def check_candidate(inspector,candidate):
         lowering=None
         try:
             if mode=="R" and anchor:
-                lowered=lower_loop(source_unit(inspector,path,b.get("unit","file")),symbol,b.get("loop_index",0))
+                source=source_unit(inspector,path,b.get("unit","file"))
+                rule=b.get("rule","sequential-async-loop-body/1")
+                if rule==CALLSITE_RULE:
+                    lowered=lower_callsite(source,symbol,b.get("callsite"))
+                elif rule=="sequential-async-loop-body/1":
+                    lowered=lower_loop(source,symbol,b.get("loop_index",0))
+                else:
+                    raise ValueError("unsupported finite R rule: "+str(rule))
                 lowering=lowered["recipe"]
                 supported=True
                 binding=dict(status="PASS",rule=lowering["rule"],recipe=lowering,inverse=lowered["verification"])
@@ -93,6 +101,10 @@ def check_candidate(inspector,candidate):
             "effects_and_retirement":dict(status="UNKNOWN",required="lifecycle/effect summary; callable exit alone may leave remote work"),
             "sequential_conformance":dict(status="NOT_RUN",required="paired native/adapted observations under frozen contract"),
             "dependency_closure":dict(status="UNKNOWN",required="imports, resources, callbacks and configuration")}
+        if mode=="R" and lowering and lowering["rule"]==CALLSITE_RULE:
+            obligations["state_stability"]=dict(status="UNKNOWN",required="actual argument references, relevant writers and lock ownership while waiting")
+            obligations["timeout_preservation"]=dict(status="UNKNOWN",required="original timeout scopes retained; actual queue delay may create a new timeout result",
+                queue_counts_inside_original_timeout=True,deadline_reset=False)
         rows.append(dict(id=identity,mode=mode,obligations=obligations,lowering=lowering,
             operations={op:dict(status="UNKNOWN" if supported else "UNSUPPORTED",admitted=False)
                         for op in ("controller_schedule","composition_export","parallel","remote")},
@@ -109,8 +121,10 @@ def check_candidate(inspector,candidate):
     for boundary,row in zip(candidate["boundaries"],rows):
         if not row["buildable"]:
             continue
-        key=(boundary["path"],boundary.get("unit","file"),boundary["symbol"],
-             boundary.get("loop_index",0) if boundary["mode"]=="R" else None)
+        lowering=row.get("lowering") or {}
+        cutpoint=(lowering.get("rule"),tuple(sorted(lowering["callsite"].items()))) if lowering.get("rule")==CALLSITE_RULE else (
+             lowering.get("rule"),boundary.get("loop_index",0)) if boundary["mode"]=="R" else None
+        key=(boundary["path"],boundary.get("unit","file"),boundary["symbol"],cutpoint)
         conflict=occupied.get(key)
         occupied[key]=row
         wiring=boundary.get("native_wiring")
@@ -135,8 +149,8 @@ def check_candidate(inspector,candidate):
             for item in group:
                 item["buildable"]=False
                 item["obligations"]["binding_rule"]=dict(status="UNSUPPORTED",
-                    reason="whole-callable and inner-loop bindings require separate alternative plans")
+                    reason="whole-callable and internal R bindings require separate alternative plans")
                 item["operations"]={op:dict(status="UNSUPPORTED",admitted=False) for op in item["operations"]}
     return dict(schema="verification-report/1",source_version=inspector.request["source_version"],
                 boundaries=rows,status="DRAFT_CHECKED",admitted=False,
-                scope="source anchors, registration syntax and finite sequential lowering only")
+                scope="source anchors, registration syntax, finite extraction and original-position call lowering only")
