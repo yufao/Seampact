@@ -150,6 +150,8 @@ def compile_plans(catalog, arguments):
                             native_edge = True
                         elif not _nonnative_branch_matches(source_schema, target_schema):
                             raise ValueError("原生对象数据边缺少同一冻结原类型的结果端口依据")
+                    if native_edge and (source_unit.get("execution") == "REMOTE" or unit.get("execution") == "REMOTE"):
+                        raise ValueError("原生对象数据边不能跨进程；当前远程规则不支持迁移原引用")
                     deferred.add(parameter)
                     if reference["step"] not in dependencies:
                         dependencies.append(reference["step"])
@@ -169,7 +171,9 @@ def compile_plans(catalog, arguments):
             unit_ids.append(identity)
         compiled = dict(proposed, steps=steps, units=unit_ids, data_edges=edges, control_edges=controls,
             binding_status="CHECKED_WITH_RUNTIME_VALUE_CONDITIONS", semantic_status="UNRESOLVED",
-            reference_scope="LOCAL_PLAN_OWNER", parallel=False, remote=False)
+            reference_scope="LOCAL_PLAN_OWNER", parallel=False,
+            remote=any(ready[identity].get("execution") == "REMOTE" for identity in unit_ids),
+            placements={identity: ready[identity].get("execution", "LOCAL") for identity in unit_ids})
         compiled["semantic_key"] = json.dumps(dict(
             units=[(ready[identity]["source_version"], ready[identity]["entry_id"],
                 ready[identity]["path"], ready[identity]["symbol"]) for identity in unit_ids],

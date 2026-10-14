@@ -29,6 +29,8 @@ def make_server(platform, port=8880, host="127.0.0.1", public_port=None):
                     return self.send(200, dict(status="ok", version=platform.state()["version"]))
                 if path == "/api/state":
                     return self.send(200, platform.state())
+                if path == "/api/runtime/session":
+                    return self.send(200, dict(session=platform.deployments.session))
                 if path.startswith("/api/analysis/"):
                     return self.send(200, platform.store.get("analysis", path.rsplit("/", 1)[1]))
                 filename = {"/": "index.html", "/inspect": "index.html", "/app.js": "app.js", "/style.css": "style.css"}.get(path)
@@ -56,6 +58,14 @@ def make_server(platform, port=8880, host="127.0.0.1", public_port=None):
                     result = platform.restore_harness(body["harness_id"])
                 elif path == "/api/chat":
                     result = platform.chat.start(body)
+                elif path == "/api/deployments/export":
+                    result = platform.deployments.export(body["group_id"], body)
+                elif path == "/api/workers/attach":
+                    result = platform.deployments.attach(body["endpoint"])
+                elif path == "/api/deployments/local":
+                    result = platform.deployments.local(body["group_id"])
+                elif path == "/api/runtime/worker":
+                    result = platform.deployments.protocol(body)
                 else:
                     return self.send(404, dict(error="没有这个接口"))
                 self.send(200, result)

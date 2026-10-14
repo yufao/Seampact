@@ -1,0 +1,10 @@
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: seampact-prototype
+nodes:
+  - role: control-plane
+    extraMounts:
+      - hostPath: /home/jym/seampact-workspace/seampact-data
+        containerPath: /home/jym/seampact-workspace/seampact-data
+      - hostPath: /home/jym/seampact-workspace/harnesses
+        containerPath: /home/jym/seampact-workspace/harnesses

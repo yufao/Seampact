@@ -2,7 +2,7 @@ name: seampact-prototype
 
 services:
   platform:
-    image: seampact-core:0.7.1
+    image: seampact-core:0.8.0
     build:
       context: ..
       dockerfile: deploy/Dockerfile

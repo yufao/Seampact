@@ -202,6 +202,22 @@ class Coordinator:
         # Prior gates remain inactive; the catalog creates a fresh binding generation.
         self.detached_sources.discard(source_id)
 
+    async def remote_unknown(self, group_id, instance_id):
+        for call in self.state["calls"].values():
+            unit = call.get("unit") or {}
+            if (unit.get("runtime_group"), unit.get("instance_id")) != (group_id, instance_id):
+                continue
+            if call["physical"] in {"AUTHORIZED", "STARTED"}:
+                call["physical"] = "UNKNOWN"
+                self.state["gates"][call["gate"]]["active"] = False
+            elif call["physical"] in {"ENABLED", "RESERVED"}:
+                call.update(physical="RETIRED", logical="REJECTED", receipt="REMOTE_RESPONSE_UNKNOWN")
+                waiter = self.waiters.get(call["id"])
+                if waiter and not waiter.done():
+                    waiter.set_exception(ProtocolError("remote response unavailable"))
+        self._persist("remote_outcome_unknown")
+        await self.pump()
+
     async def pump(self):
         if not self.automatic:
             return

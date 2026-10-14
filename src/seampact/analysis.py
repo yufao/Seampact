@@ -47,6 +47,11 @@ CLI只提交仓库实际脚本和启动参数。复杂参数或缺依赖明确mi
 粗细方案互斥，不用空字段或你的“安全/独立/并行”自述绕过引擎。entries和边界候选一同提交，由引擎决定可调用状态。
 check_candidate反馈边界报告及entry_bindings中的入口状态、真实参数接口和缺失原因；根据事实补读或修正，无法补全的入口保留MISSING。
 entries必须提供数组，即便没有可绑定入口也明确为空并说明原因。可多次 check_candidate 并修正。只有 submit_candidate 完成分析；它不执行原代码。
+运行组由原对象、共享状态和控制依赖决定。同组保留同一进程和原构造/请求生命周期；不能因同类、相同配置或同一源码而合并原本独立的对象。
+最终candidate必须提供runtime_groups:[{id:"名称",entries:["入口id"],rationale:"源码关系及为何同组"}]，覆盖所有入口，包括缺失入口；entries为空时runtime_groups也为空。
+check_candidate.entry_bindings.runtime_groups返回引擎按源码核对的分组、远程条件和缺口。JSON/制品接口本身不证明可拆分或远程。
+当前远程宿主仅覆盖原同步独立函数的有限不可变标量运算；模型/数据/对象状态、异步控制、内部重构、未知外部效果等保留本地。API可补读、修正入口和运行组，不能自述通过。
+跨组只允许remote条件已核对的独立入口，原生对象边仍在原进程。每组一个运行进程/实例；K8S重启不会恢复原会话。保留未覆盖项并说明缺口，不把候选或部署文件当成已运行。
 """
 
 
@@ -111,7 +116,7 @@ class AnalysisJobs:
                 messages = [dict(role="system", content=RULES)] + list(previous["messages"][1:])
                 feedback = self.check_entries(inspector, previous["submitted"]["candidate"]) if self.check_entries else {}
                 messages.append(dict(role="user", content=json.dumps(dict(
-                    task="在同一来源完整上下文上修正候选：不要以样例值固定业务输入。根据新机械反馈暴露真实参数，原无法解除的资源/宿主义务仍保留。无需重新读取不变源码。",
+                    task="沿用完整分析上下文，按当前RuleSet和机械反馈完善候选及运行组。暴露真实业务输入；原对象/共享状态/控制关系必须保留。未知远程条件继续本地，不宣称JSON即可拆分。无需重新读取不变源码。",
                     request=self.source_request(inspector), current_entry_feedback=feedback), ensure_ascii=False)))
                 refinement = previous["id"]
         job = dict(id=identity or uuid.uuid4().hex, request_id=inspector.request["id"], provider=provider,
@@ -176,6 +181,10 @@ class AnalysisJobs:
                         args = json.loads(call["function"]["arguments"])
                         if name in {"check_candidate", "submit_candidate"}:
                             candidate = args["candidate"]
+                            if name == "submit_candidate" and not isinstance(candidate.get("runtime_groups"), list):
+                                raise ValueError("最终交付缺少runtime_groups数组。按引擎反馈提出完整运行组；未决对象/共享状态/控制依赖留在原进程，不能仅文字声称已经分组。")
+                            if name == "submit_candidate" and candidate.get("entries") and not candidate["runtime_groups"]:
+                                raise ValueError("存在入口时运行组不能留空，须完整列出所有入口的原进程分组。")
                             result = check_candidate(inspector, candidate)
                             if self.check_entries:
                                 result["entry_bindings"] = self.check_entries(inspector, candidate)

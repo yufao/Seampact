@@ -1525,6 +1525,7 @@ class UnitCatalog:
         self.home, self.store, self.runtime = Path(home), store, runtime
         self.bindings, self.entry_specs = {}, {}
         self.lock = threading.RLock()
+        self.remote_router = None
 
     def install(self, inspector, candidate, analysis_id, installation_id=None):
         with self.lock:
@@ -1549,8 +1550,11 @@ class UnitCatalog:
 
     def source_running(self, source_id):
         with self.lock:
-            return any(binding.active_calls for binding in self.bindings.values()
-                       if binding.inspector.request.get("source_id") == source_id)
+            return (any(binding.active_calls for binding in self.bindings.values()
+                       if binding.inspector.request.get("source_id") == source_id) or
+                    any((call.get("unit") or {}).get("source_id") == source_id and
+                        call["physical"] in {"AUTHORIZED", "STARTED", "UNKNOWN"}
+                        for call in self.runtime.snapshot()["calls"].values()))
 
     def _candidate_binding(self, inspector, candidate):
         if not isinstance(candidate, dict) or "entries" not in candidate or not isinstance(candidate["entries"], list):
@@ -1602,6 +1606,7 @@ class UnitCatalog:
     def inspect_candidate(self, inspector, candidate):
         """Return the same static entry checks as installation, without state writes."""
         _, _, rows = self._candidate_checks(inspector, candidate)
+        from .deployment import runtime_groups
         entries = [dict(id=row["entry_id"], path=row["entry"].get("path"),
             unit=row["entry"].get("unit", "file"), symbol=row["entry"].get("symbol"),
             kind=row["entry"].get("kind"), **row["check"]) for row in rows]
@@ -1609,7 +1614,8 @@ class UnitCatalog:
         return dict(schema="native-entry-report/1", source_version=inspector.request["source_version"],
             entries=entries, status="READY" if ready == len(entries) and ready else "PARTIAL" if ready else "MISSING",
             has_bindable_entries=bool(ready), reason=None if ready else "no bindable native entry was discovered",
-            initialization="NOT_RUN", parallel=False, remote=False)
+            initialization="NOT_RUN", parallel=False, remote=False,
+            runtime_groups=runtime_groups(inspector, candidate, rows))
 
     def _candidate_checks(self, inspector, candidate):
         binding, binding_error, duplicates = self._candidate_binding(inspector, candidate)
@@ -1683,6 +1689,19 @@ class UnitCatalog:
                         self.bindings.pop(unit["id"], None)
                         self.entry_specs.pop(unit["id"], None)
                         self.store.save("unit", unit["id"], unit, "unit_binding_missing")
+        from .deployment import runtime_groups
+        group_report = runtime_groups(inspector, candidate, rows)
+        for group in group_report["groups"]:
+            group.update(installation_id=installation_id, analysis_id=analysis_id,
+                units=[unit["id"] for unit in result if unit["entry_id"] in group["entries"]])
+            self.store.save("runtime_group", group["id"], group)
+            for unit in result:
+                if unit["id"] not in group["units"]:
+                    continue
+                unit["runtime_group"] = group["id"]
+                unit["operations"]["remote"] = group["remote_conditions"][unit["entry_id"]]
+                unit["remote"] = unit["operations"]["remote"]["status"] == "REMOTE_CHECKED"
+                self.store.save("unit", unit["id"], unit)
         return result
 
     def public(self):
@@ -1693,6 +1712,8 @@ class UnitCatalog:
                     continue
                 if unit["status"] == "READY" and unit["id"] not in self.bindings:
                     unit.update(status="MISSING", reason="native binding is not loaded in this process")
+                route = self.remote_router.routes.get(unit.get("runtime_group")) if self.remote_router else None
+                unit["execution"] = "REMOTE" if route and unit["id"] in route["units"] else "LOCAL"
                 result.append(unit)
             return result
 
@@ -1745,6 +1766,14 @@ class UnitCatalog:
         self.validate_arguments(unit_id, arguments, native_arguments=native_arguments)
         unit = self.store.get("unit", unit_id)
         entry = self.entry_specs[unit_id]
+        if self.remote_router:
+            routed, result = self.remote_router.invoke(unit, arguments)
+            if routed:
+                with self.lock:
+                    unit = self.store.get("unit", unit_id)
+                    unit.update(initialization="BOUND", result_type=type(result).__module__ + "." + type(result).__qualname__)
+                    self.store.save("unit", unit_id, unit)
+                return result
         try:
             result = self.bindings[unit_id].invoke(entry, unit, arguments)
         except (MissingBinding, ImportError, ModuleNotFoundError, FileNotFoundError, NameError, AttributeError, ProtocolError) as error:

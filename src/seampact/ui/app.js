@@ -16,7 +16,7 @@ const sourceUpdating = new Set();
 const inspectPage = location.pathname === '/inspect';
 let inspectQuery = new URLSearchParams(location.search);
 let inspectView = inspectQuery.get('view') || 'analyses';
-const viewNames = {analyses: '来源与分析', units: '能力池', tasks: '任务详情', scheduler: '调度器'};
+const viewNames = {analyses: '来源与分析', units: '能力池', tasks: '任务详情', scheduler: '调度器', deployments: '运行组与部署'};
 if (!viewNames[inspectView]) inspectView = 'analyses';
 const renderedSections = new Map();
 const detailStates = new Map();
@@ -32,7 +32,8 @@ const statusNames = {
   SOURCE_BOUND: '源码绑定已核对', ADMITTED: '操作条件成立', NOT_RUN: '尚未运行', BOUND: '原生绑定已执行',
   UNRESOLVED: '语义条件未决', RETURNED: '正常返回', STOPPED_AT_NON_SUCCESS_EXIT: '后继已停止',
   CHECKED_WITH_RUNTIME_VALUE_CONDITIONS: '结构已核对 · 按实际值检查输入', SOURCE_CHECKED: '源码已核对',
-  DETACHED: '已摘除', SUPERSEDED: '已替换'
+  DETACHED: '已摘除', SUPERSEDED: '已替换', REMOTE_CHECKED: '远程条件已核对',
+  LOCAL_ONLY: '保留本地', EXPORTED: '运行包已导出', LOCAL: '本地进程', REMOTE: '独立运行进程'
 };
 
 function inspectLink(view, parameters = {}) {
@@ -489,6 +490,7 @@ function renderUnits() {
     if (unit.description) card.append(node('p', unit.description, 'card-note'));
     if (unit.reason) card.append(node('p', textValue(unit.reason), 'card-note'));
     card.append(node('p', '初始化：' + statusLabel(unit.initialization), 'card-meta'));
+    if (unit.runtime_group) card.append(node('p', '执行位置：' + statusLabel(unit.execution) + ' · ' + unit.runtime_group, 'card-meta'), inspectLink('deployments', {harness: sourceId}));
     if (unit.operations) {
       const operationList = node('div', undefined, 'operation-list');
       for (const [name, operation] of Object.entries(unit.operations)) {
@@ -512,6 +514,70 @@ function renderUnits() {
     detailValue(card, '入口范围', unit.entry_profile || unit.profile);
     if (!inspectPage) card.append(inspectLink('units', {harness: sourceId, unit: unit.id}));
     root.append(card);
+  }
+}
+
+function renderDeployments() {
+  const root = $('deployment-list');
+  root.replaceChildren();
+  const groups = (state.runtime_groups || []).filter(group => !selectedSource() || group.source_id === selectedSource())
+    .sort((a, b) => Number(b.status === 'REMOTE_CHECKED') - Number(a.status === 'REMOTE_CHECKED'));
+  root.append(node('p', '同组保持原进程、原对象与原生命周期。远程条件逐入口核对；未覆盖的能力继续本地执行。', 'card-note'));
+  if (!groups.length) return empty(root, '分析后显示运行组。');
+  for (const group of groups) {
+    const card = node('article', undefined, 'status-card');
+    card.dataset.itemId = group.id;
+    const head = node('div', undefined, 'card-heading');
+    head.append(node('strong', group.id), pill(group.status));
+    card.append(head, node('p', '执行位置：' + statusLabel(group.execution) + ' · 单实例 · 重启不恢复原会话', 'card-meta'));
+    card.append(node('p', '成员：' + group.entries.length + ' 个' + (group.entries.length <= 3 ? ' · ' + group.entries.join('、') : '，展开分组依据查看完整成员。'), 'card-note'));
+    detailValue(card, '分组和远程依据', group);
+    if (group.gaps?.length) detailValue(card, '未覆盖的远程条件', [...new Set(group.gaps)]);
+    const deployment = (state.deployments || []).find(item => item.id === group.id);
+    if (deployment) detailValue(card, '导出的运行包与部署文件', deployment);
+    if (group.status === 'REMOTE_CHECKED') {
+      const form = node('form', undefined, 'model-form');
+      const label = node('label', '运行进程访问平台的地址');
+      const input = node('input');
+      input.type = 'url'; input.required = true; input.value = deployment?.platform_url || 'http://seampact-platform:8880';
+      label.append(input);
+      const button = node('button', '导出原生运行包与 K8S 文件', 'secondary-button'); button.type = 'submit';
+      form.append(label, button);
+      form.onsubmit = async event => {
+        event.preventDefault(); button.disabled = true;
+        try {
+          const result = await api('/api/deployments/export', {group_id: group.id, platform_url: input.value});
+          showNotice('已导出：' + result.archive + '。可通过 SFTP 上传；尚未应用到集群。');
+        } catch (error) { showNotice(error.message); }
+        finally { button.disabled = false; await refresh(); }
+      };
+      card.append(form);
+      if (group.execution === 'REMOTE') {
+        const local = node('button', '改为本地执行', 'secondary-button');
+        local.onclick = async () => {
+          try { await api('/api/deployments/local', {group_id: group.id}); }
+          catch (error) { showNotice(error.message); }
+          await refresh();
+        };
+        card.append(local);
+      }
+    }
+    root.append(card);
+  }
+  if (inspectPage) {
+    const form = node('form', undefined, 'model-form');
+    const label = node('label', '平台访问运行进程的地址');
+    const input = node('input'); input.type = 'url'; input.required = true; input.placeholder = 'http://127.0.0.1:8890';
+    label.append(input);
+    const button = node('button', '登记已启动的运行进程', 'secondary-button'); button.type = 'submit';
+    form.append(label, button);
+    form.onsubmit = async event => {
+      event.preventDefault(); button.disabled = true;
+      try { await api('/api/workers/attach', {endpoint: input.value}); showNotice('已登记，聊天任务将使用这个运行进程。'); }
+      catch (error) { showNotice(error.message); }
+      finally { button.disabled = false; await refresh(); }
+    };
+    root.append(form);
   }
 }
 
@@ -715,6 +781,7 @@ async function refresh() {
     renderSection('scheduler', state.scheduler, renderScheduler, ['scheduler-summary']);
     renderSection('tasks', visibleTasks(), renderTasks, ['task-list']);
     renderSection('units', [visibleUnits(), state.harnesses, selectedSource()], renderUnits, ['unit-list']);
+    renderSection('deployments', [state.runtime_groups, state.deployments, selectedSource()], renderDeployments, ['deployment-list']);
     renderSection('analyses', [state.analyses, state.harnesses, selectedSource(), [...sourceUpdating]], renderAnalyses, ['analysis-list']);
     renderSection('harnesses', [state.harnesses, state.analyses, state.models?.analysis, [...analysisSubmitting], [...sourceUpdating]], renderHarnesses, ['harness-list']);
   } catch (error) {

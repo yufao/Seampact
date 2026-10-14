@@ -14,19 +14,21 @@ from .runtime import Coordinator, OwnerRuntime
 from .scheduler import TwoLayerScheduler
 from .store import Store, now
 from .units import UnitCatalog
+from .deployment import Deployments, REMOTE_PROFILE
 
 NATIVE_PROFILE = dict(id="python311-local-explicit-lifetime/1", confirmed=True,
     interpreter="Python 3.11", host="local-native-process",
     frame_observation_excluded=True, explicit_lifetime=True,
     source="用户2026-10-14确认的有限宿主范围")
 
-RULESET = dict(id="native-entry-construction-inplace/2", confirmed=True,
+RULESET = dict(id="native-entry-construction-inplace-runtime-group/3", confirmed=True,
     source="用户确认的首版执行判断",
     rules=["真实源码入口、参数、初始化和资源绑定", "缺失依赖或参数明确保留为MISSING",
            "内部W/H/R保留原controller与owner", "B-CALL原位置构造与原对象引用",
            "有限R提取及原位调用规则", "真实结果数据边及原顺序控制边",
-           "粗细方案互斥", "不依据模型自述开放并行或远程"],
-    parallel=False, remote=False)
+           "粗细方案互斥", "原对象/共享状态/控制依赖保留同进程及原生命周期",
+           "远程条件独立核对，JSON不是合法拆分依据", "重启不默认恢复原会话"],
+    parallel=False, remote="PER_ENTRY_CHECKED", remote_profile=REMOTE_PROFILE)
 
 
 class Platform:
@@ -40,6 +42,7 @@ class Platform:
         self.runtime = OwnerRuntime(Coordinator(self.store, policy=self.scheduler))
         self.intake = RepositoryIntake(self.home / "sources")
         self.catalog = UnitCatalog(self.home, self.store, self.runtime)
+        self.deployments = Deployments(self)
         self.analysis = AnalysisJobs(self.store, self.profiles, on_complete=self._connect_units,
                                      check_entries=self.catalog.inspect_candidate)
         self.chat = ChatJobs(self.store, self.profiles, self.catalog, self.runtime, self.scheduler)
@@ -85,6 +88,7 @@ class Platform:
                 job["harness_id"] = (request or {}).get("source_id")
         return dict(version=__version__, models=self.profiles.public_roles(), harnesses=harnesses,
             analyses=jobs, units=self.catalog.public(), tasks=tasks, rules=RULESET, entry_profile=NATIVE_PROFILE,
+            runtime_groups=self.deployments.public(), deployments=self.store.list("deployment"),
             scheduler=dict(status="RUNNING", policy="two-layer-tabular-q-learning", active=active, waiting=waiting,
                 used=snapshot["used"], quota=snapshot["quota"], theory_pending=False,
                 learning=self.scheduler.snapshot(), reward="success(+1)/failure(-1) - seconds/(1+seconds)"))
@@ -163,6 +167,12 @@ class Platform:
             self.store.save("harness", identity, source)
             self.analysis.cancel(source.get("analysis_id"))
             count = self.catalog.detach(identity)
+            for group in list(self.deployments.routes):
+                record = self.store.get("runtime_group", group)
+                if record and record["source_id"] == identity:
+                    # Keep the route for started physical receipts. Catalog/source
+                    # masks stop new calls, rather than killing the original owner.
+                    self.deployments.routes[group]["source_detached"] = True
         print("[SeamPact] source_detached " + identity, flush=True)
         return dict(harness_id=identity, status="DETACHED", detached_units=count,
                     history="RETAINED", started_calls="ALLOW_FINISH")
