@@ -40,8 +40,6 @@ function inspectLink(view, parameters = {}) {
   const query = new URLSearchParams({view, ...parameters});
   const link = node('a', '查看完整详情', 'detail-link');
   link.href = '/inspect?' + query;
-  link.target = '_blank';
-  link.rel = 'noopener';
   return link;
 }
 

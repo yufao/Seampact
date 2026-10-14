@@ -16,11 +16,11 @@
         <a class="rail-button chat-navigation" href="/">对话</a>
         <button id="open-configuration" class="rail-button" type="button"><span aria-hidden="true">⚙</span> 配置</button>
         <button id="open-observer" class="rail-button" type="button" aria-controls="observer" aria-expanded="false"><span aria-hidden="true">◉</span> 运行状态</button>
-        <a class="rail-button" href="/inspect?view=analyses" target="_blank" rel="noopener">来源与分析</a>
-        <a class="rail-button" href="/inspect?view=units" target="_blank" rel="noopener">能力池</a>
-        <a class="rail-button" href="/inspect?view=deployments" target="_blank" rel="noopener">运行组与部署</a>
-        <a class="rail-button" href="/inspect?view=tasks" target="_blank" rel="noopener">任务详情</a>
-        <a class="rail-button" href="/inspect?view=scheduler" target="_blank" rel="noopener">调度器</a>
+        <a class="rail-button" href="/inspect?view=analyses">来源与分析</a>
+        <a class="rail-button" href="/inspect?view=units">能力池</a>
+        <a class="rail-button" href="/inspect?view=deployments">运行组与部署</a>
+        <a class="rail-button" href="/inspect?view=tasks">任务详情</a>
+        <a class="rail-button" href="/inspect?view=scheduler">调度器</a>
       </div>
       <div class="rail-foot"><span class="connection-dot" aria-hidden="true"></span><span id="connection">正在连接</span><span id="version"></span></div>
     </aside>
@@ -47,11 +47,11 @@
       <div id="inspect-notice" class="notice" role="status" aria-live="polite" hidden></div>
       <div class="observer-scroll">
         <section class="panel-section" data-view="profile"><div class="panel-heading"><h3>入口支持范围</h3></div><div id="entry-profile-summary"></div></section>
-        <section class="panel-section" data-view="scheduler"><div class="panel-heading"><h3>调度器</h3><span id="scheduler-status" class="status-pill pending">正在读取</span><a href="/inspect?view=scheduler" target="_blank" rel="noopener">独立查看</a></div><div id="scheduler-summary" class="scheduler-summary"></div></section>
-        <section class="panel-section" data-view="tasks"><div class="panel-heading"><h3>真实任务</h3><span id="task-count" class="count-badge">0</span><a href="/inspect?view=tasks" target="_blank" rel="noopener">独立查看</a></div><div id="task-list" class="status-list"><p class="empty-note">尚无任务。</p></div></section>
-        <section class="panel-section" data-view="units"><div class="panel-heading"><h3>能力池</h3><span id="unit-count" class="count-badge">0</span><a href="/inspect?view=units" target="_blank" rel="noopener">独立查看</a></div><div id="unit-list" class="unit-list"><p class="empty-note">尚无可用的 Harness Unit。</p></div></section>
-        <section class="panel-section" data-view="deployments"><div class="panel-heading"><h3>运行组与部署</h3><a href="/inspect?view=deployments" target="_blank" rel="noopener">独立查看</a></div><div id="deployment-list" class="status-list"></div></section>
-        <section class="panel-section" data-view="analyses"><div class="panel-heading"><h3>来源与分析</h3><span id="analysis-count" class="count-badge">0</span><a href="/inspect?view=analyses" target="_blank" rel="noopener">独立查看</a></div><div id="analysis-list" class="status-list"><p class="empty-note">配置 Harness 地址后可开始分析。</p></div></section>
+        <section class="panel-section" data-view="scheduler"><div class="panel-heading"><h3>调度器</h3><span id="scheduler-status" class="status-pill pending">正在读取</span><a href="/inspect?view=scheduler">独立查看</a></div><div id="scheduler-summary" class="scheduler-summary"></div></section>
+        <section class="panel-section" data-view="tasks"><div class="panel-heading"><h3>真实任务</h3><span id="task-count" class="count-badge">0</span><a href="/inspect?view=tasks">独立查看</a></div><div id="task-list" class="status-list"><p class="empty-note">尚无任务。</p></div></section>
+        <section class="panel-section" data-view="units"><div class="panel-heading"><h3>能力池</h3><span id="unit-count" class="count-badge">0</span><a href="/inspect?view=units">独立查看</a></div><div id="unit-list" class="unit-list"><p class="empty-note">尚无可用的 Harness Unit。</p></div></section>
+        <section class="panel-section" data-view="deployments"><div class="panel-heading"><h3>运行组与部署</h3><a href="/inspect?view=deployments">独立查看</a></div><div id="deployment-list" class="status-list"></div></section>
+        <section class="panel-section" data-view="analyses"><div class="panel-heading"><h3>来源与分析</h3><span id="analysis-count" class="count-badge">0</span><a href="/inspect?view=analyses">独立查看</a></div><div id="analysis-list" class="status-list"><p class="empty-note">配置 Harness 地址后可开始分析。</p></div></section>
       </div>
     </aside>
   </div>
