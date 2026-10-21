@@ -4,6 +4,8 @@ import copy
 import hashlib
 import importlib.metadata
 import json
+import math
+import os
 import queue
 import secrets
 import sys
@@ -18,6 +20,8 @@ from .learners import Learner, default_config, learner_options
 from .scenarios import SceneSession, FrozenCatalog, arrays, freeze_scene, digest_file
 from .store import now
 from .costs import validate_costs, episode_costs, usage_record, summarize_usage
+from .capabilities import JOINT_OBSERVATION_SCHEMA, JOINT_CANDIDATE_SCHEMA
+from . import joint
 
 CANONICAL_VERSION = "seampact-json/1"
 LEARNING = {"double_dqn", "ppo", "discrete_sac"}
@@ -78,6 +82,67 @@ def compatibility(manifest):
     roles = manifest["scene"].get("model_roles", ["chat"])
     result["behavior_models"] = {role: manifest["models"][role] for role in roles}
     result["harness_resources"] = manifest.get("harness_resources")
+    for key in ("scheduling_mode", "resource_control", "runtime_contracts", "joint"):
+        result[key] = manifest.get(key)
+    return result
+
+
+def distributions():
+    return sorted({item.metadata.get("Name") + "==" + item.version
+                   for item in importlib.metadata.distributions() if item.metadata.get("Name")})
+
+
+def resource_control(value):
+    """Fixed functional-mode controller shared by every compared policy; not an RL action."""
+    value = copy.deepcopy(value or {})
+    if not isinstance(value, dict) or set(value) - {"mode", "idle_ms", "initial_state", "start_timeout_s"}:
+        raise ValueError("resource_control 仅接收 mode、idle_ms、initial_state、start_timeout_s")
+    mode = value.get("mode", "fixed_resident")
+    if mode not in {"fixed_resident", "idle_retire/1"}:
+        raise ValueError("resource_control.mode 须为 fixed_resident 或 idle_retire/1")
+    result = dict(mode=mode, initial_state=value.get("initial_state", "cold"),
+                  start_timeout_s=value.get("start_timeout_s", 900), replicas="fixed: 1 per runtime group",
+                  run_window="runtime groups start with no live instance; instances this run started are drained and stopped at its end")
+    if result["initial_state"] not in {"cold", "warm"}:
+        raise ValueError("resource_control.initial_state 须为 cold 或 warm")
+    if type(result["start_timeout_s"]) is not int or result["start_timeout_s"] < 1:
+        raise ValueError("resource_control.start_timeout_s 须为正整数")
+    if mode == "idle_retire/1":
+        idle = value.get("idle_ms")
+        if type(idle) not in (int, float) or not math.isfinite(idle) or idle <= 0:
+            raise ValueError("idle_retire/1 需要正数 idle_ms（在开发集上选定后冻结）")
+        result["idle_ms"] = idle
+    elif "idle_ms" in value:
+        raise ValueError("fixed_resident 不接收 idle_ms")
+    return result
+
+
+def feedback_protocol(value, criteria):
+    value = copy.deepcopy(value or {})
+    if not isinstance(value, dict) or set(value) - {"reward_timing", "local_weights"}:
+        raise ValueError("feedback_protocol 仅接收 reward_timing、local_weights")
+    timing = value.get("reward_timing", "sparse_terminal")
+    weights = value.get("local_weights", {})
+    if timing not in {"sparse_terminal", "event_module/1"}:
+        raise ValueError("reward_timing 须为 sparse_terminal 或 event_module/1")
+    if not isinstance(weights, dict):
+        raise ValueError("local_weights 须为模块指标 ID 到非负权重的映射")
+    dimensions = {item["id"]: item for item in criteria["dimensions"]}
+    for metric_id, weight in weights.items():
+        if (dimensions.get(metric_id) or {}).get("level") != "module":
+            raise ValueError("局部权重只能引用训练判据中的模块级指标：" + str(metric_id))
+        if type(weight) not in (int, float) or not math.isfinite(weight) or weight < 0:
+            raise ValueError("局部权重须为有限非负数：" + metric_id)
+        if weight and criteria["objective"]["weights"].get(metric_id, 0):
+            raise ValueError("该模块指标已计入终局目标；终局只结算未计入部分，请将其终局权重设为 0：" + metric_id)
+    if timing == "sparse_terminal" and any(weights.values()):
+        raise ValueError("sparse_terminal 不使用局部权重")
+    result = dict(reward_timing=timing, local_weights={key: weights[key] for key in sorted(weights)},
+                  terminal="objective.weights over episode metrics, assigned to the last transition")
+    if timing == "event_module/1":
+        result.update(local="weight * normalized module metric, once per metric per episode, assigned to the transition "
+                            "containing that Unit's last completed call; the terminal objective excludes these metrics",
+                      missing_rule="an UNKNOWN weighted module metric of a called Unit excludes the episode")
     return result
 
 
@@ -150,6 +215,7 @@ class TrainingJobs:
             pool[-1]["initialization_at_creation"] = unit.get("initialization", "UNKNOWN")
             pool[-1]["execution_at_creation"] = current[uid].get("execution", "UNKNOWN")
             pool[-1]["capability"] = current[uid].get("capability")
+            pool[-1]["placement"] = copy.deepcopy(catalog.placement[uid])
         criteria = validate_criteria(config["criteria"])
         final = validate_criteria(config["evaluation_criteria"]) if config.get("evaluation_criteria") else None
         for spec in [criteria, final]:
@@ -179,31 +245,64 @@ class TrainingJobs:
         seed = config.get("seed", 0)
         if type(seed) is not int:
             raise ValueError("seed 必须为整数")
+        scheduling = config.get("scheduling_mode", "functional/1")
+        if scheduling not in {"functional/1", joint.MODE}:
+            raise ValueError("scheduling_mode 须为 functional/1 或 joint/1")
+        if scheduling != joint.MODE and config.get("joint"):
+            raise ValueError("joint 配置只用于 scheduling_mode=joint/1")
+        dims = ((len(JOINT_OBSERVATION_SCHEMA), len(JOINT_CANDIDATE_SCHEMA)) if scheduling == joint.MODE
+                else (len(scene["observation_schema"]), len(scene["candidate_schema"])))
         if algorithm in LEARNING:
             resolved = default_config(algorithm)
             unknown = set(parameters) - set(resolved)
             if unknown:
                 raise ValueError("未知学习器参数：" + ", ".join(sorted(unknown)))
+            if scheduling == joint.MODE and "gamma" in resolved and "gamma" not in parameters:
+                # Window returns are undiscounted sums of quality and interval costs.
+                resolved["gamma"] = 1.0
             resolved.update(parameters)
             # The learner performs its own numeric/device validation before any
             # member of a comparison enters the execution queue.
-            parameters = Learner(algorithm, len(scene["observation_schema"]),
-                                 len(scene["candidate_schema"]), resolved, seed).config
+            parameters = Learner(algorithm, dims[0], dims[1], resolved, seed).config
         manifest = dict(canonical_version=CANONICAL_VERSION, method="SeamPact", implementation="native-event/1",
             algorithm=algorithm, parameters=parameters, seed=seed,
             mode=config.get("mode", "train"), parent_run_id=config.get("parent_run_id"), episodes=episodes,
             task_ids=task_ids, split=config.get("split", "development"), scene=scene, pool=pool,
-            observation_dim=len(scene["observation_schema"]), candidate_dim=len(scene["candidate_schema"]),
+            observation_dim=dims[0], candidate_dim=dims[1],
             criteria=criteria, evaluation_criteria=final, models=bound.public(), role_resources=bound.resources(),
             harness_resources=catalog.snapshot_resources(), lower_policy="FIFO",
-            reward_timing="sparse_terminal", missing_rule="exclude_incomplete_episode_keep_budget",
+            missing_rule="exclude_incomplete_episode_keep_budget",
             costs=validate_costs(config.get("costs")),
             upstream_costs=config.get("upstream_costs", {}))
+        protocol = feedback_protocol(config.get("feedback_protocol"), criteria)
+        contracts = {}
+        for group_id, placement in catalog.remote_groups().items():
+            group = self.store.get("runtime_group", group_id)
+            contracts[group_id] = dict(contract=group["contract"]["schema"], digest=group["contract"]["digest"],
+                host_profile=group["contract"]["host_profile"], replicas=group["contract"]["replicas"],
+                operations={name: item["status"] for name, item in group["contract"]["operations"].items()},
+                image=placement["image"], image_id=placement["image_id"], binding_fingerprint=placement["binding_fingerprint"])
+        if scheduling == joint.MODE:
+            manifest.update(runtime_contracts=contracts, **joint.configure(config, scene=scene, tasks=scene["tasks"],
+                task_ids=task_ids, algorithm=algorithm, criteria=criteria, contracts=contracts,
+                groups=catalog.remote_groups(), deployments=self.platform.deployments, learning=LEARNING,
+                references=REFERENCES, mode=manifest["mode"]))
+        else:
+            manifest.update(scheduling_mode="functional/1", resource_control=resource_control(config.get("resource_control")),
+                feedback_protocol=protocol, reward_timing=protocol["reward_timing"], runtime_contracts=contracts,
+                cost_window=dict(task="each task ledger charges its own measured calls, transport and start waits",
+                                 run="instance residency/idle over the run window is reported unallocated (UNALLOCATED_WINDOW_TOTAL)",
+                                 allocation="NONE"))
+        if manifest["resource_control"]["mode"] == "idle_retire/1":
+            native = [identity for identity in contracts if not self.platform.deployments._idle_rebuild_allowed(
+                self.store.get("runtime_group", identity))]
+            if native:
+                raise ValueError("原生有状态运行组须使用 fixed_resident；尚无任务/owner 结束及可重建契约：" + ", ".join(native))
         implementation = Path(__file__).parent
         manifest["implementation_files"] = [dict(path=name, sha256=digest_file(implementation / name))
             for name in ("training.py", "learners.py", "scenarios.py", "evaluation.py", "providers.py",
                          "scheduler.py", "units.py", "runtime.py", "composition.py", "capabilities.py", "costs.py",
-                         "dependencies.py", "resources.py")]
+                         "dependencies.py", "resources.py", "deployment.py", "worker.py", "backends.py", "joint.py")]
         # Keep the actual code bytes for this uncommitted research workspace.
         # Histories remain interpretable after a later authorized source edit.
         archive = self.directory.parent / "source-archive"
@@ -225,7 +324,13 @@ class TrainingJobs:
                 versions[package] = importlib.metadata.version(package)
             except importlib.metadata.PackageNotFoundError:
                 versions[package] = None
-        manifest["runtime_versions"] = dict(python=sys.version, packages=versions)
+        installed = distributions()
+        lock = os.environ.get("SEAMPACT_RUNTIME_LOCK")
+        manifest["runtime_versions"] = dict(python=sys.version, packages=versions,
+            distributions=dict(count=len(installed), sha256=hashlib.sha256("\n".join(installed).encode()).hexdigest(),
+                               file="environment.txt"),
+            platform_revision=os.environ.get("SEAMPACT_REVISION") or "UNKNOWN",
+            runtime_lock=dict(sha256=digest_file(lock)) if lock and Path(lock).is_file() else "NOT_DECLARED")
         if manifest["mode"] in {"warmstart", "freeze", "rejudge"} and algorithm in LEARNING:
             parent_id = manifest.get("parent_run_id")
             if not parent_id:
@@ -261,7 +366,7 @@ class TrainingJobs:
                 overrides = config.get("algorithm_parameters", {}).get(algorithm, {})
                 cfg["parameters"] = dict(config.get("parameters", {}), **overrides)
                 bound = BoundProfiles(self.platform.profiles)
-                catalog = FrozenCatalog(self.platform.catalog, cfg["scene"].get("unit_ids", []))
+                catalog = FrozenCatalog(self.platform.catalog, cfg["scene"].get("unit_ids", []), cfg.get("placement"))
                 manifest = self._manifest(cfg, bound, catalog)
                 prepared.append((manifest, bound, catalog))
             for manifest, bound, catalog in prepared:
@@ -276,6 +381,10 @@ class TrainingJobs:
                     except FileExistsError:
                         continue
                 (folder / "manifest.json").write_text(canonical(manifest), encoding="utf-8")
+                installed = "\n".join(distributions())
+                if hashlib.sha256(installed.encode()).hexdigest() != manifest["runtime_versions"]["distributions"]["sha256"]:
+                    raise ValueError("创建运行期间平台运行环境已改变，请重新提交")
+                (folder / "environment.txt").write_text(installed + "\n", encoding="utf-8")
                 run = dict(id=rid, run_id=rid, config_digest=digest(manifest), algorithm=manifest["algorithm"],
                     mode=manifest["mode"], split=manifest["split"], seed=manifest["seed"],
                     scene_id=manifest["scene"]["id"], source_ids=[p["source_id"] for p in manifest["pool"]],
@@ -335,6 +444,10 @@ class TrainingJobs:
             for key in ("version", "scales"):
                 if manifest["scene"].get("representation", {}).get(key) != previous["scene"].get("representation", {}).get(key):
                     raise ValueError("共同特征版本或尺度已变化，不能直接载入原参数")
+            if (manifest.get("scheduling_mode", "functional/1") != previous.get("scheduling_mode", "functional/1")
+                    or (manifest.get("joint") or {}).get("representation") != (previous.get("joint") or {}).get("representation")
+                    or (manifest.get("joint") or {}).get("learned") != (previous.get("joint") or {}).get("learned")):
+                raise ValueError("调度模式、联合特征或交给学习器的决策类型已变化，不能直接载入原参数")
             if parent["config_digest"] != manifest.get("parent_config_digest"):
                 raise ValueError("父运行清单与本次冻结身份不符")
             artifact = manifest.get("parent_checkpoint")
@@ -355,8 +468,55 @@ class TrainingJobs:
                 return dict(index=index)
         raise ValueError("参照动作不在本次合法候选内")
 
+    @staticmethod
+    def _module_feedback(transitions, calls, feedback, final_event):
+        """Per-call module feedback: completion, activation, state change and evidence references."""
+        metrics = [item for item in feedback["metrics"] if item.get("level") == "module"]
+        records = []
+        for index, stored in enumerate(transitions):
+            event = stored["event"]
+            candidate = event["candidates"][stored["decision"]["index"]]
+            following = transitions[index + 1]["event"] if index + 1 < len(transitions) else final_event
+            for position in range(*stored["call_span"]):
+                call = calls[position]
+                related = [item for item in metrics if item["unit_id"] == call["unit_id"]]
+                records.append(dict(transition=index, call_index=position, unit_id=call["unit_id"],
+                    call_completed=call["status"] == "RETURN",
+                    function_completed=[dict(metric_id=item["id"], status=item["status"], value=item["value"],
+                                             scope="episode-level module metric") for item in related] or "NO_MODULE_METRIC",
+                    activation=dict(candidate_id=candidate["id"], action_type=candidate.get("action_type"),
+                                    required=call["unit_id"] in event.get("required_units", [])),
+                    state_change=dict(before=event.get("scene_observation"),
+                                      after=following.get("scene_observation") if (following or {}).get("kind") == "decision"
+                                      else "TERMINAL"),
+                    evidence_refs=sorted({str(ref) for item in related for ref in item.get("evidence", [])}),
+                    execution=call.get("execution", "LOCAL"), instance_id=call.get("instance_id")))
+        return records
+
+    @staticmethod
+    def _local_rewards(protocol, transitions, calls, feedback):
+        """event_module/1: once per weighted module metric, at the Unit's last completed call."""
+        if protocol["reward_timing"] != "event_module/1":
+            return [], []
+        metrics = {item["id"]: item for item in feedback["metrics"]}
+        rewards, missing = [], []
+        for metric_id, weight in protocol["local_weights"].items():
+            metric = metrics[metric_id]
+            positions = [index for index, stored in enumerate(transitions)
+                         if any(calls[position]["unit_id"] == metric["unit_id"] and calls[position]["status"] == "RETURN"
+                                for position in range(*stored["call_span"]))]
+            if not weight or not positions or metric["status"] == "NOT_APPLICABLE":
+                continue
+            if metric["status"] != "KNOWN":
+                missing.append(metric_id)
+                continue
+            value = weight * metric["normalized"] * (1 if metric["direction"] == "maximize" else -1)
+            rewards.append(dict(metric_id=metric_id, unit_id=metric["unit_id"], transition=positions[-1], reward=value))
+        return rewards, missing
+
     def _episode(self, manifest, session, task, learner, number):
         started = time.perf_counter()
+        window = time.time()
         transitions = []
         event, execution_error = None, None
         try:
@@ -373,8 +533,12 @@ class TrainingJobs:
                     next_state=None, next_candidates=[], next_legal=[])
                 # Retain the actual selected action even if native continuation
                 # raises after a paid model or Unit invocation.
-                transitions.append(dict(event=old, decision=decision, transition=transition))
-                event = session.step(decision["index"])
+                transitions.append(dict(event=old, decision=decision, transition=transition,
+                                        call_span=[len(session.context.calls), len(session.context.calls)]))
+                try:
+                    event = session.step(decision["index"])
+                finally:
+                    transitions[-1]["call_span"][1] = len(session.context.calls)
                 transition.update(terminated=event["kind"] == "terminal" and event["terminated"],
                                   truncated=event["kind"] == "terminal" and event["truncated"])
                 following = event if event["kind"] == "decision" else event.get("bootstrap_decision")
@@ -402,11 +566,25 @@ class TrainingJobs:
         independent = evaluate(session.context.profiles, final_criterion, evidence,
                                final_program) if final_criterion else None
         eligible = feedback["eligible"] and not event["truncated"] and bool(transitions) and not execution_error
+        exclusion = None if eligible else ("execution_error" if execution_error else "no_transitions" if not transitions
+            else "truncated" if event["truncated"] else "feedback_unknown:" + ",".join(feedback["unknowns"]))
+        protocol = manifest.get("feedback_protocol") or dict(reward_timing="sparse_terminal", local_weights={})
+        local, missing = self._local_rewards(protocol, transitions, session.context.calls, feedback)
+        if eligible and missing:
+            eligible, exclusion = False, "local_feedback_unknown:" + ",".join(missing)
         if transitions:
             transitions[-1]["transition"]["reward"] = feedback["reward"]
-        costs = episode_costs(session.context, manifest, milliseconds, transitions, feedback, independent)
+            if eligible:
+                for item in local:
+                    transitions[item["transition"]]["transition"]["reward"] += item["reward"]
+        groups = {call["group_id"] for call in session.context.calls if call.get("execution") == "REMOTE"}
+        events = self.platform.deployments.events_between(groups, window, time.time()) if groups else None
+        costs = episode_costs(session.context, manifest, milliseconds, transitions, feedback, independent, events)
         return dict(task_id=task["id"], episode=number, terminated=event["terminated"], truncated=event["truncated"],
-            costs=costs,
+            costs=costs, exclusion_reason=exclusion,
+            module_feedback=self._module_feedback(transitions, session.context.calls, feedback, event),
+            reward_components=dict(timing=protocol["reward_timing"], terminal=feedback["reward"],
+                                   local=local if eligible else [], local_unknown=missing),
             transitions=transitions, evidence=evidence, program_metrics=program,
             evaluation_metrics=event.get("evaluation_metrics", {}), feedback=feedback,
             independent_feedback=independent, eligible=eligible, calls=copy.deepcopy(session.context.calls),
@@ -424,6 +602,8 @@ class TrainingJobs:
             raise ValueError("PPO 必须采集当前策略 rollout，不能重放重评后的旧经历")
         if compatibility(manifest) != compatibility(parent["manifest"]):
             raise ValueError("重评仅适用于环境、池、模型、候选和参数均不变的判据变更")
+        if any(value.get("reward_timing", "sparse_terminal") != "sparse_terminal" for value in (manifest, parent["manifest"])):
+            raise ValueError("event_module/1 局部奖励的旧经历重评未定义；请采集新经历")
         roles = manifest["scene"].get("model_roles", ["chat"])
         if any(manifest["models"][role].get("service_version") in {None, "", "UNKNOWN"} for role in roles):
             raise ValueError("模型服务版本未知，不能自动认定旧转移兼容；请参数热启动并采集新经历")
@@ -487,6 +667,96 @@ class TrainingJobs:
             used += 1
             yield item
 
+    def _open_window(self, rid, manifest, catalog, window):
+        """Fixed run-start state for runtime groups, so compared policies share one initial condition."""
+        deployments, control = self.platform.deployments, manifest["resource_control"]
+        catalog.bind_run(rid, control)
+        deployments.lock_groups(rid, window["groups"], control)
+        window["start"] = time.time()
+        for group_id, placement in window["groups"].items():
+            contract = manifest["runtime_contracts"][group_id]
+            current = self.store.get("runtime_group", group_id) or {}
+            if (current.get("contract") or {}).get("digest") != contract["digest"]:
+                raise ValueError("运行组契约在提交后已变化：" + group_id)
+            if deployments.live_instances(group_id):
+                raise ValueError("固定初始状态要求运行开始时该运行组没有存活实例；请先排空停止：" + group_id)
+            if control["initial_state"] == "warm" and control["mode"] != joint.MODE:
+                required = [uid for uid, value in catalog.placement.items() if value.get("group_id") == group_id]
+                unit_id = required[0]
+                started = time.perf_counter()
+                record = deployments.ensure_ready(placement, unit_id)
+                setup = dict(instance_id=record["id"], start_to_ready_ms=(time.perf_counter() - started) * 1000,
+                             process_ready=record["state"] == "READY", initialization_ready=False, required_units=required)
+                window["setup"][group_id] = setup
+                missing = sorted(set(required) - set(record["units"]))
+                rules = current["contract"]["prepare"]
+                unsupported = [uid for uid in required if rules.get((catalog.unit(uid) or {}).get("entry_id"), {}).get("status") != "SUPPORTED"]
+                if missing or unsupported:
+                    setup.update(status="FAILED", missing_units=missing, preparation_unsupported=unsupported)
+                    raise ValueError("暖态准备要求全部所需成员可用且契约允许提前初始化：" + group_id)
+                started = time.perf_counter()
+                setup["prewarm"] = deployments.prewarm(group_id, dict(instance_id=record["id"], units=required), run_id=rid)
+                setup["prewarm_ms"] = (time.perf_counter() - started) * 1000
+                setup["initialization_ready"] = setup["prewarm"].get("initialization_ready") is True
+                setup["status"] = "PREPARED" if setup["initialization_ready"] else "FAILED"
+                if not setup["initialization_ready"]:
+                    raise ValueError("所需成员预热未成功；不进入暖态任务阶段：" + group_id)
+
+    def _close_window(self, rid, window):
+        deployments, released = self.platform.deployments, {}
+        for group_id in window["groups"]:
+            try:
+                released[group_id] = deployments.release_run(group_id, rid)
+            except Exception as error:
+                released[group_id] = dict(error=str(error))
+        result = dict(setup=window["setup"], release=released,
+                      setup_scope="warm initial state is run preparation; it is not charged to any task",
+                      residency=deployments.residency(set(window["groups"]), window["start"], time.time())
+                      if window.get("start") else None)
+        with deployments.lock:
+            result["environment_changes"] = deployments.environment_changes.pop(rid, [])
+        deployments.unlock(rid)
+        return result
+
+    @staticmethod
+    def _diagnose(run, item, tasks):
+        """Training diagnostics: action use, exploration, sample coverage, feedback coverage and exclusion bias."""
+        value = run.setdefault("diagnostics", dict(decisions=0, explored=0, actions={}, by_difficulty={},
+            eligible_selected_actions={}, excluded=dict(episodes=0, reasons={}, selected_actions={}),
+            explored_meaning="training choice differs from the greedy (frozen-policy) choice of the same scores"))
+        selected = []
+        for stored in item.get("transitions", []):
+            event, decision = stored["event"], stored["decision"]
+            for candidate in event["candidates"]:
+                row = value["actions"].setdefault(candidate["id"], dict(legal=0, semantic_only=0, selected=0,
+                    explored=0, learning_samples=0, module_feedback={}))
+                row["legal"] += candidate["legal"]
+                row["semantic_only"] += bool(candidate.get("semantic_legal", candidate["legal"]) and not candidate["legal"])
+            candidate = event["candidates"][decision["index"]]
+            row = value["actions"][candidate["id"]]
+            row["selected"] += 1
+            value["decisions"] += 1
+            if (decision.get("diagnostics") or {}).get("explored"):
+                row["explored"] += 1
+                value["explored"] += 1
+            row["learning_samples"] += bool(item["eligible"])
+            selected.append(candidate["id"])
+        for record in item.get("module_feedback", []):
+            row = value["actions"].get(record["activation"]["candidate_id"])
+            for metric in record["function_completed"] if isinstance(record["function_completed"], list) else []:
+                row["module_feedback"][metric["status"]] = row["module_feedback"].get(metric["status"], 0) + 1
+        bucket = value["by_difficulty"].setdefault(str(tasks.get(item["task_id"], {}).get("difficulty", "UNDECLARED")),
+                                                   dict(episodes=0, eligible=0))
+        bucket["episodes"] += 1
+        bucket["eligible"] += bool(item["eligible"])
+        target = value["eligible_selected_actions"] if item["eligible"] else value["excluded"]["selected_actions"]
+        for action in selected:
+            target[action] = target.get(action, 0) + 1
+        if not item["eligible"]:
+            value["excluded"]["episodes"] += 1
+            reason = (item.get("exclusion_reason") or "UNRECORDED").split(":")[0]
+            value["excluded"]["reasons"][reason] = value["excluded"]["reasons"].get(reason, 0) + 1
+
     def _worker(self):
         while not self.closed:
             rid = self.pending.get()
@@ -497,7 +767,8 @@ class TrainingJobs:
     def _run(self, rid):
         run = self.store.get("scheduler_run", rid)
         folder = self.directory / rid
-        session = learner = None
+        session = learner = window = None
+        seen_changes = 0
         rewards, totals = [], defaultdict(list)
         counts = defaultdict(lambda: defaultdict(int))
         definitions = {}
@@ -518,12 +789,20 @@ class TrainingJobs:
             if manifest["mode"] == "rejudge":
                 histories = self._rejudge(manifest, bound)
             else:
-                started = time.perf_counter()
-                session = SceneSession(manifest["scene"], self.platform, rid, profiles=bound, catalog=catalog)
-                run["initialization_ms"] = (time.perf_counter() - started) * 1000
-                histories = (self._episode(manifest, session,
-                    tasks[manifest["task_ids"][i % len(manifest["task_ids"])]], learner, i)
-                    for i in range(manifest["episodes"]))
+                if catalog.remote_groups():
+                    window = dict(groups=catalog.remote_groups(), setup={}, start=None)
+                    self._open_window(rid, manifest, catalog, window)
+                if manifest.get("scheduling_mode") == joint.MODE:
+                    # Windows record history, curves and learning themselves.
+                    joint.run_windows(self, rid, run, folder, manifest, catalog, bound, learner)
+                    histories = ()
+                else:
+                    started = time.perf_counter()
+                    session = SceneSession(manifest["scene"], self.platform, rid, profiles=bound, catalog=catalog)
+                    run["initialization_ms"] = (time.perf_counter() - started) * 1000
+                    histories = (self._episode(manifest, session,
+                        tasks[manifest["task_ids"][i % len(manifest["task_ids"])]], learner, i)
+                        for i in range(manifest["episodes"]))
             histories = iter(histories)
             while not self.stops[rid].is_set() and not self.closed:
                 try:
@@ -531,6 +810,14 @@ class TrainingJobs:
                 except StopIteration:
                     break
                 # Stop only between complete tasks; never discard a paid result.
+                if window is not None:
+                    with self.platform.deployments.lock:
+                        changes = list(self.platform.deployments.environment_changes.get(rid, []))
+                    if len(changes) > seen_changes:
+                        item["environment_changes"], seen_changes = changes[seen_changes:], len(changes)
+                        if item["eligible"]:
+                            item.update(eligible=False, exclusion_reason="runtime_environment_changed")
+                self._diagnose(run, item, tasks)
                 self._append(folder, "history", item)
                 run["episodes"] += 1
                 if not item.get("rejudged_from"):
@@ -598,6 +885,8 @@ class TrainingJobs:
                 self.store.save("scheduler_run", rid, run)
                 if item.get("execution_error"):
                     raise ValueError("任务执行中断，已保留实际调用和费用材料：" + item["execution_error"]["message"])
+                if item.get("environment_changes"):
+                    raise ValueError("运行组执行条件在运行中改变（实例失联、进程替换或响应未取得），已保留本任务材料并中断运行")
                 if self.stops[rid].is_set() or self.closed:
                     break
             if learner and manifest["mode"] != "freeze" and learner.steps:
@@ -622,6 +911,8 @@ class TrainingJobs:
                     session.close()
                 except Exception as error:
                     run.update(status="FAILED", error=(run.get("error") or "") + " 场景关闭失败：" + str(error))
+            if window is not None:
+                run["runtime_window"] = self._close_window(rid, window)
             run["ended_at"] = now()
             if run.get("costs") is not None:
                 run["costs"].update(scene_initialization_ms=run.get("initialization_ms"),
@@ -637,6 +928,8 @@ class TrainingJobs:
         if (run["status"] != "COMPLETED" or not run.get("checkpoint")
                 or not run["eligible_episodes"] or not run.get("updates")):
             raise ValueError("需要已完成且实际更新过参数的策略工件")
+        if run["manifest"].get("scheduling_mode") == joint.MODE:
+            raise ValueError("joint/1 策略作用于多任务工作负载窗口；单个场景对话没有派发与资源事件，不能激活")
         if digest_file(run["checkpoint"]["path"]) != run["checkpoint"]["artifact_digest"]:
             raise ValueError("策略工件内容身份不符")
         self.active = dict(run_id=rid, checkpoint=run["checkpoint"], scene_id=run["manifest"]["scene"]["id"],
@@ -667,10 +960,15 @@ class TrainingJobs:
                 if current[role] != manifest["models"][role]:
                     raise ValueError("业务模型绑定已改变；请按新条件运行冻结评价或适应")
                 bound.role_key(role)
-            catalog = FrozenCatalog(self.platform.catalog, manifest["scene"].get("unit_ids", []))
+            catalog = FrozenCatalog(self.platform.catalog, manifest["scene"].get("unit_ids", []),
+                {item["id"]: item["placement"]["kind"] for item in manifest["pool"] if item.get("placement")})
             resources = catalog.snapshot_resources()
             if manifest.get("harness_resources") is not None and resources != manifest["harness_resources"]:
                 raise ValueError("Harness 资源配置已改变；请按新条件运行冻结评价或适应")
+            for item in manifest["pool"]:
+                if item.get("placement", {}).get("kind") == "REMOTE" and \
+                        catalog.placement[item["id"]]["contract_digest"] != item["placement"]["contract_digest"]:
+                    raise ValueError("运行组契约已改变；请按新条件运行冻结评价或适应")
             manifest.update(mode="freeze", parent_run_id=source["id"],
                 parent_checkpoint=copy.deepcopy(active["checkpoint"]), parent_config_digest=source["config_digest"],
                 harness_resources=resources, role_resources=bound.resources())
@@ -678,6 +976,7 @@ class TrainingJobs:
                 tid = identity()
                 if not self.store.get("task", tid):
                     break
+            catalog.bind_run(tid, manifest.get("resource_control") or resource_control(None))
             task = dict(id=tid, status="RUNNING", started_at=now(), response=None, error=None,
                 calls=[], model_calls=0, usage=[], latency_ms=None, phase="scene_policy",
                 scene_id=manifest["scene"]["id"], scene_task_id=selected["id"],

@@ -120,6 +120,15 @@ button, input, select, textarea { -webkit-tap-highlight-color: transparent; }
 .operation-states { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 8px; }
 .operation-list { margin-top: 9px; padding-top: 7px; border-top: 1px solid var(--line); }
 .operation-row { display: flex; justify-content: space-between; align-items: center; gap: 8px; margin-top: 5px; color: #637168; font-size: 10px; }
+.operation-item { margin-top: 8px; padding: 8px; border: 1px solid #edf0ed; border-radius: 6px; }
+.operation-item > strong { font-size: 11px; font-weight: 600; }
+#deployment-list .model-form { margin-top: 10px; }
+#deployment-list label { display: block; margin: 8px 0; color: #627166; font-size: 11px; }
+#deployment-list input:not([type="checkbox"]), #deployment-list textarea { display: block; width: 100%; min-width: 0; margin-top: 5px; padding: 8px 9px; border: 1px solid #dce2dd; border-radius: 6px; background: #fcfdfc; color: var(--ink); font-size: 12px; }
+#deployment-list .model-actions { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; }
+#deployment-list .model-actions .secondary-button { padding: 6px 10px; font-size: 11px; }
+#deployment-list .secondary-button:disabled { opacity: .5; cursor: not-allowed; }
+#deployment-list .checkbox-label { display: flex; align-items: center; gap: 6px; font-size: 10px; }
 .plan-edges { margin-top: 9px; padding: 8px; background: #f6f8f6; border-radius: 6px; }
 .plan-edges strong { display: block; margin-top: 5px; color: #637168; font-size: 10px; font-weight: 600; }
 .edge-row { margin-top: 4px; font: 10px/1.8 Consolas, "Microsoft YaHei", monospace; color: #576b5e; overflow-wrap: anywhere; }

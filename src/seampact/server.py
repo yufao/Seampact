@@ -109,8 +109,32 @@ def make_server(platform, port=8880, host="127.0.0.1", public_port=None):
                     result = platform.training.stop(body["run_id"])
                 elif path == "/api/scheduler/activate":
                     result = platform.training.activate(body["run_id"])
+                elif path == "/api/analysis/export":
+                    result = platform.export_analysis(body["analysis_id"])
+                elif path == "/api/analysis/import":
+                    result = platform.import_analysis(body)
+                elif path == "/api/deployments/backend":
+                    result = platform.deployments.configure_backend(body)
                 elif path == "/api/deployments/export":
                     result = platform.deployments.export(body["group_id"], body)
+                elif path == "/api/deployments/build":
+                    result = platform.deployments.build(body["group_id"], body)
+                elif path == "/api/deployments/publish":
+                    result = platform.deployments.publish(body["group_id"], body)
+                elif path == "/api/deployments/start":
+                    result = platform.deployments.start(body["group_id"], body)
+                elif path == "/api/deployments/prewarm":
+                    result = platform.deployments.prewarm(body["group_id"], body)
+                elif path == "/api/deployments/pause":
+                    result = platform.deployments.pause(body["group_id"], body)
+                elif path == "/api/deployments/drain-stop":
+                    result = platform.deployments.drain_stop(body["group_id"], body)
+                elif path == "/api/deployments/add-replica":
+                    result = platform.deployments.add_replica(body["group_id"], body)
+                elif path == "/api/deployments/remove-replica":
+                    result = platform.deployments.remove_replica(body["group_id"], body)
+                elif path == "/api/deployments/status":
+                    result = platform.deployments.status(body["group_id"])
                 elif path == "/api/workers/attach":
                     result = platform.deployments.attach(body["endpoint"])
                 elif path == "/api/deployments/local":

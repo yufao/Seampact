@@ -368,6 +368,8 @@ class NativeBindings:
         self.lock = threading.RLock()
         self.detached = False
         self.active_calls = 0
+        # Set only while describing an entry for a separately declared host.
+        self.environment_gaps = None
         for path in self.inspector.files:
             if not path.endswith(".py"):
                 continue
@@ -406,7 +408,7 @@ class NativeBindings:
                 self.patches[key], self.recipes[boundary["id"]] = lowered["source"], lowered["recipe"]
 
     def _dependencies(self, path, unit):
-        missing = []
+        missing, installed = [], []
         queue, visited = [(path, unit)], set()
         while queue:
             current, current_unit = queue.pop()
@@ -442,9 +444,16 @@ class NativeBindings:
                 except (ImportError, ValueError, ModuleNotFoundError):
                     available = False
                 if not available:
-                    missing.append("native dependency is not installed: " + top)
+                    installed.append("native dependency is not installed in this execution environment: " + top)
         if missing:
             raise MissingBinding("; ".join(dict.fromkeys(missing)))
+        if installed:
+            self._environment("; ".join(dict.fromkeys(installed)))
+
+    def _environment(self, message):
+        if self.environment_gaps is None:
+            raise MissingBinding(message)
+        self.environment_gaps.append(message)
 
     def _resource_check(self, entry, selected):
         declared = list(entry.get("resources", []))
@@ -460,7 +469,7 @@ class NativeBindings:
             if not location.is_absolute():
                 location = self.inspector.root / location
             if not location.exists():
-                raise MissingBinding("native resource is missing: " + path)
+                self._environment("native resource is missing in this execution environment: " + path)
 
     def _fixed_values(self, entry, node, values, location, receiver=False, call_literals=None, allow_resources=False):
         """Check value origin at this parameter anchor, not string occurrence."""
@@ -1179,8 +1188,8 @@ class NativeBindings:
                 raise MissingBinding("native controller-to-boundary binding is not statically identified: " + boundary["id"])
             if boundary.get("rule") == "inplace-callsite/1":
                 if sys.version_info[:2] != (3, 11):
-                    raise MissingBinding("R-INPLACE finite native profile requires Python 3.11; current interpreter is " +
-                                         str(sys.version_info.major) + "." + str(sys.version_info.minor))
+                    self._environment("R-INPLACE finite native profile requires Python 3.11; current interpreter is " +
+                                      str(sys.version_info.major) + "." + str(sys.version_info.minor))
                 profile = self.inspector.request.get("entry_profile") or {}
                 if not (profile.get("confirmed") is True and profile.get("frame_observation_excluded") is True
                         and profile.get("explicit_lifetime") is True):
@@ -1660,7 +1669,23 @@ class NativeBindings:
             finally:
                 self.active_owner.reset(active)
 
+    def prepare(self, entry, unit):
+        """Run the original owner construction/module import early; never the entry call."""
+        if entry.get("binding_program") is not None or entry["kind"] == "cli":
+            raise MissingBinding("request-scoped construction or per-call process cannot be prepared ahead of a request")
+        async def load():
+            with self._context():
+                before = self.initialization_state(entry, unit)
+                started = time.perf_counter()
+                await self._load(entry, unit)
+                return dict(initialization_before=before, initialization_after=self.initialization_state(entry, unit),
+                            duration_ms=(time.perf_counter() - started) * 1000)
+        return self._run(load())
+
     def invoke(self, entry, unit, arguments):
+        return self._run(self._invoke(entry, unit, arguments))
+
+    def _run(self, coroutine):
         with self.lock:
             if self.loop is None:
                 self.loop = asyncio.new_event_loop()
@@ -1671,7 +1696,7 @@ class NativeBindings:
                 self.thread.start()
             self.active_calls += 1
             try:
-                return asyncio.run_coroutine_threadsafe(self._invoke(entry, unit, arguments), self.loop).result()
+                return asyncio.run_coroutine_threadsafe(coroutine, self.loop).result()
             except Exception as error:
                 message = self.redact(error)
                 if message != str(error):
@@ -1685,9 +1710,12 @@ class UnitCatalog:
     def __init__(self, home, store, runtime):
         self.home, self.store, self.runtime = Path(home), store, runtime
         self.bindings, self.entry_specs = {}, {}
+        # Structurally checked entries whose package/file/credential facts belong to a group host.
+        self.deferred = {}
         self.lock = threading.RLock()
         self.remote_router = None
         self.resource_registry = None
+        self.host_check = None
 
     def install(self, inspector, candidate, analysis_id, installation_id=None):
         with self.lock:
@@ -1699,7 +1727,7 @@ class UnitCatalog:
             for unit in self.store.list("unit"):
                 if unit.get("source_id") != source_id:
                     continue
-                binding = self.bindings.get(unit["id"])
+                binding = self.bindings.get(unit["id"]) or (self.deferred.get(unit["id"]) or (None,))[0]
                 if binding:
                     binding.detached = True
                 if unit.get("status") in {"SUPERSEDED", "DETACHED"}:
@@ -1724,6 +1752,8 @@ class UnitCatalog:
         normalized = dict(candidate, boundaries=candidate.get("boundaries", []))
         try:
             resources = DependencyBindings(self.resource_registry, inspector, normalized) if self.resource_registry is not None else None
+            if resources is not None:
+                resources.host_check = self.host_check
             binding, binding_error = NativeBindings(inspector, normalized, self.runtime, resource_binding=resources), None
         except (ValueError, KeyError, TypeError, SyntaxError) as error:
             binding, binding_error = None, str(error)
@@ -1749,7 +1779,16 @@ class UnitCatalog:
             for required in ("path", "symbol", "kind"):
                 if not isinstance(entry.get(required), str) or not entry[required]:
                     raise MissingBinding("native entry field is missing: " + required)
-            parameters, omitted = binding.describe(entry)
+            gaps = []
+            binding.environment_gaps = gaps
+            if binding.resource_binding is not None:
+                binding.resource_binding.environment_gaps = gaps
+            try:
+                parameters, omitted = binding.describe(entry)
+            finally:
+                binding.environment_gaps = None
+                if binding.resource_binding is not None:
+                    binding.resource_binding.environment_gaps = None
             _, result_schema = binding.entry_ports(entry)
             construction = binding.programs.get(entry.get("id"))
             result.update(status="READY", parameters=parameters, input_schema=parameters,
@@ -1762,6 +1801,11 @@ class UnitCatalog:
                           effective_binding=binding.effective_bindings.get(entry.get("id"), "cli"),
                           operations={"export_entry": {"status": "SOURCE_BOUND", "formal_proof": False,
                                        "scope": "user-confirmed prototype native binding; semantic export obligations remain conditional"}})
+            if gaps:
+                gaps = list(dict.fromkeys(gaps))
+                result.update(status="MISSING", reason="; ".join(gaps), host_condition=dict(
+                    status="ENVIRONMENT_DEFERRED", gaps=gaps,
+                    scope="source, interface and construction rules passed; these execution-environment facts are re-checked by the runtime-group host"))
         except (ValueError, KeyError, TypeError, SyntaxError, OSError) as error:
             reason = binding.redact(error) if binding is not None else str(error)
             result["reason"] = reason
@@ -1796,8 +1840,9 @@ class UnitCatalog:
             checked = self._inspect_entry(binding, binding_error, entry, identity, duplicates, seen)
             row = dict(index=index, entry_id=identity, entry=entry, check=checked)
             rows.append(row)
-            if checked["status"] == "READY":
+            if checked["status"] == "READY" or checked.get("host_condition"):
                 groups.setdefault(binding._owner_key(entry), []).append(row)
+        checked = lambda row: row["check"]["status"] == "READY" or row["check"].get("host_condition")
         for group in groups.values():
             versions = {}
             for row in group:
@@ -1807,9 +1852,10 @@ class UnitCatalog:
                 cuts = {tuple(sorted(row["entry"].get("boundary_ids", []))) for row in alternatives}
                 if len(cuts) > 1:
                     for row in alternatives:
+                        row["check"].pop("host_condition", None)
                         row["check"].update(status="MISSING",
                             reason="different granularities of one native entry require separate alternative bindings")
-            group = [row for row in group if row["check"]["status"] == "READY"]
+            group = [row for row in group if checked(row)]
             selected_ids = list(dict.fromkeys(identity for row in group for identity in row["entry"].get("boundary_ids", [])))
             selected = [binding.boundaries[identity] for identity in selected_ids]
             try:
@@ -1817,6 +1863,7 @@ class UnitCatalog:
                     binding.check_nested(row["entry"], selected)
             except (ValueError, KeyError, TypeError, SyntaxError) as error:
                 for row in group:
+                    row["check"].pop("host_condition", None)
                     row["check"].update(status="MISSING", reason=str(error))
         return binding, duplicates, rows
 
@@ -1847,6 +1894,8 @@ class UnitCatalog:
             if checked["status"] == "READY":
                 self.bindings[identity], self.entry_specs[identity] = binding, entry
                 binding.approved_entries[identity] = entry
+            elif checked.get("host_condition"):
+                self.deferred[identity] = (binding, entry)
             self.store.save("unit", identity, unit, "unit_installed")
             result.append(unit)
         if binding is not None:
@@ -1870,6 +1919,7 @@ class UnitCatalog:
                     continue
                 unit["runtime_group"] = group["id"]
                 unit["operations"]["remote"] = group["remote_conditions"][unit["entry_id"]]
+                unit["operations"]["group_host"] = group["host"]["members"][unit["entry_id"]]
                 unit["remote"] = unit["operations"]["remote"]["status"] == "REMOTE_CHECKED"
                 self.store.save("unit", unit["id"], unit)
         return result
@@ -1882,8 +1932,13 @@ class UnitCatalog:
                     continue
                 if unit["status"] == "READY" and unit["id"] not in self.bindings:
                     unit.update(status="MISSING", reason="native binding is not loaded in this process")
-                route = self.remote_router.routes.get(unit.get("runtime_group")) if self.remote_router else None
-                unit["execution"] = "REMOTE" if route and unit["id"] in route["units"] else "LOCAL"
+                deferred = unit["status"] != "READY" and unit["id"] in self.deferred
+                dispatch = self.remote_router.dispatch(unit, deferred) if self.remote_router else None
+                unit["execution"] = "REMOTE" if dispatch and dispatch["status"] == "READY_INSTANCE" else "LOCAL"
+                unit["dispatch"] = dispatch or dict(status="READY_LOCAL" if unit["status"] == "READY" else "UNAVAILABLE",
+                                                    reason=unit.get("reason"))
+                if deferred and unit["execution"] == "REMOTE":
+                    unit.update(status="READY", reason=None, local_status="ENVIRONMENT_DEFERRED")
                 unit["scheduling"] = self.store.get("unit_policy", unit["id"]) or dict(
                     visibility="business", activation="business", declared=False)
                 from .capabilities import capability_card
@@ -1931,11 +1986,16 @@ class UnitCatalog:
 
     def validate_arguments(self, unit_id, arguments, native_arguments=(), deferred_arguments=()):
         """Validate a proposed call before the caller's RL action selection."""
+        binding, entry, unit = self._checked_unit(unit_id)
+        return self._validate_bound_arguments(binding, entry, unit, arguments, native_arguments, deferred_arguments)
+
+    def _checked_unit(self, unit_id):
         unit = self.store.get("unit", unit_id)
-        if not unit or unit["status"] != "READY" or unit_id not in self.bindings:
-            raise ValueError("native Unit is not ready")
-        return self._validate_bound_arguments(self.bindings[unit_id], self.entry_specs[unit_id], unit,
-            arguments, native_arguments, deferred_arguments)
+        if unit and unit["status"] == "READY" and unit_id in self.bindings:
+            return self.bindings[unit_id], self.entry_specs[unit_id], unit
+        if unit and unit.get("status") not in {"SUPERSEDED", "DETACHED"} and unit_id in self.deferred:
+            return (*self.deferred[unit_id], unit)
+        raise ValueError("native Unit is not ready")
 
     @staticmethod
     def _validate_bound_arguments(binding, entry, unit, arguments, native_arguments=(), deferred_arguments=()):
@@ -1968,17 +2028,23 @@ class UnitCatalog:
                 raise ValueError("native tool parameter type mismatch: " + name)
         return True
 
-    def freeze_resources(self, unit_ids):
-        """Keep the actual source binding/owner and private credentials in memory."""
+    def freeze_resources(self, unit_ids, remote=()):
+        """Keep the actual source binding/owner and private credentials in memory.
+
+        Units placed on a runtime-group host resolve credentials in that host.
+        """
         frozen, bindings = {}, {}
         with self.lock:
             for unit_id in dict.fromkeys(unit_ids):
-                unit = self.store.get("unit", unit_id)
-                if not unit or unit["status"] != "READY" or unit_id not in self.bindings:
+                try:
+                    binding, entry, unit = self._checked_unit(unit_id)
+                except ValueError:
+                    raise MissingBinding("cannot freeze an unavailable native Unit") from None
+                if unit_id not in remote and (unit["status"] != "READY" or unit_id not in self.bindings):
                     raise MissingBinding("cannot freeze an unavailable native Unit")
-                binding, entry = self.bindings[unit_id], self.entry_specs[unit_id]
                 frozen[unit_id] = (binding, entry, copy.deepcopy(unit))
-                bindings.setdefault(id(binding), (binding, set()))[1].add(entry["id"])
+                if unit_id not in remote:
+                    bindings.setdefault(id(binding), (binding, set()))[1].add(entry["id"])
             for binding, entry_ids in bindings.values():
                 if binding.resource_binding is not None:
                     binding.resource_binding.freeze_credentials(entry_ids=entry_ids)
@@ -1993,6 +2059,8 @@ class UnitCatalog:
                     binding, entry, _ = frozen.get(unit_id, (None, None, None))
                 else:
                     binding, entry = self.bindings.get(unit_id), self.entry_specs.get(unit_id)
+                    if binding is None and unit_id in self.deferred:
+                        binding, entry = self.deferred[unit_id]
                 if binding is None or entry is None:
                     continue
                 resources = binding.resource_binding
@@ -2015,16 +2083,18 @@ class UnitCatalog:
     def invoke(self, unit_id, arguments, native_arguments=()):
         self.validate_arguments(unit_id, arguments, native_arguments=native_arguments)
         unit = self.store.get("unit", unit_id)
-        entry = self.entry_specs[unit_id]
         if self.remote_router:
-            routed, result = self.remote_router.invoke(unit, arguments)
+            routed, result = self.remote_router.invoke(unit, arguments, native_arguments)
             if routed:
                 with self.lock:
                     unit = self.store.get("unit", unit_id)
-                    unit.update(initialization="BOUND", result_type=type(result).__module__ + "." + type(result).__qualname__)
+                    unit.update(result_type=type(result).__module__ + "." + type(result).__qualname__)
                     self.store.save("unit", unit_id, unit)
                 return result
-        return self._invoke_bound(self.bindings[unit_id], entry, unit, arguments)
+        if unit["status"] != "READY" or unit_id not in self.bindings:
+            raise MissingBinding("this Unit's execution-environment facts are met only by its runtime-group host; "
+                                 "start and register an instance first: " + str(unit.get("reason")))
+        return self._invoke_bound(self.bindings[unit_id], self.entry_specs[unit_id], unit, arguments)
 
     def _invoke_bound(self, binding, entry, unit, arguments):
         unit_id = unit["id"]

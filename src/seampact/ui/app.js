@@ -42,7 +42,10 @@ const statusNames = {
   UNRESOLVED: '语义条件未决', RETURNED: '正常返回', STOPPED_AT_NON_SUCCESS_EXIT: '后继已停止',
   CHECKED_WITH_RUNTIME_VALUE_CONDITIONS: '结构已核对 · 按实际值检查输入', SOURCE_CHECKED: '源码已核对',
   DETACHED: '已摘除', SUPERSEDED: '已替换', REMOTE_CHECKED: '远程条件已核对',
-  LOCAL_ONLY: '保留本地', EXPORTED: '运行包已导出', LOCAL: '本地进程', REMOTE: '独立运行进程'
+  LOCAL_ONLY: '保留本地', EXPORTED: '运行包已导出', LOCAL: '本地进程', REMOTE: '独立运行进程',
+  HOST_CHECKED: '宿主条件已核对', ARTIFACT_READY: '构建工件已生成', BUILT: '已构建', PUBLISHED: '已发布',
+  NOT_REQUIRED: '无需发布', OPERATOR_REPORTED: '操作者报告', BACKEND_UNAVAILABLE: '后端不可用',
+  ENVIRONMENT_DEFERRED: '环境条件由宿主核对'
 };
 
 function inspectLink(view, parameters = {}) {
@@ -589,51 +592,183 @@ function renderUnits() {
   }
 }
 
+const instanceStateNames = {UNDEPLOYED: '未部署', STARTING: '启动中', READY: '就绪', DRAINING: '排空中',
+  STOPPED: '已停止', FAILED: '失败', UNKNOWN: '结果未决'};
+const operationNames = {SUPPORTED: '允许', UNSUPPORTED: '不支持', UNKNOWN: '未知 · 不授予'};
+
+function operationId() {
+  return Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 12);
+}
+
+function deploymentButton(group, action, path, label, body = () => ({}), done = '已提交') {
+  const gate = action ? group.actions?.[action] || {enabled: false, reason: '契约未提供该操作'} : {enabled: true};
+  const button = node('button', label, 'secondary-button'); button.type = 'button';
+  button.disabled = !gate.enabled;
+  if (gate.reason) button.title = textValue(gate.reason);
+  button.onclick = async () => {
+    button.disabled = true;
+    try {
+      await api('/api/deployments/' + path, {group_id: group.id, operation_id: operationId(), ...body()});
+      showNotice(done);
+    } catch (error) { showNotice(error.message); }
+    finally { await refresh(); }
+  };
+  return button;
+}
+
+function renderInstance(card, instance) {
+  const box = node('div', undefined, 'operation-item');
+  const head = node('div', undefined, 'card-heading');
+  head.append(node('strong', instance.name || instance.id),
+    node('span', instanceStateNames[instance.state] || instance.state, 'status-pill ' + statusClass(
+      instance.state === 'READY' ? 'READY' : ['FAILED', 'UNKNOWN'].includes(instance.state) ? 'FAILED' :
+      ['STARTING', 'DRAINING'].includes(instance.state) ? 'RUNNING' : 'PENDING')));
+  box.append(head, node('p', ['代次 ' + instance.generation, instance.origin === 'OPERATOR_ATTACHED' ? '操作者启动后登记' : '平台启动',
+    instance.accepting ? '接单中' : '不接单', '在途 ' + (instance.in_flight || 0),
+    instance.run_id ? '运行 ' + instance.run_id.slice(-12) : null].filter(Boolean).join(' · '), 'card-meta'));
+  if (instance.reason) box.append(node('p', instance.reason, 'card-note'));
+  if (instance.drain_blocked || instance.pending_stop?.blocked) box.append(node('p', '停止受阻：' + textValue(instance.drain_blocked || instance.pending_stop.blocked), 'card-note'));
+  if (instance.pending_stop && !instance.released) box.append(node('p', '待释放：尚未确认后端对象已删除。', 'card-note'));
+  if (instance.apply?.manual_commands) detailValue(box, '后端不可用 · 手动命令', instance.apply.manual_commands);
+  if (instance.stop_result?.manual_commands) detailValue(box, '待释放 · 手动操作与确认命令', instance.stop_result.manual_commands);
+  detailValue(box, '实例详情', {endpoint: instance.endpoint, image: instance.image, image_id: instance.image_id,
+    units: instance.units, missing: instance.missing, initialization: instance.initialization,
+    environment: instance.environment, resources: instance.resources, observed: instance.observed,
+    apply: instance.apply, stop_result: instance.stop_result});
+  detailValue(box, '最近事件', instance.recent_events);
+  card.append(box);
+}
+
+function renderDeploymentBackend(root) {
+  const card = node('article', undefined, 'status-card');
+  card.dataset.itemId = 'deployment-backend';
+  const backend = state.deployment_backend || {kind: 'none'};
+  const head = node('div', undefined, 'card-heading');
+  head.append(node('strong', '部署后端'), node('span', backend.kind === 'none' ? '未配置' : backend.kind, 'status-pill pending'));
+  card.append(head, node('p', '平台通过 docker / kubectl / kind 命令执行构建、发布与启停；命令不可用时给出手动命令。镜像不含权重与凭据；凭据只以环境变量名或 Secret 引用注入。', 'card-note'));
+  const controller = state.runtime_controller || {};
+  if (controller.error) card.append(node('p', '控制器错误：' + textValue(controller.error), 'card-note'));
+  if (controller.locks && Object.keys(controller.locks).length) detailValue(card, '运行占用的运行组', controller.locks);
+  const form = node('form', undefined, 'model-form');
+  const label = node('label', '后端配置 JSON');
+  const input = node('textarea'); input.rows = 8;
+  const {updated_at, ...editable} = backend;
+  input.value = JSON.stringify(editable, null, 2);
+  label.append(input);
+  const button = node('button', '保存部署后端', 'secondary-button'); button.type = 'submit';
+  form.append(label, button);
+  form.onsubmit = async event => {
+    event.preventDefault(); button.disabled = true;
+    try { await api('/api/deployments/backend', JSON.parse(input.value)); showNotice('部署后端已保存。'); }
+    catch (error) { showNotice(error.message); }
+    finally { button.disabled = false; await refresh(); }
+  };
+  card.append(form);
+  root.append(card);
+}
+
 function renderDeployments() {
   const root = $('deployment-list');
   root.replaceChildren();
   const groups = (state.runtime_groups || []).filter(group => !selectedSource() || group.source_id === selectedSource())
-    .sort((a, b) => Number(b.status === 'REMOTE_CHECKED') - Number(a.status === 'REMOTE_CHECKED'));
-  root.append(node('p', '同组保持原进程、原对象与原生命周期。远程条件逐入口核对；未覆盖的能力继续本地执行。', 'card-note'));
+    .sort((a, b) => Number(b.host_status === 'HOST_CHECKED') - Number(a.host_status === 'HOST_CHECKED'));
+  root.append(node('p', '同组保持原进程、原对象与原生命周期；组外端口只传编码后的数据。生命周期操作按运行组契约逐项允许，未知不授予；重启不恢复原会话。', 'card-note'));
+  if (inspectPage) renderDeploymentBackend(root);
   if (!groups.length) return empty(root, '分析后显示运行组。');
   for (const group of groups) {
     const card = node('article', undefined, 'status-card');
     card.dataset.itemId = group.id;
     const head = node('div', undefined, 'card-heading');
-    head.append(node('strong', group.id), pill(group.status));
-    card.append(head, node('p', '执行位置：' + statusLabel(group.execution) + ' · 单实例 · 重启不恢复原会话', 'card-meta'));
-    card.append(node('p', '成员：' + group.entries.length + ' 个' + (group.entries.length <= 3 ? ' · ' + group.entries.join('、') : '，展开分组依据查看完整成员。'), 'card-note'));
-    detailValue(card, '分组和远程依据', group);
-    if (group.gaps?.length) detailValue(card, '未覆盖的远程条件', [...new Set(group.gaps)]);
-    const deployment = (state.deployments || []).find(item => item.id === group.id);
-    if (deployment) detailValue(card, '导出的运行包与部署文件', deployment);
-    if (group.status === 'REMOTE_CHECKED') {
+    head.append(node('strong', group.id), pill(group.host_status === 'HOST_CHECKED' ? 'HOST_CHECKED' : group.status));
+    const live = (group.instances || []).filter(item => !['STOPPED', 'FAILED'].includes(item.state));
+    card.append(head, node('p', ['宿主：' + (group.contract?.host_profile || '未生成契约'),
+      '执行位置：' + statusLabel(group.execution), '存活实例 ' + live.length,
+      group.contract?.replicas?.replicable ? '可增加副本' : '单实例', group.locked_by_run ? '运行占用中' : null].filter(Boolean).join(' · '), 'card-meta'));
+    card.append(node('p', '成员：' + group.entries.length + ' 个' + (group.entries.length <= 3 ? ' · ' + group.entries.join('、') : '，展开宿主核对查看完整成员。'), 'card-note'));
+    if (group.host) detailValue(card, '宿主核对（逐成员）', group.host.members);
+    if (group.contract) {
+      const list = node('div', undefined, 'operation-list');
+      for (const [name, operation] of Object.entries(group.contract.operations)) {
+        const item = node('div', undefined, 'operation-item');
+        item.append(node('strong', name + ' · ' + (operationNames[operation.status] || operation.status)), node('p', operation.basis, 'card-note'));
+        list.append(item);
+      }
+      const details = node('details'); details.append(node('summary', '运行组契约 · ' + group.contract.digest.slice(0, 12)), list);
+      card.append(details);
+      if (group.contract.lifecycle) detailValue(card, '生命周期分项资格（UNKNOWN 不授予动作）', group.contract.lifecycle);
+      detailValue(card, '契约原文', group.contract);
+    }
+    if (group.gaps?.length) detailValue(card, '未覆盖的标量远程条件', [...new Set(group.gaps)]);
+    const artifact = group.artifact;
+    if (artifact) {
+      card.append(node('p', ['工件 ' + statusLabel(artifact.status), '构建 ' + (artifact.build?.status || 'NOT_RUN'),
+        '镜像可达 ' + (artifact.publish?.status || 'NOT_RUN'), artifact.publish?.reference || artifact.image].join(' · '), 'card-meta'));
+      if (artifact.build?.reason || artifact.publish?.reason) card.append(node('p', textValue(artifact.build?.reason || artifact.publish?.reason), 'card-note'));
+      for (const step of [artifact.build, artifact.publish]) if (step?.manual_commands) detailValue(card, '后端不可用 · 手动命令', step.manual_commands);
+      detailValue(card, '构建工件', artifact);
+    }
+    if (inspectPage && group.contract) {
       const form = node('form', undefined, 'model-form');
-      const label = node('label', '运行进程访问平台的地址');
-      const input = node('input');
-      input.type = 'url'; input.required = true; input.value = deployment?.platform_url || 'http://seampact-platform:8880';
-      label.append(input);
-      const button = node('button', '导出原生运行包与 K8S 文件', 'secondary-button'); button.type = 'submit';
-      form.append(label, button);
+      const environment = artifact?.environment || {};
+      const fields = {};
+      for (const [key, title, value] of [['base_image', '基础镜像', environment.base_image || 'python:3.11-slim'],
+          ['requirements', '冻结源码内的依赖清单（逗号分隔）', (environment.requirements || []).join(', ')],
+          ['packages', '额外 pip 需求（每行一项）', (environment.packages || []).join('\n')],
+          ['pip_extra_index_url', '额外包索引（不含凭据）', environment.pip_extra_index_url || '']]) {
+        const label = node('label', title);
+        const input = node(key === 'packages' ? 'textarea' : 'input');
+        if (key === 'packages') input.rows = 3;
+        input.value = value; fields[key] = input;
+        label.append(input); form.append(label);
+      }
+      const button = node('button', '生成构建工件', 'secondary-button'); button.type = 'submit';
+      button.disabled = !group.actions?.export?.enabled;
+      if (group.actions?.export?.reason) button.title = group.actions.export.reason;
+      form.append(button);
       form.onsubmit = async event => {
         event.preventDefault(); button.disabled = true;
         try {
-          const result = await api('/api/deployments/export', {group_id: group.id, platform_url: input.value});
-          showNotice('已导出：' + result.archive + '。可通过 SFTP 上传；尚未应用到集群。');
+          const split = (text, separator) => text.split(separator).map(item => item.trim()).filter(Boolean);
+          const result = await api('/api/deployments/export', {group_id: group.id, environment: {
+            base_image: fields.base_image.value.trim(), requirements: split(fields.requirements.value, ','),
+            packages: split(fields.packages.value, '\n'), pip_extra_index_url: fields.pip_extra_index_url.value.trim()}});
+          showNotice('构建工件已生成：' + result.image + '。尚未构建镜像。');
         } catch (error) { showNotice(error.message); }
-        finally { button.disabled = false; await refresh(); }
+        finally { await refresh(); }
       };
       card.append(form);
-      if (group.execution === 'REMOTE') {
-        const local = node('button', '改为本地执行', 'secondary-button');
-        local.onclick = async () => {
-          try { await api('/api/deployments/local', {group_id: group.id}); }
-          catch (error) { showNotice(error.message); }
-          await refresh();
-        };
-        card.append(local);
-      }
+      const actions = node('div', undefined, 'model-actions');
+      const release = node('label', undefined, 'checkbox-label');
+      const releaseInput = node('input'); releaseInput.type = 'checkbox';
+      release.append(releaseInput, node('span', '停止时释放结果未决（UNKNOWN）的实例'));
+      actions.append(
+        deploymentButton(group, 'build', 'build', '构建镜像', () => ({}), '构建已在后台开始。'),
+        deploymentButton(group, 'publish', 'publish', '使镜像对后端可达', () => ({}), '发布已在后台开始。'),
+        deploymentButton(group, 'start', 'start', '启动实例', () => ({}), '实例启动已提交；进程登记后转为就绪。'),
+        deploymentButton(group, 'prewarm', 'prewarm', '预热', () => ({}), '预热已完成，结果见实例事件。'),
+        deploymentButton(group, 'pause_intake', 'pause', '停止接单', () => ({}), '已停止派发新根请求。'),
+        deploymentButton(group, 'drain_stop', 'drain-stop', '排空后停止', () => ({release_unknown: releaseInput.checked}), '已请求排空；收尾后停止。'),
+        deploymentButton(group, 'add_replica', 'add-replica', '增加副本', () => ({}), '新副本启动已提交。'),
+        deploymentButton(group, 'remove_replica', 'remove-replica', '减少副本', () => ({}), '已请求排空一个副本。'),
+        deploymentButton(group, null, 'status', '刷新后端观测', () => ({}), '已刷新实例观测。'));
+      card.append(actions, release);
+      const reported = node('form', undefined, 'model-form');
+      const reportedLabel = node('label', '平台外已构建的镜像引用（操作者报告）');
+      const reportedInput = node('input'); reportedInput.placeholder = 'registry.example/seampact-worker:tag';
+      reportedLabel.append(reportedInput);
+      const reportedButton = node('button', '记录操作者构建的镜像', 'secondary-button'); reportedButton.type = 'submit';
+      reportedButton.disabled = !group.actions?.build?.enabled;
+      reported.append(reportedLabel, reportedButton);
+      reported.onsubmit = async event => {
+        event.preventDefault();
+        try { await api('/api/deployments/build', {group_id: group.id, operator_reported_image: reportedInput.value.trim()}); showNotice('已记录；平台未核对该构建。'); }
+        catch (error) { showNotice(error.message); }
+        finally { await refresh(); }
+      };
+      card.append(reported);
     }
+    for (const instance of group.instances || []) renderInstance(card, instance);
+    if (!inspectPage) card.append(inspectLink('deployments', {harness: group.source_id}));
     root.append(card);
   }
   if (inspectPage) {
@@ -645,7 +780,7 @@ function renderDeployments() {
     form.append(label, button);
     form.onsubmit = async event => {
       event.preventDefault(); button.disabled = true;
-      try { await api('/api/workers/attach', {endpoint: input.value}); showNotice('已登记，聊天任务将使用这个运行进程。'); }
+      try { await api('/api/workers/attach', {endpoint: input.value}); showNotice('已登记为实例；已登记成员的调用将路由到该实例。'); }
       catch (error) { showNotice(error.message); }
       finally { button.disabled = false; await refresh(); }
     };
@@ -801,6 +936,8 @@ function loadResearchConfig(config) {
   $('research-teacher-role').value = criteria.teacher?.role || 'teacher';
   $('research-independent').value = researchDraft.evaluation_criteria ? JSON.stringify(researchDraft.evaluation_criteria, null, 2) : '';
   $('research-parameters').value = JSON.stringify(researchDraft.parameters || {}, null, 2);
+  $('research-scheduling-mode').value = researchDraft.scheduling_mode || 'functional/1';
+  $('research-joint').value = researchDraft.joint ? JSON.stringify(researchDraft.joint, null, 2) : '';
   hydrateResearchChoices(true);
   $('research-parent').value = researchDraft.parent_run_id || '';
   researchDirty = false;
@@ -829,6 +966,11 @@ function readResearchConfig() {
   if (independent) config.evaluation_criteria = independent;
   else delete config.evaluation_criteria;
   if (config.mode !== 'train' && !config.parent_run_id) throw new Error('冻结、继续训练或条件重评需要选择来源运行');
+  if ($('research-scheduling-mode').value === 'joint/1') {
+    config.joint = jsonField('research-joint', '联合配置', true);
+    if (!config.joint) throw new Error('joint/1 需要联合配置');
+    config.scheduling_mode = 'joint/1';
+  } else { delete config.scheduling_mode; delete config.joint; }
   return config;
 }
 
@@ -1088,6 +1230,59 @@ function configDifference(left, right, path = '', result = []) {
   return result;
 }
 
+function jointRunSummary(card, run) {
+  const manifest = run.manifest || {};
+  if (manifest.scheduling_mode !== 'joint/1') return;
+  const joint = manifest.joint || {};
+  card.append(node('p', '功能 ' + (joint.functional_policy ?? '—') + ' · 派发 ' + (joint.dispatch_policy ?? '—') +
+    ' · 资源 ' + (joint.resource_policy ?? '—') + ' · 根调用槽 ' + (joint.capacity?.call_slots ?? '—') +
+    ' · 副本上限 ' + (joint.capacity?.replica_cap ?? '—'), 'card-meta'));
+  const summary = run.joint;
+  if (summary) {
+    const means = (summary.mean_active_roots || []).filter(value => finiteNumber(value));
+    card.append(node('p', '窗口 ' + (summary.windows ?? '—') + ' · 任务 ' + (summary.tasks ?? '—') +
+      ' · 未完成 ' + (summary.unfinished_tasks ?? '—') + ' · 失败 ' + (summary.failed_tasks ?? '—') +
+      ' · 最大并行根调用 ' + (summary.max_active_roots ?? '—') + ' · 平均并行度 ' +
+      displayNumber(means.length ? means.reduce((sum, value) => sum + value, 0) / means.length : null), 'card-meta'));
+  }
+  const counters = summary?.counters || {};
+  const actions = node('table', undefined, 'research-metrics');
+  const actionHead = node('thead'), actionHeader = node('tr');
+  for (const label of ['动作', '次数']) actionHeader.append(node('th', label));
+  actionHead.append(actionHeader); actions.append(actionHead);
+  const actionBody = node('tbody');
+  for (const [label, name] of [['invoke', '功能调用'], ['continue', '推进'], ['finish', '结束'], ['dispatch', '派发'],
+    ['prepare', '提前准备'], ['scale_out', '水平扩容'], ['scale_in', '水平缩容'], ['yield_until_next_event', '保留等待']]) {
+    const row = node('tr'); row.append(node('td', name), node('td', counters['action/' + label] || 0)); actionBody.append(row);
+  }
+  for (const key of Object.keys(counters)) {
+    if (!(key.startsWith('business/') || key.startsWith('dispatch/') || key.startsWith('resource/') || key.startsWith('on_demand/'))) continue;
+    const row = node('tr'); row.append(node('td', key), node('td', counters[key] || 0)); actionBody.append(row);
+  }
+  actions.append(actionBody); card.append(actions);
+  const table = node('table', undefined, 'research-metrics');
+  const thead = node('thead'), header = node('tr');
+  for (const label of ['窗口', '回报', '并行度(平均/最大)', '并行时间占比', '任务秒', '实例秒', '资源操作', '状态']) header.append(node('th', label));
+  thead.append(header); table.append(thead);
+  const tbody = node('tbody');
+  for (const item of run.history || []) {
+    if (item.kind !== 'joint_window') continue;
+    const row = node('tr');
+    row.append(node('td', item.episode ?? '—'),
+      node('td', item.reward == null ? (item.eligible ? '—' : 'UNKNOWN') : displayNumber(item.reward)),
+      node('td', displayNumber(item.parallelism?.mean_active_roots) + ' / ' + (item.parallelism?.max_active_roots ?? '—')),
+      node('td', displayNumber(item.parallelism?.parallel_fraction)),
+      node('td', displayNumber(item.parallelism?.task_seconds)),
+      node('td', displayNumber(item.parallelism?.instance_seconds)),
+      node('td', (item.resource_ops || []).length),
+      node('td', item.eligible ? '有效' : (item.exclusion_reason || '排除')));
+    tbody.append(row);
+  }
+  table.append(tbody);
+  if (tbody.childNodes.length) card.append(table);
+  card.append(node('p', '并行度按同时执行的根调用计算，不以实例数量代替；窗口回报＝已归属到学习转移的部分＋未归属部分。', 'card-note'));
+}
+
 function renderResearchComparison() {
   const root = $('research-comparison'); root.replaceChildren();
   if (!researchSelected.size) return;
@@ -1123,6 +1318,7 @@ function renderResearchComparison() {
     table.append(tbody);
     if (tbody.childNodes.length) card.append(table); else empty(card, '暂无分项结果，未将缺失记为零。');
     card.append(curveFigure(run));
+    jointRunSummary(card, run);
     detailValue(card, '不可变运行清单与配置', manifest);
     if (run.artifacts) detailValue(card, '结果与策略工件', run.artifacts);
     if (run.checkpoint) detailValue(card, '策略工件及内容摘要', run.checkpoint);
@@ -1746,7 +1942,8 @@ async function refresh() {
       ['research-readiness', 'research-run-list', 'research-comparison']);
     renderSection('tasks', visibleTasks(), renderTasks, ['task-list']);
     renderSection('units', [visibleUnits(), state.harnesses, selectedSource()], renderUnits, ['unit-list']);
-    renderSection('deployments', [state.runtime_groups, state.deployments, selectedSource()], renderDeployments, ['deployment-list']);
+    renderSection('deployments', [state.runtime_groups, state.deployments, state.deployment_backend,
+      state.runtime_controller, selectedSource()], renderDeployments, ['deployment-list']);
     renderSection('analyses', [state.analyses, state.harnesses, resourceState(), selectedSource(), [...sourceUpdating]], renderAnalyses, ['analysis-list']);
     renderSection('harnesses', [state.harnesses, state.analyses, state.models?.analysis, resourceState(), [...analysisSubmitting], [...sourceUpdating]], renderHarnesses, ['harness-list']);
   } catch (error) {

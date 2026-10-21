@@ -2,9 +2,11 @@
 
 import uuid
 import copy
+import json
+import re
 import threading
 import time
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 
 from . import __version__
 from .analysis import AnalysisJobs
@@ -18,7 +20,7 @@ from .runtime import Coordinator, OwnerRuntime
 from .scheduler import TwoLayerScheduler
 from .store import Store, now
 from .units import UnitCatalog
-from .deployment import Deployments, REMOTE_PROFILE
+from .deployment import Deployments, REMOTE_PROFILE, GROUP_PROFILE
 from .training import TrainingJobs
 
 NATIVE_PROFILE = dict(id="python311-local-explicit-lifetime/1", confirmed=True,
@@ -33,7 +35,7 @@ RULESET = dict(id="native-entry-construction-inplace-runtime-group/3", confirmed
            "有限R提取及原位调用规则", "真实结果数据边及原顺序控制边",
            "粗细方案互斥", "原对象/共享状态/控制依赖保留同进程及原生命周期",
            "远程条件独立核对，JSON不是合法拆分依据", "重启不默认恢复原会话"],
-    parallel=False, remote="PER_ENTRY_CHECKED", remote_profile=REMOTE_PROFILE)
+    parallel=False, remote="PER_ENTRY_CHECKED", remote_profile=REMOTE_PROFILE, group_profile=GROUP_PROFILE)
 
 
 class Platform:
@@ -104,6 +106,8 @@ class Platform:
                            dependencies=requirements, bindings=selections),
             analyses=jobs, units=self.catalog.public(), tasks=tasks, rules=RULESET, entry_profile=NATIVE_PROFILE,
             runtime_groups=self.deployments.public(), deployments=self.store.list("deployment"),
+            deployment_backend=self.deployments.backend(),
+            runtime_controller=self.deployments.controller_state(),
             scheduler=dict(status="RUNNING", policy="candidate-RL / FIFO-dispatch", active=active, waiting=waiting,
                 used=snapshot["used"], quota=snapshot["quota"], theory_pending=False,
                 learning=self.scheduler.snapshot(), research=self.training.snapshot(),
@@ -287,6 +291,126 @@ class Platform:
             self.store.save("analysis", jid, job)
             return dict(analysis_id=jid, model_calls=0, units=job["units"])
 
+    def export_analysis(self, analysis_id):
+        """A shareable analysis artifact: candidate plus frozen source identity; no configuration, paths or state."""
+        job = self.store.get("analysis", analysis_id)
+        if not job or job.get("status") != "COMPLETED" or not (job.get("submitted") or {}).get("candidate"):
+            raise ValueError("需要已完成且有候选的分析")
+        request = self.store.get("request", job["request_id"]) or {}
+        value = dict(schema="seampact-analysis-export/1", analysis_id=analysis_id, kind=job.get("kind", "API_ANALYSIS"),
+            source_version=request.get("source_version"), source_revision=request.get("source_revision"),
+            rules=RULESET["id"], entry_profile=NATIVE_PROFILE["id"], candidate=job["submitted"]["candidate"],
+            exported_at=now(), excluded="configuration values, resource selections, credentials, platform paths and state; "
+                                        "rebind them on the target platform")
+        value["absolute_path_locations"] = self._absolute_paths(value["candidate"])
+        folder = self.home / "exports"
+        folder.mkdir(exist_ok=True)
+        path = folder / ("analysis-" + analysis_id + ".json")
+        path.write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8")
+        return dict(value, path=str(path))
+
+    @staticmethod
+    def _absolute_paths(value, location="candidate"):
+        """Find machine-bound file values without treating HTTP routes or prose as files."""
+        network_fields = {"url", "uri", "base_url", "endpoint", "route", "api_path", "api_route",
+                          "api_endpoint", "endpoint_path", "route_path", "request_path", "url_path"}
+        text_fields = {"description", "analysis", "rationale", "basis", "reason", "goal", "title",
+                       "label", "name", "id", "symbol", "scope", "receiver", "unit", "schema",
+                       "question", "prompt", "message", "content", "text", "pattern", "regex"}
+        file_fields = {"path", "paths", "file", "files", "filename", "filenames", "dir", "dirs",
+                       "directory", "directories", "folder", "folders", "root", "cwd", "resources",
+                       "working_directory", "model", "weights", "checkpoint", "pretrained"}
+        argument_fields = {"arguments", "fixed_arguments", "constructor_arguments", "binding_arguments",
+                           "parameters", "configuration", "environment"}
+
+        def role(key, inherited):
+            key = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", str(key)).lower().replace("-", "_")
+            if key in network_fields or key.endswith(("_url", "_uri", "_endpoint", "_route")):
+                return "network"
+            if key in text_fields:
+                return "text"
+            if key == "command":
+                return "command"
+            if key in argument_fields:
+                return "arguments"
+            if inherited == "network":
+                return "network"
+            if key in file_fields or key.endswith(("_path", "_paths", "_file", "_files", "_dir", "_dirs",
+                                                   "_directory", "_directories", "_folder", "_root")):
+                return "file"
+            return inherited
+
+        def visit(item, where, field=None):
+            if isinstance(item, dict):
+                return [found for key, child in item.items()
+                        for found in visit(child, where + "." + str(key), role(key, field))]
+            if isinstance(item, list):
+                found = []
+                option = None
+                for index, child in enumerate(item):
+                    child_role, checked = field, child
+                    if field == "command" and isinstance(child, str):
+                        if child.startswith("-"):
+                            flag, separator, checked = child.partition("=")
+                            option = flag.lstrip("-")
+                            child_role = role(option, "arguments")
+                            if not separator:
+                                continue
+                            option = None
+                        else:
+                            child_role = role(option, "arguments") if option else "file"
+                            option = None
+                    found.extend(visit(checked, where + "[" + str(index) + "]", child_role))
+                return found
+            if (not isinstance(item, str) or field not in {"file", "arguments"}
+                    or re.match(r"^[A-Za-z][A-Za-z0-9+.-]*://", item)):
+                return []
+            return [where] if PureWindowsPath(item).is_absolute() or PurePosixPath(item).is_absolute() else []
+
+        return visit(value, location)
+
+    def import_analysis(self, body):
+        """Re-check an exported analysis against a source connected on this platform; zero model calls."""
+        value = body.get("artifact") or {}
+        if value.get("schema") != "seampact-analysis-export/1" or not isinstance(value.get("candidate"), dict):
+            raise ValueError("需要 seampact-analysis-export/1 分析工件")
+        if value.get("rules") != RULESET["id"] or value.get("entry_profile") != NATIVE_PROFILE["id"]:
+            raise ValueError("分析规则或宿主范围与本平台不同，请重新分析")
+        located = self._absolute_paths(value["candidate"])
+        if located:
+            raise ValueError("分析工件含原机器绝对路径（位置：" + ", ".join(located[:8]) +
+                             "）；请导出未绑定配置的原分析，在本平台重新配置")
+        with self.source_lock:
+            source = self.store.get("harness", body.get("harness_id"))
+            if not source or source.get("status") in {"DETACHED", "ANALYZING"}:
+                raise ValueError("需要已在本平台接入且未在分析的来源")
+            if self.catalog.source_running(source["id"]):
+                raise ValueError("请等当前原生调用结束后再导入")
+            request_id = uuid.uuid4().hex
+            source["entry_profile"] = dict(NATIVE_PROFILE)
+            inspector = Inspector.freeze_repository(source, self.home / "snapshots", request_id,
+                "导入外部分析工件：只按已确认 RuleSet 在本平台重新核对，不调用模型。")
+            if inspector.request["source_version"] != value.get("source_version"):
+                raise ValueError("本平台冻结的源码内容与分析工件不一致（包括换行符差异）；请重新分析")
+            inspector.request.update(rules=RULESET, preprocessing_mode="imported", resource_catalog=self.resource_catalog(),
+                                     dependency_bindings=self.dependencies.selections(source["id"]))
+            candidate = copy.deepcopy(value["candidate"])
+            checked = self.catalog.inspect_candidate(inspector, candidate)
+            jid = uuid.uuid4().hex
+            job = dict(id=jid, request_id=request_id, harness_id=source["id"], status="COMPLETED", kind="IMPORTED_ANALYSIS",
+                imported_from=dict(analysis_id=value.get("analysis_id"), kind=value.get("kind"), exported_at=value.get("exported_at"),
+                                   source_version=value["source_version"]),
+                prior_analysis_id=None, rounds=0, usage=[], messages=[], started_at=now(), finished_at=now(), error=None,
+                submitted=dict(candidate=candidate), model_calls=0, binding_report=checked)
+            self.store.create("request", request_id, inspector.request)
+            self.store.create("analysis", jid, job)
+            source.update(request_id=request_id, analysis_id=jid)
+            self.store.save("harness", source["id"], source)
+            self.inspectors[request_id] = inspector
+            job["units"] = self._connect_units(inspector, job)
+            self.store.save("analysis", jid, job)
+        return dict(analysis_id=jid, model_calls=0, units=job["units"])
+
     def bind_dependency(self, body):
         """Apply only the analyzer's checked field mappings; never invent source wiring."""
         started_at, started = now(), time.perf_counter()
@@ -345,12 +469,7 @@ class Platform:
             self.store.save("harness", identity, source)
             self.analysis.cancel(source.get("analysis_id"))
             count = self.catalog.detach(identity)
-            for group in list(self.deployments.routes):
-                record = self.store.get("runtime_group", group)
-                if record and record["source_id"] == identity:
-                    # Keep the route for started physical receipts. Catalog/source
-                    # masks stop new calls, rather than killing the original owner.
-                    self.deployments.routes[group]["source_detached"] = True
+            self.deployments.mark_source_detached(identity)
         print("[SeamPact] source_detached " + identity, flush=True)
         return dict(harness_id=identity, status="DETACHED", detached_units=count,
                     history="RETAINED", started_calls="ALLOW_FINISH")
@@ -393,6 +512,7 @@ class Platform:
         return dict(detached=removed, history="RETAINED", ready_units=len(self.catalog.public()))
 
     def close(self):
+        self.deployments.close()
         self.training.close()
         self.analysis.close()
         self.chat.close()

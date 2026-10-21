@@ -2,10 +2,14 @@
 
 This local backend accounts for configured execution slots. It does not lease GPU
 memory, prove callback purity, revoke remote effects, or migrate a live stack.
+A joint window adds root requests: one business Unit invocation of a task holds one
+root slot and its host from dispatch to return; gated calls inside it are admitted
+under that reservation instead of taking another slot.
 """
 
 import asyncio
 import contextvars
+import copy
 import functools
 import inspect
 import time
@@ -30,9 +34,11 @@ class Coordinator:
         self.policy = policy
         self.decisions = {}
         self.waiters = {}
+        self.root_waiters = {}
+        self.root_control = None
         self.failed = False
         self.detached_sources = set()
-        self.state = dict(schema="runtime/2", quota=quota, gates={}, calls={})
+        self.state = dict(schema="runtime/3", quota=quota, gates={}, calls={}, roots={})
 
     def _persist(self, event):
         if self.failed:
@@ -44,20 +50,40 @@ class Coordinator:
             raise
 
     def snapshot(self):
-        import copy
         value = copy.deepcopy(self.state)
         value["used"] = self.used()
-        value["legal_actions"] = [c["id"] for c in value["calls"].values()
-                                  if c["physical"] == "ENABLED"
-                                  and value["gates"][c["gate"]]["active"]
-                                  and not self.owner_busy(c["owner"])
-                                  and self.used() + c["slots"] <= value["quota"]]
+        value["legal_actions"] = [c["id"] for c in self._ready()]
+        value["roots_used"] = self.roots_used()
+        value["call_slots"] = (self.root_control or {}).get("call_slots")
         value["policy"] = "tabular-q-learning" if self.policy else ("fifo" if self.automatic else "manual")
         return value
 
     def used(self):
         return sum(c["slots"] for c in self.state["calls"].values()
-                   if c["physical"] in {"RESERVED", "AUTHORIZED", "STARTED", "UNKNOWN"})
+                   if c["physical"] in {"RESERVED", "AUTHORIZED", "STARTED", "UNKNOWN"} and not c.get("root_id"))
+
+    def roots_used(self):
+        # Slots belong to the admitting window; a closed window's hosts were drained before it ended.
+        run_id = (self.root_control or {}).get("run_id")
+        return sum(1 for r in self.state["roots"].values() if r["state"] in {"ACTIVE", "UNKNOWN"} and r["run_id"] == run_id)
+
+    def _local_held(self):
+        return any(r["state"] in {"ACTIVE", "UNKNOWN"} and r["host"] == "local" for r in self.state["roots"].values())
+
+    def host_busy(self, host):
+        if any(r["state"] in {"ACTIVE", "UNKNOWN"} and r["host"] == host for r in self.state["roots"].values()):
+            return True
+        # This process runs a local root and a call outside any root one at a time.
+        return host == "local" and any(
+            not c.get("root_id") and not (c.get("unit") or {}).get("instance_id")
+            and c["physical"] in {"RESERVED", "AUTHORIZED", "STARTED", "UNKNOWN"} for c in self.state["calls"].values())
+
+    def _covering_root(self, task_id, unit):
+        if task_id is None:
+            return None
+        host = (unit or {}).get("instance_id") or "local"
+        return next((r for r in self.state["roots"].values()
+                     if r["state"] == "ACTIVE" and r["task_id"] == task_id and r["host"] == host), None)
 
     def owner_busy(self, owner):
         return any(c["owner"] == owner and c["physical"] in {"RESERVED", "AUTHORIZED", "STARTED", "UNKNOWN"}
@@ -84,11 +110,13 @@ class Coordinator:
         if not g or not g["active"] or (owner, generation) != (g["owner"], g["generation"]):
             raise ProtocolError("inactive gate or stale native-owner generation")
         identity = uuid.uuid4().hex
+        root = self._covering_root(task_id, g.get("unit"))
         self.state["calls"][identity] = dict(id=identity, gate=gate, owner=owner,
             generation=generation, slots=g["slots"], physical="ENABLED",
             logical="WAITING", starts=0, receipt=None, permit=None,
             task_id=task_id, unit=g.get("unit"), semantic_key=(g.get("unit") or {}).get("semantic_key") or
                 (g.get("unit") or {}).get("id", gate.rsplit(":",1)[-1]),
+            root_id=root["id"] if root else None,
             enabled_at=time.time(), started_at=None, latency_ms=None)
         self.waiters[identity] = asyncio.get_running_loop().create_future()
         self._persist("call_enabled")
@@ -100,8 +128,13 @@ class Coordinator:
         g = self.state["gates"][c["gate"]]
         if c["physical"] != "ENABLED" or not g["active"]:
             raise ProtocolError("call not legally reservable")
-        if self.used() + c["slots"] > self.state["quota"]:
+        if c.get("root_id"):
+            if self.state["roots"][c["root_id"]]["state"] != "ACTIVE":
+                raise ProtocolError("the covering root request is no longer active")
+        elif self.used() + c["slots"] > self.state["quota"]:
             raise ProtocolError("managed quota exhausted")
+        elif not (c.get("unit") or {}).get("instance_id") and self._local_held():
+            raise ProtocolError("this process is running a root request")
         if self.owner_busy(c["owner"]):
             raise ProtocolError("local native owner is non-reentrant until independently verified")
         c["physical"] = "RESERVED"
@@ -203,6 +236,10 @@ class Coordinator:
         self.detached_sources.discard(source_id)
 
     async def remote_unknown(self, group_id, instance_id):
+        # A root on this host may have lost its response before any inner call was recorded.
+        for r in self.state["roots"].values():
+            if r["state"] == "ACTIVE" and r["host"] == instance_id:
+                r["outcome_unknown"] = True
         for call in self.state["calls"].values():
             unit = call.get("unit") or {}
             if (unit.get("runtime_group"), unit.get("instance_id")) != (group_id, instance_id):
@@ -218,12 +255,109 @@ class Coordinator:
         self._persist("remote_outcome_unknown")
         await self.pump()
 
+    # Root requests of a joint window. The window's dispatcher chooses among
+    # legal roots; authorize_root re-checks slots, host and placement atomically.
+
+    async def configure_roots(self, control):
+        if control is None:
+            if self.root_control is not None:
+                for identity, r in list(self.state["roots"].items()):
+                    if r["state"] == "ENABLED" and r["run_id"] == self.root_control["run_id"]:
+                        await self.cancel_root(identity, "joint window closed")
+            self.root_control = None
+            await self.pump()
+            return
+        if self.root_control is not None:
+            raise ProtocolError("another joint window owns the root-request ledger")
+        slots = control.get("call_slots")
+        if type(slots) is not int or slots < 1:
+            raise ValueError("call_slots must be a positive integer")
+        self.root_control = dict(run_id=control["run_id"], call_slots=slots, notify=control.get("notify"))
+
+    def _notify_roots(self):
+        notify = (self.root_control or {}).get("notify")
+        if notify:
+            notify()
+
+    async def enable_root(self, task_id, unit_id, target):
+        control = self.root_control
+        if not control:
+            raise ProtocolError("no joint window is admitting root requests")
+        if not task_id or target.get("kind") not in {"LOCAL", "REMOTE"}:
+            raise ProtocolError("a root request needs its task identity and frozen placement")
+        identity = uuid.uuid4().hex
+        self.state["roots"][identity] = dict(id=identity, run_id=control["run_id"], task_id=task_id, unit_id=unit_id,
+            target=copy.deepcopy(target), state="ENABLED", host=None, enabled_at=time.time(),
+            granted_at=None, finished_at=None, receipt=None, duration_ms=None)
+        self.root_waiters[identity] = asyncio.get_running_loop().create_future()
+        self._persist("root_enabled")
+        self._notify_roots()
+        return identity
+
+    async def wait_root(self, identity):
+        waiter = self.root_waiters[identity]
+        try:
+            return await asyncio.shield(waiter)
+        finally:
+            if waiter.done():
+                self.root_waiters.pop(identity, None)
+
+    async def authorize_root(self, identity, host):
+        r, control = self.state["roots"].get(identity), self.root_control
+        if not r or not control or r["state"] != "ENABLED" or r["run_id"] != control["run_id"]:
+            raise ProtocolError("root request is not dispatchable")
+        target = r["target"]
+        if (host == "local") != (target["kind"] == "LOCAL") or target.get("instance_id") not in (None, host):
+            raise ProtocolError("dispatch host differs from the frozen placement or task affinity")
+        if self.roots_used() + 1 > control["call_slots"]:
+            raise ProtocolError("root call slots exhausted")
+        if self.host_busy(host):
+            raise ProtocolError("the host is still running another root request or local call")
+        r.update(state="ACTIVE", host=host, granted_at=time.time())
+        self._persist("root_authorized")
+        waiter = self.root_waiters.get(identity)
+        if waiter and not waiter.done():
+            waiter.set_result(dict(root_id=identity, host=host, wait_ms=(r["granted_at"] - r["enabled_at"]) * 1000))
+        return host
+
+    async def finish_root(self, identity, receipt):
+        r = self.state["roots"][identity]
+        if r["state"] != "ACTIVE":
+            raise ProtocolError("root request is not active")
+        unknown = r.get("outcome_unknown") or any(c.get("root_id") == identity and c["physical"] == "UNKNOWN"
+                                                  for c in self.state["calls"].values())
+        finished = time.time()
+        # An UNKNOWN inner result keeps the root's slot and host occupied.
+        r.update(state="UNKNOWN" if unknown else "RETIRED", finished_at=finished, receipt=receipt,
+                 duration_ms=(finished - r["granted_at"]) * 1000)
+        self._persist("root_retired")
+        self._notify_roots()
+        await self.pump()
+
+    async def cancel_root(self, identity, reason):
+        r = self.state["roots"].get(identity)
+        if not r or r["state"] != "ENABLED":
+            return False
+        r.update(state="CANCELLED", finished_at=time.time(), receipt=reason)
+        waiter = self.root_waiters.get(identity)
+        if waiter and not waiter.done():
+            waiter.set_exception(ProtocolError(reason))
+        self._persist("root_cancelled")
+        self._notify_roots()
+        return True
+
+    async def root_view(self, run_id):
+        return [copy.deepcopy(r) for r in self.state["roots"].values() if r["run_id"] == run_id]
+
     async def pump(self):
         if not self.automatic:
             return
         ready = self._ready()
         while ready:
-            if self.policy:
+            covered = [c for c in ready if c.get("root_id")]
+            if covered:
+                call = covered[0]
+            elif self.policy:
                 call, token = self.policy.select_ready(ready, self._observation())
                 self.decisions[call["id"]] = token
             else:
@@ -232,9 +366,19 @@ class Coordinator:
             ready = self._ready()
 
     def _ready(self):
-        return [c for c in self.state["calls"].values() if c["physical"] == "ENABLED"
-                and self.state["gates"][c["gate"]]["active"] and not self.owner_busy(c["owner"])
-                and self.used() + c["slots"] <= self.state["quota"]]
+        ready = []
+        local_held = self._local_held()
+        for c in self.state["calls"].values():
+            if (c["physical"] != "ENABLED" or not self.state["gates"][c["gate"]]["active"]
+                    or self.owner_busy(c["owner"])):
+                continue
+            if c.get("root_id"):
+                if self.state["roots"][c["root_id"]]["state"] == "ACTIVE":
+                    ready.append(c)
+            elif (self.used() + c["slots"] <= self.state["quota"]
+                  and not (local_held and not (c.get("unit") or {}).get("instance_id"))):
+                ready.append(c)
+        return ready
 
     def _observation(self):
         ready = self._ready()

@@ -213,17 +213,22 @@ class Learner:
                 index = self.random.choice(indices) if self.random.random() < epsilon else greedy
                 probability = epsilon / len(indices) + (1 - epsilon if index == greedy else 0)
                 return dict(index=index, log_prob=math.log(probability), value=float(scores[index].item()),
-                            epsilon=epsilon, policy_version=self.policy_version)
+                            epsilon=epsilon, policy_version=self.policy_version,
+                            diagnostics=dict(score_kind="q_value", greedy_index=greedy, explored=index != greedy,
+                                scores=[float(scores[i].item()) if allowed else None for i, allowed in enumerate(legal)]))
             logits = self._scores("actor", states, features)
             probabilities, log_probs = self._distribution(logits, masks)
+            greedy = int(probabilities[0].argmax().item())
             index = (int(torch.multinomial(probabilities[0], 1, generator=self.generator).item()) if training
-                     else int(probabilities[0].argmax().item()))
+                     else greedy)
             value = (self._values(states, features, masks)[0] if self.algorithm == "ppo" else
                      (probabilities * (torch.minimum(self._scores("q1", states, features),
                                                      self._scores("q2", states, features)) -
                                        self.config["temperature"] * log_probs)).sum(dim=-1)[0])
             return dict(index=index, log_prob=float(log_probs[0, index].item()), value=float(value.item()),
-                        policy_version=self.policy_version)
+                        policy_version=self.policy_version,
+                        diagnostics=dict(score_kind="action_probability", greedy_index=greedy, explored=index != greedy,
+                            scores=[float(probabilities[0, i].item()) if allowed else None for i, allowed in enumerate(legal)]))
 
     def observe(self, transition):
         row = copy.deepcopy(transition)

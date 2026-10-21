@@ -59,7 +59,23 @@ def summarize_usage(records):
     return totals
 
 
-def episode_costs(context, manifest, online_ms, transitions, feedback, independent):
+def runtime_costs(calls, events=None):
+    """Instance-level facts of the calls this task actually made."""
+    remote = [call for call in calls if call.get("execution") == "REMOTE"]
+    def measured(key):
+        values = [call[key] for call in remote if _valid(call.get(key))]
+        return dict(observed=sum(values), known_calls=len(values), calls=len(remote),
+                    total=sum(values) if len(values) == len(remote) else None)
+    return dict(remote_calls=len(remote), local_calls=len(calls) - len(remote),
+                start_wait=measured("start_wait_ms"), cold_instance_calls=sum(bool(call.get("cold_instance")) for call in remote),
+                round_trip=measured("round_trip_ms"), worker=measured("worker_ms"), transport=measured("transport_ms"),
+                instances=sorted({call["instance_id"] for call in remote if call.get("instance_id")}),
+                instance_events=copy.deepcopy(events),
+                semantics="start_wait/round_trip are nested in unit_wall_ms; start waits are charged to the task that waited; "
+                          "cross-task residency and idle time are reported only as the run-window total")
+
+
+def episode_costs(context, manifest, online_ms, transitions, feedback, independent, runtime_events=None):
     prices = manifest.get("costs", {}).get("prices", {})
     online = [usage_record(call["role"], call.get("usage"), prices=prices) for call in context.model_calls]
     for call in context.calls:
@@ -86,6 +102,7 @@ def episode_costs(context, manifest, online_ms, transitions, feedback, independe
         model_wall_ms=sum(c["duration_ms"] for c in context.model_calls),
         representation_ms=sum(t["event"].get("representation_duration_ms", 0) for t in transitions),
         policy_ms=sum(t["decision"].get("duration_ms", 0) for t in transitions),
+        runtime_groups=runtime_costs(context.calls, runtime_events),
         records=online, usage=summarize_usage(online)),
         evaluation=dict(wall_ms=sum((r or {}).get("cost_duration", 0) * 1000 for r in (feedback, independent)),
                         records=evaluations, usage=summarize_usage(evaluations)),

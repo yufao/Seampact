@@ -24,6 +24,10 @@ resource_catalog只提供非敏感连接、权重状态及已有选择；配置�
 """
 
 
+class EnvironmentGap(ValueError):
+    """A file/credential/package fact of the process that would execute the entry."""
+
+
 def fingerprint(value):
     return hashlib.sha256(json.dumps(value, ensure_ascii=False, sort_keys=True,
         allow_nan=False).encode()).hexdigest()
@@ -484,12 +488,21 @@ class DependencyBindings:
         self.registry, self.inspector = registry, inspector
         self.rows = {row["id"]: row for row in check_requirements(inspector, candidate)}
         self.selected, self.keys = {}, {}
+        # None raises; a list collects facts that a separately declared host re-checks.
+        self.environment_gaps = None
+        # A runtime-group host checks its own files instead of the platform's record.
+        self.host_check = None
         source = inspector.request.get("source_id", "")
         selections = inspector.request.get("dependency_bindings", {})
         for identity, row in self.rows.items():
             selection = selections.get(identity)
             if selection:
                 self.selected[identity] = copy.deepcopy(selection)
+
+    def _environment(self, message):
+        if self.environment_gaps is None:
+            raise EnvironmentGap(message)
+        self.environment_gaps.append(message)
 
     def snapshot(self, entry_ids=None):
         rows = {k:v for k,v in self.rows.items() if entry_ids is None or set(v.get("entry_ids", [])) & set(entry_ids)}
@@ -514,17 +527,21 @@ class DependencyBindings:
                    m.get("parameter") == parameter and m.get("field") == ref["field"] for m in row["mappings"]):
             raise ValueError("resource reference does not match its checked original parameter")
         if row["kind"] == "weight":
-            check = selection["resource"].get("check", {})
+            check = (self.host_check(selection["resource"]) if self.host_check
+                     else selection["resource"].get("check", {}))
             if str(check.get("status", "")).lower() not in {"files_present", "identity_verified", "ready", "present", "verified"}:
-                raise ValueError("weight resource required files have not been checked or are missing")
-            if check.get("necessary_files") == "not_declared":
+                self._environment("weight resource required files have not been checked or are missing in this execution environment")
+            elif check.get("necessary_files") == "not_declared":
                 raise ValueError("weight resource needs the original necessary-file list or shard index")
             return selection["resource"]["path"]
         connection = selection["connection"]
         field = ref["field"]
         if field == "credential":
-            if not selection.get("credential_available"):
-                raise ValueError("selected authentication material is unavailable")
+            available = ((connection.get("auth") or {}).get("mode") == "none" or
+                         bool(self.registry.profiles.connection_key(connection["id"]))) if self.host_check else \
+                selection.get("credential_available")
+            if not available:
+                self._environment("selected authentication material is unavailable in this execution environment")
             if not runtime:
                 return ""  # source/interface checks never resolve secret bytes
             self._freeze_credential(ref["id"], connection)
@@ -560,7 +577,7 @@ class DependencyBindings:
                     raise ValueError("required fixed model directory needs its original necessary-file list")
                 if not target.exists() or not os.access(target, os.R_OK) or any(
                         not (target / name).is_file() or not os.access(target / name, os.R_OK) for name in required):
-                    raise ValueError("required original fixed weight location is missing; see placement details")
+                    self._environment("required original fixed weight location is missing in this execution environment; see placement details")
 
     def _freeze_credential(self, identity, connection):
         profiles = self.registry.profiles

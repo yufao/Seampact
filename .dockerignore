@@ -1,5 +1,7 @@
-# Only platform source enters the image. User repositories and state are mounted.
+# Only platform source and its project metadata enter the image. User
+# repositories and state are mounted.
 **
+!pyproject.toml
 !src/
 !src/**
 !deploy/

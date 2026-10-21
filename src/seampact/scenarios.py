@@ -5,6 +5,7 @@ objects and continuation; the scheduler never treats a finished Unit as a task
 terminal. Adapters are local Python callables, not generated reward programs.
 """
 
+import contextlib
 import copy
 import hashlib
 import importlib.util
@@ -15,6 +16,7 @@ import time
 from pathlib import Path
 
 from .capabilities import freeze_representation, represent
+from .runtime import _task_context
 
 
 def digest_file(path):
@@ -91,21 +93,62 @@ def _vector(value, size, label):
 
 
 class FrozenCatalog:
-    """A run's existing native bindings, owners and nonsecret Unit interfaces."""
-    def __init__(self, catalog, unit_ids=None):
-        self.catalog = catalog
+    """A run's native bindings, owners, Unit interfaces and frozen execution placement.
+
+    LOCAL runs the bound owner in this process. REMOTE runs on the Unit's
+    runtime-group host; the fixed functional-mode controller prepares an
+    instance when needed. A placement never changes silently during a run.
+    """
+    def __init__(self, catalog, unit_ids=None, placement=None):
+        self.catalog, self.router, self.facts = catalog, catalog.remote_router, {}
         with catalog.lock:
             current = {unit["id"]: unit for unit in catalog.public()}
             selected = list(dict.fromkeys(unit_ids)) if unit_ids is not None else [
                 unit["id"] for unit in catalog.business_units()]
+            requested = dict(placement or {})
+            if set(requested) - set(selected) or any(value not in {"LOCAL", "REMOTE"} for value in requested.values()):
+                raise ValueError("placement 只能为本次 Unit 指定 LOCAL 或 REMOTE")
+            self.placement = {}
             for uid in selected:
-                if uid not in current or current[uid]["status"] != "READY":
+                unit = current.get(uid)
+                if unit is None:
                     raise ValueError("运行创建时 Unit 尚不可执行：" + uid)
-                if current[uid].get("execution") == "REMOTE":
-                    raise ValueError("该 Unit 使用既有远程路由，当前运行不能冻结该路由；不能静默改为本地执行：" + uid)
-            self.frozen = catalog.freeze_resources(selected)
+                dispatch = unit.get("dispatch") or {}
+                local = unit["status"] == "READY" and not unit.get("local_status") and uid in catalog.bindings
+                kind = requested.get(uid) or ("LOCAL" if local else "REMOTE")
+                if kind == "LOCAL":
+                    if not local:
+                        raise ValueError("运行创建时 Unit 尚不可在本进程执行：" + uid + "；" + str(dispatch.get("reason") or unit.get("reason")))
+                    self.placement[uid] = dict(kind="LOCAL")
+                    continue
+                host = (unit.get("operations") or {}).get("group_host") or {}
+                group = catalog.store.get("runtime_group", unit.get("runtime_group") or "")
+                gap = ("Unit 没有运行组" if not group or self.router is None else
+                       host.get("reason") or "成员未通过宿主核对" if host.get("status") != "HOST_CHECKED" else
+                       None if dispatch.get("status") == "READY_INSTANCE" else self.router.start_gap(group["id"]))
+                if gap:
+                    raise ValueError("该 Unit 需在运行组宿主执行，但当前既无就绪实例也不可启动：" + uid + "；" + gap)
+                artifact = catalog.store.get("deployment", group["id"]) or {}
+                self.placement[uid] = dict(kind="REMOTE", group_id=group["id"], profile=group["contract"]["host_profile"],
+                    contract_digest=group["contract"]["digest"],
+                    image=(artifact.get("publish") or {}).get("reference") or artifact.get("image"),
+                    image_id=(artifact.get("build") or {}).get("image_id"),
+                    binding_fingerprint=artifact.get("binding_fingerprint"))
+            remote = {uid for uid, value in self.placement.items() if value["kind"] == "REMOTE"}
+            self.frozen = catalog.freeze_resources(selected, remote=remote)
             self.units = {uid: copy.deepcopy(current[uid]) for uid in selected}
+            for uid in remote:
+                self.units[uid].update(status="READY", execution="REMOTE")
+                self.frozen[uid][2].update(status="READY", execution="REMOTE")
             self.resources = catalog.snapshot_resources(selected, frozen=self.frozen)
+
+    def bind_run(self, run_id, control):
+        for value in self.placement.values():
+            if value["kind"] == "REMOTE":
+                value.update(run_id=run_id, start_timeout_s=control["start_timeout_s"])
+
+    def remote_groups(self):
+        return {value["group_id"]: value for value in self.placement.values() if value["kind"] == "REMOTE"}
 
     def public(self):
         return copy.deepcopy(list(self.units.values()))
@@ -114,10 +157,52 @@ class FrozenCatalog:
         if unit_id not in self.frozen:
             raise ValueError("Unit 不在本次冻结能力池内")
         binding, entry, unit = self.frozen[unit_id]
+        if self.placement[unit_id]["kind"] == "REMOTE":
+            value = copy.deepcopy(unit)
+            stored = self.catalog.store.get("unit", unit_id) or {}
+            for key in ("initialization", "last_initialization_before", "last_binding_duration_ms"):
+                value[key] = stored.get(key)
+            return value
         with binding.lock:
             value = copy.deepcopy(unit)
             value["initialization"] = binding.initialization_state(entry, unit)
         return value
+
+    def dispatch_status(self, unit_id):
+        placement = self.placement[unit_id]
+        if placement["kind"] == "LOCAL":
+            return dict(status="READY_LOCAL")
+        fact = self.router.runtime_fact(placement["group_id"], unit_id, placement.get("image"))
+        if fact["ready_instance"]:
+            return dict(status="READY_INSTANCE")
+        if fact["cold_startable"]:
+            return dict(status="COLD_STARTABLE")
+        return dict(status="UNAVAILABLE", reason=fact.get("reason") or "实例结果未决或不可启动")
+
+    def runtime_state(self, unit_ids):
+        facts = []
+        for uid in unit_ids:
+            placement = self.placement[uid]
+            if placement["kind"] == "REMOTE":
+                facts.append(self.router.runtime_fact(placement["group_id"], uid, placement.get("image")))
+                continue
+            binding, entry, unit = self.frozen[uid]
+            group = unit.get("runtime_group")
+            facts.append(dict(local=True, ready_instance=True, warm=binding.initialization_state(entry, unit) == "BOUND",
+                              cold_startable=False, accepting=True, busy=binding.active_calls > 0,
+                              queue=self.router.queue(group) if self.router and group else 0, state_age_ms=0.0))
+        def every(name):
+            values = [fact.get(name) for fact in facts]
+            return None if None in values else all(values)
+        def some(name):
+            values = [fact.get(name) for fact in facts]
+            return True if True in values else None if None in values else False
+        def total(name, combine):
+            values = [fact.get(name) for fact in facts]
+            return None if None in values else combine(values)
+        return dict(local=every("local"), ready_instance=every("ready_instance"), warm=every("warm"),
+                    cold_startable=some("cold_startable"), accepting=every("accepting"), busy=some("busy"),
+                    queue=total("queue", sum), state_age_ms=total("state_age_ms", max))
 
     def business_units(self):
         return [unit for unit in self.public() if unit["status"] == "READY" and
@@ -144,7 +229,20 @@ class FrozenCatalog:
         return copy.deepcopy(self.resources)
 
     def invoke(self, unit_id, arguments, native_arguments=()):
-        return self.catalog.invoke_frozen(self.frozen, unit_id, arguments, native_arguments)
+        # Concurrent tasks of one window share this catalog; facts belong to the calling task.
+        key = (_task_context.get(), unit_id)
+        placement = self.placement.get(unit_id, dict(kind="LOCAL"))
+        if placement["kind"] == "LOCAL":
+            self.facts[key] = dict(execution="LOCAL")
+            return self.catalog.invoke_frozen(self.frozen, unit_id, arguments, native_arguments)
+        binding, entry, unit = self.frozen[unit_id]
+        self.catalog._validate_bound_arguments(binding, entry, unit, arguments, native_arguments)
+        if "run_id" not in placement:
+            raise ValueError("运行组放置需要运行身份")
+        self.facts[key] = dict(execution="REMOTE", group_id=placement["group_id"])
+        result, facts = self.router.invoke_placed(placement, unit, arguments, native_arguments)
+        self.facts[key] = facts
+        return result
 
 
 class SceneContext:
@@ -158,17 +256,28 @@ class SceneContext:
         self.wire_reasoning = {}
         self.native_usage = {}
         self.upstream_costs = {}
+        # A joint window replaces this with its root-request admission.
+        self.admission = lambda unit_id: contextlib.nullcontext()
 
     def invoke(self, unit_id, arguments, native_arguments=()):
         if unit_id not in self.allowed:
             raise ValueError("场景尝试调用本次动作之外的 Unit")
         started = time.perf_counter()
-        unit = self.catalog.unit(unit_id)
-        call = dict(unit_id=unit_id, status="RUNNING", initialization_before=unit.get("initialization"))
+        call = dict(unit_id=unit_id, status="RUNNING", initialization_before=None)
         self.calls.append(call)
+        facts, after = dict(execution="LOCAL"), None
         try:
-            with self.platform.runtime.context(self.run_id):
-                result = self.catalog.invoke(unit_id, arguments, native_arguments)
+            with self.platform.runtime.context(self.run_id), self.admission(unit_id) as root:
+                if root is not None:
+                    # Queueing before the grant is task time, kept in root.wait_ms, not module duration.
+                    call["root"], started = root, time.perf_counter()
+                # Read binding state while this request holds its host, not behind another task's call.
+                call["initialization_before"] = self.catalog.unit(unit_id).get("initialization")
+                try:
+                    result = self.catalog.invoke(unit_id, arguments, native_arguments)
+                finally:
+                    facts = self.catalog.facts.pop((self.run_id, unit_id), facts)
+                    after = self.catalog.unit(unit_id)
             call["status"] = "RETURN"
             binding = self.native_usage.get(unit_id, {})
             if binding.get("model_free") and binding.get("basis"):
@@ -197,12 +306,16 @@ class SceneContext:
             raise
         finally:
             call["duration_ms"] = (time.perf_counter() - started) * 1000
-            after = self.catalog.unit(unit_id)
+            call.update({key: facts.get(key) for key in ("execution", "group_id", "instance_id", "generation",
+                         "start_wait_ms", "cold_instance", "round_trip_ms", "worker_ms", "transport_ms") if key in facts})
+            after = after or {}
             if call["status"] == "RETURN":
-                call["initialization_before"] = after.get("last_initialization_before", call["initialization_before"])
-            call["initialization_after"] = after.get("initialization")
+                call["initialization_before"] = facts.get("initialization_before") or after.get(
+                    "last_initialization_before", call["initialization_before"])
+            call["initialization_after"] = facts.get("initialization_after") or after.get("initialization")
             call["cold_start"] = call["initialization_before"] != "BOUND"
-            call["binding_duration_ms"] = after.get("last_binding_duration_ms") if call["status"] == "RETURN" else None
+            call["binding_duration_ms"] = (facts.get("binding_duration_ms") if "binding_duration_ms" in facts else
+                after.get("last_binding_duration_ms")) if call["status"] == "RETURN" else None
 
     def complete(self, messages, tools=None, role="chat"):
         from .providers import Transport, completion_body
@@ -268,7 +381,7 @@ class SceneSession:
             self.last = event
             return event
         if self.spec.get("representation"):
-            represent(event, self.spec["representation"])
+            represent(event, self.spec["representation"], self.catalog.runtime_state)
         _vector(event.get("observation"), len(self.spec["observation_schema"]), "观测")
         event["raw_observation"] = list(event["observation"])
         event["observation"] = [value / scale for value, scale in zip(event["observation"], self.spec["observation_scales"])]
@@ -280,7 +393,6 @@ class SceneSession:
             raise ValueError("本次候选需要不重复 id")
         required = set(event.get("required_units", []))
         pool = set(self.spec.get("unit_ids", []))
-        live = {u["id"] for u in self.catalog.public() if u["status"] == "READY"}
         for candidate in candidates:
             _vector(candidate.get("features"), len(self.spec["candidate_schema"]), "候选特征")
             units = set(candidate.get("units", []))
@@ -289,12 +401,18 @@ class SceneSession:
             if type(candidate.get("legal")) is not bool:
                 raise ValueError("候选需显式给出 legal")
             # Environment obligations cannot be traded against a reward.
-            candidate["legal"] = candidate["legal"] and required <= units and units <= live
             groups = candidate.get("exclusive_groups", [])
-            if len(groups) != len(set(groups)):
-                candidate["legal"] = False
+            semantic = candidate["legal"] and required <= units and len(groups) == len(set(groups))
+            # Semantic legality is the task/rule judgement; dispatchability is the current runtime fact.
+            dispatch = {uid: self.catalog.dispatch_status(uid) for uid in sorted(units)}
+            dispatchable = all(item["status"] != "UNAVAILABLE" for item in dispatch.values())
+            candidate.update(semantic_legal=semantic, dispatch=dispatch, dispatchable=dispatchable,
+                             legal=semantic and dispatchable)
         if not any(c["legal"] for c in candidates):
-            raise ValueError("当前无可执行且满足必需工作的候选")
+            reasons = {c["id"]: "语义不合法" if not c["semantic_legal"] else
+                       {uid: item.get("reason") for uid, item in c["dispatch"].items() if item["status"] == "UNAVAILABLE"}
+                       for c in candidates}
+            raise ValueError("当前无可执行且满足必需工作的候选：" + json.dumps(reasons, ensure_ascii=False))
         self.last = event
         event["representation_duration_ms"] = (time.perf_counter() - started) * 1000
         return event
