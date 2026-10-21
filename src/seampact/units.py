@@ -22,11 +22,13 @@ import subprocess
 import symtable
 import sys
 import threading
+import time
 import uuid
 from pathlib import Path
 
 from .handoff import ToolListHandoff, install_method_proxy
 from .callsite import lower_callsites
+from .dependencies import DependencyBindings, reference as resource_reference
 from .inspection import Inspector, digest, units
 from .lowering import lower_loop
 from .runtime import ProtocolError
@@ -128,6 +130,27 @@ def _matches(value, schema):
     return True
 
 
+def _fixed_annotation_matches(value, annotation):
+    """A known scalar union arm suffices for an explicit fixed literal.
+
+    Unknown object arms remain unavailable; this does not convert a Path or
+    other native object to JSON or admit it through a business tool port.
+    """
+    if isinstance(annotation, ast.Constant) and isinstance(annotation.value, str):
+        try:
+            annotation = ast.parse(annotation.value, mode="eval").body
+        except SyntaxError:
+            return False
+    if isinstance(annotation, ast.BinOp) and isinstance(annotation.op, ast.BitOr):
+        return (_fixed_annotation_matches(value, annotation.left)
+                or _fixed_annotation_matches(value, annotation.right))
+    if isinstance(annotation, ast.Subscript) and ast.unparse(annotation.value).split(".")[-1] in {"Union", "Optional"}:
+        arguments = list(annotation.slice.elts) if isinstance(annotation.slice, ast.Tuple) else [annotation.slice]
+        return any(_fixed_annotation_matches(value, argument) for argument in arguments)
+    schema = _type_schema(annotation)
+    return schema is not None and "x-native-type" not in schema and _matches(value, schema)
+
+
 def _same_literal(left, right):
     if type(left) is not type(right):
         return False
@@ -182,7 +205,8 @@ def _interface(node, fixed=None, receiver=False, require_all=False, native_schem
         if schema is None:
             schema = native_schemas.get(parameter.arg) or None
         if parameter.arg in fixed:
-            if schema is None or "x-native-type" in schema or not _matches(fixed[parameter.arg], schema):
+            if ((schema is None and not _fixed_annotation_matches(fixed[parameter.arg], parameter.annotation))
+                    or (schema is not None and ("x-native-type" in schema or not _matches(fixed[parameter.arg], schema)))):
                 raise MissingBinding("original object or parameter type is missing: " + parameter.arg)
             continue
         if require_all:
@@ -323,11 +347,12 @@ class _FrozenFinder(importlib.abc.MetaPathFinder):
 
 class NativeBindings:
     """One native source context; every execution gate uses the supplied runtime."""
-    def __init__(self, inspector, candidate, runtime):
+    def __init__(self, inspector, candidate, runtime, resource_binding=None):
         request = json.loads(json.dumps(inspector.request))
         self.inspector = Inspector(inspector.root, inspector.snapshots, request)
         self.candidate = json.loads(json.dumps(candidate))
         self.runtime = runtime
+        self.resource_binding = resource_binding
         self.boundaries = {boundary["id"]: boundary for boundary in candidate.get("boundaries", [])}
         self.report = check_candidate(self.inspector, candidate)
         self.checked = {row["id"]: row for row in self.report["boundaries"]}
@@ -335,6 +360,7 @@ class NativeBindings:
         self.modules, self.notebooks, self.owners, self.entries = {}, {}, {}, {}
         self.approved_entries, self.function_owners, self.owner_keys = {}, {}, {}
         self.programs, self.program_helpers = {}, {}
+        self.effective_bindings = {}
         self.fixed_value_bindings = {}
         self.callsite_gates, self.entry_owner_ids = {}, {}
         self.active_owner = contextvars.ContextVar("seampact_native_binding_owner", default=None)
@@ -460,7 +486,11 @@ class NativeBindings:
         rows = self.fixed_value_bindings.setdefault(entry.get("id"), [])
         for parameter, value in values.items():
             source, evidence = None, None
-            if isinstance(configured, dict) and parameter in configured and _same_literal(value, configured[parameter]):
+            reference = resource_reference(value)
+            if reference is not None:
+                self._resource_values(entry, location, {parameter: value})
+                source, evidence = "USER_RESOURCE_REFERENCE", copy.deepcopy(reference)
+            elif isinstance(configured, dict) and parameter in configured and _same_literal(value, configured[parameter]):
                 source, evidence = "USER_CONFIGURATION", "configuration.entries." + str(entry.get("id")) + "." + location + "." + parameter
             elif parameter in (call_literals or {}) and _same_literal(value, call_literals[parameter]["value"]):
                 source, evidence = "ORIGINAL_REQUEST_LITERAL", call_literals[parameter]["line"]
@@ -480,12 +510,25 @@ class NativeBindings:
             if row not in rows:
                 rows.append(row)
 
+    def _resource_values(self, entry, location, values, runtime=False):
+        if not isinstance(values, dict):
+            raise MissingBinding(location + " must be a parameter mapping")
+        if self.resource_binding is not None:
+            return self.resource_binding.values(values, entry["id"], location, runtime=runtime)
+        if any(resource_reference(value) is not None for value in values.values()):
+            raise MissingBinding("resource dependency registry is unavailable")
+        return dict(values)
+
+    def redact(self, error):
+        return self.resource_binding.redact(error) if self.resource_binding is not None else str(error)
+
     def _original_defaults(self, entry, location, values):
         original = {row["parameter"] for row in self.fixed_value_bindings.get(entry.get("id"), [])
                     if row["location"] == location and row["source"] == "SIGNATURE_LITERAL_DEFAULT"}
         # Omitting the copied JSON value reuses the actual original default
         # object, including mutable defaults and their alias relationships.
-        return {name: value for name, value in values.items() if name not in original}
+        values = {name: value for name, value in values.items() if name not in original}
+        return self._resource_values(entry, location, values, runtime=True)
 
     def _port_schema(self, annotation, path, cell="file"):
         """Resolve object ports from frozen annotations, without importing code."""
@@ -704,9 +747,13 @@ class NativeBindings:
         if target["kind"] != "function":
             return None
         node, _ = _anchor(source_unit(self.inspector, target["path"], target.get("unit", "file")), target["symbol"])
-        result = self._port_schema(node.returns, target["path"], target.get("unit", "file")).get("x-native-type", {})
-        if result.get("path"):
-            return {"kind": "object", "path": result["path"], "unit": "file", "symbol": result["symbol"]}
+        # A return annotation describes an expected type, not the object that
+        # the original factory actually creates. This finite inference follows
+        # original constructor/alias operations only; branch factories remain
+        # unknown until their control-sensitive return relation is supported.
+        if any(isinstance(statement, (ast.If, ast.For, ast.AsyncFor, ast.While, ast.Try,
+                                      ast.With, ast.AsyncWith, ast.Match)) for statement in node.body):
+            return None
         local, _ = self._global_targets(target["path"], target.get("unit", "file"))
         candidates = []
         for statement in node.body:
@@ -714,6 +761,9 @@ class NativeBindings:
                 expression = statement.value
                 constructor = self._resolve_target(expression.func, local) if isinstance(expression, ast.Call) else None
                 object_ = dict(constructor, kind="object") if constructor and constructor["kind"] == "class" else None
+                if not isinstance(expression, ast.Call):
+                    alias = self._resolve_target(expression, local)
+                    object_ = alias if alias and alias["kind"] == "object" else None
                 assigned = statement.targets if isinstance(statement, ast.Assign) else [statement.target]
                 for name in assigned:
                     if isinstance(name, ast.Name):
@@ -844,7 +894,7 @@ class NativeBindings:
             expression = original_values.get(parameter)
             if not isinstance(expression, ast.Name) or expression.id != reference:
                 raise MissingBinding("native object reference is not the original request argument: " + parameter)
-        fixed = entry.get("fixed_arguments", {})
+        fixed = self._resource_values(entry, "entry.fixed_arguments", entry.get("fixed_arguments", {}))
         for parameter, expression in original_values.items():
             if parameter in references:
                 continue
@@ -861,7 +911,8 @@ class NativeBindings:
         if set(tasks) - names or set(arguments) - names or set(tasks) & set(arguments):
             raise MissingBinding("construction inputs do not match the original function interface")
         self._fixed_values(entry, scope, arguments, "binding_program.arguments", allow_resources=True)
-        _interface(scope, arguments, require_all=True, bound_refs=tasks)
+        _interface(scope, self._resource_values(entry, "binding_program.arguments", arguments),
+                   require_all=True, bound_refs=tasks)
         source_task_schema, _ = _interface(scope)
         task_schema = {}
         task_required = []
@@ -970,10 +1021,49 @@ class NativeBindings:
         if missing:
             raise MissingBinding("original native owner initialization is missing for: " + ", ".join(sorted(missing)))
 
+    def _effective_binding(self, path, cell, node, owner):
+        if owner is None:
+            return "function"
+        decorators = [ast.unparse(value).split(".")[-1] for value in node.decorator_list]
+        if not any(value in {"staticmethod", "classmethod", "property"} for value in decorators):
+            return "instance"
+        if (len(node.decorator_list) != 1 or not isinstance(node.decorator_list[0], ast.Name)
+                or node.decorator_list[0].id not in {"staticmethod", "classmethod"}):
+            raise MissingBinding("native property or combined descriptor decorators need a distinct effective binding")
+        name = node.decorator_list[0].id
+        targets, _ = self._global_targets(path, cell)
+        if targets.get(name) != {"kind": "builtin", "symbol": name}:
+            raise MissingBinding("native class descriptor is not the unshadowed builtin: " + name)
+        if (owner.decorator_list or owner.keywords
+                or any(not isinstance(base, ast.Name) or base.id != "object" for base in owner.bases)):
+            raise MissingBinding("native class descriptor requires an undecorated direct class without inherited/metaclass dispatch")
+        for member in owner.body:
+            if member.lineno >= node.lineno:
+                break
+            rebound = (isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and member.name == name)
+            if isinstance(member, (ast.Import, ast.ImportFrom)):
+                rebound |= any((alias.asname or alias.name.split(".")[0]) == name for alias in member.names)
+            if rebound or any(isinstance(value, ast.Name) and isinstance(value.ctx, (ast.Store, ast.Del)) and value.id == name
+                              for value in ast.walk(member)):
+                raise MissingBinding("native descriptor name is rebound in the original class scope: " + name)
+        return name
+
     def describe(self, entry):
         path, cell, symbol, kind = entry["path"], entry.get("unit", "file"), entry["symbol"], entry["kind"]
         if path not in self.inspector.files:
             raise MissingBinding("native entry file is outside the frozen source scope")
+        if self.resource_binding is not None:
+            self.resource_binding.check_entry(entry["id"])
+        environment = entry.get("environment", {})
+        if environment:
+            if kind != "cli" or not isinstance(environment, dict):
+                raise MissingBinding("resource environment mappings require the original CLI process start")
+            for name, value in environment.items():
+                if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name) or resource_reference(value) is None:
+                    raise MissingBinding("CLI environment must map original variable names to checked dependency references")
+            resolved = self._resource_values(entry, "environment", environment)
+            if any(not isinstance(value, str) for value in resolved.values()):
+                raise MissingBinding("original CLI environment values must be strings")
         selected = []
         for identity in entry.get("boundary_ids", []):
             boundary = self.boundaries.get(identity)
@@ -1002,17 +1092,26 @@ class NativeBindings:
             raise MissingBinding("streaming/generator lifecycle needs an original host binding")
         if (kind == "method") != (owner is not None):
             raise MissingBinding("entry kind does not match its native source receiver")
-        if owner is not None and any(ast.unparse(decorator).split(".")[-1] in {"staticmethod", "classmethod", "property"}
-                                     for decorator in node.decorator_list):
-            raise MissingBinding("static/class/property receiver needs a distinct effective native binding")
+        effective = self._effective_binding(path, cell, node, owner)
+        class_bound = effective in {"staticmethod", "classmethod"}
+        receiver = owner is not None and effective != "staticmethod"
+        self.effective_bindings[entry["id"]] = effective
+        if class_bound:
+            if entry.get("constructor") or entry.get("initializers") or entry.get("binding_program"):
+                raise MissingBinding("native class descriptor binds the original class; instance construction or a request prefix would change its binding")
+            if any(boundary["symbol"] != symbol or boundary["mode"] != "W"
+                   or boundary.get("native_wiring") or boundary.get("rule") for boundary in selected):
+                raise MissingBinding("native class descriptor currently supports only its whole original W call, without internal descriptor rewriting")
+            if len(selected) > 1:
+                raise MissingBinding("one original class descriptor occurrence cannot acquire duplicate whole-call gates")
         if entry.get("binding_program") and owner is not None and any(isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef))
                 and member.name in {"__getattribute__", "__getattr__", "__setattr__"} for member in owner.body):
             raise MissingBinding("source construction receiver has dynamic attribute dispatch without its host rule")
         ports, result_schema = self.entry_ports(entry)
         program = self._construction(entry, node, owner) if entry.get("binding_program") is not None else None
-        self._fixed_values(entry, node, entry.get("fixed_arguments", {}), "entry.fixed_arguments", receiver=owner is not None,
+        self._fixed_values(entry, node, entry.get("fixed_arguments", {}), "entry.fixed_arguments", receiver=receiver,
                            call_literals=program["call_literals"] if program else None)
-        schema, omitted = _interface(node, entry.get("fixed_arguments", {}), receiver=owner is not None,
+        schema, omitted = _interface(node, self._resource_values(entry, "entry.fixed_arguments", entry.get("fixed_arguments", {})), receiver=receiver,
                                      native_schemas=ports, bound_refs=program["references"] if program else ())
         if program:
             for name, port in program["task_schema"].items():
@@ -1023,7 +1122,7 @@ class NativeBindings:
                     schema["required"].append(name)
             if any(isinstance(boundary.get("native_wiring"), dict) for boundary in selected):
                 raise MissingBinding("construction prefix SDK registration needs a before-registration construction hook")
-        if owner is not None and not program:
+        if owner is not None and not program and not class_bound:
             constructor = entry.get("constructor")
             if not isinstance(constructor, dict) or constructor.get("symbol") != owner.name:
                 raise MissingBinding("the original owner constructor must be identified")
@@ -1042,7 +1141,8 @@ class NativeBindings:
             else:
                 self._fixed_values(entry, initializer, constructor.get("arguments", {}), "constructor.arguments",
                                    receiver=True, allow_resources=True)
-                _interface(initializer, constructor.get("arguments", {}), receiver=True, require_all=True)
+                _interface(initializer, self._resource_values(entry, "constructor.arguments", constructor.get("arguments", {})),
+                           receiver=True, require_all=True)
             for initialization in entry.get("initializers", []):
                 if initialization["symbol"].count(".") > 1 or ("." in initialization["symbol"] and initialization["symbol"].split(".")[0] != owner.name):
                     raise MissingBinding("original initializer belongs to a different native owner")
@@ -1054,7 +1154,8 @@ class NativeBindings:
                     raise MissingBinding("generator initialization needs an original lifecycle binding")
                 self._fixed_values(entry, initial, initialization.get("arguments", {}), "initializers." + initialization["symbol"],
                                    receiver=True, allow_resources=True)
-                _interface(initial, initialization.get("arguments", {}), receiver=True, require_all=True)
+                _interface(initial, self._resource_values(entry, "initializers." + initialization["symbol"], initialization.get("arguments", {})),
+                           receiver=True, require_all=True)
             self._owner_initialization(owner, entry,
                 [initialization["symbol"].split(".")[-1] for initialization in entry.get("initializers", [])])
         elif program:
@@ -1154,7 +1255,12 @@ class NativeBindings:
             raise MissingBinding("original CLI interpreter must be supplied")
         placeholders = [match.group(1) for argument in command[index + 1:]
                         for match in re.finditer(r"^\{([A-Za-z_][A-Za-z0-9_]*)\}$", argument)]
-        fixed = entry.get("fixed_arguments", {})
+        declared = entry.get("fixed_arguments", {})
+        if not isinstance(declared, dict):
+            raise MissingBinding("CLI fixed arguments must be a parameter mapping")
+        if any((resource_reference(value) or {}).get("field") == "credential" for value in declared.values()):
+            raise MissingBinding("private credentials cannot be supplied in original CLI command arguments")
+        fixed = self._resource_values(entry, "entry.fixed_arguments", declared)
         if not isinstance(fixed, dict) or set(fixed) - set(placeholders):
             raise MissingBinding("CLI fixed arguments must name actual command placeholders")
         # Command arguments are native argv strings; no shell evaluation occurs.
@@ -1287,6 +1393,20 @@ class NativeBindings:
                 entry.get("initializers", [])], sort_keys=True)
         return self.owner_keys[identity]
 
+    def initialization_state(self, entry, unit):
+        """Read this binding's retained native cache, never a Unit's old report."""
+        if entry.get("binding_program") is not None:
+            # The original B-CALL prefix creates its objects for every request,
+            # including function entries whose callable itself is cached.
+            return "REQUEST_SCOPED"
+        if unit["id"] in self.entries:
+            return "BOUND"
+        if entry["kind"] == "method":
+            record = self.owners.get(self._owner_key(entry))
+            if record is not None and record["initialized"]:
+                return "BOUND"
+        return "NOT_RUN"
+
     def _construct(self, entry, arguments):
         program = self.programs[entry["id"]]
         specification = program["spec"]
@@ -1330,6 +1450,33 @@ class NativeBindings:
         positional, keyword = _actual_arguments(helper, values)
         return helper(*positional, **keyword)
 
+    def _load_class_entry(self, entry, unit, selected):
+        namespace = self._namespace(entry)
+        class_name, _, name = entry["symbol"].partition(".")
+        owner = namespace.get(class_name)
+        if (not inspect.isclass(owner) or type(owner) is not type or owner.__qualname__ != class_name
+                or owner.__module__ != namespace.get("__name__")):
+            raise MissingBinding("native descriptor owner is not the original direct source class")
+        effective = self.effective_bindings[entry["id"]]
+        descriptor = inspect.getattr_static(owner, name)
+        expected = classmethod if effective == "classmethod" else staticmethod
+        if type(descriptor) is not expected:
+            raise MissingBinding("original native class descriptor changed after its source binding was checked")
+        self._assert_callable(descriptor.__func__, entry["symbol"], entry["path"])
+        original = getattr(owner, name)
+        self._assert_callable(original, entry["symbol"], entry["path"])
+        # The class is created once by its original module, and cls remains that
+        # exact class. Do not construct an instance or overwrite its descriptor.
+        record = self.function_owners.setdefault(("native-class", entry["path"], entry.get("unit", "file"), class_name),
+            dict(id="native-class-" + uuid.uuid4().hex, boundaries=set(), hooks=[]))
+        boundary_unit = self._boundary_unit(selected[0]) if selected else unit
+        gate = uuid.uuid4().hex + ":" + boundary_unit["id"]
+        self._register(gate, record["id"], boundary_unit)
+        callable_ = self.runtime.wrap(original, gate, record["id"])
+        self.entries[unit["id"]] = callable_
+        self.entry_owner_ids[unit["id"]] = record["id"]
+        return callable_
+
     async def _load(self, entry, unit, construction=None):
         identity = unit["id"]
         if identity in self.entries and not (construction is not None and entry["kind"] == "method"):
@@ -1355,13 +1502,17 @@ class NativeBindings:
                     match = re.fullmatch(r"\{([A-Za-z_][A-Za-z0-9_]*)\}", command[position])
                     if match:
                         command[position] = arguments[match.group(1)]
-                return subprocess.run(command, cwd=self.inspector.root, capture_output=True, check=False)
+                environment = os.environ.copy()
+                environment.update(self._resource_values(entry, "environment", entry.get("environment", {}), runtime=True))
+                return subprocess.run(command, cwd=self.inspector.root, capture_output=True, check=False, env=environment)
             owner_id = "native-cli-" + uuid.uuid4().hex
             gate = uuid.uuid4().hex + ":" + identity
             self._register(gate, owner_id, unit)
             callable_ = self.runtime.wrap(original, gate, owner_id)
             self.entries[identity] = callable_
             return callable_
+        if self.effective_bindings.get(entry["id"]) in {"staticmethod", "classmethod"}:
+            return self._load_class_entry(entry, unit, selected)
         original_entry = None
         if construction is not None and entry["kind"] == "method":
             original_entry = getattr(construction[entry["binding_program"]["receiver"]], entry["symbol"].split(".")[-1])
@@ -1474,6 +1625,10 @@ class NativeBindings:
         if self.detached:
             raise MissingBinding("Harness source is detached")
         with self._context():
+            # invoke() serializes this source binding. Capture readiness here,
+            # after any earlier queued call has initialized the same owner.
+            unit["last_initialization_before"] = self.initialization_state(entry, unit)
+            binding_started = time.perf_counter()
             construction = self._construct(entry, arguments) if entry.get("binding_program") is not None else None
             try:
                 callable_ = await self._load(entry, unit, construction)
@@ -1481,6 +1636,7 @@ class NativeBindings:
                 raise
             except Exception as error:
                 raise MissingBinding("original native binding/initialization failed: " + str(error)) from error
+            unit["last_binding_duration_ms"] = (time.perf_counter() - binding_started) * 1000
             values = self._original_defaults(entry, "entry.fixed_arguments", entry.get("fixed_arguments", {}))
             if construction is not None:
                 program_record = self.programs[entry["id"]]
@@ -1516,6 +1672,11 @@ class NativeBindings:
             self.active_calls += 1
             try:
                 return asyncio.run_coroutine_threadsafe(self._invoke(entry, unit, arguments), self.loop).result()
+            except Exception as error:
+                message = self.redact(error)
+                if message != str(error):
+                    raise MissingBinding(message) from None
+                raise
             finally:
                 self.active_calls -= 1
 
@@ -1526,6 +1687,7 @@ class UnitCatalog:
         self.bindings, self.entry_specs = {}, {}
         self.lock = threading.RLock()
         self.remote_router = None
+        self.resource_registry = None
 
     def install(self, inspector, candidate, analysis_id, installation_id=None):
         with self.lock:
@@ -1561,7 +1723,8 @@ class UnitCatalog:
             raise ValueError("candidate.entries must be an array")
         normalized = dict(candidate, boundaries=candidate.get("boundaries", []))
         try:
-            binding, binding_error = NativeBindings(inspector, normalized, self.runtime), None
+            resources = DependencyBindings(self.resource_registry, inspector, normalized) if self.resource_registry is not None else None
+            binding, binding_error = NativeBindings(inspector, normalized, self.runtime, resource_binding=resources), None
         except (ValueError, KeyError, TypeError, SyntaxError) as error:
             binding, binding_error = None, str(error)
         identifiers = [entry.get("id") for entry in candidate.get("entries", [])
@@ -1571,10 +1734,13 @@ class UnitCatalog:
 
     @staticmethod
     def _inspect_entry(binding, binding_error, entry, source_id, duplicates, seen):
+        from .capabilities import capability_card
         result = dict(status="MISSING", reason=None, parameters=None, input_schema=None,
                       result_schema={}, native_input_schemas={}, construction=None, fixed_value_bindings=[],
                       operations={"export_entry": {"status": "UNKNOWN", "formal_proof": False}})
+        result["capability"] = capability_card()
         try:
+            result["capability"] = capability_card(entry.get("capability"))
             if not isinstance(source_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]+", source_id) or source_id in seen or source_id in duplicates:
                 raise MissingBinding("entry IDs must be unique ASCII identifiers")
             seen.add(source_id)
@@ -1593,14 +1759,18 @@ class UnitCatalog:
                                                 if "x-native-type" in port},
                           construction=construction["facts"] if construction else None,
                           fixed_value_bindings=binding.fixed_value_bindings.get(entry.get("id"), []),
+                          effective_binding=binding.effective_bindings.get(entry.get("id"), "cli"),
                           operations={"export_entry": {"status": "SOURCE_BOUND", "formal_proof": False,
                                        "scope": "user-confirmed prototype native binding; semantic export obligations remain conditional"}})
         except (ValueError, KeyError, TypeError, SyntaxError, OSError) as error:
-            result["reason"] = str(error)
+            reason = binding.redact(error) if binding is not None else str(error)
+            result["reason"] = reason
             if entry.get("binding_program"):
-                result["construction"] = {"rule": "B-CALL-straight-prefix/1", "status": "UNKNOWN", "reason": str(error)}
+                result["construction"] = {"rule": "B-CALL-straight-prefix/1", "status": "UNKNOWN", "reason": reason}
             if binding is not None:
                 result["fixed_value_bindings"] = binding.fixed_value_bindings.get(entry.get("id"), [])
+                if entry.get("id") in binding.effective_bindings:
+                    result["effective_binding"] = binding.effective_bindings[entry["id"]]
         return result
 
     def inspect_candidate(self, inspector, candidate):
@@ -1714,31 +1884,67 @@ class UnitCatalog:
                     unit.update(status="MISSING", reason="native binding is not loaded in this process")
                 route = self.remote_router.routes.get(unit.get("runtime_group")) if self.remote_router else None
                 unit["execution"] = "REMOTE" if route and unit["id"] in route["units"] else "LOCAL"
+                unit["scheduling"] = self.store.get("unit_policy", unit["id"]) or dict(
+                    visibility="business", activation="business", declared=False)
+                from .capabilities import capability_card
+                unit["capability"] = (self.store.get("unit_capability", unit["id"]) or {}).get(
+                    "card", unit.get("capability") or capability_card())
                 result.append(unit)
             return result
 
     def tools(self):
         return [dict(type="function", function=dict(name=unit["tool_name"], description=unit["description"],
-                    parameters=unit["parameters"])) for unit in self.public() if unit["status"] == "READY"]
+                    parameters=unit["parameters"])) for unit in self.business_units()]
+
+    def business_units(self):
+        return [unit for unit in self.public() if unit["status"] == "READY"
+                and unit["scheduling"]["visibility"] == "business"
+                and unit["scheduling"]["activation"] == "business"]
+
+    def scheduling_policy(self, body):
+        unit_id = body["unit_id"]
+        if not self.store.get("unit", unit_id):
+            raise ValueError("没有这个 Unit")
+        pair = (body.get("visibility"), body.get("activation"))
+        if pair not in {("business", "business"), ("transparent", "platform")}:
+            raise ValueError("选择业务可见/业务申请，或透明/平台触发")
+        value = dict(visibility=pair[0], activation=pair[1], declared=True)
+        self.store.save("unit_policy", unit_id, value)
+        return dict(unit_id=unit_id, scheduling=value)
 
     def name_to_id(self, name):
-        found = [unit["id"] for unit in self.public() if unit["tool_name"] == name and unit["status"] == "READY"]
+        found = [unit["id"] for unit in self.business_units() if unit["tool_name"] == name]
         if len(found) != 1:
             raise ValueError("ready native tool name is not found")
         return found[0]
+
+    def set_capability(self, body):
+        from .capabilities import capability_card, content_digest
+        unit = self.store.get("unit", body["unit_id"])
+        if not unit:
+            raise ValueError("没有这个 Unit")
+        card = capability_card(body["card"])
+        value = dict(card=card, digest=content_digest(card), source_version=unit["source_version"],
+                     path=unit["path"], symbol=unit["symbol"], updated_at=now())
+        self.store.save("unit_capability", unit["id"], value)
+        return value
 
     def validate_arguments(self, unit_id, arguments, native_arguments=(), deferred_arguments=()):
         """Validate a proposed call before the caller's RL action selection."""
         unit = self.store.get("unit", unit_id)
         if not unit or unit["status"] != "READY" or unit_id not in self.bindings:
             raise ValueError("native Unit is not ready")
+        return self._validate_bound_arguments(self.bindings[unit_id], self.entry_specs[unit_id], unit,
+            arguments, native_arguments, deferred_arguments)
+
+    @staticmethod
+    def _validate_bound_arguments(binding, entry, unit, arguments, native_arguments=(), deferred_arguments=()):
         if not isinstance(arguments, dict):
             raise ValueError("native tool arguments must be a JSON object")
         native_arguments, deferred_arguments = set(native_arguments), set(deferred_arguments)
         if (native_arguments | deferred_arguments) - set(arguments):
             raise ValueError("native/deferred argument names must identify actual supplied parameters")
         schema = unit["parameters"]
-        entry = self.entry_specs[unit_id]
         program = entry.get("binding_program") or {}
         references = set(program.get("argument_refs", {})) - set(program.get("task_parameters", {}).values())
         if set(arguments) & (set(entry.get("fixed_arguments", {})) | set(unit.get("omitted_object_parameters", [])) | references):
@@ -1751,7 +1957,7 @@ class UnitCatalog:
             if name in deferred_arguments:
                 continue
             if name in native_arguments:
-                if name not in schema["properties"] or not self.bindings[unit_id].native_matches(value, schema["properties"][name]):
+                if name not in schema["properties"] or not binding.native_matches(value, schema["properties"][name]):
                     raise ValueError("native result object does not match its source-derived parameter type: " + name)
                 continue
             try:
@@ -1761,6 +1967,50 @@ class UnitCatalog:
             if name in schema["properties"] and not _matches(value, schema["properties"][name]):
                 raise ValueError("native tool parameter type mismatch: " + name)
         return True
+
+    def freeze_resources(self, unit_ids):
+        """Keep the actual source binding/owner and private credentials in memory."""
+        frozen, bindings = {}, {}
+        with self.lock:
+            for unit_id in dict.fromkeys(unit_ids):
+                unit = self.store.get("unit", unit_id)
+                if not unit or unit["status"] != "READY" or unit_id not in self.bindings:
+                    raise MissingBinding("cannot freeze an unavailable native Unit")
+                binding, entry = self.bindings[unit_id], self.entry_specs[unit_id]
+                frozen[unit_id] = (binding, entry, copy.deepcopy(unit))
+                bindings.setdefault(id(binding), (binding, set()))[1].add(entry["id"])
+            for binding, entry_ids in bindings.values():
+                if binding.resource_binding is not None:
+                    binding.resource_binding.freeze_credentials(entry_ids=entry_ids)
+        return frozen
+
+    def snapshot_resources(self, unit_ids, frozen=None):
+        """Research-safe configuration evidence; never return private resolvers."""
+        result = []
+        with self.lock:
+            for unit_id in dict.fromkeys(unit_ids):
+                if frozen is not None:
+                    binding, entry, _ = frozen.get(unit_id, (None, None, None))
+                else:
+                    binding, entry = self.bindings.get(unit_id), self.entry_specs.get(unit_id)
+                if binding is None or entry is None:
+                    continue
+                resources = binding.resource_binding
+                snapshot = resources.snapshot(entry_ids={entry["id"]}) if resources is not None else dict(requirements=[], bindings={})
+                requirements = [row for row in snapshot["requirements"] if entry["id"] in row.get("entry_ids", [])]
+                selected_ids = {row["id"] for row in requirements}
+                result.append(dict(unit_id=unit_id, entry_id=entry["id"],
+                    source_id=binding.inspector.request.get("source_id"),
+                    source_version=binding.inspector.request["source_version"], requirements=requirements,
+                    bindings={identity: value for identity, value in snapshot["bindings"].items() if identity in selected_ids}))
+        return dict(schema="native-resource-snapshot/1", units=result)
+
+    def invoke_frozen(self, frozen, unit_id, arguments, native_arguments=()):
+        if unit_id not in frozen:
+            raise MissingBinding("native Unit is absent from this run's frozen resources")
+        binding, entry, unit = frozen[unit_id]
+        self._validate_bound_arguments(binding, entry, unit, arguments, native_arguments)
+        return self._invoke_bound(binding, entry, unit, arguments)
 
     def invoke(self, unit_id, arguments, native_arguments=()):
         self.validate_arguments(unit_id, arguments, native_arguments=native_arguments)
@@ -1774,21 +2024,41 @@ class UnitCatalog:
                     unit.update(initialization="BOUND", result_type=type(result).__module__ + "." + type(result).__qualname__)
                     self.store.save("unit", unit_id, unit)
                 return result
+        return self._invoke_bound(self.bindings[unit_id], entry, unit, arguments)
+
+    def _invoke_bound(self, binding, entry, unit, arguments):
+        unit_id = unit["id"]
+        def record_outcome(success):
+            resources = binding.resource_binding
+            if resources is not None and self.resource_registry is not None:
+                return self.resource_registry.record_execution(binding.inspector.request.get("source_id"),
+                    entry["id"], success, resources.snapshot(entry_ids={entry["id"]}))
         try:
-            result = self.bindings[unit_id].invoke(entry, unit, arguments)
+            result = binding.invoke(entry, unit, arguments)
         except (MissingBinding, ImportError, ModuleNotFoundError, FileNotFoundError, NameError, AttributeError, ProtocolError) as error:
+            record_outcome(False)
             with self.lock:
-                binding = self.bindings[unit_id]
                 for identity, related in self.entry_specs.items():
                     if self.bindings[identity] is binding and binding._owner_key(related) == binding._owner_key(entry):
                         item = self.store.get("unit", identity)
                         if item.get("status") not in {"SUPERSEDED", "DETACHED"}:
                             item["status"] = "MISSING"
-                        item["reason"] = str(error)
+                        item["reason"] = binding.redact(error)
                         self.store.save("unit", identity, item, "unit_binding_missing")
             raise
+        except Exception:
+            record_outcome(False)
+            raise
+        outcome = record_outcome(True)
         with self.lock:
+            binding_duration = unit.get("last_binding_duration_ms")
+            initialization_before = unit.get("last_initialization_before")
             unit = self.store.get("unit", unit_id)
-            unit.update(initialization="BOUND", result_type=type(result).__module__ + "." + type(result).__qualname__)
+            unit.update(initialization=binding.initialization_state(entry, unit),
+                        result_type=type(result).__module__ + "." + type(result).__qualname__)
+            unit["last_binding_duration_ms"] = binding_duration
+            unit["last_initialization_before"] = initialization_before
+            if outcome is not None:
+                unit["last_execution"] = outcome
             self.store.save("unit", unit_id, unit, "unit_returned")
         return result

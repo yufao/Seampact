@@ -1,4 +1,9 @@
-"""Two Q-learning policies selecting only caller-supplied legal candidates."""
+"""Stable scheduler facade: historical plan Q values and legal-call FIFO.
+
+Neural intervention learners are owned by immutable research runs.  Ordinary
+business plan selection keeps its historical table, without presenting those
+old success/latency values as independent safety feedback.
+"""
 
 import json
 import math
@@ -118,6 +123,7 @@ class TwoLayerScheduler:
             self.updates = saved["updates"]
         self.pending = {}
         self.last = {"upper": None, "lower": None}
+        self.fifo_dispatches = 0
 
     def _select(self, layer, candidates, observation):
         if not isinstance(candidates, list) or not candidates:
@@ -144,8 +150,19 @@ class TwoLayerScheduler:
         return self._select("upper", plans, observation)
 
     def select_ready(self, calls, observation):
-        """The caller supplies already-enabled, legally dispatchable calls."""
-        return self._select("lower", calls, observation)
+        """The caller supplies enabled calls in their original FIFO order."""
+        if not isinstance(calls, list) or not calls:
+            raise ValueError("no legally enabled calls")
+        if any(not isinstance(call, dict) for call in calls):
+            raise ValueError("calls must be dictionaries")
+        with self.lock:
+            call = calls[0]
+            key = _action_key("lower", call)
+            token = uuid.uuid4().hex
+            self.pending[token] = dict(layer="lower", action=key)
+            self.last["lower"] = dict(candidate_count=len(calls), action_key=key, explored=False)
+            self.fifo_dispatches += 1
+            return call, token
 
     def feedback(self, token, success, duration_ms, next_candidates=None, next_observation=None):
         if type(success) is not bool:
@@ -157,6 +174,11 @@ class TwoLayerScheduler:
             if decision is None:
                 raise ValueError("unknown or already completed decision")
             layer = decision["layer"]
+            if layer == "lower":
+                # A post-return ready snapshot is not a next research decision.
+                # FIFO has no value target to bootstrap or policy to update.
+                del self.pending[token]
+                return
             following = 0.0
             # None or an empty legal set has no successor action to bootstrap.
             if next_candidates is not None and (not isinstance(next_candidates, list) or
@@ -188,13 +210,20 @@ class TwoLayerScheduler:
 
     def snapshot(self):
         with self.lock:
-            value = dict(status="READY", policy="TWO_LAYER_TABULAR_Q_LEARNING",
+            value = dict(status="READY", policy="HISTORICAL_PLAN_Q_WITH_FIFO_DISPATCH",
                          theory_pending=False, epsilon=self.epsilon, alpha=self.alpha, gamma=self.gamma)
-            for layer in ("upper", "lower"):
-                last = self.last[layer] or {}
-                count = last.get("candidate_count")
-                value[layer] = dict(updates=self.updates[layer], state_count=len(self.q[layer]),
-                    action_count=sum(len(actions) for actions in self.q[layer].values()),
-                    candidate_count=count, choice_available=count is not None and count > 1,
-                    action_key=last.get("action_key"), explored=last.get("explored", False))
+            last = self.last["upper"] or {}
+            count = last.get("candidate_count")
+            value["upper"] = dict(algorithm="historical_tabular_q", feedback="legacy_success_latency",
+                updates=self.updates["upper"], state_count=len(self.q["upper"]),
+                action_count=sum(len(actions) for actions in self.q["upper"].values()),
+                candidate_count=count, choice_available=count is not None and count > 1,
+                action_key=last.get("action_key"), explored=last.get("explored", False))
+            last = self.last["lower"] or {}
+            count = last.get("candidate_count")
+            value["lower"] = dict(algorithm="fifo", updates=0, state_count=0, action_count=0,
+                dispatches=self.fifo_dispatches, candidate_count=count,
+                choice_available=count is not None and count > 1,
+                action_key=last.get("action_key"), explored=False,
+                historical_q_updates=self.updates["lower"])
             return value

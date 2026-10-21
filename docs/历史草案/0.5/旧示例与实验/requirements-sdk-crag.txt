@@ -1,5 +1,0 @@
-# Optional CPU-only CRAG source/Workflow SDK mechanism probe.
-# Install in its own environment, separate from the MMCT SDK profile.
-# No OpenAI/Tavily integration, model weights, GPU library, or API key needed.
-llama-index-core==0.14.25
-llama-index-workflows==2.22.2

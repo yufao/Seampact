@@ -1,10 +1,12 @@
 kind: Cluster
 apiVersion: kind.x-k8s.io/v1alpha4
 name: seampact-prototype
+# Illustrative paths only. Generate a private config for the actual directories
+# using docs/运行组与K8S部署.md before creating a cluster.
 nodes:
   - role: control-plane
     extraMounts:
-      - hostPath: /home/jym/seampact-workspace/seampact-data
-        containerPath: /home/jym/seampact-workspace/seampact-data
-      - hostPath: /home/jym/seampact-workspace/harnesses
-        containerPath: /home/jym/seampact-workspace/harnesses
+      - hostPath: /srv/seampact/seampact-data
+        containerPath: /srv/seampact/seampact-data
+      - hostPath: /srv/seampact/harnesses
+        containerPath: /srv/seampact/harnesses

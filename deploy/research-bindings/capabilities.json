@@ -1,0 +1,30 @@
+{
+  "vpc3": {
+    "goal": "在同一图像、问题和初答上运行原专家与冻结 gate，交付保留或校准后的答案及证据",
+    "roles": ["revise"], "modalities": ["text", "image"],
+    "inputs": ["question", "answer", "image"], "outputs": ["answer", "evidence"],
+    "effects": ["change_answer", "add_information"], "scopes": ["visual_qa"],
+    "events": ["visual_answer_returned"], "granularity": ["whole"]
+  },
+  "qacd": {
+    "goal": "用真实 LLaVA provider 和匹配的已拟合 48 维 scorer 评估视觉回答错误风险",
+    "roles": ["check"], "modalities": ["text", "image"],
+    "inputs": ["question", "answer", "image"], "outputs": ["risk", "evidence"],
+    "effects": ["add_information"], "scopes": ["visual_qa"],
+    "events": ["visual_answer_returned"], "granularity": ["whole"]
+  },
+  "rex": {
+    "goal": "在实际固定语料与 Lucene 索引上执行原 REX BM25 检索，返回证据文档",
+    "roles": ["retrieve"], "modalities": ["text"],
+    "inputs": ["question", "corpus"], "outputs": ["passages"],
+    "effects": ["add_evidence"], "scopes": ["general_text", "paper_qa"],
+    "events": ["evidence_requested"], "granularity": ["call"]
+  },
+  "papergraph": {
+    "goal": "对论文回答运行原主张抽取、证据检索和全主张核验，返回带来源的核验标签",
+    "roles": ["check"], "modalities": ["text"],
+    "inputs": ["question", "answer", "paper_evidence"], "outputs": ["verdict", "evidence"],
+    "effects": ["add_information"], "scopes": ["paper_qa"],
+    "events": ["paper_answer_returned"], "granularity": ["whole"]
+  }
+}

@@ -33,6 +33,12 @@ class Store:
         if event in {"analysis_started", "analysis_finished", "call_enabled", "started", "physically_retired"}:
             print(f"[SeamPact] {event} {identity}", flush=True)
 
+    def create(self, kind, identity, data):
+        """Create an immutable identity without replacing a previous run."""
+        encoded = json.dumps(data, ensure_ascii=False, allow_nan=False)
+        with self.lock, self.db:
+            self.db.execute("INSERT INTO documents VALUES (?,?,?)", (kind, identity, encoded))
+
     def get(self, kind, identity):
         with self.lock:
             row = self.db.execute("SELECT data FROM documents WHERE kind=? AND id=?",

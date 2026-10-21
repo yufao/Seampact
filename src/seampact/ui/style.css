@@ -237,3 +237,81 @@ body.inspect-page .rail-button.selected { background: #eaf0ec; color: var(--acce
   body.inspect-page .status-card, body.inspect-page .unit-card { padding: 16px; }
   #inspect-source { max-width: 190px; }
 }
+
+.research-heading { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 12px; margin: 24px 0 14px; padding-top: 20px; border-top: 1px solid var(--line); }
+.research-heading h3, #research-comparison > h3 { margin: 0; color: #4c6656; font-size: 14px; }
+.research-heading .card-note { margin-top: 6px; }
+.research-filters { display: grid; grid-template-columns: minmax(0, 1fr) minmax(110px, .35fr); gap: 12px; margin: 14px 0; }
+.research-filters label, .unit-policy-control { display: block; color: var(--muted); font-size: 11px; }
+.research-filters input, .research-filters select, .unit-policy-control select { display: block; width: 100%; margin-top: 5px; padding: 9px; border: 1px solid #dce2dd; border-radius: 6px; background: white; color: var(--ink); font-size: 12px; }
+.research-run-select { display: flex; align-items: center; gap: 10px; min-width: 0; }
+.research-run-select input { accent-color: var(--accent); }
+.research-identity { margin: 7px 0; font: 10px/1.7 Consolas, monospace; color: #6b7f71; overflow-wrap: anywhere; }
+.research-run .card-heading { margin-bottom: 8px; }
+#research-comparison { margin-top: 24px; }
+.research-comparison-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 350px), 1fr)); gap: 16px; margin-top: 14px; }
+.research-comparison-grid .status-card { min-width: 0; }
+.research-metrics { width: 100%; margin: 14px 0; border-collapse: collapse; text-align: left; font-size: 11px; }
+.research-metrics th, .research-metrics td { padding: 9px 5px; border-bottom: 1px solid var(--line); vertical-align: top; }
+.research-metrics th { color: #758177; font-weight: 500; }
+.research-metrics td small { display: block; max-width: 220px; color: #8a958d; font-size: 9px; overflow-wrap: anywhere; }
+.research-curve { margin: 14px 0; }
+.research-curve svg { display: block; width: 100%; max-height: 210px; overflow: visible; }
+.curve-axis { fill: none; stroke: #cdd7d0; stroke-width: 1; }
+.curve-line { fill: none; stroke: #33785b; stroke-width: 2; }
+.curve-point { fill: #33785b; }
+.research-curve text { fill: #8b978e; font: 10px "Segoe UI", sans-serif; }
+.research-curve figcaption { color: #8a958d; font-size: 10px; line-height: 1.8; }
+.research-config fieldset { min-width: 0; margin: 16px 0; padding: 12px; border: 1px solid var(--line); border-radius: 7px; }
+.research-config legend { padding: 0 6px; color: #627166; font-size: 11px; }
+.configuration .learner-options { display: flex; flex-wrap: wrap; gap: 6px 16px; }
+.configuration .learner-options label { display: flex; align-items: center; gap: 6px; margin: 3px 0; }
+.configuration input[type="checkbox"] { display: inline; width: auto; margin: 0; padding: 0; accent-color: var(--accent); }
+.research-unit-options { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; max-height: 270px; overflow-y: auto; }
+.configuration .research-unit-choice { display: flex; align-items: flex-start; gap: 8px; margin: 0; padding: 8px; border-radius: 5px; background: #f6f8f6; }
+.research-unit-choice input { flex: 0 0 auto; margin-top: 3px !important; }
+.research-unit-choice span { min-width: 0; overflow-wrap: anywhere; }
+.research-unit-choice strong { display: block; font-size: 10px; font-weight: 500; }
+.research-unit-choice small { display: block; color: #91a096; font-size: 9px; }
+.research-config output { display: block; margin-top: 5px; padding: 9px 0; color: #466e55; overflow-wrap: anywhere; }
+.research-config textarea[spellcheck="false"] { font: 11px/1.8 Consolas, "Microsoft YaHei", monospace; tab-size: 2; }
+.research-file-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 15px; }
+.configuration .file-button { position: relative; display: inline-flex; margin: 0; color: #55685b; overflow: hidden; font-size: 10px; cursor: pointer; }
+.file-button input[type="file"] { position: absolute; inset: 0; opacity: 0; cursor: pointer; }
+.research-file-actions .secondary-button { font-size: 10px; }
+.unit-policy-control { margin: 10px 0; }
+.scene-task-label { display: flex; align-items: center; gap: 9px; margin-bottom: 10px; color: #89958d; font-size: 10px; }
+.scene-task-label select { min-width: 0; max-width: 100%; flex: 1; padding: 6px 8px; border: 1px solid #e0e7e1; border-radius: 5px; color: #536e5b; background: #f7faf7; font-size: 11px; }
+body:not(.inspect-page) .research-filters, body:not(.inspect-page) #research-run-list, body:not(.inspect-page) #research-comparison { display: none; }
+body:not(.inspect-page) .research-heading { align-items: flex-start; }
+body:not(.inspect-page) .research-heading h3 { font-size: 12px; }
+.resource-list { margin-top: 16px; }
+.resource-form, .resource-card { margin-top: 14px; padding: 15px; border: 1px solid var(--line); border-radius: 8px; background: white; min-width: 0; }
+.resource-form h4, .resource-card h4, .dependency-card h4 { margin: 0 0 8px; color: #4c6656; font-size: 12px; font-weight: 600; overflow-wrap: anywhere; }
+.resource-form .form-actions, .model-form .form-actions { flex-wrap: wrap; justify-content: flex-start; }
+.resource-form .form-status, .model-form .form-status { flex-basis: 100%; }
+.resource-path { margin-top: 7px; color: #4c6656; font: 11px/1.8 Consolas, "Microsoft YaHei", monospace; overflow-wrap: anywhere; }
+.configuration .capability-options { display: flex; flex-wrap: wrap; gap: 6px 16px; min-width: 0; margin: 14px 0; padding: 10px 12px; border: 1px solid var(--line); border-radius: 6px; }
+.capability-options legend { padding: 0 5px; color: #627166; font-size: 11px; }
+.configuration .capability-options label { display: flex; align-items: center; gap: 6px; margin: 0; }
+.resource-states { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 9px; margin-top: 11px; }
+.resource-state { padding: 8px 10px; background: #f6f8f6; border-radius: 6px; min-width: 0; overflow-wrap: anywhere; }
+.resource-state > span, .resource-state > small { display: block; color: #859087; font-size: 10px; font-weight: 400; }
+.resource-state > strong { display: block; margin-top: 3px; font-size: 11px; font-weight: 500; color: #506556; }
+.resource-state > small { margin-top: 3px; }
+.dependency-details { margin-top: 14px; border-top: 1px solid var(--line); padding-top: 8px; }
+.dependency-details > summary { color: #526f5d; font-size: 11px; cursor: pointer; }
+.dependency-card { min-width: 0; margin-top: 10px; padding: 12px; border: 1px solid var(--line); border-radius: 7px; }
+.dependency-binding { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 12px; }
+.dependency-binding select { flex: 1 1 150px; min-width: 0; max-width: 100%; padding: 8px; border: 1px solid var(--line); border-radius: 6px; font-size: 11px; background: #fcfdfc; color: var(--ink); }
+.dependency-binding .form-status { flex-basis: 100%; }
+.dependency-card > .secondary-button { margin-top: 10px; }
+.connection-operation-checks { margin-top: 12px; border-top: 1px solid var(--line); padding-top: 10px; }
+.connection-operation-checks > summary { color: #526f5d; font-size: 11px; cursor: pointer; }
+.connection-operation-result:empty { display: none; }
+.operation-response { max-height: 220px; overflow: auto; padding: 10px; border-radius: 6px; background: #f6f8f6; color: var(--ink); white-space: pre-wrap; overflow-wrap: anywhere; font: 11px/1.7 Consolas, "Microsoft YaHei", monospace; }
+@media (max-width: 640px) {
+  .research-filters, .research-unit-options { grid-template-columns: minmax(0, 1fr); }
+  .research-config .form-actions { flex-wrap: wrap; }
+  .resource-states { grid-template-columns: minmax(0, 1fr); }
+}

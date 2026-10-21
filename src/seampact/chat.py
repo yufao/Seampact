@@ -8,6 +8,7 @@ import uuid
 
 from .providers import Transport, completion_body
 from .composition import compile_plans, NativePlanOwner
+from .scenarios import FrozenCatalog
 from .store import now
 
 
@@ -84,25 +85,34 @@ class ChatJobs:
                 raise ValueError("对话消息需要user/assistant角色")
             if not isinstance(message.get("content"), (str, list)):
                 raise ValueError("消息内容需要文字或模型支持的多模态内容")
-        profile = self.profiles.role_profile("chat")
+        from .training import BoundProfiles
+        bound = BoundProfiles(self.profiles)
+        profile = bound.role_profile("chat")
         if not profile.get("base_url") or not profile.get("model"):
             raise ValueError("请先配置对话模型地址与型号")
+        bound.role_key("chat")
+        catalog = FrozenCatalog(self.catalog)
         identity = uuid.uuid4().hex
         task = dict(id=identity, status="RUNNING", started_at=now(), response=None,
-            error=None, calls=[], model_calls=0, usage=[], latency_ms=None, phase="conversation")
+            error=None, calls=[], model_calls=0, usage=[], latency_ms=None, phase="conversation",
+            models=bound.public(), role_resources=bound.resources(), harness_resources=catalog.snapshot_resources())
         self.store.save("task", identity, task)
-        threading.Thread(target=self._run, args=(task, messages, profile), daemon=True).start()
+        threading.Thread(target=self._run, args=(task, messages, bound, catalog), daemon=True).start()
         return dict(task_id=identity)
 
-    def _observation(self):
+    def _observation(self, catalog):
         snapshot = self.runtime.snapshot()
         return dict(waiting=len(snapshot["legal_actions"]), used=snapshot["used"], quota=snapshot["quota"],
-            ready_units=len(self.catalog.tools()), task_type="conversation")
+            ready_units=len(catalog.tools()), task_type="conversation")
 
-    def _plans(self, arguments):
-        return compile_plans(self.catalog, arguments)
+    def _plans(self, arguments, catalog):
+        plans = compile_plans(catalog, arguments)
+        visible = {unit["id"] for unit in catalog.business_units()}
+        if any(set(plan["units"]) - visible for plan in plans):
+            raise ValueError("业务模型不能申请透明或平台触发的 Unit")
+        return plans
 
-    def _run(self, task, messages, profile):
+    def _run(self, task, messages, bound, catalog):
         started = time.perf_counter()
         pending_feedback = None
         history = [dict(role="system", content=(
@@ -114,16 +124,16 @@ class ChatJobs:
             "结果path只能投影内建容器，不能访问对象属性或调用方法。"
             "粗细互斥，不自行声明可并行。没有可用Unit时直接对话，不冒充已调用Harness。"))] + list(messages)
         try:
-            key = self.profiles.role_key("chat")
+            profile, key = bound.role_profile("chat"), bound.role_key("chat")
             while not self.closed:
-                tools = self.catalog.tools()
+                tools = catalog.tools()
                 request_history = list(history)
                 if tools:
                     request_history[0] = dict(role="system", content=history[0]["content"] +
                         "\n可调用Unit及真实输入接口：\n" + json.dumps(tools, ensure_ascii=False) +
                         "\n原结果端口与逐操作结论：\n" + json.dumps([
                             {name: unit.get(name) for name in ("tool_name", "result_schema", "operations")}
-                            for unit in self.catalog.public() if unit["status"] == "READY"], ensure_ascii=False))
+                            for unit in catalog.business_units()], ensure_ascii=False))
                 response = self.transport.send(profile["base_url"].rstrip("/") + "/chat/completions", key,
                     completion_body(profile, request_history, [plan_tool()] if tools else None))
                 task["model_calls"] += 1
@@ -148,8 +158,8 @@ class ChatJobs:
                     if function.get("name") != "execute_harness_plan":
                         raise ValueError("模型请求了未提供的任务工具")
                     try:
-                        plans = self._plans(json.loads(function["arguments"]))
-                        observation = self._observation()
+                        plans = self._plans(json.loads(function["arguments"]), catalog)
+                        observation = self._observation(catalog)
                         if pending_feedback:
                             token, success, duration = pending_feedback
                             self.scheduler.feedback(token, success, duration, plans, observation)
@@ -163,7 +173,7 @@ class ChatJobs:
                         self.store.save("task", task["id"], task)
                         plan_started = time.perf_counter()
                         with self.runtime.context(task["id"]):
-                            result, success = NativePlanOwner(plan).execute(self.catalog, public_result)
+                            result, success = NativePlanOwner(plan).execute(catalog, public_result)
                         task["plan"].update(execution_status=result["execution_status"], results=result["results"])
                         pending_feedback = (token, success, (time.perf_counter() - plan_started) * 1000)
                     except (KeyError, TypeError, ValueError) as error:

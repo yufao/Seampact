@@ -20,6 +20,15 @@ const viewNames = {analyses: '来源与分析', units: '能力池', tasks: '任�
 if (!viewNames[inspectView]) inspectView = 'analyses';
 const renderedSections = new Map();
 const detailStates = new Map();
+let researchHydrated = false;
+let researchDraft = {};
+let researchDirty = false;
+const researchSelected = new Set();
+const researchDetails = new Map();
+const researchDetailVersions = new Map();
+const researchLoading = new Set();
+const learnerNames = {double_dqn: 'Double DQN', ppo: 'PPO', discrete_sac: '离散 SAC', required_only: '仅必需工作', all_applicable: '全部适用工作'};
+const researchModeNames = {train: '新训练', freeze: '冻结评价', warmstart: '继续训练', rejudge: '条件重评'};
 const terminalStatuses = new Set(['COMPLETED', 'SUCCEEDED', 'FAILED', 'CANCELLED', 'INTERRUPTED', 'BLOCKED']);
 const statusNames = {
   RUNNING: '运行中', QUEUED: '排队中', WAITING: '等待中', COMPLETED: '已完成',
@@ -265,15 +274,41 @@ function appendMessage(role, text) {
   return {item, body, meta};
 }
 
+function hydrateSceneTasks() {
+  const selector = $('scene-task-selector');
+  const active = researchState().active_checkpoint;
+  const tasks = Array.isArray(active?.task_ids) ? active.task_ids : [];
+  const signature = JSON.stringify([active?.run_id, active?.scene_id, tasks]);
+  if (selector.dataset.options !== signature) {
+    const selected = selector.dataset.binding === active?.run_id ? selector.value : '';
+    selector.replaceChildren(node('option', '普通对话')); selector.firstChild.value = '';
+    for (const identity of tasks) {
+      const option = node('option', (active.scene_id || '已保存场景') + ' · ' + identity);
+      option.value = String(identity); selector.append(option);
+    }
+    selector.value = tasks.some(identity => String(identity) === selected) ? selected : '';
+    selector.dataset.binding = active?.run_id || '';
+    selector.dataset.options = signature;
+  }
+  selector.disabled = Boolean(pendingTask);
+}
+
 function updateComposer() {
-  const ready = connected && isReady(state?.models?.chat);
+  const selectedSceneTask = $('scene-task-selector').value;
+  const active = researchState().active_checkpoint;
+  const ready = connected && (selectedSceneTask ? Boolean(active?.run_id) : isReady(state?.models?.chat));
   $('send-message').disabled = !ready || Boolean(pendingTask) || !$('chat-input').value.trim();
-  $('send-message').querySelector('.send-label').textContent = pendingTask ? '运行中' : '发送';
-  $('chat-model-name').textContent = isReady(state?.models?.chat) ? state.models.chat.model : '对话模型未配置';
-  $('chat-model-name').className = 'status-pill ' + (isReady(state?.models?.chat) ? 'ready' : 'pending');
+  $('scene-task-selector').disabled = Boolean(pendingTask);
+  $('send-message').querySelector('.send-label').textContent = pendingTask ? '运行中' : selectedSceneTask ? '运行任务' : '发送';
+  $('chat-input').placeholder = selectedSceneTask ? '如：运行所选任务（文字仅作为本次运行附言）' : '发送消息…';
+  $('composer-hint').textContent = selectedSceneTask ? '执行已保存场景任务，不改写原任务；文字作为运行附言记录。' : 'Enter 发送 · Shift + Enter 换行';
+  $('chat-model-name').textContent = selectedSceneTask ? '冻结策略 · ' + (active?.scene_id || '已保存场景') :
+    isReady(state?.models?.chat) ? state.models.chat.model : '对话模型未配置';
+  $('chat-model-name').className = 'status-pill ' + ((selectedSceneTask ? active?.run_id : isReady(state?.models?.chat)) ? 'ready' : 'pending');
   const units = state?.units || [];
   const available = units.filter(unit => ['READY', 'AVAILABLE'].includes(String(unit.status).toUpperCase())).length;
-  const hint = !connected ? '平台未连接。' : !isReady(state?.models?.chat) ?
+  const hint = !connected ? '平台未连接。' : selectedSceneTask ?
+    '冻结场景：' + (active?.scene_id || '—') + ' · 任务 ' + selectedSceneTask + ' · 来源运行 ' + (active?.run_id || '—') : !isReady(state?.models?.chat) ?
     '先在配置中填写对话模型接口。' : available ?
     '对话已就绪 · 能力池中有 ' + available + ' 个源码已绑定入口。' :
     '对话已就绪 · 当前没有可调用 Unit；Harness 状态见右侧。';
@@ -284,18 +319,22 @@ function updateComposer() {
 async function sendMessage(event) {
   event.preventDefault();
   const content = $('chat-input').value.trim();
-  if (!content || pendingTask || !connected || !isReady(state?.models?.chat)) return;
-  messages.push({role: 'user', content});
-  appendMessage('user', content);
+  const sceneTaskId = $('scene-task-selector').value;
+  const sceneRunId = researchState().active_checkpoint?.run_id;
+  if (!content || pendingTask || !connected || (sceneTaskId ? !sceneRunId : !isReady(state?.models?.chat))) return;
+  if (!sceneTaskId) messages.push({role: 'user', content});
+  const user = appendMessage('user', content);
+  if (sceneTaskId) user.meta.textContent = '运行附言 · 已保存任务 ' + sceneTaskId + ' · 不改写原任务';
   $('chat-input').value = '';
   resizeComposer();
   const output = appendMessage('assistant', '正在提交任务…');
   output.item.classList.add('message-pending');
-  pendingTask = {id: null, output};
+  pendingTask = {id: null, output, sceneTaskId: sceneTaskId || null};
   updateComposer();
   showNotice('');
   try {
-    const result = await api('/api/chat', {messages});
+    const body = sceneTaskId ? {scene_task_id: sceneTaskId, scene_run_id: sceneRunId, messages: [{role: 'user', content}]} : {messages};
+    const result = await api('/api/chat', body);
     if (!result.task_id) throw new Error('平台未返回任务 ID');
     pendingTask.id = result.task_id;
     output.body.textContent = '正在运行…';
@@ -323,8 +362,9 @@ function synchronizeTask() {
   if (terminalStatuses.has(status)) {
     output.item.classList.remove('message-pending');
     if (['COMPLETED', 'SUCCEEDED'].includes(status)) {
-      if (text) messages.push({role: 'assistant', content: text});
-      else output.body.textContent = '任务已完成，平台未返回对话内容。';
+      if (text) {
+        if (!pendingTask.sceneTaskId) messages.push({role: 'assistant', content: text});
+      } else output.body.textContent = '任务已完成，平台未返回对话内容。';
     } else {
       output.item.classList.add('message-error');
       if (text && task.error) output.meta.textContent += ' · ' + textValue(task.error);
@@ -361,7 +401,7 @@ function renderScheduler() {
     root.append(node('p', '执行槽：' + scheduler.used + ' / ' + scheduler.quota, 'card-meta'));
   }
   if (scheduler.learning) {
-    root.append(node('p', '原型使用两层表格 Q-learning，只选合法候选并按真实反馈更新。单候选执行不代表学到选择优势。', 'card-note'));
+    root.append(node('p', '历史表格 Q 状态仅供旧实现追溯。新的研究运行使用共享候选评分，上层选择获准干预，下层固定 FIFO；单候选执行不能说明学习收益。', 'card-note'));
     const layers = node('div', undefined, 'rl-layers');
     for (const [key, label] of [['upper', '上层 · 方案选择'], ['lower', '下层 · 调用调度']]) {
       const learning = scheduler.learning[key];
@@ -487,6 +527,27 @@ function renderUnits() {
     card.append(node('p', [unit.mode || unit.kind, source?.name || sourceId].filter(Boolean).join(' · '), 'card-meta'));
     if (unit.description) card.append(node('p', unit.description, 'card-note'));
     if (unit.reason) card.append(node('p', textValue(unit.reason), 'card-note'));
+    const policy = unit.scheduling;
+    card.append(node('p', policy?.visibility === 'transparent' ? '透明能力 · 平台按任务事件激活' :
+      policy?.visibility === 'business' ? '业务可见 · 业务模型可申请' : '激活方式未声明 · 沿用业务可见入口', 'card-meta'));
+    if (inspectPage && !['DETACHED', 'SUPERSEDED'].includes(unit.status)) {
+      const label = node('label', '激活入口', 'unit-policy-control');
+      const selector = node('select'); selector.setAttribute('aria-label', '能力激活入口 ' + (unit.name || unit.id));
+      for (const [value, text] of [['business', '业务可见，由业务模型申请'], ['transparent', '透明能力，由平台事件调度']]) {
+        const option = node('option', text); option.value = value; selector.append(option);
+      }
+      selector.value = policy?.visibility || 'business';
+      selector.onchange = async () => {
+        selector.disabled = true;
+        try {
+          await api('/api/units/policy', {unit_id: unit.id, visibility: selector.value,
+            activation: selector.value === 'transparent' ? 'platform' : 'business'});
+          await refresh();
+        } catch (error) { showNotice(error.message); selector.value = policy?.visibility || 'business'; }
+        finally { selector.disabled = false; }
+      };
+      label.append(selector); card.append(label);
+    }
     card.append(node('p', '初始化：' + statusLabel(unit.initialization), 'card-meta'));
     if (unit.runtime_group) card.append(node('p', '执行位置：' + statusLabel(unit.execution) + ' · ' + unit.runtime_group, 'card-meta'), inspectLink('deployments', {harness: sourceId}));
     if (unit.operations) {
@@ -503,6 +564,19 @@ function renderUnits() {
       detailValue(card, '逐操作依据', unit.operations);
     }
     detailValue(card, '调用输入', unit.input_schema);
+    detailValue(card, '共同能力卡', unit.capability);
+    if (inspectPage) {
+      const editor = node('details'); editor.append(node('summary', '编辑能力卡'));
+      const input = node('textarea'); input.rows = 12; input.value = JSON.stringify(unit.capability || {}, null, 2);
+      input.setAttribute('aria-label', '共同能力卡 JSON');
+      const save = node('button', '保存能力卡', 'secondary-button'); save.type = 'button';
+      save.onclick = async () => {
+        try { await api('/api/units/capability', {unit_id: unit.id, card: JSON.parse(input.value)});
+          showNotice('能力卡已保存，下次运行冻结新表示。'); await refresh(); }
+        catch (error) { showNotice(error.message); }
+      };
+      editor.append(input, save); card.append(editor);
+    }
     detailValue(card, unit.result_schema && Object.keys(unit.result_schema).length ? '原结果端口' : '原结果端口 · 类型未解析', unit.result_schema);
     if (unit.result_type) card.append(node('p', '实际返回类型：' + unit.result_type, 'card-meta'));
     if (unit.construction) detailValue(card, '原生构造与绑定', unit.construction);
@@ -599,6 +673,22 @@ function renderAnalyses() {
     const files = entryCount(harness.files);
     if (files !== null) card.append(node('p', files + ' 份可读文件' + (typeof harness.inventory_count === 'number' ? ' · 仓库共 ' + harness.inventory_count + ' 项文件' : ''), 'card-meta'));
     if (job?.rounds !== undefined) card.append(node('p', '分析模型响应 ' + job.rounds + ' 轮', 'card-meta'));
+    if (job?.preprocessing) {
+      const prep = job.preprocessing;
+      card.append(node('p', '自动预处理：' + prep.mode + ' · ' + statusLabel(prep.status) +
+        (job.pipeline_stage === 'preprocessing' ? ' · 当前运行' : ''), 'card-meta'));
+      if (prep.artifact_id) card.append(node('p', '预处理工件：' + prep.artifact_id, 'card-meta'));
+      if (inspectPage) {
+        detailValue(card, '预处理绑定候选反馈', prep.report);
+        detailValue(card, '预处理／拆分分别用量', job.usage_by_stage);
+        if (prep.artifact_id) {
+          const artifact = node('a', '查看预处理原始工件');
+          artifact.href = '/api/preprocessing/' + encodeURIComponent(prep.artifact_id);
+          artifact.target = '_blank';
+          card.append(artifact);
+        }
+      }
+    }
     if (inspectPage) {
       card.append(node('p', '源码版本：' + (harness.revision || '本地内容版本'), 'card-meta'));
       if (job) {
@@ -606,12 +696,15 @@ function renderAnalyses() {
           (job.id === harness.analysis_id ? ' · 当前记录' : ' · 历史记录'), 'card-meta'));
         if (job.started_at) card.append(node('p', '开始：' + job.started_at, 'card-meta'));
         if (job.refinement_of) card.append(node('p', '沿用分析上下文：' + job.refinement_of, 'card-meta'));
+        if (job.resumed_from) card.append(node('p', '继续分析：' + job.resumed_from +
+          ' · 已保留此前 ' + job.prior_rounds + ' 轮，本记录只统计新增用量。', 'card-meta'));
         detailValue(card, '实际模型用量', job.usage);
       }
     }
     if (harness.status === 'DETACHED') card.append(node('p', '来源已退出当前能力池。源码和分析历史保留，可重新接入。', 'card-note'));
     const error = job?.error || harness.error;
     if (error) card.append(node('p', textValue(error), 'card-note message-error'));
+    if (job?.unreported_usage || job?.resumable) card.append(node('p', '中断请求未返回用量，未将其记作零费用。', 'card-note'));
     const boundaries = job?.submitted?.candidate?.boundaries || job?.boundaries || [];
     if (boundaries.length) {
       const detail = node('details');
@@ -627,8 +720,28 @@ function renderAnalyses() {
     const entryReport = job?.submitted?.report?.entry_bindings;
     if (entryReport) detailValue(card, '入口绑定与缺失判断', entryReport);
     if (inspectPage && job?.submitted?.report) detailValue(card, '边界检查完整报告', job.submitted.report);
+    if (inspectPage && (!job || job.id === harness.analysis_id)) harnessDependencies(card, harness);
     const actions = node('div', undefined, 'harness-actions');
     if (!inspectPage) actions.append(inspectLink('analyses', {harness: harness.id}));
+    if (job?.resumable) {
+      const resume = node('button', '继续这次分析', 'secondary-button');
+      resume.disabled = harness.status === 'DETACHED' || harness.status === 'ANALYZING' || analysisSubmitting.has(harness.id);
+      if (harness.status === 'DETACHED') resume.title = '先重新接入来源，再继续保存的分析；使用当前分析模型配置。';
+      resume.onclick = async () => {
+        if (analysisSubmitting.has(harness.id)) return;
+        analysisSubmitting.add(harness.id); resume.disabled = true;
+        try {
+          await api('/api/analysis/resume', {analysis_id: job.id});
+          showNotice('已保留此前的完整上下文，使用当前分析模型继续；本次用量单独记录。');
+        } catch (error) { showNotice(error.message); }
+        finally {
+          analysisSubmitting.delete(harness.id);
+          resume.disabled = harness.status === 'DETACHED' || harness.status === 'ANALYZING';
+          await refresh();
+        }
+      };
+      actions.append(resume);
+    }
     actions.append(sourceButton(harness));
     card.append(actions);
     root.append(card);
@@ -638,21 +751,759 @@ function renderAnalyses() {
     '分析准则待确认。' : textValue(state.rules.theory_pending), 'theory-note'));
 }
 
+function researchState() { return state?.scheduler?.research || {}; }
+function runIdentity(run) { return run.run_id || run.id; }
+function shortHash(value) {
+  if (!value) return '—';
+  const text = String(value), split = text.indexOf('_');
+  if (split < 0) return text.slice(0, 14);
+  const hash = text.slice(split + 1), identities = (researchState().runs || []).map(runIdentity);
+  let length = 8;
+  while (length < hash.length && identities.some(id => id !== text && id.split('_').at(-1).startsWith(hash.slice(0, length)))) length += 4;
+  return text.slice(0, split) + ' · ' + hash.slice(0, length);
+}
+function finiteNumber(value) { return typeof value === 'number' && Number.isFinite(value); }
+function displayNumber(value) { return finiteNumber(value) ? value.toLocaleString('zh-CN', {maximumFractionDigits: 4}) : 'UNKNOWN'; }
+
+function jsonField(id, label, optional = false) {
+  const text = $(id).value.trim();
+  if (!text && optional) return undefined;
+  let result;
+  try { result = JSON.parse(text); }
+  catch (error) { throw new Error(label + '：' + error.message); }
+  if (!result || typeof result !== 'object' || Array.isArray(result)) throw new Error(label + '需要 JSON 对象');
+  return result;
+}
+
+function blankResearchConfig() {
+  return {algorithm: 'double_dqn', parameters: {}, seed: 0, mode: 'train', parent_run_id: null,
+    episodes: 1, split: 'development', tags: [], scene: {id: '', version: '1',
+      adapter: {path: '', symbol: '', dependencies: [], config: {}},
+      observation_schema: [], candidate_schema: [], unit_ids: [], tasks: []},
+    criteria: {id: '', version: '1', prompt: '', evidence_fields: [], dimensions: [],
+      teacher: {role: 'teacher'}, objective: {weights: {}, risk_limits: {}}}};
+}
+
+function loadResearchConfig(config) {
+  researchDraft = structuredClone(config || blankResearchConfig());
+  const algorithms = researchDraft.algorithms || [researchDraft.algorithm || 'double_dqn'];
+  for (const input of document.querySelectorAll('#research-form input[name="algorithm"]')) input.checked = algorithms.includes(input.value);
+  $('research-mode').value = researchDraft.mode || 'train';
+  $('research-seed').value = researchDraft.seed ?? 0;
+  $('research-episodes').value = researchDraft.episodes ?? 1;
+  $('research-split').value = researchDraft.split || 'development';
+  $('research-tags').value = (researchDraft.tags || []).join(', ');
+  $('research-task-ids').value = (researchDraft.task_ids || []).join(', ');
+  $('research-scene').value = JSON.stringify(researchDraft.scene || blankResearchConfig().scene, null, 2);
+  const criteria = researchDraft.criteria || blankResearchConfig().criteria;
+  $('research-criteria').value = JSON.stringify(criteria, null, 2);
+  $('research-prompt').value = criteria.prompt || '';
+  $('research-teacher-role').value = criteria.teacher?.role || 'teacher';
+  $('research-independent').value = researchDraft.evaluation_criteria ? JSON.stringify(researchDraft.evaluation_criteria, null, 2) : '';
+  $('research-parameters').value = JSON.stringify(researchDraft.parameters || {}, null, 2);
+  hydrateResearchChoices(true);
+  $('research-parent').value = researchDraft.parent_run_id || '';
+  researchDirty = false;
+  researchHydrated = true;
+}
+
+function readResearchConfig() {
+  const algorithms = [...document.querySelectorAll('#research-form input[name="algorithm"]:checked')].map(input => input.value);
+  if (!algorithms.length) throw new Error('至少选择一个学习器或固定参照');
+  const seed = Number($('research-seed').value);
+  const episodes = Number($('research-episodes').value);
+  if (!Number.isInteger(seed) || seed < 0 || !Number.isInteger(episodes) || episodes < 1) throw new Error('种子需为非负整数，任务次数需为正整数');
+  const config = structuredClone(researchDraft);
+  Object.assign(config, {algorithm: algorithms[0], seed, episodes, mode: $('research-mode').value,
+    parent_run_id: $('research-parent').value || null, split: $('research-split').value.trim(),
+    tags: $('research-tags').value.split(/[,，]/).map(value => value.trim()).filter(Boolean),
+    parameters: jsonField('research-parameters', '学习器参数'), scene: jsonField('research-scene', '场景配置'),
+    criteria: readResearchCriteria()});
+  if (algorithms.length > 1) config.algorithms = algorithms;
+  else delete config.algorithms;
+  const taskIds = $('research-task-ids').value.split(/[,，]/).map(value => value.trim()).filter(Boolean);
+  if (taskIds.length) config.task_ids = taskIds;
+  else delete config.task_ids;
+  config.scene.unit_ids = [...document.querySelectorAll('#research-unit-options input:checked')].map(input => input.value);
+  const independent = jsonField('research-independent', '独立评价', true);
+  if (independent) config.evaluation_criteria = independent;
+  else delete config.evaluation_criteria;
+  if (config.mode !== 'train' && !config.parent_run_id) throw new Error('冻结、继续训练或条件重评需要选择来源运行');
+  return config;
+}
+
+function readResearchCriteria() {
+  const criteria = jsonField('research-criteria', '评价资源');
+  criteria.prompt = $('research-prompt').value;
+  criteria.teacher = {...criteria.teacher, role: $('research-teacher-role').value};
+  return criteria;
+}
+
+function hydrateResearchChoices(force = false, selectedOverride = null) {
+  const parent = $('research-parent');
+  const runs = researchState().runs || [];
+  const parentValue = force ? researchDraft.parent_run_id || '' : parent.value;
+  const signature = JSON.stringify(runs.map(run => [runIdentity(run), run.algorithm, run.status]));
+  if (force || parent.dataset.options !== signature) {
+    parent.replaceChildren(node('option', '无'));
+    parent.firstChild.value = '';
+    for (const run of runs) {
+      const identity = runIdentity(run);
+      const option = node('option', (learnerNames[run.algorithm] || run.algorithm || '运行') + ' · ' + identity + ' · ' + statusLabel(run.status));
+      option.value = identity;
+      parent.append(option);
+    }
+    if (parentValue && !runs.some(run => runIdentity(run) === parentValue)) {
+      const option = node('option', parentValue + ' · 来源配置保留'); option.value = parentValue; parent.append(option);
+    }
+    parent.value = parentValue;
+    parent.dataset.options = signature;
+  }
+  const root = $('research-unit-options');
+  const units = (state?.units || []).filter(unit => !['SUPERSEDED', 'DETACHED'].includes(unit.status));
+  const unitSignature = JSON.stringify(units.map(unit => [unit.id, unit.name, unit.status, unit.source_id]));
+  if (force || selectedOverride || root.dataset.options !== unitSignature) {
+    let selected;
+    if (selectedOverride) selected = selectedOverride;
+    else if (force) selected = new Set(researchDraft.scene?.unit_ids || []);
+    else selected = new Set([...root.querySelectorAll('input:checked')].map(input => input.value));
+    root.replaceChildren();
+    for (const unit of units) {
+      const source = (state.harnesses || []).find(item => item.id === unit.source_id);
+      const label = node('label', undefined, 'research-unit-choice');
+      const check = node('input'); check.type = 'checkbox'; check.value = unit.id; check.checked = selected.has(unit.id);
+      const description = node('span');
+      description.append(node('strong', unit.name || unit.id), node('small', (source?.name || unit.source_id || '') + ' · ' + statusLabel(unit.status)));
+      check.disabled = unit.status !== 'READY' && !check.checked;
+      check.onchange = () => {
+        researchDirty = true;
+        try {
+          const scene = jsonField('research-scene', '场景配置');
+          scene.unit_ids = [...root.querySelectorAll('input:checked')].map(input => input.value);
+          $('research-scene').value = JSON.stringify(scene, null, 2);
+        } catch (error) { $('research-form-status').textContent = error.message; }
+      };
+      label.append(check, description); root.append(label);
+    }
+    for (const identity of selected) {
+      if (units.some(unit => unit.id === identity)) continue;
+      const label = node('label', undefined, 'research-unit-choice');
+      const check = node('input'); check.type = 'checkbox'; check.value = identity; check.checked = true;
+      label.append(check, node('span', identity + ' · 当前能力池不可用')); root.append(label);
+    }
+    if (!units.length && !selected.size) empty(root, '当前没有可选 Unit。先分析 Harness 并补齐原资源。');
+    root.dataset.options = unitSignature;
+  }
+  const role = $('research-teacher-role').value;
+  const profile = state?.models?.[role];
+  $('research-teacher-status').textContent = isReady(profile) ? profile.model + ' · ' + (role === 'analysis' ? '复用分析角色' : '独立教师') : '所选角色尚未配置';
+}
+
+function hydrateResearch() {
+  if (!researchHydrated) loadResearchConfig(researchState().config?.config || researchState().config || blankResearchConfig());
+  hydrateResearchChoices();
+}
+
+async function saveResearch(event) {
+  event.preventDefault();
+  const button = event.submitter;
+  if (button) button.disabled = true;
+  const status = $('research-form-status');
+  try {
+    const config = readResearchConfig();
+    const result = await api('/api/scheduler/config', config);
+    researchDraft = structuredClone(config); researchDirty = false;
+    status.textContent = '已保存 · ' + (result.config_digest || result.id || '下次运行使用');
+    await refresh();
+  } catch (error) { status.textContent = error.message; }
+  finally { if (button) button.disabled = false; }
+}
+
+async function startResearch() {
+  const button = $('research-start');
+  const status = $('research-form-status');
+  button.disabled = true; status.textContent = '正在提交…';
+  try {
+    const config = readResearchConfig();
+    const result = await api('/api/scheduler/runs', {config});
+    const ids = result.run_ids || [result.run_id || result.id].filter(Boolean);
+    for (const identity of ids) researchSelected.add(identity);
+    status.textContent = '已提交 ' + ids.length + ' 次独立运行';
+    showNotice('已提交运行：' + ids.join('、') + '。结果按时间与哈希保存。');
+    await refresh();
+  } catch (error) { status.textContent = error.message; }
+  finally { button.disabled = false; }
+}
+
+function downloadJson(value, filename) {
+  const url = URL.createObjectURL(new Blob([JSON.stringify(value, null, 2)], {type: 'application/json;charset=utf-8'}));
+  const link = node('a'); link.href = url; link.download = filename; link.click();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+function researchAction(label, path, body, completed) {
+  const button = node('button', label, 'secondary-button'); button.type = 'button';
+  button.onclick = async () => {
+    button.disabled = true;
+    try { await api(path, body); showNotice(completed); await refresh(); }
+    catch (error) { showNotice(error.message); }
+    finally { button.disabled = false; }
+  };
+  return button;
+}
+
+function renderResearch() {
+  const research = researchState();
+  const readyRoot = $('research-readiness'); readyRoot.replaceChildren();
+  if (!state?.scheduler?.research) empty(readyRoot, '当前进程尚未加载研究运行接口。');
+  const readyUnits = (state.units || []).filter(unit => unit.status === 'READY').length;
+  const summary = node('p', '能力池：' + readyUnits + ' 个源码已绑定入口 · 已保存运行：' + (research.runs || []).length, 'card-meta');
+  readyRoot.append(summary);
+  if (research.active_checkpoint) readyRoot.append(node('p', '当前冻结策略：' + textValue(research.active_checkpoint), 'card-note'));
+  if (research.readiness) detailValue(readyRoot, '原环境、资源与入口条件', research.readiness);
+  if (research.options) detailValue(readyRoot, '学习器可用配置', research.options);
+  const filter = $('research-filter').value.trim().toLowerCase();
+  const mode = $('research-mode-filter').value;
+  const root = $('research-run-list'); root.replaceChildren();
+  const runs = (research.runs || []).filter(run => {
+    const sources = (run.source_ids || []).map(id => (state.harnesses || []).find(source => source.id === id)?.name || id);
+    return (!mode || (run.mode || run.config?.mode) === mode) &&
+      (!filter || JSON.stringify([run, sources]).toLowerCase().includes(filter));
+  });
+  if (!runs.length) empty(root, filter || mode ? '没有匹配的运行。可用完整哈希或时间查找。' : '尚无研究运行。配置真实场景及评价后开始。');
+  for (const run of runs) {
+    const identity = runIdentity(run);
+    const card = node('article', undefined, 'status-card research-run'); card.dataset.itemId = identity;
+    const head = node('div', undefined, 'card-heading');
+    const select = node('label', undefined, 'research-run-select');
+    const check = node('input'); check.type = 'checkbox'; check.checked = researchSelected.has(identity); check.setAttribute('aria-label', '加入对比 ' + identity);
+    check.onchange = () => {
+      if (check.checked) researchSelected.add(identity); else researchSelected.delete(identity);
+      renderResearchComparison(); refreshResearchDetails();
+    };
+    select.append(check, node('strong', learnerNames[run.algorithm] || run.algorithm || '运行')); head.append(select, pill(run.status)); card.append(head);
+    card.append(node('p', identity, 'research-identity'));
+    card.append(node('p', [researchModeNames[run.mode] || run.mode, run.split, run.started_at || run.created_at,
+      run.episodes !== undefined ? '已完成 ' + (run.episodes_completed ?? run.episodes) + ' / ' + (run.budget ?? run.total_episodes ?? '—') : null].filter(Boolean).join(' · '), 'card-meta'));
+    const checkpointId = run.checkpoint_id || run.checkpoint?.checkpoint_id;
+    card.append(node('p', '配置 ' + shortHash(run.config_digest) + (checkpointId ? ' · 策略 ' + shortHash(checkpointId) : ''), 'card-meta'));
+    if (run.eligible_episodes !== undefined) card.append(node('p', '可学习任务 ' + run.eligible_episodes + ' · 缺失而排除 ' + (run.excluded_episodes ?? 0) +
+      ' · 有取舍交互 ' + (run.choice_interactions ?? 0) + ' · 更新 ' + (run.updates ?? 0), 'card-meta'));
+    if (run.tags?.length) card.append(node('p', run.tags.join(' · '), 'card-note'));
+    if (run.error) card.append(node('p', textValue(run.error), 'message-error card-note'));
+    const actions = node('div', undefined, 'harness-actions');
+    const view = node('button', '查看与对比', 'secondary-button'); view.type = 'button';
+    view.onclick = () => { researchSelected.add(identity); check.checked = true; renderResearchComparison(); refreshResearchDetails(); };
+    actions.append(view);
+    if (['QUEUED', 'RUNNING', 'STOPPING'].includes(run.status)) actions.append(researchAction('在任务边界停止', '/api/scheduler/runs/stop', {run_id: identity}, '已请求在当前任务收尾后停止。'));
+    if (checkpointId || run.artifacts?.checkpoint) actions.append(researchAction('启用冻结策略', '/api/scheduler/activate', {run_id: identity}, '已请求启用该运行的兼容冻结策略。'));
+    card.append(actions); root.append(card);
+  }
+  renderResearchComparison(); refreshResearchDetails();
+}
+
+async function refreshResearchDetails() {
+  const runs = researchState().runs || [];
+  await Promise.all([...researchSelected].map(async identity => {
+    const summary = runs.find(run => runIdentity(run) === identity);
+    const version = JSON.stringify(summary || identity);
+    if (researchLoading.has(identity) || researchDetailVersions.get(identity) === version) return;
+    researchLoading.add(identity);
+    try {
+      researchDetails.set(identity, await api('/api/scheduler/runs/' + encodeURIComponent(identity)));
+      researchDetailVersions.set(identity, version);
+    } catch (error) { researchDetails.set(identity, {id: identity, error: error.message}); }
+    finally { researchLoading.delete(identity); }
+  }));
+  renderResearchComparison();
+}
+
+function runMetrics(run) {
+  const provided = run.metrics || run.summary?.metrics;
+  if (Array.isArray(provided)) return provided;
+  if (provided && typeof provided === 'object') return Object.entries(provided).map(([id, value]) =>
+    value && typeof value === 'object' ? {id, ...value} : {id, value});
+  const groups = new Map();
+  for (const item of run.history || []) {
+    const list = item.feedback?.metrics || item.evaluation?.metrics || [];
+    for (const metric of list) {
+    const key = JSON.stringify([metric.scope, metric.id, metric.definition, metric.version, metric.unit, metric.direction]);
+      if (!groups.has(key)) groups.set(key, {...metric, values: [], known: 0, unknown: 0, not_applicable: 0, denominator: 0});
+      const group = groups.get(key);
+      if (metric.status === 'KNOWN' && metric.value !== null && finiteNumber(Number(metric.value))) { group.values.push(Number(metric.value)); group.known++; }
+      else if (metric.status === 'NOT_APPLICABLE') group.not_applicable++;
+      else group.unknown++;
+      group.denominator += metric.denominator ?? (metric.status === 'NOT_APPLICABLE' ? 0 : 1);
+    }
+  }
+  return [...groups.values()].map(group => ({...group, status: group.known ? 'KNOWN' : group.not_applicable && !group.unknown ? 'NOT_APPLICABLE' : 'UNKNOWN',
+    value: group.values.length ? group.values.reduce((sum, value) => sum + value, 0) / group.values.length : null}));
+}
+
+function curvePoints(run) {
+  const curves = run.curves;
+  if (Array.isArray(curves)) return curves.map((item, index) => typeof item === 'number' ? {x: index + 1, y: item} :
+    {x: item.episode ?? item.step ?? index + 1, y: item.reward ?? item.return ?? null});
+  const rewards = curves?.reward || curves?.rewards;
+  if (Array.isArray(rewards)) return rewards.map((value, index) => ({x: index + 1, y: typeof value === 'object' ? value.value : value}));
+  return (run.history || []).map((item, index) => ({x: item.episode ?? index + 1, y: item.feedback?.reward ?? item.reward ?? null}));
+}
+
+function curveFigure(run) {
+  const points = curvePoints(run);
+  const known = points.filter(point => finiteNumber(point.x) && finiteNumber(point.y));
+  if (!known.length) return node('p', '尚无可用的任务回报曲线；UNKNOWN 不按零绘制。', 'empty-note');
+  const figure = node('figure', undefined, 'research-curve');
+  const ns = 'http://www.w3.org/2000/svg';
+  const svg = document.createElementNS(ns, 'svg'); svg.setAttribute('viewBox', '0 0 600 180'); svg.setAttribute('role', 'img'); svg.setAttribute('aria-label', '实际任务回报曲线');
+  const lowX = Math.min(...known.map(point => point.x)), highX = Math.max(...known.map(point => point.x));
+  const lowY = Math.min(...known.map(point => point.y)), highY = Math.max(...known.map(point => point.y));
+  const px = point => 45 + (point.x - lowX) / (highX - lowX || 1) * 540;
+  const py = point => 145 - (point.y - lowY) / (highY - lowY || 1) * 125;
+  const axis = document.createElementNS(ns, 'path'); axis.setAttribute('d', 'M45 15 V145 H585'); axis.setAttribute('class', 'curve-axis'); svg.append(axis);
+  let segment = [];
+  const appendSegment = () => {
+    if (!segment.length) return;
+    const path = document.createElementNS(ns, 'polyline'); path.setAttribute('points', segment.join(' ')); path.setAttribute('class', 'curve-line'); svg.append(path); segment = [];
+  };
+  for (const point of points) {
+    if (!finiteNumber(point.x) || !finiteNumber(point.y)) { appendSegment(); continue; }
+    segment.push(px(point) + ',' + py(point));
+    const dot = document.createElementNS(ns, 'circle'); dot.setAttribute('cx', px(point)); dot.setAttribute('cy', py(point)); dot.setAttribute('r', '2.5'); dot.setAttribute('class', 'curve-point');
+    const title = document.createElementNS(ns, 'title'); title.textContent = '任务 ' + point.x + '：' + point.y; dot.append(title); svg.append(dot);
+  }
+  appendSegment();
+  for (const [x, y, text] of [[45, 167, lowX], [555, 167, highX], [2, 24, displayNumber(highY)], [2, 146, displayNumber(lowY)]]) {
+    const label = document.createElementNS(ns, 'text'); label.setAttribute('x', x); label.setAttribute('y', y); label.textContent = text; svg.append(label);
+  }
+  figure.append(svg, node('figcaption', '横轴为任务序号，纵轴为该运行的实际回报。缺失值断开，目标配置不同的回报不直接排名。'));
+  return figure;
+}
+
+function configDifference(left, right, path = '', result = []) {
+  if (JSON.stringify(left) === JSON.stringify(right)) return result;
+  if (left && right && typeof left === 'object' && typeof right === 'object' && !Array.isArray(left) && !Array.isArray(right)) {
+    for (const key of new Set([...Object.keys(left), ...Object.keys(right)])) configDifference(left[key], right[key], path ? path + '.' + key : key, result);
+  } else result.push({field: path, first: left === undefined ? null : left, other: right === undefined ? null : right});
+  return result;
+}
+
+function renderResearchComparison() {
+  const root = $('research-comparison'); root.replaceChildren();
+  if (!researchSelected.size) return;
+  root.append(node('h3', '所选运行 · 分项对照'));
+  root.append(node('p', '按原始运行身份并列。指标定义、版本、单位或判据不同的结果需结合配置差异解释；UNKNOWN 与 N/A 保留。', 'card-note'));
+  const grid = node('div', undefined, 'research-comparison-grid');
+  const selected = [...researchSelected];
+  for (const identity of selected) {
+    const run = researchDetails.get(identity);
+    const card = node('article', undefined, 'status-card'); card.dataset.itemId = identity;
+    const head = node('div', undefined, 'card-heading'); head.append(node('strong', String(identity).slice(-14)));
+    const close = node('button', '移出对照', 'icon-button'); close.type = 'button';
+    close.onclick = () => { researchSelected.delete(identity); renderResearch(); };
+    head.append(close); card.append(head, node('p', identity, 'research-identity'));
+    if (!run) { empty(card, '正在读取结果…'); grid.append(card); continue; }
+    if (run.error) card.append(node('p', textValue(run.error), 'message-error card-note'));
+    const manifest = run.manifest || {};
+    card.append(node('p', (learnerNames[run.algorithm || manifest.algorithm] || run.algorithm || manifest.algorithm || '') + ' · ' + statusLabel(run.status), 'card-meta'));
+    const table = node('table', undefined, 'research-metrics');
+    const thead = node('thead'), header = node('tr'); for (const label of ['指标', '原值 / 均值', '覆盖']) header.append(node('th', label)); thead.append(header); table.append(thead);
+    const tbody = node('tbody');
+    for (const metric of runMetrics(run)) {
+      const row = node('tr'), name = node('td', metric.name || metric.id || '指标');
+      name.append(node('small', [metric.scope === 'independent' ? '独立评价' : metric.scope === 'training' ? '训练反馈' : metric.scope,
+        metric.version, metric.unit, metric.direction === 'minimize' ? '越低越好' : metric.direction === 'maximize' ? '越高越好' : ''].filter(Boolean).join(' · ')));
+      name.title = metric.definition || '';
+      const value = metric.status === 'NOT_APPLICABLE' ? 'N/A' : metric.status === 'UNKNOWN' ? 'UNKNOWN' : displayNumber(metric.value ?? metric.mean);
+      const counts = metric.status_counts;
+      const coverage = counts ? (counts.KNOWN || 0) + ' / ' + metric.population + ' · 未知 ' + (counts.UNKNOWN || 0) + ' · N/A ' + (counts.NOT_APPLICABLE || 0) :
+        metric.known !== undefined ? metric.known + ' / ' + metric.denominator + (metric.unknown ? ' · 未知 ' + metric.unknown : '') : metric.status || '—';
+      row.append(name, node('td', value), node('td', coverage)); tbody.append(row);
+    }
+    table.append(tbody);
+    if (tbody.childNodes.length) card.append(table); else empty(card, '暂无分项结果，未将缺失记为零。');
+    card.append(curveFigure(run));
+    detailValue(card, '不可变运行清单与配置', manifest);
+    if (run.artifacts) detailValue(card, '结果与策略工件', run.artifacts);
+    if (run.checkpoint) detailValue(card, '策略工件及内容摘要', run.checkpoint);
+    if (run.learning) detailValue(card, '学习更新状态', run.learning);
+    if (run.costs) detailValue(card, '实测成本与采集覆盖', run.costs);
+    if (run.summary) detailValue(card, '完整结果摘要', run.summary);
+    const exportButton = node('button', '导出这次运行', 'secondary-button'); exportButton.type = 'button';
+    exportButton.onclick = () => downloadJson(run, identity + '.json'); card.append(exportButton);
+    grid.append(card);
+  }
+  root.append(grid);
+  if (selected.length > 1) {
+    const first = researchDetails.get(selected[0]);
+    if (first) for (const identity of selected.slice(1)) {
+      const other = researchDetails.get(identity); if (!other) continue;
+      const differences = configDifference(first.manifest?.config || first.manifest || first.config,
+        other.manifest?.config || other.manifest || other.config);
+      detailValue(root, '配置差异 · ' + shortHash(selected[0]) + ' / ' + shortHash(identity), differences.length ? differences : '保存的配置内容相同；运行身份与真实结果仍各自独立。');
+    }
+  }
+}
+
+function resourceState() { return state?.resources || {}; }
+function resourceId(record) { return record?.id || record?.connection_id || record?.resource_id; }
+function connectionOptions(select, value) {
+  const connections = entries(resourceState().connections);
+  const signature = JSON.stringify(connections.map(item => [resourceId(item), item.name, item.model]));
+  if (select.dataset.options !== signature) {
+    const previous = select.value;
+    const option = node('option', '选择命名连接'); option.value = '';
+    select.replaceChildren(option);
+    for (const connection of connections) {
+      const item = node('option', connection.name + (connection.model ? ' · ' + connection.model : ''));
+      item.value = resourceId(connection); select.append(item);
+    }
+    select.value = previous;
+    select.dataset.options = signature;
+  }
+  if (value !== undefined) select.value = value || '';
+}
+
+function resourceStatus(root, label, value, note) {
+  const row = node('div', undefined, 'resource-state');
+  row.append(node('span', label), node('strong', value || '未检查'));
+  if (note) row.append(node('small', note));
+  root.append(row);
+}
+
+function resourceExecution(record) {
+  return typeof record.execution === 'string' ? record.execution : record.execution?.status ||
+    record.target_execution || record.check?.target_execution || 'NOT_RUN';
+}
+
+function declaredCapabilities(connection) {
+  return connection.service_capabilities || (Array.isArray(connection.capabilities) ? connection.capabilities : []);
+}
+
+function selectCredentialConnection(id) {
+  const form = $('connection-credential-form');
+  if (form.elements.connection_id.value !== id) form.elements.credential.value = '';
+  connectionOptions(form.elements.connection_id, id);
+}
+
+function readableResourceStatus(status, kind) {
+  const labels = {NOT_RUN: 'NOT_RUN · 未执行', NOT_CHECKED: '未检查', UNCHECKED: '未检查',
+    MISSING: '缺失', UNREADABLE: '不可读', FAILED: '失败', SUCCEEDED: '实际调用成功', UNKNOWN: '无法确定',
+    MATCHED: '匹配', MISMATCH: '不匹配', MISMATCHED: '不匹配', AVAILABLE: '可访问',
+    ACCESSIBLE: '可访问', CONFIGURED: '已配置', SAVED: '选择已保存', SELECTED: '选择已保存',
+    MAPPING_CHECKED: '原字段映射已核对', BOUND: '映射已核对',
+    VERIFIED: '已核对', FILES_PRESENT: '必要文件存在', PRESENT: '必要文件存在', WRONG_TYPE: '路径类型不符',
+    INVALID_MANIFEST: '文件清单无效', CHECKSUM_OR_SIZE_MISMATCH: '摘要或文件大小不符',
+    UNSUPPORTED_PATH: '执行环境不支持此路径', MODELS_LIST_ACCESSIBLE: '模型列表可访问',
+    AUTHENTICATION_FAILED: '认证失败', ACCESSIBLE_HTTP_ERROR: '地址可达，服务返回错误',
+    CONNECTION_FAILED: '连接失败', INVALID_RESPONSE: '响应格式不匹配',
+    CREDENTIAL_MISSING: '缺少凭据', CREDENTIAL_UNREADABLE: '凭据读取失败',
+    RESOLVABLE: '可解析', NOT_REQUIRED: '无需认证',
+    READY: kind === 'weight' ? '必要文件存在' : '可访问'};
+  return labels[String(status || '').toUpperCase()] || status || '未检查';
+}
+
+function credentialSummary(connection) {
+  const auth = connection.auth || {};
+  const mode = auth.mode || connection.auth_mode;
+  if (mode === 'none') return '明确无需认证';
+  const error = connection.credential_error || auth.error;
+  if (error) return '读取失败 · ' + error;
+  const status = connection.credential_status || auth.status || connection.credential?.status;
+  if (status) return readableResourceStatus(status);
+  if (mode === 'environment') return '环境变量 ' + (auth.env || connection.env || '未指定') + ' · ' +
+    (connection.key_present || auth.available ? '可解析' : '尚未确认可取得');
+  return connection.key_present || auth.available || connection.credential?.available ? '已配置，可解析' : '未配置或尚未确认可解析';
+}
+
+async function resourceAction(button, endpoint, body, message) {
+  button.disabled = true;
+  try { await api(endpoint, body); showNotice(message); await refresh(); }
+  catch (error) { showNotice(error.message); }
+  finally { button.disabled = false; }
+}
+
+function editConnection(connection) {
+  const form = $('connection-form');
+  form.elements.id.value = resourceId(connection) || '';
+  for (const field of ['name', 'base_url', 'model', 'service_version']) form.elements[field].value = connection[field] || '';
+  form.elements.protocol.value = connection.protocol || 'openai-compatible';
+  form.elements.parameters.value = textValue(connection.parameters || {});
+  form.elements.auth_mode.value = connection.auth?.mode || 'none';
+  form.elements.auth_env.value = connection.auth?.env || '';
+  for (const input of form.querySelectorAll('[name="capability"]')) input.checked = declaredCapabilities(connection).includes(input.value);
+  form.dataset.savedUrl = connection.base_url || '';
+  $('connection-form-title').textContent = '编辑连接 · ' + (connection.name || resourceId(connection));
+  $('connection-form-status').textContent = '';
+  connectionAuthChanged();
+  selectCredentialConnection(resourceId(connection));
+  form.scrollIntoView({block: 'nearest'});
+}
+
+function connectionAuthChanged() {
+  const form = $('connection-form');
+  form.elements.auth_env.disabled = form.elements.auth_mode.value !== 'environment';
+  form.elements.auth_env.required = form.elements.auth_mode.value === 'environment';
+}
+
+function connectionOperationChecks(connection) {
+  const checks = connection.operation_checks || {};
+  return Array.isArray(checks) ? checks : Object.entries(checks).map(([operation, result]) => ({operation, ...result}));
+}
+
+function renderConnectionOperation(root, result) {
+  if (!result) return;
+  const heading = [result.operation, readableResourceStatus(result.status), result.checked_at].filter(Boolean).join(' · ');
+  root.append(node('p', heading, 'card-meta'));
+  if (result.latency_ms != null) root.append(node('p', '调用耗时：' + result.latency_ms + ' ms', 'card-meta'));
+  if (result.usage) root.append(node('p', '服务返回用量：' + textValue(result.usage), 'card-meta'));
+  if (result.response !== undefined && result.response !== null) root.append(node('pre', textValue(result.response), 'operation-response'));
+  if (result.reason) root.append(node('p', result.reason, 'card-note'));
+  root.append(node('p', '此连接操作不执行 Harness 原目标；真实目标执行见 Harness 依赖记录。', 'card-meta'));
+}
+
+function updateConnectionInvocation() {
+  const form = $('connection-invoke-form');
+  connectionOptions(form.elements.connection_id);
+  const connection = entries(resourceState().connections).find(item => resourceId(item) === form.elements.connection_id.value);
+  const operations = connection?.protocol === 'openai-compatible' ?
+    ['text', 'image', 'embedding'].filter(operation => declaredCapabilities(connection).includes(operation)) : [];
+  const selector = form.elements.operation;
+  const signature = JSON.stringify([resourceId(connection), operations]);
+  if (selector.dataset.options !== signature) {
+    const previous = selector.value;
+    const prompt = node('option', operations.length ? '选择实际调用操作' : '没有可调用的兼容操作'); prompt.value = '';
+    selector.replaceChildren(prompt);
+    for (const operation of operations) {
+      const option = node('option', {text: '文本生成', image: '图像理解', embedding: 'Embedding'}[operation]);
+      option.value = operation; selector.append(option);
+    }
+    selector.value = operations.includes(previous) ? previous : '';
+    selector.dataset.options = signature;
+  }
+  const image = selector.value === 'image';
+  $('connection-invoke-image-label').hidden = !image;
+  form.elements.image_path.disabled = !image;
+  form.elements.image_path.required = image;
+  form.querySelector('[type="submit"]').disabled = !selector.value || form.dataset.submitting === 'true';
+}
+
+async function invokeConnection(event) {
+  event.preventDefault();
+  const form = event.currentTarget, status = $('connection-invoke-status'), root = $('connection-invoke-result');
+  if (!form.elements.input.value.trim()) { status.textContent = '请填写本次实际发送的明确输入'; return; }
+  const connection = entries(resourceState().connections).find(item => resourceId(item) === form.elements.connection_id.value);
+  const operation = form.elements.operation.value;
+  if (connection?.protocol !== 'openai-compatible' || !['text', 'image', 'embedding'].includes(operation) || !declaredCapabilities(connection).includes(operation)) {
+    status.textContent = '请先选择已声明对应能力的 OpenAI 兼容连接'; return;
+  }
+  const body = {connection_id: resourceId(connection), operation, input: form.elements.input.value};
+  if (operation === 'image') {
+    if (!form.elements.image_path.value.trim()) { status.textContent = '请填写平台实际执行环境可见的图像路径'; return; }
+    body.image_path = form.elements.image_path.value.trim();
+  }
+  form.dataset.submitting = 'true'; updateConnectionInvocation();
+  status.textContent = '正在使用本次输入调用连接能力'; root.replaceChildren();
+  try {
+    const result = await api('/api/connections/invoke', body);
+    renderConnectionOperation(root, result);
+    status.textContent = '连接能力调用已记录；Harness 原目标执行见依赖记录';
+    await refresh();
+  } catch (error) { status.textContent = error.message; }
+  finally { delete form.dataset.submitting; updateConnectionInvocation(); }
+}
+
+function renderConnections() {
+  const root = $('connection-list'); root.replaceChildren();
+  const connections = entries(resourceState().connections);
+  if (!connections.length) empty(root, '尚未登记命名连接。可先保存地址，再单独保存私有凭据。');
+  for (const connection of connections) {
+    const card = node('article', undefined, 'resource-card'); card.dataset.itemId = resourceId(connection);
+    card.append(node('h4', connection.name || resourceId(connection)), node('p', connection.base_url, 'card-meta'));
+    card.append(node('p', [connection.protocol, connection.model || '无固定模型 ID',
+      '版本 ' + (connection.service_version || 'UNKNOWN')].filter(Boolean).join(' · '), 'card-meta'));
+    const checks = connection.check || connection.checks || {};
+    const operations = connectionOperationChecks(connection);
+    const statuses = node('div', undefined, 'resource-states');
+    resourceStatus(statuses, '凭据', credentialSummary(connection));
+    resourceStatus(statuses, '服务连接', readableResourceStatus(checks.status || connection.connection_status), checks.reason || checks.error);
+    resourceStatus(statuses, '连接操作调用', operations.length ?
+      operations.map(result => result.operation + '：' + readableResourceStatus(result.status)).join('；') :
+      readableResourceStatus(checks.capability_status || connection.capability_status || 'NOT_RUN'),
+      '声明：' + (declaredCapabilities(connection).join('、') || '尚未声明'));
+    resourceStatus(statuses, '操作范围', '连接检查与明确能力调用',
+      '这些操作不执行 Harness 原目标；真实目标执行见 Harness 依赖记录。');
+    card.append(statuses);
+    if (operations.length) {
+      const detail = node('details', undefined, 'connection-operation-checks');
+      detail.append(node('summary', '最近明确触发的连接能力调用'));
+      for (const result of operations) renderConnectionOperation(detail, result);
+      card.append(detail);
+    }
+    if (checks.checked_at) card.append(node('p', '连接检查时间：' + checks.checked_at, 'card-meta'));
+    if (connection.revision || connection.digest) card.append(node('p', '配置身份：' + (connection.revision || connection.digest), 'card-meta'));
+    const actions = node('div', undefined, 'harness-actions');
+    const edit = node('button', '编辑配置', 'secondary-button'); edit.type = 'button'; edit.onclick = () => editConnection(connection);
+    const check = node('button', '检查连接', 'secondary-button'); check.type = 'button';
+    check.onclick = () => resourceAction(check, '/api/connections/check', {connection_id: resourceId(connection)},
+      '连接检查已记录。模型列表或协议入口可访问不代表图像、工具、embedding 或原目标已运行。');
+    const credential = node('button', '设置凭据', 'secondary-button'); credential.type = 'button';
+    credential.onclick = () => {
+      selectCredentialConnection(resourceId(connection));
+      $('connection-credential-form').scrollIntoView({block: 'nearest'});
+    };
+    const invoke = node('button', '输入并调用能力', 'secondary-button'); invoke.type = 'button';
+    invoke.onclick = () => {
+      connectionOptions($('connection-invoke-form').elements.connection_id, resourceId(connection));
+      updateConnectionInvocation(); $('connection-invoke-form').scrollIntoView({block: 'nearest'});
+    };
+    actions.append(edit, check, credential, invoke); card.append(actions); root.append(card);
+  }
+  connectionOptions($('connection-credential-form').elements.connection_id);
+  updateConnectionInvocation();
+}
+
+function editWeight(weight) {
+  const form = $('weight-form');
+  form.elements.id.value = resourceId(weight) || '';
+  for (const field of ['name', 'path', 'model_revision']) form.elements[field].value = weight[field] || '';
+  form.elements.kind.value = weight.kind || 'directory';
+  const required = weight.required_files || [];
+  form.elements.required_files.value = required.some(item => typeof item === 'object' && Object.keys(item).some(key => key !== 'path')) ?
+    textValue(required) : required.map(item => typeof item === 'string' ? item : item.path).join('\n');
+  $('weight-form-title').textContent = '编辑权重 · ' + (weight.name || resourceId(weight));
+  $('weight-form-status').textContent = '';
+  form.scrollIntoView({block: 'nearest'});
+}
+
+function renderWeights() {
+  const root = $('weight-list'); root.replaceChildren();
+  const weights = entries(resourceState().weights);
+  if (!weights.length) empty(root, '尚未登记权重路径。路径可以暂缺；检查会明确显示实际缺失项。');
+  for (const weight of weights) {
+    const card = node('article', undefined, 'resource-card'); card.dataset.itemId = resourceId(weight);
+    card.append(node('h4', weight.name || resourceId(weight)), node('p', weight.path, 'resource-path'));
+    card.append(node('p', '执行环境：' + (weight.execution_environment || 'local') + ' · ' +
+      (weight.kind === 'file' ? '单个文件' : '目录') + ' · 模型版本：' + (weight.model_revision || 'UNKNOWN'), 'card-meta'));
+    const check = weight.check || weight.checks || {};
+    const statuses = node('div', undefined, 'resource-states');
+    const filesStatus = String(check.status).toUpperCase() === 'PRESENT' && check.necessary_files === 'not_declared' ?
+      '路径存在 · 必要文件未声明' : readableResourceStatus(check.status || weight.status, 'weight');
+    resourceStatus(statuses, '文件检查', filesStatus, check.reason || check.error);
+    resourceStatus(statuses, '检查范围', '路径与必要文件',
+      '文件检查不加载模型或执行 Harness 原目标；真实目标执行见 Harness 依赖记录。');
+    card.append(statuses);
+    const missing = check.missing || check.missing_files || weight.missing_files;
+    if (missing?.length) card.append(node('p', '缺失：' + missing.join('、'), 'card-note message-error'));
+    if (check.path || check.resolved_path) card.append(node('p', '实际检查位置：' + (check.resolved_path || check.path), 'resource-path'));
+    if (weight.required_files?.length) detailValue(card, '登记的必要文件', weight.required_files);
+    if (check.checked_at) card.append(node('p', '检查时间：' + check.checked_at, 'card-meta'));
+    detailValue(card, '资源身份及只读检查', check);
+    const actions = node('div', undefined, 'harness-actions');
+    const edit = node('button', '编辑路径', 'secondary-button'); edit.type = 'button'; edit.onclick = () => editWeight(weight);
+    const action = node('button', '检查资源', 'secondary-button'); action.type = 'button';
+    action.onclick = () => resourceAction(action, '/api/resources/check', {resource_id: resourceId(weight)},
+      '已核对路径及必要文件。本次检查未导入原库、加载模型或发起推理。');
+    actions.append(edit, action); card.append(actions); root.append(card);
+  }
+}
+
+function harnessDependencies(card, harness) {
+  const dependencies = entries(resourceState().dependencies).filter(item => (item.source_id || item.harness_id) === harness.id);
+  const detail = node('details', undefined, 'dependency-details');
+  detail.append(node('summary', '依赖配置 · ' + dependencies.length + ' 项分析器需求'));
+  if (!dependencies.length) {
+    detail.append(node('p', '尚未形成依赖需求。先由分析器读取原库；已登记的服务或权重不会自动制造入口或参数映射。', 'card-note'));
+    card.append(detail); return;
+  }
+  const bindings = entries(resourceState().bindings);
+  for (const dependency of dependencies) {
+    const id = dependency.id || dependency.dependency_id;
+    const binding = bindings.find(item => item.dependency_id === id);
+    const row = node('article', undefined, 'dependency-card'); row.dataset.itemId = id;
+    row.append(node('h4', dependency.description || dependency.name || id), node('p',
+      (dependency.kind === 'service' ? '原 API 服务' : '原加载器的权重') + ' · 需求 ' + id, 'card-meta'));
+    const statuses = node('div', undefined, 'resource-states');
+    resourceStatus(statuses, '依赖绑定', readableResourceStatus(binding?.status || dependency.status || 'NOT_CONFIGURED'), binding?.reason || dependency.reason);
+    resourceStatus(statuses, '原目标执行', readableResourceStatus(resourceExecution(dependency)));
+    row.append(statuses);
+    detailValue(row, '原源码依据、读取时点与 owner', {anchor: dependency.anchor || dependency.evidence,
+      original_configuration: dependency.configuration || dependency.config_field,
+      read_time: dependency.read_time || dependency.read_at,
+      owner_scope: dependency.owner_scope || dependency.owner, lifetime: dependency.lifetime, required: dependency.required});
+    if (dependency.configurable === false) {
+      const placement = dependency.placement || {};
+      row.append(node('p', '源库要求的位置 · 原路径不可覆盖', 'card-note'));
+      if (typeof placement === 'string') row.append(node('p', placement, 'resource-path'));
+      else {
+        row.append(node('p', '实际放置位置：' + (placement.absolute_path || placement.resolved_path || placement.path || '位置未确定'), 'resource-path'));
+        if (placement.expression || placement.relative_path || placement.value || placement.base || placement.original_cwd) row.append(node('p',
+          '原表达式：' + (placement.expression || placement.relative_path || placement.value || '—') +
+          ' · 原工作目录：' + (placement.original_cwd || placement.base || '未确定'), 'card-note'));
+        if (placement.execution_environment) row.append(node('p', '执行环境：' + placement.execution_environment, 'card-note'));
+      }
+      const required = dependency.required_files || placement.required_files;
+      const missing = dependency.missing_files || placement.missing_files || placement.missing;
+      if (required?.length) detailValue(row, '所需文件', required);
+      if (missing?.length) row.append(node('p', '缺失：' + missing.join('、'), 'card-note message-error'));
+      if (dependency.check) detailValue(row, '源库要求位置的最近检查', dependency.check);
+      row.append(node('p', '按原位置准备后重新检查；登记另一路径不会改变原加载方式。', 'card-note'));
+      const check = node('button', '检查源库要求的位置', 'secondary-button'); check.type = 'button';
+      check.onclick = () => resourceAction(check, '/api/harnesses/check-dependency', {harness_id: harness.id, dependency_id: id},
+        '已核对源库要求的位置及文件。本次未覆盖路径或加载模型。');
+      row.append(check);
+    } else {
+      const form = node('form', undefined, 'dependency-binding');
+      const select = node('select'); select.required = true; select.setAttribute('aria-label', '为 ' + (dependency.description || id) + ' 选择资源');
+      const none = node('option', '选择已登记的' + (dependency.kind === 'service' ? '连接' : '权重')); none.value = ''; select.append(none);
+      const records = entries(dependency.kind === 'service' ? resourceState().connections : resourceState().weights);
+      for (const resource of records) {
+        const option = node('option', resource.name || resourceId(resource)); option.value = resourceId(resource); select.append(option);
+      }
+      select.value = binding?.connection_id || binding?.resource_id || '';
+      const button = node('button', '保存依赖选择', 'secondary-button'); button.type = 'submit';
+      const status = node('span', '', 'form-status'); status.setAttribute('role', 'status');
+      form.append(select, button, status);
+      form.onsubmit = async event => {
+        event.preventDefault(); button.disabled = true; status.textContent = '正在核对映射…';
+        try {
+          const body = {harness_id: harness.id, dependency_id: id};
+          body[dependency.kind === 'service' ? 'connection_id' : 'resource_id'] = select.value;
+          await api('/api/harnesses/bind-dependency', body); status.textContent = '选择已保存，执行状态另行记录'; await refresh();
+        } catch (error) { status.textContent = error.message; }
+        finally { button.disabled = false; }
+      };
+      row.append(form);
+    }
+    detailValue(row, '分析器提出的原字段映射', dependency.mappings || dependency.mapping);
+    if (dependency.last_execution) detailValue(row, '最近原生调用及冻结配置依据', dependency.last_execution);
+    detail.append(row);
+  }
+  detail.append(node('p', '绑定只使用规则核对的原字段；同一资源不合并原 owner。新配置用于新运行，在途运行保留冻结配置。', 'card-note'));
+  card.append(detail);
+}
+
 function hydrateModels() {
-  for (const role of ['chat', 'analysis']) {
+  for (const role of ['chat', 'analysis', 'teacher']) {
     const form = $(role + '-model-form');
     const profile = state.models?.[role];
+    const selector = form.elements.connection_id;
+    connectionOptions(selector);
+    if (selector.dataset.selected !== (profile?.connection_id || '')) {
+      selector.value = profile?.connection_id || ''; selector.dataset.selected = profile?.connection_id || '';
+    }
     if (!form.dataset.hydrated) {
       form.elements.base_url.value = profile?.base_url || '';
       form.elements.model.value = profile?.model || '';
       form.elements.max_output_tokens.value = profile?.max_output_tokens || '';
+      form.elements.service_version.value = profile?.service_version || '';
       form.dataset.hydrated = 'true';
     }
-    form.elements.api_key.placeholder = profile?.key_present ? '同一接口留空保持；更换地址填写新 Key' :
-      role === 'chat' ? '本地接口可留空' : '填写云端 API Key';
+    form.elements.api_key.placeholder = profile?.key_present ? '留空保留；点击单独保存凭据才会写入' :
+      role !== 'analysis' ? '本地接口可留空' : '填写云端 API Key';
     const readiness = $(role + '-model-readiness');
     readiness.textContent = profile?.credential_error || (isReady(profile) ?
-      '已配置 · ' + (profile.key_present ? '密钥已配置' : '未配置 Key') :
+      '配置可用 · ' + (profile.key_present ? '凭据已配置' : '认证按所选连接') :
       profile?.configured ? '地址与模型已保存，请填写云端 API Key。' : '尚未配置');
     readiness.classList.toggle('message-error', Boolean(profile?.credential_error));
   }
@@ -691,6 +1542,7 @@ function renderHarnesses() {
     if (detached) card.append(node('p', '已摘除；重新接入会使用已有分析，不重复调用分析模型。', 'card-note'));
     if (!isReady(state.models?.analysis)) actions.append(node('span', '先配置分析模型', 'form-note'));
     card.append(actions);
+    harnessDependencies(card, harness);
     root.append(card);
   }
 }
@@ -701,15 +1553,124 @@ async function saveModel(event) {
   const button = form.querySelector('button[type="submit"]');
   const status = form.querySelector('.form-status');
   const body = {role: form.dataset.role, base_url: form.elements.base_url.value.trim(), model: form.elements.model.value.trim()};
-  if (form.elements.api_key.value.trim()) body.api_key = form.elements.api_key.value.trim();
   body.max_output_tokens = form.elements.max_output_tokens.value ? Number(form.elements.max_output_tokens.value) : null;
+  body.service_version = form.elements.service_version.value.trim() || null;
   button.disabled = true;
   status.textContent = '正在保存…';
   try {
     await api('/api/models', body);
-    form.elements.api_key.value = '';
-    status.textContent = '已保存';
+    status.textContent = form.elements.api_key.value ? '配置已保存；输入的凭据尚未保存，请点击“单独保存凭据”' : '配置已保存';
     await refresh();
+  } catch (error) { status.textContent = error.message; }
+  finally { button.disabled = false; }
+}
+
+async function selectRoleConnection(event) {
+  const button = event.currentTarget;
+  const form = button.closest('form');
+  const status = form.querySelector('.form-status');
+  const connectionId = form.elements.connection_id.value;
+  if (!connectionId) { status.textContent = '先选择已保存的命名连接'; return; }
+  button.disabled = true;
+  try {
+    await api('/api/models/select', {role: form.dataset.role, connection_id: connectionId});
+    form.elements.api_key.value = '';
+    delete form.dataset.hydrated;
+    status.textContent = '已选择连接；不会改动其他角色或在途运行';
+    await refresh();
+  } catch (error) { status.textContent = error.message; }
+  finally { button.disabled = false; }
+}
+
+async function saveRoleCredential(event) {
+  const button = event.currentTarget;
+  const form = button.closest('form');
+  const status = form.querySelector('.form-status');
+  const profile = state.models?.[form.dataset.role];
+  if (!profile?.connection_id || profile.base_url !== form.elements.base_url.value.trim() || profile.model !== form.elements.model.value.trim()) {
+    status.textContent = '先保存当前地址及模型配置，再为该连接单独保存凭据'; return;
+  }
+  if (!form.elements.api_key.value) { status.textContent = '输入为空，保留已有凭据'; return; }
+  button.disabled = true;
+  try {
+    await api('/api/credentials', {connection_id: profile.connection_id, action: 'save', value: form.elements.api_key.value});
+    form.elements.api_key.value = '';
+    status.textContent = '该连接凭据已单独保存'; await refresh();
+  } catch (error) { status.textContent = error.message; }
+  finally { button.disabled = false; }
+}
+
+async function saveConnection(event) {
+  event.preventDefault();
+  const form = event.currentTarget, status = $('connection-form-status');
+  const button = form.querySelector('[type="submit"]'); button.disabled = true;
+  try {
+    const parameters = JSON.parse(form.elements.parameters.value.trim() || '{}');
+    if (!parameters || typeof parameters !== 'object' || Array.isArray(parameters)) throw new Error('非敏感参数需要 JSON 对象');
+    const body = {name: form.elements.name.value.trim(), protocol: form.elements.protocol.value,
+      base_url: form.elements.base_url.value.trim(), model: form.elements.model.value.trim(),
+      service_version: form.elements.service_version.value.trim() || null, parameters,
+      capabilities: [...form.querySelectorAll('[name="capability"]:checked')].map(input => input.value),
+      auth: {mode: form.elements.auth_mode.value}};
+    if (form.elements.id.value) body.id = form.elements.id.value;
+    if (body.auth.mode === 'environment') body.auth.env = form.elements.auth_env.value.trim();
+    if (body.auth.mode === 'saved') {
+      const previous = entries(resourceState().connections).find(item => resourceId(item) === body.id);
+      if (previous?.base_url === body.base_url && previous.auth?.credential_ref) body.auth.credential_ref = previous.auth.credential_ref;
+    }
+    const result = await api('/api/connections', body);
+    const id = resourceId(result.connection || result);
+    if (id) form.elements.id.value = id;
+    form.dataset.savedUrl = body.base_url;
+    status.textContent = '配置已保存；未启动服务或发起推理';
+    await refresh();
+    if (id) {
+      selectCredentialConnection(id);
+      $('connection-form-title').textContent = '编辑连接 · ' + body.name;
+    }
+  } catch (error) { status.textContent = error.message; }
+  finally { button.disabled = false; }
+}
+
+async function saveConnectionCredential(event) {
+  event.preventDefault();
+  const form = event.currentTarget, status = $('credential-form-status');
+  const button = form.querySelector('[type="submit"]');
+  if (!form.elements.credential.value) { status.textContent = '输入为空，保留已有凭据'; return; }
+  button.disabled = true;
+  try {
+    await api('/api/credentials', {connection_id: form.elements.connection_id.value, action: 'save', value: form.elements.credential.value});
+    form.elements.credential.value = ''; status.textContent = '凭据已单独保存'; await refresh();
+  } catch (error) { status.textContent = error.message; }
+  finally { button.disabled = false; }
+}
+
+async function clearConnectionCredential(event) {
+  const button = event.currentTarget, form = $('connection-credential-form'), status = $('credential-form-status');
+  if (!form.elements.connection_id.value) { status.textContent = '先选择需要清除凭据的命名连接'; return; }
+  button.disabled = true;
+  try {
+    await api('/api/credentials', {connection_id: form.elements.connection_id.value, action: 'clear'});
+    form.elements.credential.value = ''; status.textContent = '凭据已清除；请按原服务要求选择认证方式'; await refresh();
+  } catch (error) { status.textContent = error.message; }
+  finally { button.disabled = false; }
+}
+
+async function saveWeight(event) {
+  event.preventDefault();
+  const form = event.currentTarget, status = $('weight-form-status');
+  const button = form.querySelector('[type="submit"]'); button.disabled = true;
+  try {
+    const text = form.elements.required_files.value.trim();
+    const required = text.startsWith('[') ? JSON.parse(text) : text.split(/\r?\n/).map(value => value.trim()).filter(Boolean);
+    if (!Array.isArray(required)) throw new Error('必要文件需要每行一个路径或 JSON 列表');
+    const body = {name: form.elements.name.value.trim(), path: form.elements.path.value.trim(), kind: form.elements.kind.value,
+      model_revision: form.elements.model_revision.value.trim() || null, execution_environment: 'local', required_files: required};
+    if (form.elements.id.value) body.id = form.elements.id.value;
+    const result = await api('/api/weights', body), id = resourceId(result.resource || result.weight || result);
+    if (id) form.elements.id.value = id;
+    $('weight-form-title').textContent = '编辑权重 · ' + body.name;
+    status.textContent = '路径已登记；点击“检查资源”核对必要文件'; await refresh();
   } catch (error) { status.textContent = error.message; }
   finally { button.disabled = false; }
 }
@@ -773,15 +1734,21 @@ async function refresh() {
     $('version').textContent = state.version ? '核心 ' + state.version : '';
     document.querySelector('.connection-dot').classList.remove('disconnected');
     hydrateModels();
+    hydrateResearch();
+    hydrateSceneTasks();
     updateInspectPage();
     renderSection('profile', state.entry_profile, renderProfile, ['entry-profile-summary', 'config-entry-profile']);
+    renderSection('connections', resourceState().connections, renderConnections, ['connection-list']);
+    renderSection('weights', resourceState().weights, renderWeights, ['weight-list']);
     synchronizeTask();
     renderSection('scheduler', state.scheduler, renderScheduler, ['scheduler-summary']);
+    renderSection('research', [state.scheduler?.research, state.units, state.harnesses], renderResearch,
+      ['research-readiness', 'research-run-list', 'research-comparison']);
     renderSection('tasks', visibleTasks(), renderTasks, ['task-list']);
     renderSection('units', [visibleUnits(), state.harnesses, selectedSource()], renderUnits, ['unit-list']);
     renderSection('deployments', [state.runtime_groups, state.deployments, selectedSource()], renderDeployments, ['deployment-list']);
-    renderSection('analyses', [state.analyses, state.harnesses, selectedSource(), [...sourceUpdating]], renderAnalyses, ['analysis-list']);
-    renderSection('harnesses', [state.harnesses, state.analyses, state.models?.analysis, [...analysisSubmitting], [...sourceUpdating]], renderHarnesses, ['harness-list']);
+    renderSection('analyses', [state.analyses, state.harnesses, resourceState(), selectedSource(), [...sourceUpdating]], renderAnalyses, ['analysis-list']);
+    renderSection('harnesses', [state.harnesses, state.analyses, state.models?.analysis, resourceState(), [...analysisSubmitting], [...sourceUpdating]], renderHarnesses, ['harness-list']);
   } catch (error) {
     connected = false;
     $('connection').textContent = '连接中断';
@@ -807,6 +1774,7 @@ function observerOpen(open) {
 }
 
 $('chat-form').onsubmit = sendMessage;
+$('scene-task-selector').onchange = updateComposer;
 $('chat-input').oninput = resizeComposer;
 $('chat-input').onkeydown = event => {
   if (event.key === 'Enter' && !event.shiftKey && !event.isComposing) {
@@ -816,6 +1784,102 @@ $('chat-input').onkeydown = event => {
 };
 $('chat-model-form').onsubmit = saveModel;
 $('analysis-model-form').onsubmit = saveModel;
+$('teacher-model-form').onsubmit = saveModel;
+for (const button of document.querySelectorAll('.select-role-connection')) button.onclick = selectRoleConnection;
+for (const button of document.querySelectorAll('.save-role-credential')) button.onclick = saveRoleCredential;
+$('connection-form').onsubmit = saveConnection;
+$('connection-invoke-form').onsubmit = invokeConnection;
+$('connection-invoke-form').elements.connection_id.onchange = () => {
+  $('connection-invoke-status').textContent = ''; $('connection-invoke-result').replaceChildren();
+  updateConnectionInvocation();
+};
+$('connection-invoke-form').elements.operation.onchange = updateConnectionInvocation;
+$('connection-form').elements.auth_mode.onchange = connectionAuthChanged;
+$('connection-form').elements.base_url.onchange = () => {
+  const form = $('connection-form');
+  if (form.dataset.savedUrl && form.dataset.savedUrl !== form.elements.base_url.value.trim()) {
+    form.elements.auth_mode.value = 'saved'; form.elements.auth_env.value = ''; connectionAuthChanged();
+    $('connection-auth-note').textContent = '地址已更改。请为新目标明确选择认证方式；原凭据不会默认转发。';
+  }
+};
+$('connection-new').onclick = () => {
+  const form = $('connection-form'); form.reset(); form.elements.id.value = ''; delete form.dataset.savedUrl;
+  $('connection-form-title').textContent = '新增命名连接'; $('connection-form-status').textContent = '';
+  $('connection-auth-note').textContent = '凭据值使用下方独立表单保存。更换地址后需重新明确认证方式。'; connectionAuthChanged();
+};
+$('connection-credential-form').onsubmit = saveConnectionCredential;
+$('connection-credential-form').elements.connection_id.onchange = () => {
+  $('connection-credential-form').elements.credential.value = '';
+  $('credential-form-status').textContent = '';
+};
+$('connection-clear-credential').onclick = clearConnectionCredential;
+$('weight-form').onsubmit = saveWeight;
+$('weight-new').onclick = () => {
+  const form = $('weight-form'); form.reset(); form.elements.id.value = '';
+  $('weight-form-title').textContent = '新增权重资源'; $('weight-form-status').textContent = '';
+};
+$('research-form').onsubmit = saveResearch;
+$('research-start').onclick = startResearch;
+$('research-form').addEventListener('input', () => { researchDirty = true; });
+$('research-teacher-role').onchange = () => hydrateResearchChoices();
+$('research-filter').oninput = renderResearch;
+$('research-mode-filter').onchange = renderResearch;
+$('research-load-saved').onclick = () => {
+  const saved = researchState().config;
+  loadResearchConfig(saved?.config || saved || blankResearchConfig());
+  $('research-form-status').textContent = saved ? '已加载保存的配置。' : '尚无保存配置，请填写真实环境和评价资源。';
+};
+$('research-criteria').onchange = () => {
+  try {
+    const criteria = jsonField('research-criteria', '评价资源');
+    $('research-prompt').value = criteria.prompt || '';
+    $('research-teacher-role').value = criteria.teacher?.role || 'teacher';
+    hydrateResearchChoices();
+  } catch (error) { $('research-form-status').textContent = error.message; }
+};
+$('research-scene').onchange = () => {
+  try {
+    researchDraft.scene = jsonField('research-scene', '场景配置');
+    $('research-unit-options').dataset.options = '';
+    const selected = new Set(researchDraft.scene.unit_ids || []);
+    hydrateResearchChoices(false, selected);
+  } catch (error) { $('research-form-status').textContent = error.message; }
+};
+$('research-export').onclick = () => {
+  try { downloadJson(readResearchConfig(), 'seampact-run-config.json'); }
+  catch (error) { $('research-form-status').textContent = error.message; }
+};
+$('research-criteria-export').onclick = () => {
+  try { downloadJson(readResearchCriteria(), 'seampact-criterion.json'); }
+  catch (error) { $('research-form-status').textContent = error.message; }
+};
+$('research-import').onchange = async event => {
+  try {
+    const file = event.target.files[0]; if (!file) return;
+    const value = JSON.parse(await file.text());
+    if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('配置文件需要 JSON 对象');
+    loadResearchConfig(value.config || value); researchDirty = true;
+    $('research-form-status').textContent = '已导入到编辑区；保存或开始运行后生效。';
+  } catch (error) { $('research-form-status').textContent = error.message; }
+  finally { event.target.value = ''; }
+};
+$('research-criteria-import').onchange = async event => {
+  try {
+    const file = event.target.files[0]; if (!file) return;
+    const criteria = JSON.parse(await file.text());
+    if (!criteria || typeof criteria !== 'object' || Array.isArray(criteria)) throw new Error('评价文件需要 JSON 对象');
+    $('research-criteria').value = JSON.stringify(criteria, null, 2);
+    $('research-prompt').value = criteria.prompt || '';
+    $('research-teacher-role').value = criteria.teacher?.role || 'teacher';
+    researchDirty = true; hydrateResearchChoices();
+    $('research-form-status').textContent = '已导入完整评价资源；在途运行继续使用原副本。';
+  } catch (error) { $('research-form-status').textContent = error.message; }
+  finally { event.target.value = ''; }
+};
+$('open-research-configuration').onclick = () => {
+  $('configuration').showModal();
+  $('research-configuration').scrollIntoView({block: 'start'});
+};
 $('harness-form').onsubmit = addHarness;
 $('open-configuration').onclick = () => $('configuration').showModal();
 $('close-configuration').onclick = () => $('configuration').close();

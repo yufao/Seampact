@@ -66,6 +66,93 @@ def decode_text(path, data):
     return text, encoding
 
 
+def _authentication_field(name):
+    value = re.sub(r"[^a-z0-9]", "", name.lower()) if isinstance(name, str) else ""
+    return value in {"password", "passwd", "authorization", "clientsecret", "secretkey", "hf_token",
+                     "hftoken", "bearertoken", "refreshtoken"} or value.endswith(("apikey", "accesstoken", "authtoken"))
+
+
+def _placeholder(value):
+    value = value.strip().lower()
+    compact = re.sub(r"[\s_\-<>\[\]{}.]", "", value)
+    if not value or compact in {"empty", "none", "null", "dummy", "test", "testing", "example", "placeholder",
+                   "changeme", "notrequired", "notneeded", "unused", "apikey", "yourkey", "yourapikey",
+                   "yourtoken", "yourpassword", "yourapikeyhere", "yourkeyhere", "replaceme", "replacewithyourapikey"}:
+        return True
+    return bool(re.fullmatch(r"(?:sk[-_])?(?:x{3,}|\*{3,}|\.\.\.)", value))
+
+
+def withheld_source(path, data):
+    """Finite literal-credential guard; it is not a general secret-flow proof."""
+    text, _ = decode_text(path, data)
+    positions = []
+    def record(unit, line, field, value):
+        if isinstance(value, str) and _authentication_field(field) and not _placeholder(value):
+            positions.append(dict(path=path, unit=unit, line=line, status="WITHHELD",
+                                  reason="explicit authentication field contains a non-placeholder string literal"))
+    def inspect(unit, source, python=False):
+        if python:
+            try:
+                tree = ast.parse(source)
+            except SyntaxError:
+                tree = None
+            if tree:
+                def literal(field, node):
+                    if isinstance(node, ast.Constant):
+                        record(unit, node.lineno, field, node.value)
+                for node in ast.walk(tree):
+                    if isinstance(node, (ast.Assign, ast.AnnAssign)):
+                        targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+                        for target in targets:
+                            if isinstance(target, (ast.Name, ast.Attribute)):
+                                literal(target.id if isinstance(target, ast.Name) else target.attr, node.value)
+                            elif isinstance(target, ast.Subscript) and isinstance(target.slice, ast.Constant):
+                                literal(target.slice.value, node.value)
+                    elif isinstance(node, ast.keyword):
+                        literal(node.arg, node.value)
+                    elif isinstance(node, ast.Dict):
+                        for key, value in zip(node.keys, node.values):
+                            if isinstance(key, ast.Constant):
+                                literal(key.value, value)
+                    elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+                        args = [*node.args.posonlyargs, *node.args.args]
+                        for arg, value in zip(args[len(args) - len(node.args.defaults):], node.args.defaults):
+                            literal(arg.arg, value)
+                        for arg, value in zip(node.args.kwonlyargs, node.args.kw_defaults):
+                            literal(arg.arg, value)
+        # Covers explicit quoted fields in non-Python files and literal comments.
+        pattern = r'''(?<![\w])(?P<field>[A-Za-z_][\w-]*)['"]?\s*[:=]\s*(?:"(?P<double>(?:\\.|[^"\\\r\n])*)"|'(?P<single>(?:\\.|[^'\\\r\n])*)')'''
+        dynamic_tail = re.compile(r"\s*(?:\+|%|\.(?:format|join)\s*\()")
+        for match in re.finditer(pattern, source):
+            if not _authentication_field(match["field"]):
+                continue
+            value = match["double"] if match["double"] is not None else match["single"]
+            if _placeholder(value) or dynamic_tail.match(source, match.end()):
+                continue
+            record(unit, source.count("\n", 0, match.start()) + 1, match["field"],
+                   value)
+    inspect("file", text, str(path).lower().endswith((".py", ".pyi")))
+    if str(path).lower().endswith(".ipynb"):
+        try:
+            book = json.loads(text)
+            for index, cell in enumerate(book.get("cells", [])):
+                source = cell.get("source", [])
+                source = "".join(source) if isinstance(source, list) else source
+                if isinstance(source, str):
+                    inspect(f"cell:{index}", source, cell.get("cell_type") == "code")
+        except (ValueError, TypeError, AttributeError):
+            pass
+    return sorted({(item["unit"], item["line"]): item for item in positions}.values(),
+                  key=lambda item: (item["unit"], item["line"]))
+
+
+class SourceWithheld(ValueError):
+    def __init__(self, path, positions):
+        super().__init__("source text withheld: explicit authentication literal must be removed from analysis scope")
+        self.report = dict(path=path, status="WITHHELD", positions=positions,
+                           reason="explicit authentication literal; original file and historical snapshot remain unchanged")
+
+
 def file_kind(path):
     suffix = Path(path).suffix.lower()
     if suffix in MODEL_SUFFIXES:
@@ -109,6 +196,9 @@ def units(path, data):
 
 
 def symbols(path, data):
+    positions = withheld_source(path, data)
+    if positions:
+        return dict(symbols=[], unknown=positions, closure="UNKNOWN", status="WITHHELD")
     result, unknown = [], []
     for unit, source in units(path, data):
         if not path.lower().endswith((".py", ".ipynb")):
@@ -139,6 +229,10 @@ def symbols(path, data):
 
 def source_facts(path, data):
     """Static imports and entry anchors are evidence candidates, not bindings."""
+    positions = withheld_source(path, data)
+    if positions:
+        return dict(imports=[], entry_candidates=[], unknown=positions,
+                    dependency_closure="UNKNOWN", status="WITHHELD")
     imports, entries, unknown = [], [], []
     suffix = Path(path).suffix.lower()
     try:
@@ -265,15 +359,21 @@ def inventory_repository(root, excluded_roots=()):
                 except (UnicodeError, ValueError, SyntaxError):
                     record["kind"] = "binary"
                 else:
-                    record.update(readable=True, encoding=encoding)
-                    files.append(relative)
-                    try:
-                        entries.extend(source_facts(relative, data)["entry_candidates"])
-                    except (ValueError, TypeError, AttributeError):
-                        record["structure"] = "PARSE_UNSUPPORTED"
+                    positions = withheld_source(relative, data)
+                    if positions:
+                        record.update(status="WITHHELD", positions=positions,
+                                      reason="explicit authentication literal; source text excluded")
+                    else:
+                        record.update(readable=True, encoding=encoding)
+                        files.append(relative)
+                        try:
+                            entries.extend(source_facts(relative, data)["entry_candidates"])
+                        except (ValueError, TypeError, AttributeError):
+                            record["structure"] = "PARSE_UNSUPPORTED"
             inventory.append(record)
             if not record["readable"]:
-                resources.append({key: record[key] for key in ("path", "kind", "bytes")})
+                resources.append({key: record[key] for key in ("path", "kind", "bytes", "status", "positions", "reason")
+                                  if key in record})
     return dict(files=files, inventory=inventory, resources=resources, entry_candidates=entries)
 
 
@@ -290,13 +390,18 @@ class Inspector:
             raise ValueError("entry and pre-analysis observation contract required")
         snapshots = Path(snapshots)
         snapshots.mkdir(parents=True, exist_ok=True)
-        records = []
+        records, withheld = [], []
         for relative in dict.fromkeys(paths):
             path = safe_path(root, relative)
             if path.suffix.lower() in BINARY_SUFFIXES or not path.is_file():
                 raise ValueError(f"not a supported source artifact: {relative}")
             data = path.read_bytes()
             decode_text(relative, data)
+            positions = withheld_source(relative, data)
+            if positions:
+                withheld.append(dict(path=relative.replace("\\", "/"), status="WITHHELD", positions=positions,
+                                     reason="explicit authentication literal; source text excluded"))
+                continue
             sha = digest(data)
             destination = snapshots / sha
             if not destination.exists():
@@ -305,8 +410,10 @@ class Inspector:
             records.append(dict(path=relative.replace("\\", "/"), sha256=sha, bytes=len(data)))
         request = dict(schema="integration-request/1", id=identity, entry=entry,
                        observation=observation, files=records, dependency_closure="UNKNOWN",
-                       resources=[], missing=["native run", "dependency closure", "owner/effect summaries"])
-        request["source_version"] = digest(json.dumps(records, sort_keys=True).encode())
+                       resources=[], withheld_sources=withheld,
+                       missing=["native run", "dependency closure", "owner/effect summaries"])
+        versioned = dict(files=records, withheld_sources=withheld) if withheld else records
+        request["source_version"] = digest(json.dumps(versioned, sort_keys=True).encode())
         return cls(root, snapshots, request)
 
     @classmethod
@@ -318,6 +425,17 @@ class Inspector:
             inventory=source["inventory"], resources=source.get("resources", []),
             entry_profile=source.get("entry_profile", {}), configuration=source.get("configuration", {}),
             user_resources=source.get("user_resources", []))
+        withheld = {item["path"]: item for item in source["inventory"] if item.get("status") == "WITHHELD"}
+        withheld.update({item["path"]: item for item in inspector.request["withheld_sources"]})
+        if withheld:
+            inspector.request["withheld_sources"] = list(withheld.values())
+            inspector.request["inventory"] = [{**item, **withheld[item["path"]], "readable": False}
+                if item["path"] in withheld else item for item in source["inventory"]]
+            if isinstance(inspector.request["entry"], dict) and isinstance(inspector.request["entry"].get("candidates"), list):
+                inspector.request["entry"] = dict(inspector.request["entry"], candidates=[item for item in
+                    inspector.request["entry"]["candidates"] if item.get("path") not in withheld])
+            inspector.request["source_version"] = digest(json.dumps(dict(files=inspector.request["files"],
+                withheld_sources=inspector.request["withheld_sources"]), sort_keys=True).encode())
         return inspector
 
     def list_source(self, offset=0, count=100):
@@ -329,16 +447,25 @@ class Inspector:
                     dependency_closure="UNKNOWN")
 
     def data(self, path):
+        blocked = next((item for item in self.request.get("withheld_sources", []) if item["path"] == path), None)
+        if blocked:
+            raise SourceWithheld(path, blocked["positions"])
         record = self.files[path]
         data = (self.snapshots / record["sha256"]).read_bytes()
         if digest(data) != record["sha256"]:
             raise ValueError("frozen source digest changed")
+        positions = withheld_source(path, data)
+        if positions:
+            raise SourceWithheld(path, positions)
         return data
 
     def read_file(self, path, unit="file", start=1, count=200):
         if type(start) is not int or start < 1 or type(count) is not int or count < 1:
             raise ValueError("positive line start and page size required")
-        available = dict(units(path, self.data(path)))
+        try:
+            available = dict(units(path, self.data(path)))
+        except SourceWithheld as error:
+            return error.report
         if unit not in available:
             return dict(path=path, units=list(available), requested_unit=unit)
         lines = available[unit].splitlines()
@@ -347,11 +474,17 @@ class Inspector:
                     next_line=start+count if start-1+count < len(lines) else None)
 
     def inspect_symbols(self, path):
-        return dict(path=path, sha256=self.files[path]["sha256"], **symbols(path, self.data(path)))
+        try:
+            return dict(path=path, sha256=self.files[path]["sha256"], **symbols(path, self.data(path)))
+        except SourceWithheld as error:
+            return error.report
 
     def inspect_construction(self, path, unit="file"):
         """Original statement anchors and def-use names; no candidate code is evaluated."""
-        available = dict(units(path, self.data(path)))
+        try:
+            available = dict(units(path, self.data(path)))
+        except SourceWithheld as error:
+            return error.report
         if unit not in available:
             raise ValueError("source unit is not frozen")
         tree = ast.parse(available[unit])
@@ -403,7 +536,11 @@ class Inspector:
         paths = [path] if path is not None else list(self.files)
         imports, unknown = [], []
         for relative in paths:
-            facts = source_facts(relative, self.data(relative))
+            try:
+                facts = source_facts(relative, self.data(relative))
+            except SourceWithheld as error:
+                unknown.extend(error.report["positions"])
+                continue
             imports.extend(item for item in facts["imports"] if unit is None or item.get("unit") == unit)
             unknown.extend(item for item in facts["unknown"] if unit is None or item.get("unit") == unit)
         return dict(paths=paths, imports=imports, unknown=unknown, dependency_closure="UNKNOWN")
@@ -426,25 +563,42 @@ class Inspector:
         for relative in self.files:
             if not relative.startswith(path):
                 continue
-            facts = source_facts(relative, self.data(relative))
+            try:
+                facts = source_facts(relative, self.data(relative))
+            except SourceWithheld as error:
+                unknown.extend(error.report["positions"])
+                continue
             candidates.extend(facts["entry_candidates"])
             unknown.extend(facts["unknown"])
         return dict(path=path, candidates=candidates, unknown=unknown, selected=None, execution="NOT_RUN")
 
     def add_source(self, path):
         """Explicit dependency extension makes a new version; never silently mutates a freeze."""
+        if path.replace("\\", "/") in self.files:
+            raise ValueError("already frozen; use the existing immutable artifact")
         if Path(path).suffix.lower() in BINARY_SUFFIXES:
             raise ValueError("unsupported source type")
         data = safe_path(self.root, path).read_bytes()
         _, encoding = decode_text(path, data)
+        positions = withheld_source(path, data)
+        if positions:
+            item = dict(path=path.replace("\\", "/"), status="WITHHELD", positions=positions,
+                        reason="explicit authentication literal; source text excluded")
+            previous = self.request.setdefault("withheld_sources", [])
+            if item not in previous:
+                previous.append(item)
+            if "inventory" in self.request:
+                self.request["inventory"] = [record for record in self.request["inventory"] if record["path"] != item["path"]]
+                self.request["inventory"].append(dict(item, kind=file_kind(path), readable=False))
+            self.request["source_version"] = digest(json.dumps(dict(files=self.request["files"],
+                withheld_sources=previous), sort_keys=True).encode())
+            return item
         sha = digest(data)
         dest = self.snapshots / sha
         if not dest.exists():
             with dest.open("xb") as out:
                 out.write(data)
         record = dict(path=path.replace("\\", "/"), sha256=sha, bytes=len(data))
-        if record["path"] in self.files:
-            raise ValueError("already frozen; use the existing immutable artifact")
         self.request["files"].append(record)
         self.files[record["path"]] = record
         if "inventory" in self.request:
