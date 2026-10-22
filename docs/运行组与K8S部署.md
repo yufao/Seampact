@@ -1,6 +1,6 @@
 # 从能力池到原生运行组
 
-更新：2026-10-21，0.9.0 工作区。首次远端部署从[服务器部署](服务器部署.md)开始；本页说明运行组宿主、运行组契约、部署后端、实例生命周期和功能调度模式下的运行组执行。建设范围来自[部署前建设与调度动作方案](部署前建设与调度动作方案.md)的 P1–P8。
+更新：2026-10-22，0.10.0 工作区。首次远端部署从[服务器部署](服务器部署.md)开始；本页说明运行组宿主、运行组契约、部署后端、实例生命周期和功能调度模式下的运行组执行。建设范围来自[部署前建设与调度动作方案](部署前建设与调度动作方案.md)的 P1–P8；新增独立 Python、环境证据及零模型重新核对见 [0.10 异构运行环境](0.10_异构运行环境.md)。旧 worker 工件需重新生成与构建，历史分析和实验材料保留。
 
 **联合模式目标更新：** [部署前方案第 5.2—5.3 节](部署前建设与调度动作方案.md#52-功能派发与生命周期联合模式本轮建设目标)已将合法就绪学习派发、prepare、scale_out、scale_in 和保留等待列为本轮建设目标，工作区已有代码实现，尚无真实联合运行；Linux／GPU／K8S 仍为 NOT_RUN。scale_out／scale_in 是运行组级水平扩缩，现有每实例一个 Deployment 可继续承载；不要求改为共享 Deployment，也不同时启用 HPA 控制同一组。FIFO 保留为基线，节点放置、垂直伸缩和现场恢复仍不在本轮动作内。
 
@@ -129,7 +129,9 @@ flowchart LR
 
 docker 后端使用 `docker_network`（同一用户自建网络中按容器名访问），或 `publish_host`／`advertise_host` 发布到一个空闲端口；`mounts` 为 `{source, target, read_only}`，`gpus` 原样传给 `--gpus`，`pass_env` 只列变量名，值来自平台进程环境。K8S 后端为每个实例生成一个副本数 1、`Recreate` 的 Deployment（名称 `<组>-g<代次>`），保存在工件目录 `instances/`；Pod 以 downward API 取得自身 IP 并登记 `http://$(POD_IP):8890`，按实例标签观测，停止时删除该 Deployment。凭据以 `env_secret` 中同名键注入；权重须挂载到与平台登记相同的路径。
 
-平台通过 docker／kubectl／kind 命令行执行，不经 shell。客户端或守护进程不可用时报告 `BACKEND_UNAVAILABLE` 并给出 `manual_commands`；操作者在宿主执行后，带 `--instance-id` 的进程登记时绑定到平台预先创建的同一实例。平台镜像不含 docker／kubectl：平台在容器或 K8S Pod 中运行时属于这种情况，命令中的 `/data/...` 对应宿主 `$SEAMPACT_DATA_DIR/...`。平台直接运行在已有 docker／kubectl 的宿主时，由平台执行。
+平台通过 docker／kubectl／kind 命令行执行，不经 shell。客户端或守护进程不可用时报告 `BACKEND_UNAVAILABLE` 并给出 `manual_commands`；操作者在宿主执行后，带 `--instance-id` 的进程登记时绑定到平台预先创建的同一实例。默认平台镜像不含 docker／kubectl；需要容器内自动调用 Docker 时，选择 [Docker 工具镜像与 socket 配置](Docker部署.md#6-可选容器内使用-docker-自动准备与部署)。平台直接运行在已有 docker／kubectl 的宿主时，由平台执行。容器中的 `/data/...` 与宿主数据挂载目录是两个路径视角，手动命令须按实际映射执行。
+
+registry 发布成功后优先保存并使用实际 `RepoDigest`；本机 Docker 构建则使用返回的镜像 ID，减少可变标签和节点缓存造成的混淆。K8S 继续以 `IfNotPresent` 拉取目标镜像。私有镜像仓库可在后端 JSON 加 `"image_pull_secrets": ["registry-secret"]`，引用同一命名空间内已有的仓库 Secret；对应语义见 [Kubernetes 镜像文档](https://kubernetes.io/docs/concepts/containers/images/)。平台不创建仓库账号或凭据；节点仍需实际可访问仓库。
 
 ## 实例生命周期与路由
 
@@ -209,7 +211,7 @@ export SEAMPACT_HARNESS_DIR="$HOME/seampact-workspace/harnesses"
 export SEAMPACT_K8S_DIR="$PWD/.local-private/deployment/k8s"
 mkdir -p "$SEAMPACT_DATA_DIR" "$SEAMPACT_HARNESS_DIR" "$SEAMPACT_K8S_DIR"
 export SEAMPACT_REVISION="$(git rev-parse --short HEAD)"
-export SEAMPACT_CORE_IMAGE="seampact-core:0.9.0-$SEAMPACT_REVISION"
+export SEAMPACT_CORE_IMAGE="seampact-core:0.10.0-$SEAMPACT_REVISION"
 python3 -I -B - <<'PY'
 import json
 import os

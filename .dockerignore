@@ -6,5 +6,6 @@
 !src/**
 !deploy/
 !deploy/Dockerfile
+!deploy/Dockerfile.tools
 **/__pycache__/
 **/*.pyc

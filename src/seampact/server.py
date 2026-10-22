@@ -84,6 +84,8 @@ def make_server(platform, port=8880, host="127.0.0.1", public_port=None):
                     result = platform.dependencies.check_fixed(body)
                 elif path == "/api/harnesses":
                     result = platform.add_harness(body)
+                elif path == "/api/harnesses/environment":
+                    result = platform.configure_environment(body)
                 elif path == "/api/units/policy":
                     result = platform.catalog.scheduling_policy(body)
                 elif path == "/api/units/capability":

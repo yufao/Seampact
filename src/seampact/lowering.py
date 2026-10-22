@@ -8,6 +8,8 @@ import ast
 import copy
 import hashlib
 
+from .inspection import native_ast
+
 
 class UnsupportedLowering(ValueError):
     pass
@@ -57,7 +59,7 @@ def lexical_bindings(nodes):
 
 
 def analyze_loop(source, symbol, loop_index=0):
-    tree=ast.parse(source)
+    tree=native_ast(source)
     cls,method=locate(tree,symbol)
     if any(isinstance(n,(ast.Global,ast.Nonlocal,ast.FunctionDef,ast.AsyncFunctionDef,
                          ast.ClassDef,ast.Lambda)) for statement in method.body for n in ast.walk(statement)):
@@ -142,13 +144,14 @@ def analyze_loop(source, symbol, loop_index=0):
 
 def lower_loop(source,symbol,loop_index=0):
     recipe=analyze_loop(source,symbol,loop_index)
-    tree=ast.parse(source)
+    tree=native_ast(source)
     cls,method=locate(tree,symbol)
     loop=method.body[recipe["loop_position"]]
     helper=ast.AsyncFunctionDef(name=recipe["helper"],
         args=ast.arguments(posonlyargs=[],args=[ast.arg(arg=name) for name in ["self"]+recipe["incoming"]],
                            vararg=None,kwarg=None,kwonlyargs=[],kw_defaults=[],defaults=[]),
-        body=copy.deepcopy(loop.body),decorator_list=[])
+        body=copy.deepcopy(loop.body),decorator_list=[],returns=None,type_comment=None,
+        **({"type_params": []} if "type_params" in ast.AsyncFunctionDef._fields else {}))
     loop.body=[ast.Expr(value=ast.Await(value=ast.Call(
         func=ast.Attribute(value=ast.Name(id="self",ctx=ast.Load()),attr=recipe["helper"],ctx=ast.Load()),
         args=[ast.Name(id=name,ctx=ast.Load()) for name in recipe["incoming"]],keywords=[])))]
@@ -165,8 +168,8 @@ def verify_lowering(original,patched,recipe):
     derived=analyze_loop(original,recipe["symbol"],recipe["loop_index"])
     if any(recipe.get(k)!=derived[k] for k in ("rule","symbol","loop_index","loop_position","helper","incoming","body_locals")):
         return dict(structural_inverse=False,reason="recipe disagrees with independent source analysis")
-    before=ast.parse(original)
-    after=ast.parse(patched)
+    before=native_ast(original)
+    after=native_ast(patched)
     cls,method=locate(after,recipe["symbol"])
     candidates=[n for n in cls.body if isinstance(n,ast.AsyncFunctionDef) and n.name==recipe["helper"]]
     if len(candidates)!=1:

@@ -21,7 +21,7 @@ from pathlib import Path
 
 from .deployment import (GROUP_PROFILE, IDENTITY_PROTOCOL, REMOTE_PROFILE, PortGap, binding_fingerprint, decode_port, encode_port,
                          json_request)
-from .inspection import Inspector, digest, safe_path
+from .inspection import Inspector, digest, python_runtime_issue, safe_path
 from .resources import ResourceRegistry
 from .runtime import OwnerRuntime, ProtocolError
 from .store import Store
@@ -111,15 +111,33 @@ def host_weight_check(root):
 
 class Worker:
     def __init__(self, spec_path, coordinator, instance_id=None, generation=0):
-        if sys.version_info[:2] != (3, 11):
-            raise ValueError("当前运行组宿主只覆盖Python 3.11，请用生成的运行镜像")
+        issue = python_runtime_issue()
+        if issue:
+            raise ValueError(issue)
         self.spec_path = Path(spec_path).resolve()
         self.spec = json.loads(self.spec_path.read_text(encoding="utf-8"))
         if self.spec.get("schema") != "native-worker/1":
             raise ValueError("未知运行组格式")
+        environment = self.spec.get("runtime_environment") or {"python": "3.11"}
+        expected = environment.get("python") if isinstance(environment, dict) else None
+        if not isinstance(expected, str) or not re.fullmatch(r"3\.(?:10|11|12|13)(?:\.\d+)?", expected):
+            raise ValueError("运行组必须声明 Python 3.10–3.13 中的一个解释器版本")
+        if tuple(map(int, expected.split(".")[:2])) != tuple(sys.version_info[:2]):
+            raise ValueError("运行组声明 Python " + expected + "，当前解释器为 " +
+                             ".".join(map(str, sys.version_info[:2])) + "；请使用匹配的运行镜像")
+        from .environments import check_python_version
+        checked_python = check_python_version(".".join(map(str, sys.version_info[:3])),
+                                              environment.get("python_requirements", []))
+        if checked_python["status"] != "SUPPORTED":
+            raise ValueError("运行组实际 Python 不满足原库声明：" + "; ".join(checked_python["missing"]))
         self.profile = self.spec.get("profile", REMOTE_PROFILE["id"])
         if self.profile not in {REMOTE_PROFILE["id"], GROUP_PROFILE["id"]}:
-            raise ValueError("未知运行组宿主规格")
+            raise ValueError("旧版或未知运行组宿主规格；请用当前平台重新生成运行工件")
+        from .target_runtime import core_identity
+        if not isinstance(self.spec.get("platform_core"), dict):
+            raise ValueError("运行工件缺少平台核对规则版本；请用当前平台重新生成运行工件")
+        if self.spec["platform_core"] != core_identity():
+            raise ValueError("运行镜像的平台核对代码与冻结工件不一致；请重新生成并构建运行镜像")
         self.group = self.spec["group"]
         root = self.spec_path.parent
         inspector = Inspector(root / "source", root / "snapshots", self.spec["request"])

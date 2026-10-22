@@ -1,0 +1,11 @@
+# Optional Docker client image. Build the platform image first; this target
+# adds no daemon and does not install anything into the Harness environment.
+ARG DOCKER_CLI_IMAGE=docker:29-cli
+ARG PLATFORM_IMAGE
+FROM ${DOCKER_CLI_IMAGE} AS docker_cli
+FROM ${PLATFORM_IMAGE}
+
+# Paths from the official docker-library/docker cli image. Both binaries are
+# supplied by that image; no package manager or download command runs here.
+COPY --from=docker_cli /usr/local/bin/docker /usr/local/bin/docker
+COPY --from=docker_cli /usr/local/libexec/docker/cli-plugins/docker-buildx /usr/local/libexec/docker/cli-plugins/docker-buildx

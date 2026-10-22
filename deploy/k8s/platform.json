@@ -6,7 +6,7 @@
       "spec": {"replicas": 1, "strategy": {"type": "Recreate"}, "selector": {"matchLabels": {"app": "seampact-platform"}},
         "template": {"metadata": {"labels": {"app": "seampact-platform"}}, "spec": {
           "securityContext": {"runAsUser": 1000, "runAsGroup": 1000},
-          "containers": [{"name": "platform", "image": "seampact-core:0.9.0", "imagePullPolicy": "IfNotPresent",
+          "containers": [{"name": "platform", "image": "seampact-core:0.10.0", "imagePullPolicy": "IfNotPresent",
             "ports": [{"containerPort": 8880}], "volumeMounts": [{"name": "state", "mountPath": "/data"}, {"name": "sources", "mountPath": "/harnesses"}]}],
           "volumes": [
             {"name": "state", "hostPath": {"path": "/srv/seampact/seampact-data", "type": "Directory"}},

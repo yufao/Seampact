@@ -324,6 +324,8 @@ def _path_expression(node, root, file):
 
 def check_requirements(inspector, candidate):
     """Check source anchors, parameter destinations and fixed path expressions."""
+    if getattr(inspector, "target_runtime", None):
+        return inspector.target_runtime.call("check_requirements", candidate=candidate)
     result = []
     definitions = candidate.get("dependencies", [])
     if not isinstance(definitions, list) or any(not isinstance(item, dict) for item in definitions):

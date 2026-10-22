@@ -31,12 +31,14 @@ from .inspection import digest, safe_path
 from .runtime import ProtocolError, _task_context
 from .store import now
 from .verification import source_unit
+from .environments import normalize_environment
+from .target_runtime import core_identity, environment_selection
 
-REMOTE_PROFILE = dict(id="python311-scalar-worker/1", confirmed=True,
+REMOTE_PROFILE = dict(id="python-native-scalar-worker/2", confirmed=True, python_versions=["3.10", "3.11", "3.12", "3.13"],
     process_per_group=1, replicas=1, preserve_original_lifetimes=True,
     session_recovery=False, codec="JSON_SCALARS", parallel=False,
     source="用户确认：按原对象/共享状态/控制依赖分组，远程条件独立核对，未覆盖继续本地")
-GROUP_PROFILE = dict(id="python311-native-group-worker/1", process_per_instance=1,
+GROUP_PROFILE = dict(id="python-native-group-worker/2", process_per_instance=1, python_versions=["3.10", "3.11", "3.12", "3.13"],
     preserve_original_lifetimes=True, session_recovery=False, codec="group-port/1", parallel=False,
     environment="RECHECKED_IN_HOST",
     source="部署前建设方案 P2：整组冻结原源码与核对后的绑定在同一工作进程；原 owner、构造、controller 与内部许可留在组内")
@@ -144,12 +146,17 @@ def worker_spec(binding, group, unit):
     contract = group.get("contract") or {}
     return dict(schema="native-worker/1", profile=contract.get("host_profile", REMOTE_PROFILE["id"]),
                 contract_digest=contract.get("digest"), group=group, request=binding.inspector.request,
+                runtime_environment=group.get("runtime_environment") or binding.inspector.request.get("runtime_environment") or {"python": "3.11"},
+                platform_core=core_identity(),
                 candidate=candidate, analysis_id=unit["analysis_id"], installation_id=unit["installation_id"])
 
 
 def binding_fingerprint(spec):
     payload = {key: spec[key] for key in ("request", "candidate", "analysis_id", "installation_id")}
     payload["group"] = {key: spec["group"][key] for key in ("id", "units", "source_id", "source_version")}
+    for key in ("runtime_environment", "platform_core"):
+        if key in spec:
+            payload[key] = spec[key]
     if spec.get("profile", REMOTE_PROFILE["id"]) != REMOTE_PROFILE["id"]:
         payload["host"] = dict(profile=spec["profile"], contract_digest=spec.get("contract_digest"))
     return digest(json.dumps(payload, sort_keys=True, ensure_ascii=False).encode())
@@ -650,7 +657,14 @@ class Deployments:
         artifacts = {item["id"]: item for item in self.platform.store.list("deployment")}
         result = []
         with self.lock:
-            for group in self._current_groups():
+            groups = {group["id"]: group for group in self._current_groups()}
+            # Keep older backend objects visible for release after an
+            # environment edit, source detachment or platform-code update.
+            for group in self.platform.store.list("runtime_group"):
+                if group["id"] not in groups and any(self._held(item) for item in self._instances(group["id"])):
+                    group["environment_gap"] = "旧接入版本的实例尚待释放；该组只允许排空停止"
+                    groups[group["id"]] = group
+            for group in groups.values():
                 records = sorted(self._instances(group["id"]), key=lambda item: item["generation"], reverse=True)
                 shown = [item for item in records if item["state"] in LIVE] + [item for item in records if item["state"] not in LIVE][:3]
                 ready = [item for item in shown if item["state"] == "READY" and item["accepting"]]
@@ -659,6 +673,10 @@ class Deployments:
                     instances=[self._view(item) for item in shown], artifact=artifacts.get(group["id"]),
                     locked_by_run=lock["run_id"] if lock else None,
                     actions=self._actions(group, artifacts.get(group["id"])) if group.get("contract") else {})
+                if group.get("environment_gap"):
+                    for name, action in group["actions"].items():
+                        if name != "drain_stop":
+                            action.update(enabled=False, reason=group["environment_gap"])
                 result.append(group)
         return result
 
@@ -668,6 +686,10 @@ class Deployments:
         if (artifact.get("contract_digest") != group["contract"]["digest"]
                 or artifact.get("installation_id") != group.get("installation_id")):
             return "构建工件与当前运行组契约/接入版本不一致，请重新生成"
+        if artifact.get("platform_core") != core_identity():
+            return "构建工件与当前平台核心代码不同，请重新生成并构建 worker"
+        if any(artifact.get(field, {}).get("status") == "RUNNING" for field in ("build", "publish")):
+            return "该运行组正在构建或发布镜像"
         if (artifact.get("build") or {}).get("status") not in {"BUILT", "OPERATOR_REPORTED"}:
             return "镜像尚未构建成功"
         if (artifact.get("publish") or {}).get("status") not in {"PUBLISHED", "NOT_REQUIRED", "OPERATOR_REPORTED"}:
@@ -692,11 +714,15 @@ class Deployments:
         built = (artifact or {}).get("build", {}).get("status") in {"BUILT", "OPERATOR_REPORTED"}
         gap = self._start_gap(group, artifact)
         single = None if not held else "已有实例或待释放对象；该组只允许一个实例，先排空停止" if not contract["replicas"]["replicable"] else "已有实例或待释放对象；请先核对，再用增加副本"
+        editing = ("运行 " + lock["run_id"] + " 正在使用该组" if lock else
+                   "已有实例或待释放对象，请先排空停止" if held else
+                   "该运行组正在构建或发布镜像" if any((artifact or {}).get(field, {}).get("status") == "RUNNING"
+                                                           for field in ("build", "publish")) else None)
         return dict(
-            export=dict(enabled=group.get("host_status") == "HOST_CHECKED",
-                        reason=None if group.get("host_status") == "HOST_CHECKED" else "没有通过宿主核对的成员"),
-            build=dict(enabled=bool(artifact), reason=None if artifact else "先生成构建工件"),
-            publish=dict(enabled=built, reason=None if built else "镜像尚未构建成功"),
+            export=dict(enabled=not editing and group.get("host_status") == "HOST_CHECKED",
+                        reason=editing or (None if group.get("host_status") == "HOST_CHECKED" else "没有通过宿主核对的成员")),
+            build=dict(enabled=not editing and bool(artifact), reason=editing or (None if artifact else "先生成构建工件")),
+            publish=dict(enabled=not editing and built, reason=editing or (None if built else "镜像尚未构建成功")),
             start=gate("start", gap or single), prewarm=gate("prewarm", None if ready else "没有就绪实例"),
             pause_intake=gate("pause_intake", None if any(item["accepting"] for item in ready) else "没有正在接单的实例"),
             drain_stop=dict(enabled=bool(held) and not lock, reason=None if held and not lock else
@@ -904,29 +930,32 @@ class Deployments:
     # Build artifacts, images and image reachability.
 
     def _environment(self, value, binding):
-        value = value or {}
-        base = value.get("base_image") or "python:3.11-slim"
-        if not isinstance(base, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/:@-]*", base):
-            raise ValueError("base_image 须为镜像引用")
-        requirements = value.get("requirements", [])
-        if not isinstance(requirements, list) or any(item not in binding.inspector.files for item in requirements):
-            raise ValueError("依赖清单须为冻结源码内的文件路径")
-        packages = value.get("packages", [])
-        if not isinstance(packages, list) or any(not isinstance(item, str) or not re.fullmatch(
-                r"[A-Za-z0-9][A-Za-z0-9._\-\[\],<>=!~;:+@/ ]*", item) for item in packages):
-            raise ValueError("packages 须为 pip 需求说明")
-        index = value.get("pip_extra_index_url") or ""
-        if index and (urlsplit(index).scheme not in {"http", "https"} or "@" in urlsplit(index).netloc):
-            raise ValueError("pip_extra_index_url 须为不含凭据的 HTTP 地址")
-        return dict(base_image=base, requirements=list(requirements), packages=list(packages),
-                    pip_extra_index_url=index, python="3.11", weights_in_image=False, secrets_in_image=False)
+        environment = normalize_environment(value, binding.inspector)
+        checked_python = (binding.inspector.request.get("runtime_environment") or {}).get("python", "3.11")
+        if environment["python"] != checked_python:
+            raise ValueError("所选 Python 与源码核对解释器不同；请先在来源配置准备该解释器并零模型重新核对候选")
+        return environment
+
+    def _artifact_guard(self, identity):
+        self._guard(identity, None)
+        if any(self._held(item) for item in self._instances(identity)):
+            raise ValueError("请先排空并停止该运行组实例，再修改或重建镜像")
+        artifact = self.platform.store.get("deployment", identity) or {}
+        if any(artifact.get(field, {}).get("status") == "RUNNING" for field in ("build", "publish")):
+            raise ValueError("该运行组正在构建或发布镜像，请结束后再操作")
 
     def export(self, identity, body):
+        with self.platform.source_lock, self.lock:
+            return self._export(identity, body)
+
+    def _export(self, identity, body):
+        self._artifact_guard(identity)
         group = self._group(identity)
         if group["host"]["status"] != "HOST_CHECKED":
             raise ValueError("运行组没有通过宿主核对的成员，继续本地执行；请查看缺口")
         binding, _, unit = self._binding(group)
         environment = self._environment(body.get("environment"), binding)
+        group["runtime_environment"] = environment_selection(environment)
         destination = self.folder / (identity + "-" + uuid.uuid4().hex[:8])
         destination.mkdir(parents=True)
         original, snapshots = destination / "source", destination / "snapshots"
@@ -941,33 +970,48 @@ class Deployments:
             target.write_bytes(data)
             (snapshots / record["sha256"]).write_bytes(data)
         shutil.copytree(Path(__file__).parent, destination / "core" / "seampact", ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
-        spec = worker_spec(binding, self.platform.store.get("runtime_group", identity), unit)
+        spec = worker_spec(binding, group, unit)
         fingerprint = binding_fingerprint(spec)
         image = "seampact-worker-" + identity[3:15] + ":" + digest(
             json.dumps([fingerprint, environment], sort_keys=True).encode())[:16]
         (destination / "worker.json").write_text(json.dumps(spec, ensure_ascii=False, indent=2), encoding="utf-8")
         (destination / "environment.json").write_text(json.dumps(environment, ensure_ascii=False, indent=2), encoding="utf-8")
         index = '${PIP_EXTRA_INDEX_URL:+--extra-index-url "$PIP_EXTRA_INDEX_URL"} '
-        steps = ['python -c "import sys; assert sys.version_info[:2] == (3, 11), \'worker image requires Python 3.11: \' + sys.version"']
-        steps += ["python -m pip install --no-cache-dir " + index + "-r " + shlex.quote(path) for path in environment["requirements"]]
+        check_python = ("import sys; from seampact.environments import check_python_version; "
+            "assert '.'.join(map(str,sys.version_info[:2])) == " + repr(environment["python"]) + "; "
+            "r=check_python_version('.'.join(map(str,sys.version_info[:3])), " + repr(environment["python_requirements"]) +
+            "); assert r['status'] == 'SUPPORTED', r['missing']")
+        preparation = []
+        if environment["python"] == "3.10":
+            preparation.append("python -m pip install --no-cache-dir " + index + "'tomli>=2,<3'")
+        preparation.append("python -c " + shlex.quote(check_python))
+        steps = ["python -m pip install --no-cache-dir " + index + "-r " + shlex.quote(path) for path in environment["requirements"]]
+        if environment["project"]:
+            project = "." if environment["project"] == "." else "./" + environment["project"]
+            steps.append("python -m pip install --no-cache-dir " + index + shlex.quote(project))
         if environment["packages"]:
             steps.append("python -m pip install --no-cache-dir " + index + " ".join(shlex.quote(item) for item in environment["packages"]))
-        steps.append("python -m pip freeze --all > /work/environment.lock")
+        steps += ["python -m pip check", "python -m pip freeze --all > /work/environment.lock"]
         (destination / "Dockerfile").write_text(
             "# Generated runtime-group image: frozen source, checked binding and declared environment only.\n"
             "# Weights, configuration and credentials are mounted/injected at start, never copied here.\n"
-            "ARG BASE_IMAGE=python:3.11-slim\nFROM ${BASE_IMAGE}\nARG PIP_EXTRA_INDEX_URL=\n"
+            "ARG BASE_IMAGE=" + environment["base_image"] + "\nFROM ${BASE_IMAGE}\nARG PIP_EXTRA_INDEX_URL=\n"
+            "COPY core /app\nENV PYTHONPATH=/app PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1\n"
+            "WORKDIR /work\nRUN " + " \\\n && ".join(preparation) + "\n"
             "COPY source /work/source\nWORKDIR /work/source\nRUN " + " \\\n && ".join(steps) + "\n"
-            "COPY core /app\nCOPY snapshots /work/snapshots\nCOPY worker.json /work/worker.json\nWORKDIR /work\n"
-            "ENV PYTHONPATH=/app PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 SEAMPACT_ENVIRONMENT_LOCK=/work/environment.lock\n"
+            "COPY snapshots /work/snapshots\nCOPY worker.json /work/worker.json\nWORKDIR /work\n"
+            "ENV SEAMPACT_ENVIRONMENT_LOCK=/work/environment.lock\n"
             'ENTRYPOINT ["python","-B","-m","seampact","worker","--spec","/work/worker.json","--host","0.0.0.0","--port","8890"]\n',
             encoding="utf-8")
         archive = shutil.make_archive(str(destination), "zip", root_dir=destination)
         record = dict(id=identity, status="ARTIFACT_READY", folder=str(destination), archive=archive, image=image,
             profile=spec["profile"], contract_digest=group["contract"]["digest"], binding_fingerprint=fingerprint,
             installation_id=group["installation_id"], analysis_id=group.get("analysis_id"), environment=environment,
+            source_runtime_environment=environment_selection(binding.inspector.request.get("runtime_environment") or {}),
+            platform_core=spec["platform_core"],
             created_at=now(), source_version=group["source_version"], build=dict(status="NOT_RUN"),
             publish=dict(status="NOT_RUN"), deployment="NOT_APPLIED", copies_original_code=True, resource_downloads=0)
+        self.platform.store.save("runtime_group", identity, group)
         self.platform.store.save("deployment", identity, record)
         return record
 
@@ -998,7 +1042,12 @@ class Deployments:
         return artifact
 
     def build(self, identity, body):
+        with self.platform.source_lock, self.lock:
+            return self._build(identity, body)
+
+    def _build(self, identity, body):
         def action():
+            self._artifact_guard(identity)
             image = body.get("operator_reported_image")
             if image is not None:
                 if not isinstance(image, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/:@-]*", image):
@@ -1014,14 +1063,20 @@ class Deployments:
         return self._once(body, "build:" + identity, action)
 
     def publish(self, identity, body):
+        with self.platform.source_lock, self.lock:
+            return self._publish(identity, body)
+
+    def _publish(self, identity, body):
         def action():
+            self._artifact_guard(identity)
             artifact = self._artifact(identity)
             if (artifact.get("build") or {}).get("status") not in {"BUILT", "OPERATOR_REPORTED"}:
                 raise ValueError("镜像尚未构建成功")
             config = self.backend()
             if config["kind"] == "none":
                 raise ValueError("先配置部署后端")
-            return self._background(identity, "publish", lambda item: backends.publish(item["image"], config))
+            return self._background(identity, "publish", lambda item: backends.publish(
+                item["image"], config, image_id=item.get("build", {}).get("image_id")))
         return self._once(body, "publish:" + identity, action)
 
     # Instances: start, registration, intake, drain and stop.
@@ -1037,7 +1092,7 @@ class Deployments:
                           lambda: self._start(identity, run_id, replica, (body or {}).get("expected_image")))
 
     def _start(self, identity, run_id, replica, expected_image=None):
-        with self.lock:
+        with self.platform.source_lock, self.lock:
             self._guard(identity, run_id)
             group = self._group(identity)
             contract = group["contract"]
@@ -1194,7 +1249,9 @@ class Deployments:
         def action():
             with self.lock:
                 self._guard(identity, run_id)
-                group = self._group(identity)
+                group = self.platform.store.get("runtime_group", identity)
+                if not group or not group.get("contract"):
+                    raise ValueError("没有可释放的运行组契约")
                 targets = [item for item in self._instances(identity) if self._held(item)
                            and body.get("instance_id") in (None, item["id"])]
                 if not targets:

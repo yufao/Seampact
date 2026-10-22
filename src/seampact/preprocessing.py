@@ -8,7 +8,7 @@ import ast
 import copy
 import json
 
-from .inspection import units
+from .inspection import native_ast, units
 from .dependencies import check_requirements, DEPENDENCY_RULES
 
 
@@ -72,7 +72,7 @@ def _anchor(inspector, value, cache):
                     scope="script reference only; original CLI binding is checked separately")
     if not path.lower().endswith((".py", ".ipynb")):
         raise ValueError("callable anchor inspection currently covers Python sources only")
-    parent, node = ast.parse(source), None
+    parent, node = native_ast(source), None
     parts = symbol.split(".")
     for part in parts:
         found = [member for member in getattr(parent, "body", [])
@@ -109,6 +109,8 @@ def check_preprocessing(inspector, artifact, check_entries=None):
     The supplied native entry checker retains its own existing dependency and
     resource checks; all of its results remain non-executing candidate feedback.
     """
+    if getattr(inspector, "target_runtime", None):
+        return inspector.target_runtime.call("check_preprocessing", artifact=artifact)
     if not isinstance(artifact, dict) or artifact.get("schema") != "source-preparation/1":
         raise ValueError("preprocessing artifact requires schema source-preparation/1")
     if not isinstance(artifact.get("goal"), str) or not artifact["goal"].strip():

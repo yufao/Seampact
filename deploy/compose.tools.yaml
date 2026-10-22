@@ -1,0 +1,26 @@
+# Opt-in only: first build Dockerfile and Dockerfile.tools, then use this with
+# compose.yaml and `up --no-build`. This file does not start a Docker daemon.
+services:
+  platform:
+    image: "${SEAMPACT_TOOLS_IMAGE:?Build and select the tools image first}"
+    pull_policy: never
+    environment:
+      DOCKER_HOST: "unix:///var/run/docker.sock"
+      DOCKER_CONFIG: "/data/docker-client"
+    group_add:
+      - "${SEAMPACT_DOCKER_GID:?Set the selected Docker socket group ID}"
+    volumes:
+      - type: bind
+        source: "${DOCKER_SOCKET_PATH:?Set the local daemon Unix socket path}"
+        target: /var/run/docker.sock
+        bind:
+          create_host_path: false
+    networks:
+      runtime:
+        aliases:
+          - seampact-platform
+
+networks:
+  runtime:
+    external: true
+    name: "${SEAMPACT_RUNTIME_NETWORK:?Create and select a shared worker network}"

@@ -75,6 +75,7 @@ check_candidate.entry_bindings.runtime_groups返回引擎按源码核对的分�
 
 
 RULES += DEPENDENCY_RULES
+RULES += "\n运行环境由inspect_environment返回原库声明、推荐、冲突与用户选择。entry_profile保留平台本地基线，runtime_environment为明确选择的独立目标解释器，具体语法与构造仍须通过引擎核对。先核对环境事实；不自行升级依赖、执行安装命令或以镜像存在证明原能力可用。需要不同Python/依赖时说明来源依据和缺口，交由运行环境配置，不改变原算法或拆分规则。\n"
 
 
 def function(name, description, properties, required):
@@ -83,6 +84,7 @@ def function(name, description, properties, required):
 
 
 TOOLS = [
+    function("inspect_environment", "读取冻结原库的Python/依赖/镜像环境证据与所选环境，不执行安装", {}, []),
     function("list_source", "分页列出已冻结工件；页大小可自行选择", {"offset":{"type":"integer"},"count":{"type":"integer"}}, []),
     function("read_file", "读取冻结文件的源码；笔记本只提供源码单元，不发输出", {
         "path":{"type":"string"},"unit":{"type":"string"},"start":{"type":"integer"},"count":{"type":"integer"}}, ["path"]),
@@ -106,7 +108,7 @@ SOURCE_TOOLS = [tool for tool in TOOLS if tool["function"]["name"] not in {"chec
 def preparation_input(inspector):
     return {key: inspector.request.get(key) for key in
             ("source_version", "entry", "configuration", "user_resources", "rules", "entry_profile", "observation",
-             "dependency_bindings", "resource_catalog")}
+             "dependency_bindings", "resource_catalog", "runtime_environment", "target_runtime")}
 
 
 def content_digest(value):
@@ -137,7 +139,7 @@ class AnalysisJobs:
         self.implementation_bytes = {name: Path(__file__).with_name(name).read_bytes() for name in
             ("analysis.py", "preprocessing.py", "inspection.py", "units.py", "verification.py",
              "lowering.py", "callsite.py", "deployment.py", "dependencies.py", "resources.py", "providers.py",
-             "service.py")}
+             "service.py", "environments.py", "target_runtime.py")}
         self.implementation = {name: digest(data) for name, data in self.implementation_bytes.items()}
         for old in store.list("analysis"):
             if old["status"] in {"RUNNING", "CANCELLING"}:
@@ -251,7 +253,7 @@ class AnalysisJobs:
             # model messages. Recover its completed analysis, not a fresh
             # source-discovery conversation, only across checked identity links.
             seen = set()
-            while context and context.get("kind") == "ANALYZER_RESOURCE_BINDING":
+            while context and context.get("kind") in {"ANALYZER_RESOURCE_BINDING", "ENVIRONMENT_RECHECK"}:
                 identity_seen = context.get("id")
                 prior_id = context.get("prior_analysis_id")
                 prior = self.store.get("analysis", prior_id) if isinstance(prior_id, str) else None
@@ -430,6 +432,12 @@ class AnalysisJobs:
                                     raise ValueError("one final submission per response")
                                 job["submitted"] = dict(candidate=candidate, report=result)
                                 submitted = True
+                        elif name == "inspect_environment":
+                            from .environments import discover_environment
+                            result = dict(discovery=discover_environment(inspector,
+                                (inspector.request.get("runtime_environment") or {}).get("project", "")),
+                                selected=inspector.request.get("runtime_environment"),
+                                target_runtime=inspector.request.get("target_runtime"), execution="NOT_RUN")
                         elif name in {"list_source", "read_file", "inspect_symbols", "inspect_construction", "add_source", "list_structure", "inspect_imports", "entry_candidates", "list_resources"}:
                             result = getattr(inspector, name)(**args)
                         else:

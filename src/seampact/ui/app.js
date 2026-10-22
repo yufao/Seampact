@@ -13,6 +13,8 @@ let refreshing = false;
 let connected = false;
 const analysisSubmitting = new Set();
 const sourceUpdating = new Set();
+const deploymentDrafts = new Map();
+const deploymentSubmitting = new Set();
 let inspectPage = location.pathname === '/inspect';
 let configurationPage = location.pathname === '/configuration';
 const configNames = {models: '模型角色', services: '服务连接', weights: '权重资源', harnesses: 'Harness 接入', research: '研究运行', scope: '入口范围'};
@@ -77,6 +79,9 @@ function renderSection(key, value, render, roots) {
   if (renderedSections.get(key) === signature) return;
   const focus = document.activeElement;
   let focusedKey = null;
+  const environmentFocus = focus?.dataset.deploymentField;
+  const selection = environmentFocus && ['INPUT', 'TEXTAREA'].includes(focus.tagName) ?
+    {start: focus.selectionStart, end: focus.selectionEnd} : null;
   for (const id of roots) {
     const root = $(id);
     for (const detail of root.querySelectorAll('details')) {
@@ -99,6 +104,16 @@ function renderSection(key, value, render, roots) {
   }
   scroller.scrollTop = scrollTop;
   document.querySelector('.config-body').scrollTop = configScroll;
+  if (environmentFocus) {
+    const replacement = roots.flatMap(id => [...$(id).querySelectorAll('[data-deployment-field]')])
+      .find(input => input.dataset.deploymentField === environmentFocus);
+    if (replacement && !replacement.disabled) {
+      replacement.focus({preventScroll: true});
+      if (selection?.start !== null && selection?.start !== undefined && replacement.setSelectionRange) {
+        replacement.setSelectionRange(selection.start, selection.end);
+      }
+    }
+  }
   renderedSections.set(key, signature);
 }
 
@@ -292,7 +307,7 @@ function renderProfile() {
       empty(root, '平台尚未提供入口支持范围。');
       continue;
     }
-    root.append(node('p', [profile.interpreter, profile.host === 'local-native-process' ? '本地原生进程' : profile.host,
+    root.append(node('p', [profile.interpreter + '（平台本地基线；运行组另选目标 Python）', profile.host === 'local-native-process' ? '本地原生进程' : profile.host,
       profile.explicit_lifetime ? '显式生命周期' : null,
       profile.frame_observation_excluded ? '不使用栈 / frame 反射' : null].filter(Boolean).join(' · '), 'card-note'));
     root.append(node('p', (profile.confirmed ? '已确认范围：' : '范围待确认：') + profile.id, 'card-meta'));
@@ -641,22 +656,143 @@ const instanceStateNames = {UNDEPLOYED: '未部署', STARTING: '启动中', READ
   STOPPED: '已停止', FAILED: '失败', UNKNOWN: '结果未决'};
 const operationNames = {SUPPORTED: '允许', UNSUPPORTED: '不支持', UNKNOWN: '未知 · 不授予'};
 
+function environmentEditor(initial, key) {
+  const environment = deploymentDrafts.get(key) || initial || {};
+  const form = node('form', undefined, 'model-form runtime-environment-form');
+  const fields = {};
+  const pythonLabel = node('label', '目标 Python（与基础镜像内解释器一致）');
+  const python = node('select'); python.required = true;
+  for (const version of ['', '3.10', '3.11', '3.12', '3.13']) {
+    const option = node('option', version ? 'Python ' + version : '选择目标 Python'); option.value = version; python.append(option);
+  }
+  python.value = environment.python || ''; fields.python = python; pythonLabel.append(python); form.append(pythonLabel);
+  for (const [name, title, value] of [
+    ['base_image', '基础镜像（可使用含所需 CUDA／系统依赖的镜像）', environment.base_image || (python.value ? 'python:' + python.value + '-slim' : '')],
+    ['requirements', '要安装的冻结源码依赖清单（每行一份，按原库选择）', (environment.requirements || []).join('\n')],
+    ['project', '安装原项目的路径（. 或源码子目录；留空不安装）', environment.project || ''],
+    ['packages', '额外 pip 需求（每行一项）', (environment.packages || []).join('\n')],
+    ['pip_extra_index_url', '额外包索引（不含凭据）', environment.pip_extra_index_url || '']]) {
+    const label = node('label', title);
+    const input = node(['packages', 'requirements'].includes(name) ? 'textarea' : 'input');
+    if (input.tagName === 'TEXTAREA') input.rows = 3;
+    input.value = value; fields[name] = input; label.append(input); form.append(label);
+  }
+  const read = () => {
+    const lines = text => text.split('\n').map(item => item.trim()).filter(Boolean);
+    return {python: fields.python.value, base_image: fields.base_image.value.trim(),
+      requirements: lines(fields.requirements.value), project: fields.project.value.trim(),
+      packages: lines(fields.packages.value), pip_extra_index_url: fields.pip_extra_index_url.value.trim()};
+  };
+  for (const [name, field] of Object.entries(fields)) {
+    field.dataset.deploymentField = key + '/' + name;
+    field.oninput = () => deploymentDrafts.set(key, read());
+  }
+  let previousPython = python.value;
+  python.onchange = () => {
+    if (!fields.base_image.value || fields.base_image.value === 'python:' + previousPython + '-slim') {
+      fields.base_image.value = python.value ? 'python:' + python.value + '-slim' : '';
+    }
+    previousPython = python.value; deploymentDrafts.set(key, read());
+  };
+  const load = value => {
+    for (const [name, field] of Object.entries(fields)) {
+      field.value = ['requirements', 'packages'].includes(name) ? (value[name] || []).join('\n') : value[name] || '';
+    }
+    previousPython = python.value; deploymentDrafts.set(key, read());
+  };
+  return {form, fields, read, load};
+}
+
+function environmentEvidence(card, discovery) {
+  if (!discovery) {
+    card.append(node('p', '仓库环境建议尚未生成；可依据原库声明填写。', 'card-note')); return;
+  }
+  card.append(node('p', '仓库环境建议：' + (discovery.status || 'UNKNOWN') +
+    (discovery.suggested?.python ? ' · Python ' + discovery.suggested.python : ' · Python 版本待确定'), 'card-meta'));
+  if (discovery.missing?.length) detailValue(card, '尚未确定的环境条件', discovery.missing);
+  if (discovery.conflicts?.length) detailValue(card, '仓库环境声明冲突', discovery.conflicts);
+  detailValue(card, '冻结仓库环境依据', discovery.evidence || {python_declarations: discovery.python_declarations,
+    requirements: discovery.requirements, projects: discovery.projects, base_images: discovery.base_images,
+    conda_files: discovery.conda_files});
+}
+
+function sourceEnvironment(card, harness) {
+  const discovery = harness.environment_discovery;
+  const selected = harness.runtime_environment;
+  const target = harness.target_runtime || {};
+  const labels = {READY: '目标解释器已准备', PREPARING: '目标解释器准备中', FAILED: '目标解释器准备失败',
+    BACKEND_UNAVAILABLE: '解释器构建后端不可用', NOT_PREPARED: '目标解释器未准备'};
+  const targetLabel = selected ? (labels[target.status] || target.status || '目标解释器未准备') : '沿用平台本地环境';
+  const detail = node('details', undefined, 'runtime-environment');
+  detail.append(node('summary', '运行环境 · ' + (selected?.python ? '已选 Python ' + selected.python : '未选择独立环境') + ' · ' + targetLabel));
+  environmentEvidence(detail, discovery);
+  if (selected) detailValue(detail, '已保存的环境选择', selected);
+  if (harness.environment_pending_recheck) detail.append(node('p', '环境选择已变化，已有能力待重新核对。先准备目标解释器，再沿用完整候选重新核对。', 'card-note message-error'));
+  detail.append(node('p', selected ? targetLabel + '。此状态只说明源码核对解释器，原库依赖安装、权重和真实 worker 就绪分别记录。' :
+    '当前分析沿用平台本地环境；原库需要独立 Python 时在此选择并准备。依赖、权重与真实调用状态分别记录。', 'card-note'));
+  if (target.reason) detail.append(node('p', textValue(target.reason), 'card-note' + (target.status === 'FAILED' ? ' message-error' : '')));
+  detailValue(detail, '目标解释器记录', target);
+  const key = 'source/' + harness.id;
+  const {form, fields, read, load} = environmentEditor(selected || discovery?.suggested, key);
+  const job = (state.analyses || []).find(item => item.id === harness.analysis_id);
+  const locked = (state.runtime_groups || []).some(group => group.source_id === harness.id && group.locked_by_run);
+  const busy = harness.status === 'DETACHED' || analysisSubmitting.has(harness.id) || sourceUpdating.has(harness.id) ||
+    ['RUNNING', 'QUEUED'].includes(job?.status) || target.status === 'PREPARING' || locked || deploymentSubmitting.has(key);
+  for (const field of Object.values(fields)) field.disabled = busy;
+  form.append(node('p', '表单用于选择环境。保存不会修改原库源码或已有研究记录；准备解释器不安装原库。仓库建议不会自动执行 Dockerfile，也不会把多份依赖清单全部合并。', 'card-note'));
+  const actions = node('div', undefined, 'harness-actions');
+  if (discovery?.suggested) {
+    const suggested = node('button', '填写仓库建议', 'secondary-button'); suggested.type = 'button'; suggested.disabled = busy;
+    suggested.onclick = () => load(discovery.suggested); actions.append(suggested);
+  }
+  const hasCandidate = job?.status === 'COMPLETED' && Boolean(job.submitted?.candidate);
+  for (const [mode, label] of [['save', '保存环境选择'], ['prepare', '保存并准备目标解释器'], ['recheck', '按此环境重新核对已有候选']]) {
+    const button = node('button', label, 'secondary-button'); button.type = 'submit'; button.value = mode;
+    button.disabled = busy || (mode === 'recheck' && !hasCandidate);
+    if (locked) button.title = '研究运行正在使用该来源；结束后再修改环境';
+    else if (mode === 'recheck' && !hasCandidate) button.title = '先形成分析器候选，再使用零模型调用重新核对';
+    actions.append(button);
+  }
+  form.append(actions, node('p', '重新核对沿用分析器候选，不调用分析模型；不会重新生成入口或拆分边界。', 'card-note'));
+  form.onsubmit = async event => {
+    event.preventDefault();
+    if (busy || deploymentSubmitting.has(key)) return;
+    const mode = event.submitter?.value || 'save';
+    deploymentSubmitting.add(key);
+    for (const control of form.elements) control.disabled = true;
+    try {
+      await api('/api/harnesses/environment', {harness_id: harness.id, environment: read(),
+        ...(mode === 'prepare' ? {prepare: true} : mode === 'recheck' ? {recheck: true} : {})});
+      deploymentDrafts.delete(key);
+      showNotice(mode === 'prepare' ? '环境选择已保存，目标解释器准备已提交；状态见运行环境。' :
+        mode === 'recheck' ? '已提交已有候选的环境重新核对，不调用分析模型。' : '环境选择已保存。已有候选需重新核对，新镜像需重新生成。');
+    } catch (error) { showNotice(error.message); }
+    finally {
+      deploymentSubmitting.delete(key); renderedSections.delete('harnesses'); renderedSections.delete('deployments'); await refresh();
+    }
+  };
+  detail.append(form); card.append(detail);
+}
+
 function operationId() {
   return Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 12);
 }
 
 function deploymentButton(group, action, path, label, body = () => ({}), done = '已提交') {
   const gate = action ? group.actions?.[action] || {enabled: false, reason: '契约未提供该操作'} : {enabled: true};
+  const operation = group.id + '/' + path;
   const button = node('button', label, 'secondary-button'); button.type = 'button';
-  button.disabled = !gate.enabled;
+  button.disabled = !gate.enabled || deploymentSubmitting.has(operation);
   if (gate.reason) button.title = textValue(gate.reason);
   button.onclick = async () => {
+    if (deploymentSubmitting.has(operation)) return;
+    deploymentSubmitting.add(operation);
     button.disabled = true;
     try {
       await api('/api/deployments/' + path, {group_id: group.id, operation_id: operationId(), ...body()});
       showNotice(done);
     } catch (error) { showNotice(error.message); }
-    finally { await refresh(); }
+    finally { deploymentSubmitting.delete(operation); renderedSections.delete('deployments'); await refresh(); }
   };
   return button;
 }
@@ -698,15 +834,20 @@ function renderDeploymentBackend(root) {
   const label = node('label', '后端配置 JSON');
   const input = node('textarea'); input.rows = 8;
   const {updated_at, ...editable} = backend;
-  input.value = JSON.stringify(editable, null, 2);
+  input.value = deploymentDrafts.get('backend') ?? JSON.stringify(editable, null, 2);
+  input.dataset.deploymentField = 'backend';
+  input.oninput = () => deploymentDrafts.set('backend', input.value);
   label.append(input);
   const button = node('button', '保存部署后端', 'secondary-button'); button.type = 'submit';
+  button.disabled = deploymentSubmitting.has('backend');
   form.append(label, button);
   form.onsubmit = async event => {
-    event.preventDefault(); button.disabled = true;
-    try { await api('/api/deployments/backend', JSON.parse(input.value)); showNotice('部署后端已保存。'); }
+    event.preventDefault();
+    if (deploymentSubmitting.has('backend')) return;
+    deploymentSubmitting.add('backend'); button.disabled = true;
+    try { await api('/api/deployments/backend', JSON.parse(input.value)); deploymentDrafts.delete('backend'); showNotice('部署后端已保存。'); }
     catch (error) { showNotice(error.message); }
-    finally { button.disabled = false; await refresh(); }
+    finally { deploymentSubmitting.delete('backend'); renderedSections.delete('deployments'); await refresh(); }
   };
   card.append(form);
   root.append(card);
@@ -729,6 +870,7 @@ function renderDeployments() {
     card.append(head, node('p', ['宿主：' + (group.contract?.host_profile || '未生成契约'),
       '执行位置：' + statusLabel(group.execution), '存活实例 ' + live.length,
       group.contract?.replicas?.replicable ? '可增加副本' : '单实例', group.locked_by_run ? '运行占用中' : null].filter(Boolean).join(' · '), 'card-meta'));
+    if (group.environment_gap) card.append(node('p', group.environment_gap, 'card-note message-error'));
     card.append(node('p', '成员：' + group.entries.length + ' 个' + (group.entries.length <= 3 ? ' · ' + group.entries.join('、') : '，展开宿主核对查看完整成员。'), 'card-note'));
     if (group.host) detailValue(card, '宿主核对（逐成员）', group.host.members);
     if (group.contract) {
@@ -745,6 +887,11 @@ function renderDeployments() {
     }
     if (group.gaps?.length) detailValue(card, '未覆盖的标量远程条件', [...new Set(group.gaps)]);
     const artifact = group.artifact;
+    const source = (state.harnesses || []).find(item => item.id === group.source_id);
+    const discovery = group.environment_discovery || source?.environment_discovery;
+    environmentEvidence(card, discovery);
+    if (source?.runtime_environment) card.append(node('p', '来源已选环境：Python ' + source.runtime_environment.python +
+      ' · ' + source.runtime_environment.base_image, 'card-meta'));
     if (artifact) {
       card.append(node('p', ['工件 ' + statusLabel(artifact.status), '构建 ' + (artifact.build?.status || 'NOT_RUN'),
         '镜像可达 ' + (artifact.publish?.status || 'NOT_RUN'), artifact.publish?.reference || artifact.image].join(' · '), 'card-meta'));
@@ -752,39 +899,46 @@ function renderDeployments() {
       for (const step of [artifact.build, artifact.publish]) if (step?.manual_commands) detailValue(card, '后端不可用 · 手动命令', step.manual_commands);
       detailValue(card, '构建工件', artifact);
     }
+    card.append(node('p', '真实 worker：' + ((group.instances || []).some(item => item.state === 'READY' && item.accepting) ?
+      '已有就绪且接单的实例' : '尚无就绪且接单的实例') + '。生成工件、构建成功、镜像可达与实例就绪分别记录。', 'card-note'));
     if (inspectPage && group.contract) {
-      const form = node('form', undefined, 'model-form');
-      const environment = artifact?.environment || {};
-      const fields = {};
-      for (const [key, title, value] of [['base_image', '基础镜像', environment.base_image || 'python:3.11-slim'],
-          ['requirements', '冻结源码内的依赖清单（逗号分隔）', (environment.requirements || []).join(', ')],
-          ['packages', '额外 pip 需求（每行一项）', (environment.packages || []).join('\n')],
-          ['pip_extra_index_url', '额外包索引（不含凭据）', environment.pip_extra_index_url || '']]) {
-        const label = node('label', title);
-        const input = node(key === 'packages' ? 'textarea' : 'input');
-        if (key === 'packages') input.rows = 3;
-        input.value = value; fields[key] = input;
-        label.append(input); form.append(label);
+      const key = 'group/' + group.id;
+      const environment = artifact?.environment || source?.runtime_environment || discovery?.suggested || {};
+      const {form, fields, read, load} = environmentEditor(environment, key);
+      const editingLocked = Boolean(group.locked_by_run || group.environment_gap) || deploymentSubmitting.has(key);
+      for (const field of Object.values(fields)) field.disabled = editingLocked;
+      form.prepend(node('h4', '选择构建环境'), node('p', '基础镜像会实际用于镜像构建；目标 Python 需与镜像内解释器一致。改变环境后须重新核对与构建，已有实例保持原环境。', 'card-note'));
+      if (source?.runtime_environment) {
+        const useSource = node('button', '填写来源已选环境', 'secondary-button'); useSource.type = 'button'; useSource.disabled = editingLocked;
+        useSource.onclick = () => load(source.runtime_environment); form.append(useSource);
       }
       const button = node('button', '生成构建工件', 'secondary-button'); button.type = 'submit';
-      button.disabled = !group.actions?.export?.enabled;
-      if (group.actions?.export?.reason) button.title = group.actions.export.reason;
+      button.disabled = !group.actions?.export?.enabled || editingLocked;
+      if (group.actions?.export?.reason || group.locked_by_run) button.title = group.actions?.export?.reason || '研究运行正在使用此组，结束后再修改环境';
       form.append(button);
       form.onsubmit = async event => {
-        event.preventDefault(); button.disabled = true;
+        event.preventDefault();
+        if (editingLocked || deploymentSubmitting.has(key)) return;
+        deploymentSubmitting.add(key); button.disabled = true;
+        for (const field of Object.values(fields)) field.disabled = true;
         try {
-          const split = (text, separator) => text.split(separator).map(item => item.trim()).filter(Boolean);
-          const result = await api('/api/deployments/export', {group_id: group.id, environment: {
-            base_image: fields.base_image.value.trim(), requirements: split(fields.requirements.value, ','),
-            packages: split(fields.packages.value, '\n'), pip_extra_index_url: fields.pip_extra_index_url.value.trim()}});
+          const result = await api('/api/deployments/export', {group_id: group.id, environment: read()});
+          deploymentDrafts.delete(key);
           showNotice('构建工件已生成：' + result.image + '。尚未构建镜像。');
         } catch (error) { showNotice(error.message); }
-        finally { await refresh(); }
+        finally { deploymentSubmitting.delete(key); renderedSections.delete('deployments'); await refresh(); }
       };
       card.append(form);
+      if (source) {
+        const environmentLink = node('a', '调整来源环境与目标解释器', 'detail-link');
+        environmentLink.href = '/configuration?section=harnesses'; card.append(environmentLink);
+      }
       const actions = node('div', undefined, 'model-actions');
       const release = node('label', undefined, 'checkbox-label');
       const releaseInput = node('input'); releaseInput.type = 'checkbox';
+      releaseInput.checked = deploymentDrafts.get('release/' + group.id) || false;
+      releaseInput.dataset.deploymentField = 'release/' + group.id;
+      releaseInput.onchange = () => deploymentDrafts.set('release/' + group.id, releaseInput.checked);
       release.append(releaseInput, node('span', '停止时释放结果未决（UNKNOWN）的实例'));
       actions.append(
         deploymentButton(group, 'build', 'build', '构建镜像', () => ({}), '构建已在后台开始。'),
@@ -800,15 +954,22 @@ function renderDeployments() {
       const reported = node('form', undefined, 'model-form');
       const reportedLabel = node('label', '平台外已构建的镜像引用（操作者报告）');
       const reportedInput = node('input'); reportedInput.placeholder = 'registry.example/seampact-worker:tag';
+      const reportedKey = 'reported/' + group.id;
+      reportedInput.value = deploymentDrafts.get(reportedKey) || '';
+      reportedInput.dataset.deploymentField = reportedKey;
+      reportedInput.oninput = () => deploymentDrafts.set(reportedKey, reportedInput.value);
       reportedLabel.append(reportedInput);
       const reportedButton = node('button', '记录操作者构建的镜像', 'secondary-button'); reportedButton.type = 'submit';
-      reportedButton.disabled = !group.actions?.build?.enabled;
+      reportedButton.disabled = !group.actions?.build?.enabled || Boolean(group.locked_by_run) || deploymentSubmitting.has(reportedKey);
       reported.append(reportedLabel, reportedButton);
       reported.onsubmit = async event => {
         event.preventDefault();
-        try { await api('/api/deployments/build', {group_id: group.id, operator_reported_image: reportedInput.value.trim()}); showNotice('已记录；平台未核对该构建。'); }
+        if (deploymentSubmitting.has(reportedKey)) return;
+        deploymentSubmitting.add(reportedKey); reportedButton.disabled = true;
+        try { await api('/api/deployments/build', {group_id: group.id, operator_reported_image: reportedInput.value.trim()});
+          deploymentDrafts.delete(reportedKey); showNotice('已记录；平台未核对该构建。'); }
         catch (error) { showNotice(error.message); }
-        finally { await refresh(); }
+        finally { deploymentSubmitting.delete(reportedKey); renderedSections.delete('deployments'); await refresh(); }
       };
       card.append(reported);
     }
@@ -820,14 +981,19 @@ function renderDeployments() {
     const form = node('form', undefined, 'model-form');
     const label = node('label', '平台访问运行进程的地址');
     const input = node('input'); input.type = 'url'; input.required = true; input.placeholder = 'http://127.0.0.1:8890';
+    input.value = deploymentDrafts.get('attach') || ''; input.dataset.deploymentField = 'attach';
+    input.oninput = () => deploymentDrafts.set('attach', input.value);
     label.append(input);
     const button = node('button', '登记已启动的运行进程', 'secondary-button'); button.type = 'submit';
+    button.disabled = deploymentSubmitting.has('attach');
     form.append(label, button);
     form.onsubmit = async event => {
-      event.preventDefault(); button.disabled = true;
-      try { await api('/api/workers/attach', {endpoint: input.value}); showNotice('已登记为实例；已登记成员的调用将路由到该实例。'); }
+      event.preventDefault();
+      if (deploymentSubmitting.has('attach')) return;
+      deploymentSubmitting.add('attach'); button.disabled = true;
+      try { await api('/api/workers/attach', {endpoint: input.value}); deploymentDrafts.delete('attach'); showNotice('已登记为实例；已登记成员的调用将路由到该实例。'); }
       catch (error) { showNotice(error.message); }
-      finally { button.disabled = false; await refresh(); }
+      finally { deploymentSubmitting.delete('attach'); renderedSections.delete('deployments'); await refresh(); }
     };
     root.append(form);
   }
@@ -1875,7 +2041,9 @@ function renderHarnesses() {
     const busy = analysisSubmitting.has(harness.id) || ['RUNNING', 'QUEUED', 'ANALYZING'].includes(String(job?.status || harness.status).toUpperCase());
     const action = node('button', busy ? '分析中…' : '分析 Harness', 'secondary-button');
     action.type = 'button';
-    action.disabled = detached || busy || sourceUpdating.has(harness.id) || !isReady(state.models?.analysis);
+    action.disabled = detached || busy || harness.target_runtime?.status === 'PREPARING' || deploymentSubmitting.has('source/' + harness.id) ||
+      sourceUpdating.has(harness.id) || !isReady(state.models?.analysis);
+    if (harness.target_runtime?.status === 'PREPARING') action.title = '目标解释器正在准备，完成后再分析';
     action.onclick = async () => {
       analysisSubmitting.add(harness.id);
       action.disabled = true;
@@ -1892,6 +2060,7 @@ function renderHarnesses() {
     if (detached) card.append(node('p', '已摘除；重新接入会使用已有分析，不重复调用分析模型。', 'card-note'));
     if (!isReady(state.models?.analysis)) actions.append(node('span', '先配置分析模型', 'form-note'));
     card.append(actions);
+    sourceEnvironment(card, harness);
     harnessDependencies(card, harness);
     root.append(card);
   }

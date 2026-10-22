@@ -12,6 +12,7 @@ import copy
 import hashlib
 
 from .lowering import UnsupportedLowering, lexical_bindings
+from .inspection import native_ast
 
 
 RULE = "inplace-callsite/1"
@@ -109,7 +110,7 @@ def analyze_callsite(source, symbol, callsite):
     if not isinstance(callsite, dict) or any(type(callsite.get(key)) is not int
             for key in ("line", "column", "end_line", "end_column")):
         raise UnsupportedLowering("callsite needs exact line/column/end_line/end_column source coordinates")
-    tree = ast.parse(source)
+    tree = native_ast(source)
     controller, owner = _anchor(tree, symbol)
     if controller.decorator_list:
         raise UnsupportedLowering("decorated controller needs an effective native callable binding")
@@ -194,7 +195,7 @@ def lower_callsite(source, symbol, callsite):
 
 
 def verify_callsites(original, patched, recipes):
-    before, after = ast.parse(original), ast.parse(patched)
+    before, after = native_ast(original), native_ast(patched)
     paths = set()
     for recipe in recipes:
         derived = analyze_callsite(original, recipe["symbol"], recipe["callsite"])

@@ -29,7 +29,7 @@ from pathlib import Path
 from .handoff import ToolListHandoff, install_method_proxy
 from .callsite import lower_callsites
 from .dependencies import DependencyBindings, reference as resource_reference
-from .inspection import Inspector, digest, units
+from .inspection import Inspector, digest, native_ast, python_runtime_issue, units
 from .lowering import lower_loop
 from .runtime import ProtocolError
 from .store import now
@@ -46,7 +46,7 @@ class MissingBinding(ValueError):
 
 def _anchor(source, symbol):
     parts = symbol.split(".")
-    tree = ast.parse(source)
+    tree = native_ast(source)
     found = [node for node in tree.body if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
              and node.name == parts[0]]
     if len(found) != 1:
@@ -269,7 +269,7 @@ def _definition_cells(inspector, path, unit, patches):
         if int(cell.split(":")[1]) > stop:
             break
         source = patches.get((path, cell), source)
-        tree = ast.parse(source)
+        tree = native_ast(source)
         body = []
         for node in tree.body:
             if isinstance(node, (ast.Import, ast.ImportFrom, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
@@ -419,6 +419,14 @@ class NativeBindings:
             if current.endswith(".ipynb"):
                 stop = int(current_unit.split(":")[1])
                 facts["imports"] = [item for item in facts["imports"] if int(item["unit"].split(":")[1]) <= stop]
+            for issue in facts.get("unknown", []):
+                if issue.get("kind") not in {"PARSE_UNSUPPORTED", "SOURCE_STRUCTURE_PARSE_UNSUPPORTED", "NATIVE_SYNTAX_UNSUPPORTED"}:
+                    continue
+                issue_unit = issue.get("unit", "")
+                if current.endswith(".ipynb") and issue_unit.startswith("cell:") and int(issue_unit.split(":")[1]) > stop:
+                    continue
+                missing.append("native dependency source syntax is unsupported in this interpreter: " + current +
+                               (" at line " + str(issue["line"]) if issue.get("line") is not None else ""))
             module = next((name for name, value in self.module_paths.items() if value[0] == current), "")
             package = module if current.endswith("/__init__.py") else module.rpartition(".")[0]
             for imported in facts["imports"]:
@@ -569,7 +577,7 @@ class NativeBindings:
         if not isinstance(annotation, (ast.Name, ast.Attribute)):
             return {}
         name = ast.unparse(annotation)
-        tree = ast.parse(source_unit(self.inspector, path, cell))
+        tree = native_ast(source_unit(self.inspector, path, cell))
         local = next((node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == name), None)
         if local is not None:
             return {"x-native-type": {"source_version": self.inspector.request["source_version"], "path": path, "symbol": name}}
@@ -600,7 +608,7 @@ class NativeBindings:
             if qualified.startswith(module + "."):
                 path, _ = self.module_paths[module]
                 symbol = qualified[len(module) + 1:]
-                tree = ast.parse(source_unit(self.inspector, path))
+                tree = native_ast(source_unit(self.inspector, path))
                 if any(isinstance(node, ast.ClassDef) and node.name == symbol for node in tree.body):
                     return {"x-native-type": {"source_version": self.inspector.request["source_version"], "path": path, "symbol": symbol}}
                 return {}
@@ -635,7 +643,7 @@ class NativeBindings:
                     definitions = []
                     for cell, source in units(reference["path"], self.inspector.data(reference["path"])):
                         try:
-                            tree = ast.parse(source)
+                            tree = native_ast(source)
                         except SyntaxError:
                             continue
                         if any(isinstance(node, ast.ClassDef) and node.name == name for node in tree.body):
@@ -679,7 +687,7 @@ class NativeBindings:
         return values
 
     def _global_targets(self, path, cell):
-        tree = ast.parse(source_unit(self.inspector, path, cell))
+        tree = native_ast(source_unit(self.inspector, path, cell))
         module = next((name for name, record in self.module_paths.items() if record[0] == path), "")
         package = module if path.endswith("/__init__.py") else module.rpartition(".")[0]
         targets = {name: {"kind": "builtin", "symbol": name} for name in dir(builtins)}
@@ -822,9 +830,9 @@ class NativeBindings:
         return facts, targets
 
     def _construction(self, entry, node, owner):
-        if sys.version_info[:2] != (3, 11):
-            raise MissingBinding("B-CALL finite native profile requires Python 3.11; current interpreter is " +
-                                 str(sys.version_info.major) + "." + str(sys.version_info.minor))
+        issue = python_runtime_issue()
+        if issue:
+            raise MissingBinding("B-CALL " + issue)
         program = entry.get("binding_program")
         if not isinstance(program, dict):
             raise MissingBinding("binding_program must describe an anchored original construction prefix")
@@ -957,7 +965,7 @@ class NativeBindings:
         return record
 
     def _direct_reachable(self, source, entry_symbol, boundary_symbol):
-        tree = ast.parse(source)
+        tree = native_ast(source)
         parts = entry_symbol.split(".")
         if len(parts) == 2:
             owner = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == parts[0])
@@ -1187,9 +1195,9 @@ class NativeBindings:
                   or not self._direct_reachable(source, symbol, boundary["symbol"])):
                 raise MissingBinding("native controller-to-boundary binding is not statically identified: " + boundary["id"])
             if boundary.get("rule") == "inplace-callsite/1":
-                if sys.version_info[:2] != (3, 11):
-                    self._environment("R-INPLACE finite native profile requires Python 3.11; current interpreter is " +
-                                      str(sys.version_info.major) + "." + str(sys.version_info.minor))
+                issue = python_runtime_issue()
+                if issue:
+                    self._environment("R-INPLACE " + issue)
                 profile = self.inspector.request.get("entry_profile") or {}
                 if not (profile.get("confirmed") is True and profile.get("frame_observation_excluded") is True
                         and profile.get("explicit_lifetime") is True):
@@ -1277,7 +1285,7 @@ class NativeBindings:
         if any(not isinstance(value, str) for value in fixed.values()):
             raise MissingBinding("native CLI argv values must be strings")
         if entry["path"].endswith(".py"):
-            tree = ast.parse(source_unit(self.inspector, entry["path"], entry.get("unit", "file")))
+            tree = native_ast(source_unit(self.inspector, entry["path"], entry.get("unit", "file")))
             declarations = []
             for call in ast.walk(tree):
                 if isinstance(call, ast.Call) and isinstance(call.func, ast.Attribute) and call.func.attr == "add_argument":
@@ -1719,7 +1727,25 @@ class UnitCatalog:
 
     def install(self, inspector, candidate, analysis_id, installation_id=None):
         with self.lock:
-            return self._install(inspector, candidate, analysis_id, installation_id or analysis_id)
+            installation_id = installation_id or analysis_id
+            if getattr(inspector, "target_runtime", None):
+                from .target_runtime import install_catalog
+                result = install_catalog(self, inspector, candidate, analysis_id, installation_id)
+            else:
+                result = self._install(inspector, candidate, analysis_id, installation_id)
+            # Rebuilding the in-memory catalog must retain the operator's group
+            # environment when its source and selected source environment agree.
+            from .target_runtime import environment_selection
+            basis = environment_selection(inspector.request.get("runtime_environment") or {})
+            for identity in {unit.get("runtime_group") for unit in result} - {None}:
+                group = self.store.get("runtime_group", identity)
+                artifact = self.store.get("deployment", identity) or {}
+                if (artifact.get("source_version") == group["source_version"]
+                        and artifact.get("contract_digest") == group["contract"]["digest"]
+                        and artifact.get("source_runtime_environment") == basis):
+                    group["runtime_environment"] = environment_selection(artifact["environment"])
+                    self.store.save("runtime_group", identity, group)
+            return result
 
     def detach(self, source_id):
         with self.lock:
@@ -1819,6 +1845,8 @@ class UnitCatalog:
 
     def inspect_candidate(self, inspector, candidate):
         """Return the same static entry checks as installation, without state writes."""
+        if getattr(inspector, "target_runtime", None):
+            return inspector.target_runtime.call("inspect_candidate", candidate=candidate)
         _, _, rows = self._candidate_checks(inspector, candidate)
         from .deployment import runtime_groups
         entries = [dict(id=row["entry_id"], path=row["entry"].get("path"),

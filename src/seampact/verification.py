@@ -3,7 +3,7 @@
 import ast
 import re
 
-from .inspection import units
+from .inspection import native_ast, units
 from .lowering import lower_loop
 from .callsite import RULE as CALLSITE_RULE, lower_callsite
 
@@ -25,7 +25,7 @@ def check_tool_list(inspector,boundary):
             raise ValueError("simple controller and member names required")
     if wiring.get("schema_policy","native") not in {"native","resolved-types"}:
         raise ValueError("unknown schema policy")
-    tree=ast.parse(source_unit(inspector,wiring["controller_path"],wiring.get("controller_unit","file")))
+    tree=native_ast(source_unit(inspector,wiring["controller_path"],wiring.get("controller_unit","file")))
     owners=[n for n in tree.body if isinstance(n,ast.ClassDef) and n.name==wiring["controller_symbol"]]
     if len(owners)!=1:
         raise ValueError("native owner class anchor absent or duplicated")
@@ -55,6 +55,8 @@ def check_tool_list(inspector,boundary):
 
 
 def check_candidate(inspector,candidate):
+    if getattr(inspector,"target_runtime",None):
+        return inspector.target_runtime.call("check_candidate",candidate=candidate)
     if not isinstance(candidate,dict) or not isinstance(candidate.get("boundaries"),list):
         raise ValueError("candidate.boundaries must be an array")
     rows=[]
@@ -76,6 +78,8 @@ def check_candidate(inspector,candidate):
         binding=dict(status="PASS" if supported else "UNSUPPORTED",rule="native-callable-local/1")
         lowering=None
         try:
+            if anchor:
+                native_ast(source_unit(inspector,path,b.get("unit","file")))
             if mode=="R" and anchor:
                 source=source_unit(inspector,path,b.get("unit","file"))
                 rule=b.get("rule","sequential-async-loop-body/1")

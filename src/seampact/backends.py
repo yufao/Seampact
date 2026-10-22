@@ -46,6 +46,9 @@ def validate_config(body):
             raise ValueError("mounts 每项需要 source 与 target")
     if value.get("env_secret") is not None and not NAME.fullmatch(str(value["env_secret"])):
         raise ValueError("env_secret 须为已有 K8S Secret 名称")
+    if (not isinstance(value.get("image_pull_secrets", []), list)
+            or any(not isinstance(name, str) or not NAME.fullmatch(name) for name in value.get("image_pull_secrets", []))):
+        raise ValueError("image_pull_secrets 须为已有 K8S 镜像仓库 Secret 名称列表")
     for key in ("resources", "volumes", "volume_mounts"):
         if key in value and not isinstance(value[key], (dict, list)):
             raise ValueError(key + " 须为 K8S 原生结构")
@@ -141,10 +144,11 @@ def build(folder, image, environment, config):
     return _result(steps, "BUILT", image=image, image_id=image_id)
 
 
-def publish(image, config):
+def publish(image, config, image_id=None):
     access = config["image_access"]
     if access == "local":
-        return dict(status="NOT_REQUIRED", image=image, reference=image, reason="本机 Docker 后端直接使用本地镜像")
+        return dict(status="NOT_REQUIRED", image=image, reference=image_id or image,
+                    reason="本机 Docker 后端使用实际构建镜像 ID" if image_id else "本机 Docker 后端直接使用本地镜像")
     if access == "preloaded":
         return dict(status="OPERATOR_REPORTED", image=image, reference=image,
                     reason="由操作者保证目标节点已存在该镜像；平台未核对节点镜像")
@@ -170,7 +174,10 @@ def publish(image, config):
             digests = json.loads(steps[-1]["stdout"].strip())
         except ValueError:
             digests = None
-    return _result(steps, "PUBLISHED", image=image, reference=reference, repo_digests=digests)
+    repository = reference.rsplit(":", 1)[0]
+    immutable = next((item for item in digests or [] if isinstance(item, str) and item.startswith(repository + "@sha256:")), None)
+    return _result(steps, "PUBLISHED", image=image, reference=immutable or reference,
+                   tag_reference=reference, repo_digests=digests)
 
 
 def _free_port(host):
@@ -221,6 +228,8 @@ def start(record, reference, folder, config):
     if config.get("volume_mounts"):
         container["volumeMounts"] = copy.deepcopy(config["volume_mounts"])
     pod = dict(containers=[container], restartPolicy="Always")
+    if config.get("image_pull_secrets"):
+        pod["imagePullSecrets"] = [dict(name=name) for name in config["image_pull_secrets"]]
     if config.get("volumes"):
         pod["volumes"] = copy.deepcopy(config["volumes"])
     manifest = dict(apiVersion="apps/v1", kind="Deployment",

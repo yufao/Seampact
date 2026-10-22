@@ -8,11 +8,53 @@ import io
 import json
 import os
 import re
+import sys
 import tokenize
-import tomllib
 from pathlib import Path, PurePosixPath
 
-EXCLUDED = {".git", ".venv", "venv", "node_modules", "__pycache__", ".env",
+try:
+    import tomllib
+except ModuleNotFoundError:
+    try:
+        import tomli as tomllib
+    except ModuleNotFoundError:
+        tomllib = None
+
+
+SUPPORTED_PYTHON_VERSIONS = ((3, 10), (3, 11), (3, 12), (3, 13))
+
+
+def python_runtime_issue(version=None):
+    version = tuple(sys.version_info[:2] if version is None else version)
+    if version not in SUPPORTED_PYTHON_VERSIONS:
+        return ("finite native profile covers Python 3.10–3.13; current interpreter is " +
+                ".".join(map(str, version)))
+    return None
+
+
+def native_syntax_issues(tree):
+    """New interpreters do not grant new scope or binding rules implicitly."""
+    result = []
+    for node in ast.walk(tree):
+        if type(node).__name__ == "TypeAlias" or getattr(node, "type_params", None):
+            result.append(dict(kind="NATIVE_SYNTAX_UNSUPPORTED", line=getattr(node, "lineno", None),
+                node=type(node).__name__, reason="type aliases and type-parameter scopes need a finite native binding rule"))
+    return result
+
+
+def native_ast(source, filename="<unknown>"):
+    issue = python_runtime_issue()
+    if issue:
+        raise ValueError(issue)
+    tree = ast.parse(source, filename=filename)
+    issues = native_syntax_issues(tree)
+    if issues:
+        issue = issues[0]
+        raise ValueError("native syntax unsupported at line " + str(issue["line"]) + ": " + issue["reason"])
+    return tree
+
+
+EXCLUDED = {".git", ".venv", "venv", "node_modules", "__pycache__", ".env", ".local-private",
             ".cache", ".pytest_cache", ".mypy_cache", ".ruff_cache", ".tox", ".aws", ".ssh"}
 SOURCE_SUFFIXES = {".py", ".pyi", ".ipynb", ".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx",
                    ".java", ".kt", ".kts", ".go", ".rs", ".c", ".cc", ".cpp", ".h", ".hpp",
@@ -206,8 +248,10 @@ def symbols(path, data):
         try:
             tree = ast.parse(source)
         except SyntaxError as e:
-            unknown.append(dict(unit=unit, kind="PARSE_UNSUPPORTED", line=e.lineno))
+            unknown.append(dict(unit=unit, kind="PARSE_UNSUPPORTED", line=e.lineno,
+                                python=".".join(map(str, sys.version_info[:2]))))
             continue
+        unknown.extend(dict(unit=unit, **issue) for issue in native_syntax_issues(tree))
 
         def walk(parent, prefix=""):
             for node in ast.iter_child_nodes(parent):
@@ -245,8 +289,10 @@ def source_facts(path, data):
             try:
                 tree = ast.parse(source)
             except SyntaxError as error:
-                unknown.append(dict(path=path, unit=unit, kind="PARSE_UNSUPPORTED", line=error.lineno))
+                unknown.append(dict(path=path, unit=unit, kind="PARSE_UNSUPPORTED", line=error.lineno,
+                                    python=".".join(map(str, sys.version_info[:2]))))
                 continue
+            unknown.extend(dict(path=path, unit=unit, **issue) for issue in native_syntax_issues(tree))
             for node in ast.walk(tree):
                 if isinstance(node, ast.Import):
                     for name in node.names:
@@ -294,6 +340,10 @@ def source_facts(path, data):
                 entries.append(dict(path=path, unit=unit, line=1, kind="script", symbol=None))
             try:
                 if Path(path).name == "pyproject.toml":
+                    if tomllib is None:
+                        unknown.append(dict(path=path, unit=unit, kind="TOML_PARSER_MISSING",
+                            reason="Python 3.10 TOML inspection requires tomli in the target environment"))
+                        continue
                     project = tomllib.loads(source)
                     tables = [project.get("project", {}).get("scripts", {}),
                               project.get("project", {}).get("gui-scripts", {}),
@@ -474,6 +524,8 @@ class Inspector:
                     next_line=start+count if start-1+count < len(lines) else None)
 
     def inspect_symbols(self, path):
+        if getattr(self, "target_runtime", None):
+            return self.target_runtime.call("inspect_symbols", path=path)
         try:
             return dict(path=path, sha256=self.files[path]["sha256"], **symbols(path, self.data(path)))
         except SourceWithheld as error:
@@ -481,13 +533,15 @@ class Inspector:
 
     def inspect_construction(self, path, unit="file"):
         """Original statement anchors and def-use names; no candidate code is evaluated."""
+        if getattr(self, "target_runtime", None):
+            return self.target_runtime.call("inspect_construction", path=path, unit=unit)
         try:
             available = dict(units(path, self.data(path)))
         except SourceWithheld as error:
             return error.report
         if unit not in available:
             raise ValueError("source unit is not frozen")
-        tree = ast.parse(available[unit])
+        tree = native_ast(available[unit])
         scopes = []
         for node in tree.body:
             functions = [(node.name, node)] if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) else (
@@ -533,6 +587,8 @@ class Inspector:
 
     def inspect_imports(self, path=None, unit=None):
         """Query static imports from frozen text; dynamic closure stays unknown."""
+        if getattr(self, "target_runtime", None):
+            return self.target_runtime.call("inspect_imports", path=path, unit=unit)
         paths = [path] if path is not None else list(self.files)
         imports, unknown = [], []
         for relative in paths:
@@ -557,6 +613,8 @@ class Inspector:
 
     def entry_candidates(self, path=""):
         """Expose source entry anchors without selecting an execution host."""
+        if getattr(self, "target_runtime", None):
+            return self.target_runtime.call("entry_candidates", path=path)
         if not isinstance(path, str):
             raise ValueError("entry path prefix required")
         candidates, unknown = [], []

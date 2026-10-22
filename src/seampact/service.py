@@ -23,6 +23,8 @@ from .store import Store, now
 from .units import UnitCatalog
 from .deployment import Deployments, REMOTE_PROFILE, GROUP_PROFILE
 from .training import TrainingJobs
+from .environments import discover_environment, normalize_environment
+from .target_runtime import attach_target, checker_identity, environment_selection, prepare_checker
 
 NATIVE_PROFILE = dict(id="python311-local-explicit-lifetime/1", confirmed=True,
     interpreter="Python 3.11", host="local-native-process",
@@ -61,6 +63,11 @@ class Platform:
         for source in self.store.list("harness"):
             if source.get("status") == "DETACHED":
                 self.catalog.detach(source["id"])
+            elif source.get("runtime_environment"):
+                self._checker_record(source, restarted=True)
+                if source.get("environment_pending_recheck"):
+                    self._invalidate_environment_units(source, "运行环境尚未重新核对；原能力记录保留为历史")
+                    self.store.save("harness", source["id"], source)
         for job in self.store.list("analysis"):
             if job.get("status") != "COMPLETED" or not job.get("submitted"):
                 continue
@@ -69,10 +76,21 @@ class Platform:
                 continue
             source = self.store.get("harness", request.get("source_id"))
             if source and source.get("status") != "DETACHED" and source.get("analysis_id") == job["id"]:
-                inspector = Inspector(source["root"], self.home / "snapshots", request)
-                self.inspectors[request["id"]] = inspector
-                self.dependencies.record(inspector, job["submitted"]["candidate"])
-                self.catalog.install(inspector, job["submitted"]["candidate"], job["id"], source.get("installation_id"))
+                if source.get("environment_pending_recheck"):
+                    continue
+                try:
+                    inspector = self._attach_inspector(Inspector(source["root"], self.home / "snapshots", request), source)
+                    self.inspectors[request["id"]] = inspector
+                    self.dependencies.record(inspector, job["submitted"]["candidate"])
+                    self.catalog.install(inspector, job["submitted"]["candidate"], job["id"], source.get("installation_id"))
+                except ValueError as error:
+                    if not request.get("runtime_environment") and not source.get("runtime_environment"):
+                        raise
+                    record = source.get("target_runtime") or {}
+                    source.update(environment_pending_recheck=True, error=str(error),
+                        target_runtime=dict(record, status="NOT_PREPARED", reason=str(error)))
+                    self._invalidate_environment_units(source, str(error))
+                    self.store.save("harness", source["id"], source)
         self.training = TrainingJobs(self)
 
     def state(self):
@@ -87,7 +105,8 @@ class Platform:
         harnesses = []
         for source in self.store.list("harness"):
             harnesses.append({name: source.get(name) for name in
-                ("id", "name", "address", "revision", "status", "error", "analysis_id", "entry", "resources", "detached_at")})
+                ("id", "name", "address", "revision", "status", "error", "analysis_id", "entry", "resources", "detached_at",
+                 "runtime_environment", "environment_discovery", "target_runtime", "environment_pending_recheck")})
             harnesses[-1]["files"] = len(source.get("files", []))
             harnesses[-1]["inventory_count"] = len(source.get("inventory", []))
             job = self.store.get("analysis", source.get("analysis_id"))
@@ -138,9 +157,179 @@ class Platform:
         source["configuration"] = configuration
         source["user_resources"] = body.get("resources") or []
         source["status"] = "CONNECTED"
+        inspector = self._environment_inspector(source)
+        source["environment_discovery"] = discover_environment(inspector)
+        if body.get("environment"):
+            source["runtime_environment"] = normalize_environment(body["environment"], inspector)
         self.store.save("harness", source["id"], source)
         print("[SeamPact] source_connected " + source["id"], flush=True)
         return dict(id=source["id"], files=len(source["files"]))
+
+    def _environment_inspector(self, source):
+        request = self.store.get("request", source.get("request_id"))
+        if request:
+            return Inspector(source["root"], self.home / "snapshots", copy.deepcopy(request))
+        return Inspector.freeze_repository(source, self.home / "snapshots", uuid.uuid4().hex,
+                                            "读取原库运行环境声明，不执行原库或分析模型。")
+
+    def _attach_inspector(self, inspector, source, selected=False):
+        if selected and source.get("runtime_environment"):
+            # A new analysis can freeze newer manifest bytes. Revalidate the
+            # choice against those bytes before any paid model request.
+            environment = normalize_environment(source["runtime_environment"], inspector)
+            source.update(runtime_environment=environment, environment_discovery=environment["discovery"])
+        current = environment_selection(source.get("runtime_environment") or {})
+        if selected:
+            if current:
+                inspector.request["runtime_environment"] = current
+                inspector.request["target_runtime"] = {key: value for key, value in source.get("target_runtime", {}).items()
+                    if key in {"status", "identity", "image", "image_id", "python", "base_image"}}
+            else:
+                inspector.request.pop("runtime_environment", None)
+                inspector.request.pop("target_runtime", None)
+        elif environment_selection(inspector.request.get("runtime_environment") or {}) != current:
+            raise ValueError("当前运行环境与原分析冻结环境不同，请先零模型重新核对候选")
+        if inspector.request.get("runtime_environment"):
+            record = self._checker_record(source)
+            attach_target(inspector, record, self.deployments.backend()["operation_timeout_s"])
+        return inspector
+
+    def _invalidate_environment_units(self, source, reason):
+        """Keep reports as history while removing obsolete callable bindings."""
+        with self.catalog.lock:
+            for unit in self.store.list("unit"):
+                if unit.get("source_id") != source["id"] or unit.get("status") in {"SUPERSEDED", "DETACHED"}:
+                    continue
+                binding = self.catalog.bindings.pop(unit["id"], None)
+                deferred = self.catalog.deferred.pop(unit["id"], None)
+                if binding or deferred:
+                    (binding or deferred[0]).detached = True
+                self.catalog.entry_specs.pop(unit["id"], None)
+                unit.update(status="MISSING", reason=reason)
+                self.store.save("unit", unit["id"], unit)
+        # Current groups use this installation identity.  An old contract or
+        # artifact must not stay actionable after its environment was changed.
+        source["installation_id"] = None
+
+    def _checker_record(self, source, restarted=False):
+        environment = source.get("runtime_environment") or {}
+        record = source.get("target_runtime") or {}
+        if not environment:
+            return record
+        stale = record.get("identity") != checker_identity(environment)
+        interrupted = restarted and record.get("status") == "PREPARING"
+        incomplete = record.get("status") == "READY" and not record.get("image_id")
+        if stale or interrupted or incomplete:
+            reason = ("平台代码或所选环境已变化，请重新准备目标解释器" if stale else
+                      "上次环境准备未完成，请重新准备目标解释器" if interrupted else
+                      "目标解释器缺少实际镜像记录，请重新准备")
+            record = dict(record, status="NOT_PREPARED", python=environment["python"],
+                          base_image=environment["base_image"], reason=reason)
+            source.update(target_runtime=record, environment_pending_recheck=bool(source.get("analysis_id")))
+            self._invalidate_environment_units(source, reason)
+            self.store.save("harness", source["id"], source)
+        return record
+
+    def _environment_guard(self, source):
+        if source.get("status") in {"DETACHED", "ANALYZING"} or (source.get("target_runtime") or {}).get("status") == "PREPARING":
+            raise ValueError("请先结束当前分析或环境准备，再调整运行环境")
+        if self.catalog.source_running(source["id"]):
+            raise ValueError("请等原调用结束后再调整运行环境")
+        for group in self.store.list("runtime_group"):
+            if group["source_id"] != source["id"]:
+                continue
+            self.deployments._guard(group["id"], None)
+            if any(self.deployments._held(item) for item in self.deployments._instances(group["id"])):
+                raise ValueError("该来源仍有运行实例；请先排空并停止，再调整运行环境")
+            artifact = self.store.get("deployment", group["id"]) or {}
+            if any(artifact.get(field, {}).get("status") == "RUNNING" for field in ("build", "publish")):
+                raise ValueError("该来源正在构建或发布镜像，请结束后再调整环境")
+
+    def configure_environment(self, body):
+        with self.source_lock:
+            source = self.store.get("harness", body.get("harness_id"))
+            if not source:
+                raise ValueError("Harness 尚未接入")
+            self._environment_guard(source)
+            inspector = self._environment_inspector(source)
+            environment = normalize_environment(body.get("environment", source.get("runtime_environment") or {}), inspector)
+            changed = environment_selection(environment) != environment_selection(source.get("runtime_environment") or {})
+            record = source.get("target_runtime") or {}
+            if record.get("identity") != checker_identity(environment):
+                record = dict(status="NOT_PREPARED", python=environment["python"], base_image=environment["base_image"])
+            source.update(runtime_environment=environment, environment_discovery=environment["discovery"], target_runtime=record)
+            record = self._checker_record(source)
+            if changed:
+                source["environment_pending_recheck"] = bool(source.get("analysis_id"))
+                # Keep history, but an environment edit cannot leave old local
+                # bindings callable under a newly displayed configuration.
+                self._invalidate_environment_units(source, "运行环境已修改，请零模型重新核对已有候选")
+            if body.get("prepare"):
+                # An explicit preparation can restore a removed image even if
+                # the last persisted receipt still says READY.
+                source["target_runtime"] = dict(record, status="PREPARING", started_at=now())
+                config = self.deployments.backend()
+                def prepare():
+                    try:
+                        answer = prepare_checker(self.home, environment, config)
+                    except Exception as error:
+                        answer = dict(status="FAILED", reason=str(error))
+                    with self.source_lock:
+                        current = self.store.get("harness", source["id"])
+                        current["target_runtime"] = dict(answer, finished_at=now())
+                        if record.get("image_id") and (answer.get("status") != "READY" or
+                                answer.get("image_id") != record["image_id"]):
+                            current["environment_pending_recheck"] = bool(current.get("analysis_id"))
+                            self._invalidate_environment_units(current, "目标解释器镜像已变化或不可用，请重新准备并核对已有候选")
+                        self.store.save("harness", current["id"], current)
+                self.store.save("harness", source["id"], source)
+                threading.Thread(target=prepare, daemon=True).start()
+                return dict(harness_id=source["id"], runtime_environment=environment, target_runtime=source["target_runtime"])
+            self.store.save("harness", source["id"], source)
+            if body.get("recheck"):
+                return self._recheck_environment(source)
+            return dict(harness_id=source["id"], runtime_environment=environment, target_runtime=record)
+
+    def _recheck_environment(self, source):
+        previous = self.store.get("analysis", source.get("analysis_id"))
+        if not previous or previous.get("status") != "COMPLETED" or not previous.get("submitted"):
+            raise ValueError("尚无完整分析候选；准备目标解释器后再开始分析")
+        request = copy.deepcopy(self.store.get("request", previous["request_id"]))
+        if not request:
+            raise ValueError("原分析的冻结源码请求缺失，请重新分析")
+        request["id"] = uuid.uuid4().hex
+        request.update(resource_catalog=self.resource_catalog(),
+                       dependency_bindings=self.dependencies.selections(source["id"]))
+        inspector = self._attach_inspector(Inspector(source["root"], self.home / "snapshots", request), source, selected=True)
+        candidate = copy.deepcopy(previous["submitted"]["candidate"])
+        checked = self.catalog.inspect_candidate(inspector, candidate)
+        implementation = self.analysis.freeze_implementation(inspector)
+        jid = uuid.uuid4().hex
+        job = dict(id=jid, request_id=request["id"], harness_id=source["id"], status="RUNNING",
+            kind="ENVIRONMENT_RECHECK", prior_analysis_id=previous["id"], rounds=0, usage=[], messages=[],
+            started_at=now(), finished_at=None, error=None, model_calls=0, implementation=implementation,
+            phase="environment_installation",
+            submitted=dict(candidate=candidate), binding_report=checked)
+        self.store.create("request", request["id"], request)
+        self.store.create("analysis", jid, job)
+        source.update(request_id=request["id"], analysis_id=jid, error=None)
+        self.store.save("harness", source["id"], source)
+        self.inspectors[request["id"]] = inspector
+        try:
+            job["units"] = self._connect_units(inspector, job)
+            if job["status"] == "RUNNING":
+                job.update(status="COMPLETED", phase="installation")
+        except Exception as error:
+            job.update(status="FAILED", error=str(error))
+            source.update(environment_pending_recheck=True, error=str(error),
+                          analysis_id=previous["id"], request_id=previous["request_id"])
+            self._invalidate_environment_units(source, str(error))
+            self.store.save("harness", source["id"], source)
+            raise
+        finally:
+            job["finished_at"] = now()
+            self.store.save("analysis", jid, job)
+        return dict(analysis_id=jid, model_calls=0, units=job["units"])
 
     def analyze(self, identity, preprocessing="api", preprocessing_id=None):
         with self.source_lock:
@@ -155,6 +344,7 @@ class Platform:
         if any(job["status"] == "RUNNING" and job.get("request_id") == source.get("request_id")
                for job in self.store.list("analysis")):
             raise ValueError("这个来源正在分析")
+        self._environment_guard(source)
         request_id = uuid.uuid4().hex
         previous = self.store.get("analysis", source.get("analysis_id"))
         source["entry_profile"] = dict(NATIVE_PROFILE)
@@ -163,6 +353,14 @@ class Platform:
         inspector.request["rules"] = RULESET
         inspector.request.update(preprocessing_mode=preprocessing, preprocessing_id=preprocessing_id,
             resource_catalog=self.resource_catalog(), dependency_bindings=self.dependencies.selections(identity))
+        self._attach_inspector(inspector, source, selected=True)
+        if getattr(inspector, "target_runtime", None):
+            inspector.target_runtime.call("entry_candidates", path="")
+        else:
+            # Fail before paid analysis when the local interpreter cannot meet
+            # the original project's declared Python requirements.
+            import sys
+            normalize_environment(dict(python=".".join(map(str, sys.version_info[:2]))), inspector)
         self.store.save("request", request_id, inspector.request)
         self.inspectors[request_id] = inspector
         analysis_id = uuid.uuid4().hex
@@ -185,7 +383,8 @@ class Platform:
                 return []
             self.dependencies.record(inspector, job["submitted"]["candidate"])
             units = self.catalog.install(inspector, job["submitted"]["candidate"], job["id"])
-            source.update(status="ANALYZED", analysis_id=job["id"], installation_id=job["id"], error=None)
+            source.update(status="ANALYZED", analysis_id=job["id"], installation_id=job["id"], error=None,
+                          environment_pending_recheck=False)
             self.store.save("harness", source["id"], source)
         print("[SeamPact] units_connected " + str(len(units)), flush=True)
         return [unit["id"] for unit in units]
@@ -212,9 +411,11 @@ class Platform:
                         "configuration": "configuration", "user_resources": "user_resources"}
             if any(request.get(old) != source.get(current) for old, current in bindings.items()):
                 raise ValueError("来源版本、接入目标或资源配置已变化，请重新分析")
-            inspector = Inspector(source["root"], self.home / "snapshots", request)
+            inspector = self._attach_inspector(Inspector(source["root"], self.home / "snapshots", request), source)
             for path in inspector.files:
                 inspector.data(path)
+            if getattr(inspector, "target_runtime", None):
+                inspector.target_runtime.call("entry_candidates", path="")
             analysis_id = uuid.uuid4().hex
             source.update(status="ANALYZING", analysis_id=analysis_id,
                           request_id=request["id"], error=None)
@@ -275,7 +476,7 @@ class Platform:
             request.update(id=uuid.uuid4().hex, configuration=configuration)
             if "resources" in body:
                 request["user_resources"] = body["resources"]
-            inspector = Inspector(source["root"], self.home / "snapshots", request)
+            inspector = self._attach_inspector(Inspector(source["root"], self.home / "snapshots", request), source, selected=True)
             # Original finite source/binding checks still decide READY/MISSING.
             self.catalog.inspect_candidate(inspector, candidate)
             jid = uuid.uuid4().hex
@@ -558,6 +759,7 @@ class Platform:
                 raise ValueError("本平台冻结的源码内容与分析工件不一致（包括换行符差异）；请重新分析")
             inspector.request.update(rules=RULESET, preprocessing_mode="imported", resource_catalog=self.resource_catalog(),
                                      dependency_bindings=self.dependencies.selections(source["id"]))
+            self._attach_inspector(inspector, source, selected=True)
             candidate = copy.deepcopy(value["candidate"])
             checked = self.catalog.inspect_candidate(inspector, candidate)
             jid = uuid.uuid4().hex
@@ -594,7 +796,7 @@ class Platform:
             request = copy.deepcopy(self.store.get("request", previous["request_id"]))
             request.update(id=uuid.uuid4().hex, resource_catalog=self.resource_catalog(),
                            dependency_bindings=self.dependencies.selections(source["id"]))
-            inspector = Inspector(source["root"], self.home / "snapshots", request)
+            inspector = self._attach_inspector(Inspector(source["root"], self.home / "snapshots", request), source, selected=True)
             implementation = self.analysis.freeze_implementation(inspector)
             checked = self.catalog.inspect_candidate(inspector, candidate)
             jid = uuid.uuid4().hex
@@ -650,17 +852,25 @@ class Platform:
             job = next((item for item in self.store.list("analysis")
                         if item.get("status") == "COMPLETED" and item.get("submitted")
                         and (self.store.get("request", item["request_id"]) or {}).get("source_id") == identity), None)
+            self._checker_record(source)
             self.runtime.call("restore_source", identity)
             try:
-                if job:
+                if job and not source.get("environment_pending_recheck"):
                     request = self.store.get("request", job["request_id"])
-                    inspector = Inspector(source["root"], self.home / "snapshots", request)
+                    inspector = self._attach_inspector(Inspector(source["root"], self.home / "snapshots", request), source)
                     installation_id = uuid.uuid4().hex
                     self.catalog.install(inspector, job["submitted"]["candidate"], job["id"], installation_id)
-                    source.update(status="ANALYZED", analysis_id=job["id"], installation_id=installation_id)
+                    source.update(status="ANALYZED", analysis_id=job["id"], installation_id=installation_id,
+                                  request_id=request["id"])
+                    self.inspectors[request["id"]] = inspector
+                elif job:
+                    source.update(status="ANALYZED", analysis_id=job["id"], installation_id=None,
+                                  request_id=job["request_id"])
                 else:
                     source.update(status="CONNECTED", analysis_id=None)
-                source.update(detached_at=None, error=None)
+                source.update(detached_at=None)
+                if not source.get("environment_pending_recheck"):
+                    source["error"] = None
                 self.store.save("harness", identity, source)
             except Exception:
                 self.catalog.detach(identity)
