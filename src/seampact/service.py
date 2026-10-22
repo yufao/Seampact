@@ -3,6 +3,7 @@
 import uuid
 import copy
 import json
+import math
 import re
 import threading
 import time
@@ -290,6 +291,169 @@ class Platform:
             job["units"] = self._connect_units(inspector, job)
             self.store.save("analysis", jid, job)
             return dict(analysis_id=jid, model_calls=0, units=job["units"])
+
+    def analysis_snapshot(self, analysis_id):
+        """Export observation metadata without source messages or machine configuration."""
+        job = self.store.get("analysis", analysis_id)
+        if not job:
+            raise ValueError("没有这个分析记录")
+        request = self.store.get("request", job.get("request_id")) or {}
+
+        def status(value):
+            return value if isinstance(value, str) and re.fullmatch(r"[A-Z][A-Z0-9_/-]{0,95}", value) else None
+
+        def relative_path(value):
+            if not isinstance(value, str) or not value or "\\" in value:
+                return None
+            if (PurePosixPath(value).is_absolute() or PureWindowsPath(value).is_absolute()
+                    or ".." in PurePosixPath(value).parts or ":" in value):
+                return None
+            return value
+
+        token_fields = {"prompt_tokens", "completion_tokens", "total_tokens", "input_tokens", "output_tokens",
+                        "prompt_cache_hit_tokens", "prompt_cache_miss_tokens", "cached_tokens", "reasoning_tokens",
+                        "audio_tokens", "image_tokens", "text_tokens", "accepted_prediction_tokens",
+                        "rejected_prediction_tokens"}
+        detail_fields = {"prompt_tokens_details", "completion_tokens_details", "input_tokens_details", "output_tokens_details"}
+
+        def usage(value):
+            if not isinstance(value, dict):
+                return None
+            return {key: (usage(item) if key in detail_fields else item) for key, item in value.items()
+                    if (key in token_fields and type(item) is int and item >= 0)
+                    or (key in detail_fields and isinstance(item, dict))}
+
+        def report_summary(report):
+            if not isinstance(report, dict):
+                return None
+            counts = {}
+
+            def visit(value):
+                if isinstance(value, dict):
+                    label = status(value.get("status"))
+                    if label:
+                        counts[label] = counts.get(label, 0) + 1
+                    for child in value.values():
+                        visit(child)
+                elif isinstance(value, list):
+                    for child in value:
+                        visit(child)
+
+            visit(report)
+            summary = dict(status=status(report.get("status")), status_counts=counts)
+            for key in ("admitted", "has_bindable_entries", "admission_granted", "split_permission", "export_permission"):
+                if type(report.get(key)) is bool:
+                    summary[key] = report[key]
+            for key in ("boundaries", "entries", "targets", "issues", "missing", "dependencies"):
+                if isinstance(report.get(key), list):
+                    summary[key + "_count"] = len(report[key])
+            if isinstance(report.get("entry_bindings"), dict):
+                summary["entry_bindings"] = report_summary(report["entry_bindings"])
+            return summary
+
+        messages = job.get("messages") or []
+        replies = {message.get("tool_call_id"): message for message in messages
+                   if isinstance(message, dict) and message.get("role") == "tool"}
+        tool_names = {"list_source", "read_file", "inspect_symbols", "inspect_construction", "list_structure",
+                      "inspect_imports", "entry_candidates", "list_resources", "add_source", "check_candidate",
+                      "submit_candidate", "check_preprocessing", "submit_preprocessing"}
+        tools = []
+        for message in messages:
+            if not isinstance(message, dict):
+                continue
+            for call in message.get("tool_calls") or []:
+                if not isinstance(call, dict):
+                    continue
+                function = call.get("function") or {}
+                if not isinstance(function, dict):
+                    continue
+                name = function.get("name")
+                if name not in tool_names:
+                    continue
+                item = dict(index=len(tools) + 1, name=name, status="PENDING")
+                try:
+                    arguments = json.loads(function.get("arguments", "{}"))
+                except (TypeError, ValueError):
+                    arguments = {}
+                if isinstance(arguments, dict):
+                    path = relative_path(arguments.get("path"))
+                    if path:
+                        item["path"] = path
+                    for key in ("start", "count", "offset"):
+                        if type(arguments.get(key)) is int and arguments[key] >= 0:
+                            item[key] = arguments[key]
+                reply = replies.get(call.get("id"))
+                if reply:
+                    item["status"] = "RETURNED"
+                    try:
+                        result = json.loads(reply.get("content", "null"))
+                    except (TypeError, ValueError):
+                        result = None
+                    if isinstance(result, dict):
+                        item["result_status"] = status(result.get("status"))
+                        if result.get("error"):
+                            item["status"] = "ERROR"
+                        for key in ("total_lines", "next_line", "total", "next_offset"):
+                            if type(result.get(key)) is int and result[key] >= 0:
+                                item[key] = result[key]
+                        if isinstance(result.get("lines"), list):
+                            item["returned_lines"] = len(result["lines"])
+                tools.append(item)
+
+        submitted = job.get("submitted") or {}
+        candidate = submitted.get("candidate") or {}
+        preparation = job.get("preprocessing") or {}
+        binding = job.get("model_binding") or {}
+        output = binding.get("output_configuration") or {}
+        output_configuration = {}
+        if isinstance(output, dict):
+            if type(output.get("stream")) is bool:
+                output_configuration["stream"] = output["stream"]
+            for key in ("max_tokens", "max_completion_tokens", "seed"):
+                if type(output.get(key)) is int:
+                    output_configuration[key] = output[key]
+            for key in ("temperature", "top_p"):
+                if type(output.get(key)) is int or (type(output.get(key)) is float and math.isfinite(output[key])):
+                    output_configuration[key] = output[key]
+            if (isinstance(output.get("reasoning_effort"), str)
+                    and output["reasoning_effort"] in {"none", "minimal", "low", "medium", "high", "xhigh", "max"}):
+                output_configuration["reasoning_effort"] = output["reasoning_effort"]
+            thinking = output.get("thinking")
+            if (isinstance(thinking, dict) and isinstance(thinking.get("type"), str)
+                    and thinking["type"] in {"enabled", "disabled"}):
+                output_configuration["thinking"] = dict(type=thinking["type"])
+        terminal = job.get("status") in {"COMPLETED", "FAILED", "INTERRUPTED", "CANCELLED"}
+        revision = request.get("source_revision")
+        if not (isinstance(revision, str) and re.fullmatch(r"[A-Za-z0-9_.@+/-]{1,256}", revision)
+                and not PurePosixPath(revision).is_absolute() and not PureWindowsPath(revision).is_absolute()
+                and ".." not in PurePosixPath(revision).parts):
+            revision = None
+        return dict(schema="seampact-analysis-progress/1", analysis_id=job["id"], exported_at=now(),
+            status=status(job.get("status")), complete=job.get("status") == "COMPLETED", partial=job.get("status") != "COMPLETED",
+            terminal=terminal, importable=False, resumable_artifact=False,
+            scope="Observation snapshot only; not an importable candidate or a resumable checkpoint.",
+            excluded=["messages", "source text", "credential values and references", "service addresses",
+                      "machine paths", "raw candidate arguments", "raw errors", "non-whitelisted generation parameters"],
+            request_id=job.get("request_id"),
+            source=dict(source_id=request.get("source_id"), source_version=request.get("source_version"),
+                        source_revision=revision),
+            pipeline=dict(stage=job.get("pipeline_stage"), phase=job.get("phase"),
+                preprocessing=dict(mode=preparation.get("mode"), status=status(preparation.get("status")),
+                    artifact_id=preparation.get("artifact_id"), report=report_summary(preparation.get("report")))),
+            model_binding=dict({key: binding[key] for key in ("provider", "model")
+                                if isinstance(binding.get(key), str) and relative_path(binding[key])},
+                               output_configuration=output_configuration),
+            rounds=job.get("rounds", 0), prior_rounds=job.get("prior_rounds", 0),
+            refinement_of=job.get("refinement_of"), resumed_from=job.get("resumed_from"),
+            started_at=job.get("started_at"), finished_at=job.get("finished_at"),
+            usage=[usage(item) for item in job.get("usage", [])],
+            usage_by_stage={stage: [usage(item) for item in job.get("usage_by_stage", {}).get(stage, [])]
+                            for stage in ("preprocessing", "analysis")},
+            unreported_usage=bool(job.get("unreported_usage")), error_present=bool(job.get("error")),
+            tools=tools, tools_scope="current pipeline stage saved messages",
+            candidate=dict(submitted=bool(submitted), analysis_completed=job.get("status") == "COMPLETED",
+                **{key + "_count": len(candidate[key]) if isinstance(candidate.get(key), list) else 0
+                   for key in ("entries", "boundaries", "runtime_groups")}, report=report_summary(submitted.get("report"))))
 
     def export_analysis(self, analysis_id):
         """A shareable analysis artifact: candidate plus frozen source identity; no configuration, paths or state."""

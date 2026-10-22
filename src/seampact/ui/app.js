@@ -13,7 +13,15 @@ let refreshing = false;
 let connected = false;
 const analysisSubmitting = new Set();
 const sourceUpdating = new Set();
-const inspectPage = location.pathname === '/inspect';
+let inspectPage = location.pathname === '/inspect';
+let configurationPage = location.pathname === '/configuration';
+const configNames = {models: '模型角色', services: '服务连接', weights: '权重资源', harnesses: 'Harness 接入', research: '研究运行', scope: '入口范围'};
+let configSection = new URLSearchParams(location.search).get('section') || 'models';
+if (!configNames[configSection]) configSection = 'models';
+let configurationReturnUrl = '/';
+const configurationScroll = new Map();
+const observerScroll = new Map();
+let activePageUrl = location.pathname + location.search;
 let inspectQuery = new URLSearchParams(location.search);
 let inspectView = inspectQuery.get('view') || 'analyses';
 const viewNames = {analyses: '来源与分析', units: '能力池', tasks: '任务详情', scheduler: '调度器', deployments: '运行组与部署'};
@@ -135,15 +143,31 @@ function sourceButton(harness) {
 }
 
 function updateInspectPage() {
+  document.body.classList.toggle('inspect-page', inspectPage);
+  document.body.classList.toggle('configuration-page', configurationPage);
+  $('configuration').hidden = !configurationPage;
+  document.querySelector('.chat-shell').setAttribute('aria-hidden', String(inspectPage || configurationPage));
+  document.querySelector('.rail-caption').textContent = '异构 Harness · ' + (configurationPage ? '配置' : inspectPage ? '详情' : '对话');
+  document.title = 'SeamPact · ' + (configurationPage ? '配置 · ' + configNames[configSection] : inspectPage ? viewNames[inspectView] : '对话');
+  $('open-configuration').classList.toggle('selected', configurationPage);
+  document.querySelector('.chat-navigation').classList.toggle('selected', !inspectPage && !configurationPage);
+  for (const section of document.querySelectorAll('[data-config-section]')) section.hidden = section.dataset.configSection !== configSection;
+  for (const link of document.querySelectorAll('[data-config-link]')) {
+    const selected = link.dataset.configLink === configSection;
+    link.classList.toggle('selected', selected);
+    if (selected) link.setAttribute('aria-current', 'page'); else link.removeAttribute('aria-current');
+  }
+  $('close-configuration').href = configurationReturnUrl;
+  $('close-configuration').textContent = configurationReturnUrl.startsWith('/inspect') ? '返回运行详情' : '返回对话';
+  for (const section of document.querySelectorAll('.observer-scroll > .panel-section')) section.hidden = inspectPage && section.dataset.view !== inspectView;
+  for (const link of document.querySelectorAll('.rail-actions a[href^="/inspect"]')) {
+    const view = new URL(link.href).searchParams.get('view');
+    link.classList.toggle('selected', inspectPage && view === inspectView);
+  }
+  $('observer-title').textContent = inspectPage ? viewNames[inspectView] : '运行状态';
+  $('inspect-description').hidden = !inspectPage;
+  $('inspect-filter').hidden = !inspectPage || inspectView === 'scheduler';
   if (!inspectPage) return;
-  document.body.classList.add('inspect-page');
-  document.title = 'SeamPact · ' + viewNames[inspectView];
-  $('observer-title').textContent = viewNames[inspectView];
-  $('inspect-description').hidden = false;
-  $('inspect-filter').hidden = inspectView === 'scheduler';
-  document.querySelector('.chat-shell').setAttribute('aria-hidden', 'true');
-  document.querySelector('.rail-caption').textContent = '异构 Harness · 详情';
-  for (const section of document.querySelectorAll('.observer-scroll > .panel-section')) section.hidden = section.dataset.view !== inspectView;
   for (const link of document.querySelectorAll('.rail-actions a[href^="/inspect"]')) {
     const view = new URL(link.href).searchParams.get('view');
     const query = new URLSearchParams({view});
@@ -152,7 +176,7 @@ function updateInspectPage() {
     link.removeAttribute('target');
     link.classList.toggle('selected', view === inspectView);
   }
-  const options = (state.harnesses || []).map(source => [source.id, source.name || source.address, source.status]);
+  const options = (state?.harnesses || []).map(source => [source.id, source.name || source.address, source.status]);
   const selector = $('inspect-source');
   if (selector.dataset.options !== JSON.stringify(options)) {
     selector.replaceChildren(node('option', '全部来源'));
@@ -165,6 +189,27 @@ function updateInspectPage() {
     selector.dataset.options = JSON.stringify(options);
   }
   selector.value = selectedSource();
+}
+
+function navigatePage(href, push = true) {
+  const target = new URL(href, location.href);
+  const previous = activePageUrl;
+  if (configurationPage) configurationScroll.set(configSection, document.querySelector('.config-body').scrollTop);
+  if (inspectPage) observerScroll.set(previous, document.querySelector('.observer-scroll').scrollTop);
+  if (target.pathname === '/configuration' && !configurationPage && push) configurationReturnUrl = previous;
+  if (push) history.pushState(null, '', target.pathname + target.search + target.hash);
+  activePageUrl = target.pathname + target.search;
+  inspectPage = target.pathname === '/inspect';
+  configurationPage = target.pathname === '/configuration';
+  inspectQuery = new URLSearchParams(target.search);
+  inspectView = viewNames[inspectQuery.get('view')] ? inspectQuery.get('view') : 'analyses';
+  configSection = configNames[inspectQuery.get('section')] ? inspectQuery.get('section') : 'models';
+  observerOpen(false);
+  updateInspectPage();
+  document.querySelector('.config-body').scrollTop = configurationScroll.get(configSection) || 0;
+  if (inspectPage) document.querySelector('.observer-scroll').scrollTop = observerScroll.get(target.pathname + target.search) || 0;
+  renderedSections.clear();
+  if (state) refresh();
 }
 
 async function api(path, body) {
@@ -182,7 +227,7 @@ function textValue(value) {
 }
 
 function showNotice(text) {
-  const notice = $(inspectPage ? 'inspect-notice' : 'notice');
+  const notice = $(configurationPage ? 'configuration-notice' : inspectPage ? 'inspect-notice' : 'notice');
   notice.textContent = text;
   notice.hidden = !text;
 }
@@ -788,6 +833,70 @@ function renderDeployments() {
   }
 }
 
+function analysisProgress(job) {
+  const root = node('div', undefined, 'analysis-progress');
+  const preparation = job.preprocessing || {};
+  const finished = job.status === 'COMPLETED';
+  const active = ['RUNNING', 'QUEUED'].includes(job.status);
+  const reusedCandidate = job.model_calls === 0 || ['IMPORTED_ANALYSIS', 'ANALYZER_RESOURCE_BINDING', 'EXPLICIT_RESOURCE_BINDING'].includes(job.kind);
+  const steps = [
+    ['自动预处理', reusedCandidate || ['SKIPPED', 'REPLAYED'].includes(preparation.status) ? 'reused' : preparation.status === 'COMPLETED' ? 'done' :
+      active && job.pipeline_stage === 'preprocessing' ? 'active' : 'pending'],
+    ['入口与拆分', reusedCandidate ? 'reused' : finished || job.submitted ? 'done' : active && job.pipeline_stage === 'analysis' ? 'active' : 'pending'],
+    ['规则与绑定', finished ? 'done' : job.submitted && active ? 'active' : 'pending']
+  ];
+  const stages = node('ol', undefined, 'analysis-stages');
+  for (const [label, status] of steps) {
+    const step = node('li', undefined, 'analysis-stage'); step.dataset.state = status;
+    step.append(node('strong', label), node('span', {done: '已记录', active: '进行中', reused: reusedCandidate ? '沿用已有分析' :
+      preparation.status === 'REPLAYED' ? '复用已核对结果' : '本次跳过', pending: '等待'}[status]));
+    stages.append(step);
+  }
+  root.append(stages);
+  if (job.phase) root.append(node('p', '当前操作：' + ({model_request: '等待模型响应', source_tools: '读取源码与核对候选',
+    binding_installation: '安装资源绑定', installation: '安装能力入口'}[job.phase] || job.phase), 'card-meta'));
+  const usage = Array.isArray(job.usage) ? job.usage : [];
+  const table = node('table', undefined, 'research-metrics analysis-usage');
+  const header = node('tr');
+  for (const label of ['阶段', '响应记录', '输入 token', '输出 token', '总 token']) header.append(node('th', label));
+  const thead = node('thead'); thead.append(header); table.append(thead);
+  const tbody = node('tbody');
+  const groups = job.usage_by_stage && Object.keys(job.usage_by_stage).length ? Object.entries(job.usage_by_stage) : [['all', usage]];
+  for (const [stage, records] of groups) {
+    if (!Array.isArray(records)) continue;
+    const row = node('tr');
+    row.append(node('td', {preprocessing: '预处理', analysis: '拆分分析', all: '本次记录'}[stage] || stage), node('td', records.length));
+    for (const field of ['prompt_tokens', 'completion_tokens', 'total_tokens']) {
+      const alias = {prompt_tokens: 'input_tokens', completion_tokens: 'output_tokens'}[field];
+      const values = records.map(item => item?.[field] ?? item?.[alias]);
+      const known = values.filter(value => finiteNumber(value));
+      const total = known.reduce((sum, value) => sum + value, 0);
+      row.append(node('td', !known.length ? 'UNKNOWN' : total.toLocaleString('zh-CN') + (known.length < records.length ? '（已报告部分）' : '')));
+    }
+    tbody.append(row);
+  }
+  table.append(tbody); root.append(table);
+  root.append(node('p', '用量随模型响应更新；等待中的请求可能尚无用量。阶段已记录不代表资源齐备或原目标已运行。', 'card-note'));
+  return root;
+}
+
+function analysisExportButton(job, candidate = false) {
+  const button = node('button', candidate ? '导出完成候选' : '导出当前进度', 'secondary-button'); button.type = 'button';
+  button.onclick = async () => {
+    button.disabled = true;
+    try {
+      const result = candidate ? await api('/api/analysis/export', {analysis_id: job.id}) :
+        await api('/api/analysis/' + encodeURIComponent(job.id) + '/snapshot');
+      const value = {...result}; delete value.path;
+      downloadJson(value, 'analysis-' + job.id + (candidate ? '-candidate' : '-progress') + '.json');
+      showNotice(candidate ? (value.absolute_path_locations?.length ? '候选已导出，但包含本机绝对路径；迁移须从未绑定配置的原分析导出。' :
+        '已导出完成候选；目标平台仍需核对源码并重新绑定资源。') : '已导出当前已保存进度；进度快照用于观察，不是可恢复或导入的分析工件。');
+    } catch (error) { showNotice(error.message); }
+    finally { button.disabled = false; }
+  };
+  return button;
+}
+
 function renderAnalyses() {
   const harnesses = (state.harnesses || []).filter(source => !selectedSource() || source.id === selectedSource());
   const analyses = state.analyses || [];
@@ -808,6 +917,7 @@ function renderAnalyses() {
     const files = entryCount(harness.files);
     if (files !== null) card.append(node('p', files + ' 份可读文件' + (typeof harness.inventory_count === 'number' ? ' · 仓库共 ' + harness.inventory_count + ' 项文件' : ''), 'card-meta'));
     if (job?.rounds !== undefined) card.append(node('p', '分析模型响应 ' + job.rounds + ' 轮', 'card-meta'));
+    if (job) card.append(analysisProgress(job));
     if (job?.preprocessing) {
       const prep = job.preprocessing;
       card.append(node('p', '自动预处理：' + prep.mode + ' · ' + statusLabel(prep.status) +
@@ -834,6 +944,7 @@ function renderAnalyses() {
         if (job.resumed_from) card.append(node('p', '继续分析：' + job.resumed_from +
           ' · 已保留此前 ' + job.prior_rounds + ' 轮，本记录只统计新增用量。', 'card-meta'));
         detailValue(card, '实际模型用量', job.usage);
+        if (job.model_binding) detailValue(card, '本记录冻结的模型与请求参数', job.model_binding);
       }
     }
     if (harness.status === 'DETACHED') card.append(node('p', '来源已退出当前能力池。源码和分析历史保留，可重新接入。', 'card-note'));
@@ -858,6 +969,8 @@ function renderAnalyses() {
     if (inspectPage && (!job || job.id === harness.analysis_id)) harnessDependencies(card, harness);
     const actions = node('div', undefined, 'harness-actions');
     if (!inspectPage) actions.append(inspectLink('analyses', {harness: harness.id}));
+    if (job?.id) actions.append(analysisExportButton(job));
+    if (job?.status === 'COMPLETED' && job.submitted?.candidate) actions.append(analysisExportButton(job, true));
     if (job?.resumable) {
       const resume = node('button', '继续这次分析', 'secondary-button');
       resume.disabled = harness.status === 'DETACHED' || harness.status === 'ANALYZING' || analysisSubmitting.has(harness.id);
@@ -1083,6 +1196,35 @@ function downloadJson(value, filename) {
   setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
+async function exportResearchRun(identity, button) {
+  button.disabled = true;
+  try {
+    const run = await api('/api/scheduler/runs/' + encodeURIComponent(identity));
+    researchDetails.set(identity, run);
+    const value = {schema: 'seampact-research-progress/1', exported_at: new Date().toISOString(),
+      run_id: identity, status: run.status, partial: run.status !== 'COMPLETED',
+      resumable_artifact: false, visibility: 'private',
+      scope: 'saved task/window results, evidence, configuration and curves; may include local paths; excludes in-flight memory and policy weight files', run};
+    downloadJson(value, identity + (value.partial ? '-progress' : '-results') + '.json');
+    showNotice('已导出最新已保存结果，包含任务证据与本机路径。进行中的任务在收尾后进入结果；JSON 不包含策略权重文件。');
+  } catch (error) { showNotice(error.message); }
+  finally { button.disabled = false; }
+}
+
+const researchAutoShown = new Set();
+
+function researchProgress(run) {
+  const completed = run.episodes_completed ?? run.episodes;
+  const budget = run.budget ?? run.total_episodes ?? run.manifest?.episodes;
+  const root = node('div', undefined, 'run-progress');
+  if (finiteNumber(completed) && finiteNumber(budget) && budget > 0) {
+    const progress = node('progress'); progress.max = budget; progress.value = completed;
+    progress.setAttribute('aria-label', '已保存任务或窗口 ' + completed + ' / ' + budget);
+    root.append(progress, node('p', '已保存 ' + completed + ' / ' + budget + ' · 结果在任务／窗口边界更新', 'card-meta'));
+  }
+  return root;
+}
+
 function researchAction(label, path, body, completed) {
   const button = node('button', label, 'secondary-button'); button.type = 'button';
   button.onclick = async () => {
@@ -1096,6 +1238,12 @@ function researchAction(label, path, body, completed) {
 
 function renderResearch() {
   const research = researchState();
+  for (const run of research.runs || []) {
+    const identity = runIdentity(run);
+    if (['RUNNING', 'QUEUED', 'STOPPING'].includes(run.status) && !researchAutoShown.has(identity)) {
+      researchSelected.add(identity); researchAutoShown.add(identity);
+    }
+  }
   const readyRoot = $('research-readiness'); readyRoot.replaceChildren();
   if (!state?.scheduler?.research) empty(readyRoot, '当前进程尚未加载研究运行接口。');
   const readyUnits = (state.units || []).filter(unit => unit.status === 'READY').length;
@@ -1133,10 +1281,13 @@ function renderResearch() {
       ' · 有取舍交互 ' + (run.choice_interactions ?? 0) + ' · 更新 ' + (run.updates ?? 0), 'card-meta'));
     if (run.tags?.length) card.append(node('p', run.tags.join(' · '), 'card-note'));
     if (run.error) card.append(node('p', textValue(run.error), 'message-error card-note'));
+    card.append(researchProgress(run));
     const actions = node('div', undefined, 'harness-actions');
     const view = node('button', '查看与对比', 'secondary-button'); view.type = 'button';
     view.onclick = () => { researchSelected.add(identity); check.checked = true; renderResearchComparison(); refreshResearchDetails(); };
     actions.append(view);
+    const exportButton = node('button', '导出当前结果', 'secondary-button'); exportButton.type = 'button';
+    exportButton.onclick = () => exportResearchRun(identity, exportButton); actions.append(exportButton);
     if (['QUEUED', 'RUNNING', 'STOPPING'].includes(run.status)) actions.append(researchAction('在任务边界停止', '/api/scheduler/runs/stop', {run_id: identity}, '已请求在当前任务收尾后停止。'));
     if (checkpointId || run.artifacts?.checkpoint) actions.append(researchAction('启用冻结策略', '/api/scheduler/activate', {run_id: identity}, '已请求启用该运行的兼容冻结策略。'));
     card.append(actions); root.append(card);
@@ -1301,6 +1452,7 @@ function renderResearchComparison() {
     if (run.error) card.append(node('p', textValue(run.error), 'message-error card-note'));
     const manifest = run.manifest || {};
     card.append(node('p', (learnerNames[run.algorithm || manifest.algorithm] || run.algorithm || manifest.algorithm || '') + ' · ' + statusLabel(run.status), 'card-meta'));
+    card.append(researchProgress(run));
     const table = node('table', undefined, 'research-metrics');
     const thead = node('thead'), header = node('tr'); for (const label of ['指标', '原值 / 均值', '覆盖']) header.append(node('th', label)); thead.append(header); table.append(thead);
     const tbody = node('tbody');
@@ -1325,8 +1477,8 @@ function renderResearchComparison() {
     if (run.learning) detailValue(card, '学习更新状态', run.learning);
     if (run.costs) detailValue(card, '实测成本与采集覆盖', run.costs);
     if (run.summary) detailValue(card, '完整结果摘要', run.summary);
-    const exportButton = node('button', '导出这次运行', 'secondary-button'); exportButton.type = 'button';
-    exportButton.onclick = () => downloadJson(run, identity + '.json'); card.append(exportButton);
+    const exportButton = node('button', '导出当前结果', 'secondary-button'); exportButton.type = 'button';
+    exportButton.onclick = () => exportResearchRun(identity, exportButton); card.append(exportButton);
     grid.append(card);
   }
   root.append(grid);
@@ -1453,6 +1605,7 @@ function renderConnectionOperation(root, result) {
   root.append(node('p', heading, 'card-meta'));
   if (result.latency_ms != null) root.append(node('p', '调用耗时：' + result.latency_ms + ' ms', 'card-meta'));
   if (result.usage) root.append(node('p', '服务返回用量：' + textValue(result.usage), 'card-meta'));
+  if (result.request_parameters) detailValue(root, '本次请求参数', result.request_parameters);
   if (result.response !== undefined && result.response !== null) root.append(node('pre', textValue(result.response), 'operation-response'));
   if (result.reason) root.append(node('p', result.reason, 'card-note'));
   root.append(node('p', '此连接操作不执行 Harness 原目标；真实目标执行见 Harness 依赖记录。', 'card-meta'));
@@ -1537,7 +1690,8 @@ function renderConnections() {
       card.append(detail);
     }
     if (checks.checked_at) card.append(node('p', '连接检查时间：' + checks.checked_at, 'card-meta'));
-    if (connection.revision || connection.digest) card.append(node('p', '配置身份：' + (connection.revision || connection.digest), 'card-meta'));
+    if (connection.revision) card.append(node('p', '配置版本：' + connection.revision, 'card-meta'));
+    else if (connection.digest) card.append(node('p', '配置摘要：' + connection.digest, 'card-meta'));
     const actions = node('div', undefined, 'harness-actions');
     const edit = node('button', '编辑配置', 'secondary-button'); edit.type = 'button'; edit.onclick = () => editConnection(connection);
     const check = node('button', '检查连接', 'secondary-button'); check.type = 'button';
@@ -1691,7 +1845,7 @@ function hydrateModels() {
     if (!form.dataset.hydrated) {
       form.elements.base_url.value = profile?.base_url || '';
       form.elements.model.value = profile?.model || '';
-      form.elements.max_output_tokens.value = profile?.max_output_tokens || '';
+      form.elements.max_output_tokens.value = profile?.declared_max_output_tokens ?? '';
       form.elements.service_version.value = profile?.service_version || '';
       form.dataset.hydrated = 'true';
     }
@@ -2004,6 +2158,11 @@ $('connection-new').onclick = () => {
   $('connection-form-title').textContent = '新增命名连接'; $('connection-form-status').textContent = '';
   $('connection-auth-note').textContent = '凭据值使用下方独立表单保存。更换地址后需重新明确认证方式。'; connectionAuthChanged();
 };
+$('connection-create').onclick = () => {
+  $('connection-new').click();
+  $('connection-form').scrollIntoView({block: 'start'});
+  $('connection-form').elements.name.focus({preventScroll: true});
+};
 $('connection-credential-form').onsubmit = saveConnectionCredential;
 $('connection-credential-form').elements.connection_id.onchange = () => {
   $('connection-credential-form').elements.credential.value = '';
@@ -2074,12 +2233,9 @@ $('research-criteria-import').onchange = async event => {
   finally { event.target.value = ''; }
 };
 $('open-research-configuration').onclick = () => {
-  $('configuration').showModal();
-  $('research-configuration').scrollIntoView({block: 'start'});
+  navigatePage('/configuration?section=research');
 };
 $('harness-form').onsubmit = addHarness;
-$('open-configuration').onclick = () => $('configuration').showModal();
-$('close-configuration').onclick = () => $('configuration').close();
 $('open-observer').onclick = () => observerOpen(!document.body.classList.contains('observer-open'));
 $('close-observer').onclick = () => observerOpen(false);
 $('drawer-shade').onclick = () => observerOpen(false);
@@ -2088,12 +2244,30 @@ $('inspect-source').onchange = async event => {
   if (event.target.value) query.set('harness', event.target.value);
   inspectQuery = query;
   history.replaceState(null, '', '/inspect?' + query);
+  activePageUrl = '/inspect?' + query;
   renderedSections.clear();
   document.querySelector('.observer-scroll').scrollTop = 0;
   await refresh();
 };
+document.addEventListener('click', event => {
+  if (event.defaultPrevented || event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+  const link = event.target.closest('a[href]');
+  if (!link || link.hasAttribute('download') || (link.target && link.target !== '_self')) return;
+  const target = new URL(link.href, location.href);
+  if (target.origin !== location.origin || !['/', '/inspect', '/configuration'].includes(target.pathname)) return;
+  if (target.hash && target.pathname + target.search === activePageUrl) {
+    const section = document.getElementById(target.hash.slice(1));
+    if (section) { event.preventDefault(); section.scrollIntoView({block: 'start'}); }
+    return;
+  }
+  event.preventDefault();
+  navigatePage(target.href);
+});
+window.addEventListener('popstate', () => navigatePage(location.href, false));
+
 document.addEventListener('keydown', event => {
   if (event.key === 'Escape') observerOpen(false);
 });
+updateInspectPage();
 refresh();
 setInterval(refresh, 1500);

@@ -11,7 +11,7 @@ from pathlib import Path
 from .inspection import digest
 from .preprocessing import RULES as PREPROCESS_RULES, TOOLS as PREPROCESS_TOOLS, check_preprocessing
 from .dependencies import check_requirements, DEPENDENCY_RULES
-from .providers import ProviderError, Transport, completion_body, output_capability
+from .providers import ProviderError, Transport, completion_body, completion_parameters
 from .store import now
 from .verification import check_candidate
 
@@ -204,9 +204,13 @@ class AnalysisJobs:
 
     @staticmethod
     def model_binding(profile):
+        configuration = dict(stream=False, max_tokens=None)
+        parameters = completion_parameters(profile)
+        if "max_completion_tokens" in parameters:
+            configuration.pop("max_tokens")
+        configuration.update(parameters)
         return dict(provider=profile.get("provider"), base_url=profile.get("base_url"),
-                    model=profile.get("model"), output_configuration=dict(
-                        stream=False, max_tokens=output_capability(profile)))
+                    model=profile.get("model"), output_configuration=configuration)
 
     def start(self, inspector, provider, identity=None, previous=None, resume=None,
               preprocessing="api", preprocessing_id=None):

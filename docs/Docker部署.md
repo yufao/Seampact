@@ -57,7 +57,7 @@ docker compose -p "$SEAMPACT_COMPOSE_PROJECT" -f "$SEAMPACT_CODE_DIR/deploy/comp
 
 容器监听0.0.0.0:8880，宿主只发布127.0.0.1:$SEAMPACT_PORT。电脑SSH转发18880→A的8880，打开http://127.0.0.1:18880。数据和来源挂载与host路线相同；输入仍使用容器路径 `/harnesses/<项目>`。
 
-代码中的固定image标签为seampact-core:0.8.0；更新用 `--build` 和 `--force-recreate` 重建／替换该Compose项目，不能只pull代码就认为进程已经更新。Host主路线用commit标签则更容易识别实际版本。
+当前 Compose 镜像标签为 `seampact-core:0.9.0${SEAMPACT_IMAGE_SUFFIX:-}`；更新用 `--build` 和 `--force-recreate` 重建／替换原 Compose 项目，并保持原数据目录、环境文件和挂载。只 pull 代码或 restart 旧容器不会加载镜像里的新代码。Host 主路线用 commit 标签更容易识别实际版本。
 
 ## 3. bridge 平台怎样接 worker
 

@@ -10,7 +10,7 @@ import json
 import math
 import time
 
-from .providers import Transport, completion_body, output_capability, image_evidence
+from .providers import Transport, completion_body, completion_parameters, image_evidence
 
 
 TEACHER_RULES = """You evaluate actual task results using the supplied frozen criteria.
@@ -36,9 +36,15 @@ def _number(value):
 
 def model_binding(profile):
     """Nonsecret identity frozen in a run; external service versions may be unknown."""
-    return dict(provider=profile.get("provider"), base_url=profile.get("base_url"),
-                model=profile.get("model"), max_output_tokens=output_capability(profile),
+    parameters = completion_parameters(profile)
+    binding = dict(provider=profile.get("provider"), base_url=profile.get("base_url"),
+                model=profile.get("model"), max_output_tokens=parameters.get("max_tokens", parameters.get("max_completion_tokens")),
                 service_version=profile.get("service_version"))
+    # Preserve the old empty-parameter identity while freezing every new wire
+    # option; raw Harness mapping configuration is not the request identity.
+    if profile.get("parameters"):
+        binding["request_parameters"] = parameters
+    return binding
 
 
 def validate_criteria(criteria):
@@ -285,7 +291,8 @@ def evaluate(profiles, criteria, evidence, program_metrics, *, transport=None):
             binding = model_binding(profile)
             raw["teacher_binding"] = binding
             expected = spec["teacher"].get("model_binding")
-            if expected is not None and any(binding.get(key) != value for key, value in expected.items()):
+            if expected is not None and (any(binding.get(key) != value for key, value in expected.items()) or
+                    binding.get("request_parameters", {}) != expected.get("request_parameters", {})):
                 raise ValueError("teacher model configuration changed since this run was frozen")
             if not profile.get("base_url") or not profile.get("model"):
                 raise ValueError("configure the selected teacher model role")

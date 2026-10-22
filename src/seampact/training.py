@@ -418,7 +418,10 @@ class TrainingJobs:
                 raise ValueError("运行清单内容身份不符")
             for key in ("history", "curves"):
                 path = folder / (key + ".jsonl")
-                result[key] = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()] if path.exists() else []
+                # An interrupted writer may leave a partial final record. Only
+                # newline-terminated records are complete observation material.
+                lines = path.read_bytes().splitlines(keepends=True) if path.exists() else []
+                result[key] = [json.loads(line.decode("utf-8")) for line in lines if line.endswith(b"\n") and line.strip()]
         return result
 
     def _append(self, folder, name, value):

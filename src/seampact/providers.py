@@ -77,7 +77,8 @@ def provider_name(base_url):
 
 def output_capability(profile):
     selected = (profile.get("capabilities") or {}).get("selected") or {}
-    return selected.get("max_output_tokens") or profile.get("declared_max_output_tokens") or profile.get("max_output_tokens")
+    return (profile.get("declared_max_output_tokens") or profile.get("max_output_tokens")
+            or selected.get("max_output_tokens"))
 
 
 def capability_metadata(value):
@@ -428,6 +429,8 @@ class Profiles:
                 parameters=self._parameters(body.get("parameters", previous.get("parameters", {}))),
                 service_version=version, declared_max_output_tokens=ceiling,
                 created_at=previous.get("created_at", now()), updated_at=now())
+            if protocol == "openai-compatible" and connection_id in self.roles.values():
+                completion_parameters(replacement)
             if "auth" in body:
                 replacement["auth"] = self._auth(body["auth"])
             elif base != previous.get("base_url"):
@@ -484,6 +487,7 @@ class Profiles:
             if connection["protocol"] != "openai-compatible" or not connection.get("model"):
                 raise ValueError("platform model roles require an OpenAI-compatible connection with a model ID")
             self._url(connection["base_url"], cloud=role == "analysis")
+            completion_parameters(connection)
             self.roles[role] = selected
             self._save()
             return self._public(role)
@@ -628,8 +632,58 @@ class Transport:
                                 kind="transport" if isinstance(error, OSError) else "invalid_response") from None
 
 
+def request_parameters(profile, reserved):
+    """Validate wire-body options without imposing a vendor parameter whitelist.
+
+    The saved object also serves checked Harness mappings. Interpret it only at
+    the actual platform endpoint, rather than changing those original mappings.
+    """
+    parameters = Profiles._parameters(profile.get("parameters", {}))
+    if set(parameters) & set(reserved):
+        raise ValueError("参数 JSON 不能覆盖平台管理的请求字段：" +
+                         ", ".join(sorted(set(parameters) & set(reserved))))
+    wrappers = set(parameters) & {"extra_body", "extra_headers", "headers", "base_url"}
+    if wrappers:
+        raise ValueError("参数 JSON 直接填写服务请求体字段，不使用 SDK／HTTP 包装字段：" +
+                         ", ".join(sorted(wrappers)))
+    return parameters
+
+
+def completion_parameters(profile):
+    """Return the exact nonsecret generation options sent to Chat Completions."""
+    parameters = request_parameters(profile, {
+        "model", "messages", "stream", "stream_options", "tools", "tool_choice",
+        "functions", "function_call"})
+    if "n" in parameters and (type(parameters["n"]) is not int or parameters["n"] != 1):
+        raise ValueError("平台每次只处理一条模型回答，参数 n 只能为 1")
+    limits = set(parameters) & {"max_tokens", "max_completion_tokens"}
+    if len(limits) > 1:
+        raise ValueError("max_tokens 与 max_completion_tokens 只能填写其中一个")
+    if limits:
+        field = next(iter(limits))
+        value = parameters[field]
+        if type(value) is not int or value < 1:
+            raise ValueError(field + " 必须为正整数")
+        declared = profile.get("declared_max_output_tokens") or profile.get("max_output_tokens")
+        if declared is not None and value != declared:
+            raise ValueError("参数 JSON 的最大输出与独立的最大输出 token 字段冲突，请保留一处或填写相同值")
+    elif output_capability(profile):
+        parameters["max_tokens"] = output_capability(profile)
+    return parameters
+
+
+def embedding_body(profile, text):
+    parameters = request_parameters(profile, {"model", "input"})
+    if "dimensions" in parameters and (type(parameters["dimensions"]) is not int or parameters["dimensions"] < 1):
+        raise ValueError("embedding dimensions 必须为正整数")
+    if "encoding_format" in parameters and (not isinstance(parameters["encoding_format"], str)
+            or parameters["encoding_format"] not in {"float", "base64"}):
+        raise ValueError("明确能力调用支持 float 或 base64 embedding 编码")
+    return dict(parameters, model=profile["model"], input=text)
+
+
 def completion_body(profile, messages, tools=None):
-    # Preserve every message; provider defaults apply unless its output capability is known.
+    # Preserve every message and explicit option; only unset fields use provider defaults.
     if profile.get("provider") == "deepseek":
         # AgentDojo's OpenAI wire codec uses developer/content-block messages.
         # Keep native task messages intact and adapt only their provider format.
@@ -643,10 +697,7 @@ def completion_body(profile, messages, tools=None):
                 message["content"] = "\n".join(block.get("text", "") for block in content)
             converted.append(message)
         messages = converted
-    body = dict(model=profile["model"], messages=messages, stream=False)
+    body = dict(completion_parameters(profile), model=profile["model"], messages=messages, stream=False)
     if tools:
         body.update(tools=tools, tool_choice="auto")
-    ceiling = output_capability(profile)
-    if ceiling:
-        body["max_tokens"] = ceiling
     return body

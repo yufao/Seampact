@@ -1,5 +1,7 @@
 """Named local resources, connection checks and explicit capability calls."""
 
+import base64
+import binascii
 import copy
 import hashlib
 import http.client
@@ -10,6 +12,7 @@ import re
 import secrets
 import socket
 import ssl
+import struct
 import threading
 import time
 import urllib.error
@@ -17,7 +20,7 @@ import urllib.request
 from pathlib import Path, PurePosixPath
 
 from .store import now
-from .providers import ProviderError, Transport, completion_body, image_evidence
+from .providers import ProviderError, Transport, completion_body, completion_parameters, embedding_body, image_evidence
 
 
 class ResourceRegistry:
@@ -140,6 +143,17 @@ class ResourceRegistry:
         checks = {item["id"]: item for item in self.store.list("connection_check")}
         for connection in connections:
             identity = connection["id"]
+            # Public max_output_tokens may be a discovered display value, not
+            # an independently configured limit. Compare the actual profile.
+            profile = self.profiles.connection_profile(identity)
+            parameters = {}
+            for operation in ("text", "image", "embedding"):
+                try:
+                    parameters[operation] = self._operation_parameters(profile, operation)
+                except (ValueError, TypeError, KeyError):
+                    # Observation must still load when an old connection has
+                    # options that the current request path cannot accept.
+                    parameters[operation] = None
             current = lambda item: (item.get("connection_id", item.get("id")) == identity and
                 item.get("revision") == connection.get("revision") and
                 item.get("config_digest") == connection.get("config_digest") and
@@ -151,9 +165,36 @@ class ResourceRegistry:
             for item in records:
                 operation = item.get("operation")
                 if (current(item) and item.get("credential_version") == connection.get("credential_version") and
-                        operation not in connection["operation_checks"]):
+                        operation not in connection["operation_checks"] and
+                        self._operation_parameters_match(item, profile, parameters.get(operation))):
                     connection["operation_checks"][operation] = item
         return connections
+
+    @staticmethod
+    def _operation_parameters(profile, operation):
+        if operation == "embedding":
+            return {name: value for name, value in embedding_body(profile, "").items()
+                    if name not in {"model", "input"}}
+        return completion_parameters(profile)
+
+    @staticmethod
+    def _operation_parameters_match(record, profile, parameters):
+        if parameters is None:
+            return False
+        if "request_parameters" in record:
+            return record["request_parameters"] == parameters
+        # Before request options were forwarded, only empty-JSON operations can
+        # retain their meaning. Keep their history even when no longer current.
+        if profile.get("parameters"):
+            return False
+        legacy = {}
+        if record.get("operation") in {"text", "image"}:
+            selected = (profile.get("capabilities") or {}).get("selected") or {}
+            ceiling = (selected.get("max_output_tokens") or profile.get("declared_max_output_tokens")
+                       or profile.get("max_output_tokens"))
+            if ceiling:
+                legacy["max_tokens"] = ceiling
+        return legacy == parameters
 
     @staticmethod
     def _usage(value):
@@ -198,12 +239,18 @@ class ResourceRegistry:
                     credential_error = "selected connection credentials are missing"
             except (ValueError, OSError):
                 key, credential_error = "", "selected connection credentials cannot be read by this runtime"
+        # Reject configuration conflicts before any paid request, with the field
+        # explanation intact instead of the generic provider-response diagnostic.
+        request = embedding_body(profile, text) if operation == "embedding" else None
+        parameters = ({name: value for name, value in request.items() if name not in {"model", "input"}}
+                      if request is not None else completion_parameters(profile))
         result = dict(id=secrets.token_hex(16), connection_id=profile["id"], revision=profile["revision"],
             config_digest=profile["config_digest"], credential_ref=profile.get("credential_ref"),
             credential_version=profile.get("credential_version"), auth_binding=copy.deepcopy(profile["auth"]),
             operation=operation, checked_at=now(),
             status="FAILED", latency_ms=None, usage=None, target_execution="NOT_RUN", response=None,
             reason=credential_error, requests=0, money_status="UNKNOWN", server_inference_ms=None,
+            request_parameters=parameters,
             input_identity=dict(sha256=hashlib.sha256(text.encode("utf-8")).hexdigest(), characters=len(text)))
         started = time.perf_counter()
         try:
@@ -211,7 +258,6 @@ class ResourceRegistry:
                 raise ValueError("credential_unavailable")
             if operation == "embedding":
                 endpoint = "/embeddings"
-                request = dict(model=profile["model"], input=text)
             else:
                 content = text
                 if operation == "image":
@@ -233,10 +279,20 @@ class ResourceRegistry:
                 dimensions = []
                 for item in values:
                     vector = item.get("embedding") if isinstance(item, dict) else None
-                    if (not isinstance(vector, list) or not vector or any(type(number) not in (int, float)
-                            or not math.isfinite(number) for number in vector)):
+                    if isinstance(vector, str) and request.get("encoding_format") == "base64":
+                        try:
+                            encoded = base64.b64decode(vector, validate=True)
+                        except (ValueError, binascii.Error):
+                            raise ValueError("invalid_embedding_vector") from None
+                        if (not encoded or len(encoded) % 4 or
+                                any(not math.isfinite(number[0]) for number in struct.iter_unpack("<f", encoded))):
+                            raise ValueError("invalid_embedding_vector")
+                        dimensions.append(len(encoded) // 4)
+                    elif isinstance(vector, list) and vector and all(type(number) in (int, float)
+                            and math.isfinite(number) for number in vector):
+                        dimensions.append(len(vector))
+                    else:
                         raise ValueError("invalid_embedding_vector")
-                    dimensions.append(len(vector))
                 result["response"] = dict(embeddings_count=len(values), dimensions=dimensions)
             else:
                 choices = data.get("choices")

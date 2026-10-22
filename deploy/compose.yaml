@@ -16,6 +16,7 @@ services:
     environment:
       DEEPSEEK_API_KEY: "${DEEPSEEK_API_KEY:-}"
       GLM_API_KEY: "${GLM_API_KEY:-}"
+      MOONSHOT_API_KEY: "${MOONSHOT_API_KEY:-}"
       SEAMPACT_CHAT_API_KEY: "${SEAMPACT_CHAT_API_KEY:-}"
       SEAMPACT_ANALYSIS_API_KEY: "${SEAMPACT_ANALYSIS_API_KEY:-}"
     ports:

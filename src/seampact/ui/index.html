@@ -14,7 +14,7 @@
       <p class="rail-caption">异构 Harness · 对话</p>
       <div class="rail-actions">
         <a class="rail-button chat-navigation" href="/">对话</a>
-        <button id="open-configuration" class="rail-button" type="button"><span aria-hidden="true">⚙</span> 配置</button>
+        <a id="open-configuration" class="rail-button" href="/configuration?section=models"><span aria-hidden="true">⚙</span> 配置</a>
         <button id="open-observer" class="rail-button" type="button" aria-controls="observer" aria-expanded="false"><span aria-hidden="true">◉</span> 运行状态</button>
         <a class="rail-button" href="/inspect?view=analyses">来源与分析</a>
         <a class="rail-button" href="/inspect?view=units">能力池</a>
@@ -49,7 +49,7 @@
       <div class="observer-scroll">
         <section class="panel-section" data-view="profile"><div class="panel-heading"><h3>入口支持范围</h3></div><div id="entry-profile-summary"></div></section>
         <section class="panel-section" data-view="scheduler"><div class="panel-heading"><h3>调度器</h3><span id="scheduler-status" class="status-pill pending">正在读取</span><a href="/inspect?view=scheduler">独立查看</a></div><div id="scheduler-summary" class="scheduler-summary"></div>
-          <div class="research-heading"><div><h3>学习与研究运行</h3><p class="card-note">固定下层 FIFO，比较上层获准干预。每次运行保存独立配置与结果。</p></div><button id="open-research-configuration" class="secondary-button" type="button">配置训练</button></div>
+          <div class="research-heading"><div><h3>学习与研究运行</h3><p class="card-note">按功能或联合调度模式保存独立配置与结果。进行中的运行自动展开曲线，可随时导出已保存结果。</p></div><button id="open-research-configuration" class="secondary-button" type="button">配置训练</button></div>
           <div id="research-readiness" class="status-list"></div>
           <div class="research-filters"><label>搜索<input id="research-filter" type="search" placeholder="时间、哈希、标签、算法或来源"></label><label>运行方式<select id="research-mode-filter"><option value="">全部方式</option><option value="train">新训练</option><option value="freeze">冻结评价</option><option value="warmstart">继续训练</option><option value="rejudge">条件重评</option></select></label></div>
           <div id="research-run-list" class="status-list"><p class="empty-note">尚无研究运行。</p></div>
@@ -61,14 +61,24 @@
         <section class="panel-section" data-view="analyses"><div class="panel-heading"><h3>来源与分析</h3><span id="analysis-count" class="count-badge">0</span><a href="/inspect?view=analyses">独立查看</a></div><div id="analysis-list" class="status-list"><p class="empty-note">配置 Harness 地址后可开始分析。</p></div></section>
       </div>
     </aside>
-  </div>
-  <div id="drawer-shade" class="drawer-shade" hidden></div>
-  <dialog id="configuration" class="configuration" aria-labelledby="configuration-title">
-    <header class="config-header"><div><div class="eyebrow">CONFIGURATION</div><h2 id="configuration-title">配置</h2></div><button id="close-configuration" class="icon-button" type="button" aria-label="关闭配置">×</button></header>
-    <div class="config-body">
-      <section class="config-section"><h3>当前入口范围</h3><div id="config-entry-profile"><p class="form-note">正在读取已确认的宿主范围。</p></div></section>
-      <section class="config-section">
-        <h3>模型</h3><p class="form-note">对话、分析和教师模型分别保存。教师使用文字标准评价训练结果；可在训练配置中明确复用分析角色。</p>
+  <main id="configuration" class="configuration" aria-labelledby="configuration-title" hidden>
+    <header class="config-header"><div><div class="eyebrow">CONFIGURATION</div><h1 id="configuration-title">配置</h1><p>管理模型、资源与研究配置。每个表单分别保存。</p></div><a id="close-configuration" class="secondary-button" href="/">返回对话</a></header>
+    <div id="configuration-notice" class="notice" role="status" aria-live="polite" hidden></div>
+    <div class="config-workspace">
+      <nav class="config-navigation" aria-label="配置分区">
+        <a href="/configuration?section=models" data-config-link="models"><strong>模型角色</strong><span>对话、分析与教师</span></a>
+        <a href="/configuration?section=services" data-config-link="services"><strong>服务连接</strong><span>API、认证与请求参数</span></a>
+        <a href="/configuration?section=weights" data-config-link="weights"><strong>权重资源</strong><span>本地路径与必要文件</span></a>
+        <a href="/configuration?section=harnesses" data-config-link="harnesses"><strong>Harness 接入</strong><span>来源、分析与依赖绑定</span></a>
+        <a href="/configuration?section=research" data-config-link="research"><strong>研究运行</strong><span>学习器、场景与评价</span></a>
+        <a href="/configuration?section=scope" data-config-link="scope"><strong>入口范围</strong><span>已确认的宿主支持</span></a>
+        <p>切换分区保留未保存内容；刷新或离开页面前请保存。</p>
+      </nav>
+    <div class="config-body" tabindex="-1">
+      <section class="config-section" data-config-section="scope" hidden><h2>当前入口范围</h2><div id="config-entry-profile"><p class="form-note">正在读取已确认的宿主范围。</p></div></section>
+      <section class="config-section" data-config-section="models">
+        <h2>模型角色</h2><p class="form-note">先在“服务连接”中登记 API，再分别分配给对话、分析和教师。教师使用文字标准评价训练结果；可在研究运行中明确复用分析角色。</p>
+        <div class="config-section-actions"><a class="secondary-button" href="/configuration?section=services">管理服务连接</a></div>
         <div class="model-grid">
           <form id="chat-model-form" class="model-form" data-role="chat">
             <h4>对话模型</h4><p class="form-note">支持本地部署 API 与云端 API。</p><p id="chat-model-readiness" class="form-note">正在读取配置。</p>
@@ -101,28 +111,21 @@
             <div class="form-actions"><button class="secondary-button save-role-credential" type="button">单独保存凭据</button><button class="primary-button" type="submit">保存教师配置</button><span class="form-status" role="status"></span></div>
           </form>
         </div>
-        <p class="form-note">保存配置与保存凭据是两个动作。API Key 不回填；清除凭据和环境变量认证在下方服务连接中设置。选择连接不会自动复用其他角色的认证。</p>
+        <p class="form-note">保存配置与保存凭据是两个动作。API Key 不回填；清除凭据和环境变量认证在“服务连接”中设置。选择连接不会自动复用其他角色的认证。</p>
       </section>
-      <section id="service-configuration" class="config-section">
-        <h3>服务连接</h3><p class="form-note">登记用户已启动的本机、实验室机器或云端 HTTP／HTTPS 服务。localhost 指平台进程或容器自身。保存配置不会启动模型或发起推理。</p>
+      <section id="service-configuration" class="config-section" data-config-section="services" hidden>
+        <h2>服务连接</h2><p class="form-note">登记用户已启动的本机、实验室机器或云端 HTTP／HTTPS 服务。localhost 指平台进程或容器自身。保存配置不会启动模型或发起推理。</p>
+        <nav class="config-section-actions" aria-label="服务连接操作"><button id="connection-create" class="primary-button" type="button">新增连接</button><a class="secondary-button" href="#connection-form">连接配置</a><a class="secondary-button" href="#connection-credential-form">私有凭据</a><a class="secondary-button" href="#connection-invoke-form">明确能力调用</a></nav>
         <div id="connection-list" class="status-list resource-list"></div>
-        <form id="connection-invoke-form" class="resource-form">
-          <h4>明确调用连接能力</h4>
-          <p class="form-note">使用下方明确输入向已启动服务发起一次真实能力调用，可能产生费用。此结果只核对连接操作；Harness 原目标执行仍单独记录。保存、检查连接及页面刷新都不会触发此调用。</p>
-          <div class="optional-grid"><label>已保存的命名连接<select name="connection_id" required><option value="">选择命名连接</option></select></label><label>调用操作<select name="operation" required><option value="">先选择声明能力的兼容连接</option></select></label></div>
-          <label>本次明确输入<textarea name="input" rows="3" required placeholder="填写要实际发送的文本、图像问题或 embedding 输入；请勿填写凭据"></textarea></label>
-          <label id="connection-invoke-image-label" hidden>图像路径<input name="image_path" placeholder="平台实际执行环境可见的本地图像路径" disabled></label>
-          <p id="connection-invoke-note" class="form-note">首版支持已声明 text、image 或 embedding 能力的 OpenAI 兼容连接；其他协议使用原库客户端。</p>
-          <div class="form-actions"><button class="primary-button" type="submit" disabled>使用上述输入调用一次</button><span id="connection-invoke-status" class="form-status" role="status"></span></div>
-          <div id="connection-invoke-result" class="connection-operation-result" aria-live="polite"></div>
-        </form>
+
         <form id="connection-form" class="resource-form">
-          <h4 id="connection-form-title">新增命名连接</h4><input name="id" type="hidden">
+          <h4 id="connection-form-title">新增命名连接</h4><input name="id" type="hidden"><p class="form-note">编辑会更新原连接。要保留旧模型并登记另一个模型，请先点击“新建”。</p>
           <div class="optional-grid"><label>连接名称<input name="name" required placeholder="如：实验室视觉模型"></label><label>协议<select name="protocol"><option value="openai-compatible">OpenAI 兼容</option><option value="http">原库 HTTP 服务</option></select></label></div>
           <label>服务地址<input name="base_url" type="url" required placeholder="http://服务器地址:8000/v1"></label>
           <div class="optional-grid"><label>模型 ID（原服务需要时填写）<input name="model"></label><label>可核对服务／模型版本<input name="service_version" placeholder="未知可留空"></label></div>
           <fieldset class="capability-options"><legend>服务声明能力（实际操作另行核对）</legend><label><input type="checkbox" name="capability" value="text"> 文本</label><label><input type="checkbox" name="capability" value="image"> 图像</label><label><input type="checkbox" name="capability" value="embedding"> Embedding</label><label><input type="checkbox" name="capability" value="retrieval"> 检索</label></fieldset>
           <label>非敏感参数（JSON 对象）<textarea name="parameters" rows="3" spellcheck="false">{}</textarea></label>
+          <p class="form-note">按提供方官方文档填写生成参数，例如 {"reasoning_effort":"max","thinking":{"type":"enabled"}}。文本、图像能力调用及平台对话／分析／教师请求会携带这些参数；保留 model、messages、tools 等平台请求字段，不在这里填写。向量接口只使用其支持的参数；Harness 原库按已核对的映射读取参数。</p>
           <div class="optional-grid"><label>认证方式<select name="auth_mode"><option value="none">明确无需认证</option><option value="saved">私有保存的凭据</option><option value="environment">平台进程环境变量</option></select></label><label>环境变量名<input name="auth_env" placeholder="仅填变量名，不填值" disabled></label></div>
           <p id="connection-auth-note" class="form-note">凭据值使用下方独立表单保存。更换地址后需重新明确认证方式。</p>
           <div class="form-actions"><button id="connection-new" class="secondary-button" type="button">新建</button><button class="primary-button" type="submit">保存连接配置</button><span id="connection-form-status" class="form-status" role="status"></span></div>
@@ -133,9 +136,19 @@
           <p id="credential-storage-note" class="form-note">Windows 使用当前用户 DPAPI；Linux 使用服务器私有目录及文件权限。环境变量引用只保存变量名。迁移机器需重新配置凭据。</p>
           <div class="form-actions"><button id="connection-clear-credential" class="secondary-button" type="button">清除所选连接凭据</button><button class="primary-button" type="submit">单独保存凭据</button><span id="credential-form-status" class="form-status" role="status"></span></div>
         </form>
+        <form id="connection-invoke-form" class="resource-form">
+          <h4>明确调用连接能力</h4>
+          <p class="form-note">使用下方明确输入向已启动服务发起一次真实能力调用，可能产生费用。此结果只核对连接操作；Harness 原目标执行仍单独记录。保存、检查连接及页面刷新都不会触发此调用。</p>
+          <div class="optional-grid"><label>已保存的命名连接<select name="connection_id" required><option value="">选择命名连接</option></select></label><label>调用操作<select name="operation" required><option value="">先选择声明能力的兼容连接</option></select></label></div>
+          <label>本次明确输入<textarea name="input" rows="3" required placeholder="填写要实际发送的文本、图像问题或 embedding 输入；请勿填写凭据"></textarea></label>
+          <label id="connection-invoke-image-label" hidden>图像路径<input name="image_path" placeholder="平台实际执行环境可见的本地图像路径" disabled></label>
+          <p id="connection-invoke-note" class="form-note">首版支持已声明 text、image 或 embedding 能力的 OpenAI 兼容连接；其他协议使用原库客户端。</p>
+          <div class="form-actions"><button class="primary-button" type="submit" disabled>使用上述输入调用一次</button><span id="connection-invoke-status" class="form-status" role="status"></span></div>
+          <div id="connection-invoke-result" class="connection-operation-result" aria-live="polite"></div>
+        </form>
       </section>
-      <section id="weight-configuration" class="config-section">
-        <h3>权重资源</h3><p class="form-note">路径属于平台实际执行环境：Windows 填 Windows 路径，Linux 填 Linux 路径，Docker 填容器内路径。登记远端机器的目录不会把文件同步到此处；原库直接加载模型对象时仍须由原宿主读取。</p>
+      <section id="weight-configuration" class="config-section" data-config-section="weights" hidden>
+        <h2>权重资源</h2><p class="form-note">路径属于平台实际执行环境：Windows 填 Windows 路径，Linux 填 Linux 路径，Docker 填容器内路径。登记远端机器的目录不会把文件同步到此处；原库直接加载模型对象时仍须由原宿主读取。</p>
         <div id="weight-list" class="status-list resource-list"></div>
         <form id="weight-form" class="resource-form">
           <h4 id="weight-form-title">新增权重资源</h4><input name="id" type="hidden">
@@ -147,8 +160,9 @@
           <div class="form-actions"><button id="weight-new" class="secondary-button" type="button">新建</button><button class="primary-button" type="submit">保存权重路径</button><span id="weight-form-status" class="form-status" role="status"></span></div>
         </form>
       </section>
-      <section id="research-configuration" class="config-section research-config">
-        <h3>调度学习与结果评价</h3><p class="form-note">选择真实任务环境和获准 Unit。完整标准、允许证据、尺度和目标在每次运行内冻结；缺失判据不会被记成成功。</p>
+      <section id="research-configuration" class="config-section research-config" data-config-section="research" hidden>
+        <h2>调度学习与结果评价</h2><p class="form-note">选择真实任务环境和获准 Unit。完整标准、允许证据、尺度和目标在每次运行内冻结；缺失判据不会被记成成功。</p>
+        <div class="config-section-actions"><a class="secondary-button" href="/inspect?view=scheduler">查看运行与结果</a></div>
         <form id="research-form">
           <fieldset class="learner-options"><legend>学习器与固定参照</legend><label><input type="checkbox" name="algorithm" value="double_dqn" checked> Double DQN</label><label><input type="checkbox" name="algorithm" value="ppo"> PPO</label><label><input type="checkbox" name="algorithm" value="discrete_sac"> 离散 SAC</label><label><input type="checkbox" name="algorithm" value="required_only"> 仅必需工作</label><label><input type="checkbox" name="algorithm" value="all_applicable"> 全部适用工作</label><label><input type="checkbox" name="algorithm" value="simple"> 场景简单策略</label></fieldset>
           <div class="optional-grid"><label>运行方式<select id="research-mode"><option value="train">新训练</option><option value="freeze">冻结评价</option><option value="warmstart">继续训练</option><option value="rejudge">条件重评后训练</option></select></label><label>来源运行<select id="research-parent"><option value="">无</option></select></label><label>随机种子<input id="research-seed" type="number" min="0" step="1" value="0" required></label><label>任务交互次数<input id="research-episodes" type="number" min="1" step="1" value="1" required></label><label>数据划分<input id="research-split" value="development" required></label><label>标签（逗号分隔）<input id="research-tags" placeholder="如：开发集、教师反馈"></label></div>
@@ -164,17 +178,21 @@
           <div class="form-actions"><button class="secondary-button" type="submit">保存供新运行使用</button><button id="research-start" class="primary-button" type="button">开始运行</button><span id="research-form-status" class="form-status" role="status"></span></div>
         </form>
       </section>
-      <section class="config-section">
-        <h3>Harness</h3><p class="form-note">填入远程仓库 URL 或本地目录路径，由分析器读取来源并发现能力。</p>
+      <section class="config-section" data-config-section="harnesses" hidden>
+        <h2>Harness 接入</h2><p class="form-note">填入远程仓库 URL 或本地目录路径，由分析器读取来源并发现能力。</p>
+        <div class="config-section-actions"><a class="secondary-button" href="/inspect?view=analyses">查看分析进度与结果</a><a class="secondary-button" href="/configuration?section=weights">登记权重</a><a class="secondary-button" href="/configuration?section=services">登记服务</a></div>
         <form id="harness-form">
           <label>模块地址<input id="harness-address" name="address" type="text" placeholder="https://github.com/组织/仓库 或 C:\Harness\目录" required></label>
-          <details class="harness-options"><summary>版本、入口、资源与配置（可选）</summary><div class="optional-grid"><label>版本<input name="revision" type="text" placeholder="分支、标签或提交 ID"></label><label>原生入口<input name="entry" type="text" placeholder="已知入口可填写"></label></div><label>资源路径（JSON 列表）<textarea name="resources" rows="3" placeholder='["/path/to/model", {"path":"/path/to/data"}]'></textarea></label><p class="form-note">每项填写真实路径字符串或包含 path 的资源对象。连接和权重在上方登记；依赖、原参数映射及构造仍由平台分析器提出。</p><label>已有非敏感初始化配置（JSON 对象）<textarea name="configuration" rows="4" placeholder='{"entries":{}}'></textarea></label><p class="form-note">保留原有配置入口。可留空；不接受 API Key，不在这里手写来源包装或切分答案。分析形成需求后，在该 Harness 的“依赖配置”中选择资源。</p></details>
+          <details class="harness-options"><summary>版本、入口、资源与配置（可选）</summary><div class="optional-grid"><label>版本<input name="revision" type="text" placeholder="分支、标签或提交 ID"></label><label>原生入口<input name="entry" type="text" placeholder="已知入口可填写"></label></div><label>资源路径（JSON 列表）<textarea name="resources" rows="3" placeholder='["/path/to/model", {"path":"/path/to/data"}]'></textarea></label><p class="form-note">每项填写真实路径字符串或包含 path 的资源对象。连接和权重在各自配置分区登记；依赖、原参数映射及构造仍由平台分析器提出。</p><label>已有非敏感初始化配置（JSON 对象）<textarea name="configuration" rows="4" placeholder='{"entries":{}}'></textarea></label><p class="form-note">保留原有配置入口。可留空；不接受 API Key，不在这里手写来源包装或切分答案。分析形成需求后，在该 Harness 的“依赖配置”中选择资源。</p></details>
           <div class="form-actions"><button id="add-harness" class="primary-button" type="submit">接入 Harness</button><span id="harness-form-status" class="form-status" role="status"></span></div>
         </form>
         <div id="harness-list" class="status-list"><p class="empty-note">尚未配置 Harness 来源。</p></div>
       </section>
     </div>
-    <footer class="dialog-footer">配置完成后可回到对话。运行状态始终以平台实际返回为准。</footer>
-  </dialog>
+    </div>
+    <footer class="config-footer">保存后用于后续请求与新运行；在途运行保留已冻结配置。运行状态以平台实际返回为准。</footer>
+  </main>
+  </div>
+  <div id="drawer-shade" class="drawer-shade" hidden></div>
 </body>
 </html>
