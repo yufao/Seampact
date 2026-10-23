@@ -26,16 +26,22 @@
     </aside>
     <main class="chat-shell">
       <header class="chat-header">
-        <div class="chat-heading"><div class="eyebrow">SEAMPACT</div><h1>对话</h1></div>
-        <div class="header-actions"><span id="chat-model-name" class="status-pill pending">对话模型未配置</span></div>
+        <div class="chat-heading"><div class="eyebrow">SEAMPACT</div><h1 id="chat-title">对话</h1></div>
+        <div class="header-actions"><button id="new-chat" class="secondary-button" type="button">新对话</button><button id="toggle-chat-history" class="secondary-button" type="button" aria-controls="chat-history" aria-expanded="false">历史会话</button><span id="chat-model-name" class="status-pill pending">对话模型未配置</span></div>
       </header>
+      <section id="chat-history" class="chat-history" aria-label="历史会话" hidden>
+        <label for="chat-history-search">搜索历史会话</label><input id="chat-history-search" type="search" placeholder="搜索问题或回答" autocomplete="off">
+        <p class="card-note">普通对话保存在当前平台。旧记录若未保存问题，仅展示已有回答。删除会话只从历史移除，可撤销；执行记录保留在任务详情。</p>
+        <div id="chat-history-feedback" class="card-note" role="status" aria-live="polite"></div>
+        <div id="chat-history-list" class="chat-history-list" aria-live="polite"></div>
+      </section>
       <div id="notice" class="notice" role="status" aria-live="polite" hidden></div>
       <section id="conversation" class="conversation" role="log" aria-label="对话内容" aria-live="polite" aria-relevant="additions text">
         <div class="welcome"><div class="welcome-mark" aria-hidden="true">S</div><h2>有什么想一起完成的？</h2><p>直接发送任务。Harness 的分析与调用状态会显示在右侧。</p><p id="welcome-context" class="context-note">正在读取模型与能力池。</p></div>
       </section>
       <div class="composer-area">
         <form id="chat-form" class="composer">
-          <label class="scene-task-label" for="scene-task-selector">任务入口<select id="scene-task-selector"><option value="">普通对话</option></select></label>
+          <label id="scene-task-label" class="scene-task-label" for="scene-task-selector" hidden>对话或场景任务<select id="scene-task-selector"><option value="">普通对话</option></select></label>
           <label class="visually-hidden" for="chat-input">消息</label>
           <textarea id="chat-input" rows="1" placeholder="发送消息…" aria-describedby="composer-hint" required></textarea>
           <div class="composer-footer"><span id="composer-hint" class="composer-hint">Enter 发送 · Shift + Enter 换行</span><button id="send-message" class="primary-button" type="submit" disabled><span class="send-label">发送</span><span aria-hidden="true">↑</span></button></div>
@@ -115,12 +121,16 @@
       </section>
       <section id="service-configuration" class="config-section" data-config-section="services" hidden>
         <h2>服务连接</h2><p class="form-note">登记用户已启动的本机、实验室机器或云端 HTTP／HTTPS 服务。localhost 指平台进程或容器自身。保存配置不会启动模型或发起推理。</p>
+        <details class="resource-guide"><summary>本地模型、API 和权重分别在哪里配置？</summary>
+          <ul><li>本地或云端模型已提供 OpenAI 兼容 API：在此选择“OpenAI 兼容接口”，再到“模型角色”应用到对话、分析或教师。分析模型还需支持工具调用。</li><li>Harness 使用自有 HTTP 接口：选择“原库专用 HTTP 接口”，保留原客户端及原参数；不能直接作为平台对话或分析模型。</li><li>只有模型权重文件，还没有启动服务：去<a href="/configuration?section=weights">权重资源</a>登记本机目录或文件。原 Harness 按自己的加载器使用这些文件；平台不会仅凭登记路径启动推理服务。</li><li>“API”是调用方式；本地与云端是部署位置。这里选择的是接口格式，HTTP 和 HTTPS 地址均可使用。仓库源码则在<a href="/configuration?section=harnesses">Harness 接入</a>登记。</li></ul>
+        </details>
         <nav class="config-section-actions" aria-label="服务连接操作"><button id="connection-create" class="primary-button" type="button">新增连接</button><a class="secondary-button" href="#connection-form">连接配置</a><a class="secondary-button" href="#connection-credential-form">私有凭据</a><a class="secondary-button" href="#connection-invoke-form">明确能力调用</a></nav>
         <div id="connection-list" class="status-list resource-list"></div>
 
         <form id="connection-form" class="resource-form">
           <h4 id="connection-form-title">新增命名连接</h4><input name="id" type="hidden"><p class="form-note">编辑会更新原连接。要保留旧模型并登记另一个模型，请先点击“新建”。</p>
-          <div class="optional-grid"><label>连接名称<input name="name" required placeholder="如：实验室视觉模型"></label><label>协议<select name="protocol"><option value="openai-compatible">OpenAI 兼容</option><option value="http">原库 HTTP 服务</option></select></label></div>
+          <div class="optional-grid"><label>连接名称<input name="name" required placeholder="如：实验室视觉模型"></label><label>接口格式<select name="protocol"><option value="openai-compatible">OpenAI 兼容接口（本地或云端）</option><option value="http">原库专用 HTTP 接口</option></select></label></div>
+          <p class="form-note">这里登记已启动的服务；如果只有权重文件，请先去<a href="/configuration?section=weights">登记权重路径</a>。无需为本地模型另选一种协议。</p>
           <label>服务地址<input name="base_url" type="url" required placeholder="http://服务器地址:8000/v1"></label>
           <div class="optional-grid"><label>模型 ID（原服务需要时填写）<input name="model"></label><label>可核对服务／模型版本<input name="service_version" placeholder="未知可留空"></label></div>
           <fieldset class="capability-options"><legend>服务声明能力（实际操作另行核对）</legend><label><input type="checkbox" name="capability" value="text"> 文本</label><label><input type="checkbox" name="capability" value="image"> 图像</label><label><input type="checkbox" name="capability" value="embedding"> Embedding</label><label><input type="checkbox" name="capability" value="retrieval"> 检索</label></fieldset>
@@ -149,6 +159,8 @@
       </section>
       <section id="weight-configuration" class="config-section" data-config-section="weights" hidden>
         <h2>权重资源</h2><p class="form-note">路径属于平台实际执行环境：Windows 填 Windows 路径，Linux 填 Linux 路径，Docker 填容器内路径。登记远端机器的目录不会把文件同步到此处；原库直接加载模型对象时仍须由原宿主读取。</p>
+        <ol class="resource-guide"><li>先把原 Harness 所需的模型文件准备在平台可见的位置。此页登记已有路径，不下载权重。</li><li>在下方填写名称、选择“目录”或“单个文件”，再填写完整路径。多文件模型通常登记整个目录；格式以原加载器要求为准。</li><li>目录的必要文件每行填写一个相对文件名；保存后点击该资源卡片的“检查资源”。文件存在不等于模型已加载或调用成功。</li><li>回到<a href="/inspect?view=analyses">来源与分析</a>的“依赖配置”选择权重。若原参数映射尚未通过，需先修复候选；登记路径不会绕过这个条件。</li></ol>
+        <div class="config-section-actions"><button id="weight-create" class="primary-button" type="button">新增权重资源</button></div>
         <div id="weight-list" class="status-list resource-list"></div>
         <form id="weight-form" class="resource-form">
           <h4 id="weight-form-title">新增权重资源</h4><input name="id" type="hidden">

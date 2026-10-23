@@ -1,5 +1,6 @@
 """Conversation tasks use the actual Unit pool and shared runtime."""
 
+import copy
 import json
 import subprocess
 import threading
@@ -75,6 +76,63 @@ class ChatJobs:
         self.runtime, self.scheduler = runtime, scheduler
         self.transport = Transport()
         self.closed = False
+        for task in self._history_tasks():
+            if task.get("status") == "RUNNING":
+                task.update(status="INTERRUPTED", error="平台已重启，原任务未恢复；已保存的对话仍可查看。", finished_at=now())
+                self.store.save("task", task["id"], task)
+
+    def _history_tasks(self):
+        return [task for task in self.store.list("task")
+                if task.get("conversation_id") or task.get("phase") in {"conversation", "harness_execution"}]
+
+    def conversations(self, query=""):
+        groups = {}
+        deleted = {row["id"] for row in self.store.list("chat_deleted")}
+        for task in self._history_tasks():
+            identity = task.get("conversation_id") or task["id"]
+            if identity not in deleted:
+                groups.setdefault(identity, []).append(task)
+        result = []
+        for identity, tasks in groups.items():
+            latest = tasks[0]
+            messages = latest.get("messages") or []
+            first = next((message["content"] for message in messages if message.get("role") == "user"), "")
+            title = first if isinstance(first, str) else "多模态会话"
+            title = " ".join(title.split())[:60] or "旧对话（仅保存回答）"
+            searchable = json.dumps([messages, [task.get("response") for task in tasks]], ensure_ascii=False).casefold()
+            if query and query.casefold() not in searchable and query.casefold() not in title.casefold():
+                continue
+            result.append(dict(id=identity, title=title, updated_at=latest.get("finished_at") or latest.get("started_at"),
+                               status=latest["status"], turns=len(tasks), legacy=not bool(latest.get("messages"))))
+        return dict(conversations=result)
+
+    def conversation(self, identity):
+        if self.store.get("chat_deleted", identity):
+            raise ValueError("这段会话已从历史删除")
+        tasks = [task for task in self._history_tasks() if (task.get("conversation_id") or task["id"]) == identity]
+        if not tasks:
+            raise ValueError("没有这段历史会话")
+        latest = tasks[0]
+        messages = copy.deepcopy(latest.get("messages") or [])
+        # Only user-visible messages are restored; tool traces remain task details.
+        if latest.get("status") == "COMPLETED" and latest.get("response"):
+            messages.append(dict(role="assistant", content=latest["response"]))
+        return dict(id=identity, messages=messages, legacy=not bool(latest.get("messages")),
+                    task={key: latest.get(key) for key in ("id", "status", "response", "error", "latency_ms")})
+
+    def delete_conversation(self, identity):
+        if self.store.get("chat_deleted", identity):
+            return dict(deleted=identity)
+        detail = self.conversation(identity)
+        if detail["task"]["status"] == "RUNNING":
+            raise ValueError("请等这段会话的任务结束后再删除")
+        # History visibility is separate from the execution evidence in tasks.
+        self.store.save("chat_deleted", identity, dict(id=identity, deleted_at=now()))
+        return dict(deleted=identity)
+
+    def restore_conversation(self, identity):
+        self.store.delete("chat_deleted", identity)
+        return dict(restored=self.conversation(identity)["id"])
 
     def start(self, body):
         messages = body.get("messages")
@@ -92,13 +150,23 @@ class ChatJobs:
             raise ValueError("请先配置对话模型地址与型号")
         bound.role_key("chat")
         catalog = FrozenCatalog(self.catalog)
+        conversation_id = body.get("conversation_id") or uuid.uuid4().hex
+        if not isinstance(conversation_id, str) or not conversation_id.strip():
+            raise ValueError("会话标识需要非空文字")
+        if body.get("conversation_id"):
+            previous = self.conversation(conversation_id)
+            if previous["legacy"]:
+                raise ValueError("旧对话没有保存完整问题，请新建会话")
+            if previous["task"]["status"] == "RUNNING":
+                raise ValueError("这段会话还有任务正在运行")
         identity = uuid.uuid4().hex
         task = dict(id=identity, status="RUNNING", started_at=now(), response=None,
             error=None, calls=[], model_calls=0, usage=[], latency_ms=None, phase="conversation",
+            conversation_id=conversation_id, messages=copy.deepcopy(messages),
             models=bound.public(), role_resources=bound.resources(), harness_resources=catalog.snapshot_resources())
         self.store.save("task", identity, task)
         threading.Thread(target=self._run, args=(task, messages, bound, catalog), daemon=True).start()
-        return dict(task_id=identity)
+        return dict(task_id=identity, conversation_id=conversation_id)
 
     def _observation(self, catalog):
         snapshot = self.runtime.snapshot()

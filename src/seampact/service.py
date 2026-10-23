@@ -100,7 +100,8 @@ class Platform:
         snapshot = self.runtime.snapshot()
         active = [call for call in snapshot["calls"].values() if call["physical"] in {"AUTHORIZED", "STARTED"}]
         waiting = [call for call in snapshot["calls"].values() if call["physical"] in {"ENABLED", "RESERVED"}]
-        tasks = self.store.list("task")
+        tasks = [{key: value for key, value in task.items() if key != "messages"}
+                 for task in self.store.list("task")]
         for task in tasks:
             calls = [call for call in snapshot["calls"].values() if call.get("task_id") == task["id"]]
             if calls or task.get("status") == "RUNNING":
@@ -108,23 +109,23 @@ class Platform:
         harnesses = []
         for source in self.store.list("harness"):
             harnesses.append({name: source.get(name) for name in
-                ("id", "name", "address", "revision", "status", "error", "analysis_id", "entry", "resources", "detached_at",
+                ("id", "name", "address", "root", "revision", "status", "error", "analysis_id", "entry", "resources", "detached_at",
                  "runtime_environment", "environment_discovery", "target_runtime", "environment_pending_recheck")})
             harnesses[-1]["files"] = len(source.get("files", []))
             harnesses[-1]["inventory_count"] = len(source.get("inventory", []))
             job = self.store.get("analysis", source.get("analysis_id"))
             if source.get("status") != "DETACHED" and job and job["status"] in {"FAILED", "INTERRUPTED", "CANCELLED"}:
                 harnesses[-1].update(status=job["status"], error=job.get("error"))
-        jobs = [dict({name: value for name, value in job.items()
-                      if name not in {"messages", "provider_profile"}},
-                     resumable=self.analysis.can_resume(job))
-                for job in self.store.list("analysis")]
+        source_ids = {source["id"] for source in harnesses}
+        jobs = self.store.analysis_summaries(source_ids)
         for job in jobs:
+            # Continuation needs the complete saved conversation only for
+            # failed/interrupted jobs; ordinary polling never displays it.
+            original = self.store.get("analysis", job["id"]) if job.get("status") in {"FAILED", "INTERRUPTED"} else job
+            job["resumable"] = self.analysis.can_resume(original)
             if not job.get("harness_id"):
                 request = self.store.get("request", job.get("request_id"))
                 job["harness_id"] = (request or {}).get("source_id")
-        source_ids = {source["id"] for source in harnesses}
-        jobs = [job for job in jobs if job.get("harness_id") in source_ids]
         requirements, selections = self.dependencies.public()
         return dict(version=__version__, models=self.profiles.public_roles(), harnesses=harnesses,
             resources=dict(connections=self.public_connections(), weights=self.resources.public_weights(),
@@ -896,6 +897,22 @@ class Platform:
             self.store.save("analysis", jid, job)
             return dict(analysis_id=jid, model_calls=0, units=job["units"])
 
+    def preprocessing_summary(self, identity):
+        record = self.store.get("preprocessing", identity)
+        if not record:
+            raise ValueError("没有这份预处理记录")
+        content, report = record.get("content") or {}, record.get("report") or {}
+        bindings = {row.get("id"): row for row in report.get("entry_bindings", {}).get("entries", [])}
+        return dict(id=identity, goal=content.get("goal"), status=report.get("status"),
+            targets=[{key: target.get(key) for key in ("path", "symbol", "kind", "purpose", "execution_role")}
+                     for target in content.get("targets", [])],
+            entries=[dict({key: entry.get(key) for key in ("id", "path", "symbol", "description")},
+                          status=bindings.get(entry.get("id"), {}).get("status", "NOT_CHECKED"),
+                          reason=bindings.get(entry.get("id"), {}).get("reason"))
+                     for entry in content.get("entries", [])],
+            dependency_count=len(content.get("dependencies", [])), missing=content.get("missing", []),
+            issues=report.get("issues", []), execution=report.get("execution", "NOT_RUN"))
+
     def analysis_snapshot(self, analysis_id):
         """Export observation metadata without source messages or machine configuration."""
         job = self.store.get("analysis", analysis_id)
@@ -933,10 +950,13 @@ class Platform:
             result = {key: item for key, item in value.items()
                       if key in {"stage", "phase", "tool", "outcome"} and isinstance(item, str)
                       and re.fullmatch(r"[A-Za-z][A-Za-z0-9_/-]{0,95}", item)}
-            for key in ("round", "duration_ms"):
+            for key in ("round", "duration_ms", "input_tokens", "output_tokens", "reasoning_tokens", "tool_calls"):
                 item = value.get(key)
                 if type(item) in {int, float} and math.isfinite(item) and item >= 0:
                     result[key] = item
+            value = value.get("started_at")
+            if isinstance(value, str) and re.fullmatch(r"\d{4}-\d{2}-\d{2}T[0-9:.+Z-]{8,40}", value):
+                result["started_at"] = value
             return result
 
         def report_summary(report):
@@ -1063,6 +1083,7 @@ class Platform:
             refinement_of=job.get("refinement_of"), resumed_from=job.get("resumed_from"),
             started_at=job.get("started_at"), finished_at=job.get("finished_at"),
             duration_ms=job.get("duration_ms"),
+            active_operation=timing(job.get("active_operation")),
             timings=[timing(item) for item in job.get("timings", []) if isinstance(item, dict)],
             usage=[usage(item) for item in job.get("usage", [])],
             usage_by_stage={stage: [usage(item) for item in job.get("usage_by_stage", {}).get(stage, [])]

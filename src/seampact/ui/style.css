@@ -43,7 +43,27 @@ button, input, select, textarea { -webkit-tap-highlight-color: transparent; }
 .chat-header { display: flex; justify-content: space-between; align-items: center; gap: 16px; padding: 23px 32px 20px; border-bottom: 1px solid var(--line); }
 .eyebrow { color: var(--muted); font-size: 10px; font-weight: 600; letter-spacing: 1.6px; }
 .chat-heading h1 { margin-top: 3px; font-size: 18px; font-weight: 600; letter-spacing: -.3px; }
-.header-actions { display: flex; align-items: center; gap: 6px; min-width: 0; max-width: 60%; }
+.header-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; align-items: center; gap: 6px; min-width: 0; max-width: 75%; }
+.chat-heading { min-width: 0; }
+#chat-title { overflow-wrap: anywhere; }
+.chat-history { padding: 14px 24px; border-bottom: 1px solid var(--line); background: var(--soft); }
+.chat-history > label { font-size: 12px; font-weight: 600; }
+.chat-history > input { width: 100%; padding: 8px 10px; margin: 6px 0; border: 1px solid var(--line); border-radius: 7px; }
+.chat-history-list { max-height: 230px; overflow-y: auto; margin-top: 8px; display: grid; gap: 6px; }
+.chat-history-item { text-align: left; padding: 9px 12px; border: 1px solid var(--line); border-radius: 7px; background: white; color: var(--ink); }
+.chat-history-item strong, .chat-history-item span { display: block; overflow-wrap: anywhere; }
+.chat-history-item[aria-current="true"] { border-color: var(--accent); }
+.chat-history-item span { color: var(--muted); font-size: 11px; margin-top: 3px; }
+.chat-history-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 6px; align-items: center; }
+.chat-history-delete { color: var(--danger); }
+.resource-guide { margin: 12px 0; padding: 12px 16px; background: var(--soft); border-radius: 8px; font-size: 12px; }
+ol.resource-guide { padding-left: 32px; }
+.resource-guide li + li { margin-top: 6px; }
+.dependency-selection-note { margin: 8px 0; }
+.analysis-result-summary, .preprocessing-summary, .analysis-next-steps { margin: 16px 0; padding: 14px; border: 1px solid var(--line); border-radius: 9px; background: #fafcfb; }
+.preprocessing-summary h4, .analysis-next-steps h4 { margin: 0 0 8px; }
+.analysis-next-steps ol { padding-left: 20px; }
+.preprocessing-summary table td, .analysis-result-summary table td { overflow-wrap: anywhere; }
 .header-actions .status-pill { white-space: normal; overflow-wrap: anywhere; }
 .icon-button { display: inline-flex; align-items: center; justify-content: center; min-width: 34px; height: 34px; padding: 0 10px; border: 1px solid transparent; border-radius: 7px; background: transparent; color: #68756c; font-size: 13px; white-space: nowrap; }
 .icon-button:hover { color: var(--accent); background: #f0f4f1; }

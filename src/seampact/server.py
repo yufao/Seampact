@@ -4,7 +4,9 @@ import json
 import socket
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
+
+from . import __version__
 
 
 class PlatformHTTPServer(ThreadingHTTPServer):
@@ -24,20 +26,31 @@ def make_server(platform, port=8880, host="127.0.0.1", public_port=None):
 
         def send(self, status, value, mime="application/json; charset=utf-8"):
             data = json.dumps(value, ensure_ascii=False).encode() if isinstance(value, (dict, list)) else value
-            self.send_response(status)
-            self.send_header("Content-Type", mime)
-            self.send_header("Content-Length", str(len(data)))
-            self.send_header("Cache-Control", "no-store")
-            self.end_headers()
-            self.wfile.write(data)
+            try:
+                self.send_response(status)
+                self.send_header("Content-Type", mime)
+                self.send_header("Content-Length", str(len(data)))
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                self.wfile.write(data)
+            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                # Navigation or a closed tab can discard a polling response.
+                # The request's work is already done; do not write another
+                # error response to the disconnected browser socket.
+                self.close_connection = True
 
         def do_GET(self):
             path = urlsplit(self.path).path
             try:
                 if path == "/health":
-                    return self.send(200, dict(status="ok", version=platform.state()["version"]))
+                    return self.send(200, dict(status="ok", version=__version__))
                 if path == "/api/state":
                     return self.send(200, platform.state())
+                if path == "/api/chats":
+                    query = parse_qs(urlsplit(self.path).query).get("q", [""])[0]
+                    return self.send(200, platform.chat.conversations(query))
+                if path.startswith("/api/chats/"):
+                    return self.send(200, platform.chat.conversation(path.rsplit("/", 1)[1]))
                 if path == "/api/runtime/session":
                     return self.send(200, dict(session=platform.deployments.session))
                 if path.startswith("/api/analysis/revisions/"):
@@ -46,6 +59,8 @@ def make_server(platform, port=8880, host="127.0.0.1", public_port=None):
                     return self.send(200, platform.analysis_snapshot(path.split("/")[-2]))
                 if path.startswith("/api/analysis/"):
                     return self.send(200, platform.store.get("analysis", path.rsplit("/", 1)[1]))
+                if path.startswith("/api/preprocessing/") and path.endswith("/summary"):
+                    return self.send(200, platform.preprocessing_summary(path.split("/")[-2]))
                 if path.startswith("/api/preprocessing/"):
                     return self.send(200, platform.store.get("preprocessing", path.rsplit("/", 1)[1]))
                 if path.startswith("/api/scheduler/runs/"):
@@ -122,6 +137,10 @@ def make_server(platform, port=8880, host="127.0.0.1", public_port=None):
                 elif path == "/api/chat":
                     result = (platform.training.start_chat(body) if "scene_task_id" in body
                               else platform.chat.start(body))
+                elif path == "/api/chats/delete":
+                    result = platform.chat.delete_conversation(body["conversation_id"])
+                elif path == "/api/chats/restore":
+                    result = platform.chat.restore_conversation(body["conversation_id"])
                 elif path == "/api/scheduler/config":
                     result = platform.training.configure(body)
                 elif path == "/api/scheduler/runs":

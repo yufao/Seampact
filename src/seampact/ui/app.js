@@ -11,6 +11,14 @@ let state = null;
 let pendingTask = null;
 let refreshing = false;
 let connected = false;
+let activeChatId = null;
+let chatLegacy = false;
+let chatRestoring = false;
+let chatLoadVersion = 0;
+let historySearchVersion = 0;
+let historySearchTimer;
+const preparationSummaries = new Map();
+const preparationErrors = new Map();
 const analysisSubmitting = new Set();
 const sourceUpdating = new Set();
 const revisionDetails = new Map();
@@ -264,6 +272,7 @@ function navigatePage(href, push = true) {
   activePageUrl = target.pathname + target.search;
   inspectPage = target.pathname === '/inspect';
   configurationPage = target.pathname === '/configuration';
+  if (inspectPage || configurationPage) { chatLoadVersion += 1; chatRestoring = false; }
   inspectQuery = new URLSearchParams(target.search);
   inspectView = viewNames[inspectQuery.get('view')] ? inspectQuery.get('view') : 'analyses';
   configSection = configNames[inspectQuery.get('section')] ? inspectQuery.get('section') : 'models';
@@ -272,6 +281,7 @@ function navigatePage(href, push = true) {
   document.querySelector('.config-body').scrollTop = configurationScroll.get(configSection) || 0;
   if (inspectPage) document.querySelector('.observer-scroll').scrollTop = observerScroll.get(target.pathname + target.search) || 0;
   renderedSections.clear();
+  if (!inspectPage && !configurationPage) restoreChatFromLocation();
   if (state) refresh();
 }
 
@@ -385,10 +395,113 @@ function appendMessage(role, text) {
   return {item, body, meta};
 }
 
+function setChatAddress(identity, push = false) {
+  const url = identity ? '/?chat=' + encodeURIComponent(identity) : '/';
+  history[push ? 'pushState' : 'replaceState'](null, '', url);
+  activePageUrl = url;
+  for (const link of document.querySelectorAll('.chat-navigation')) link.href = url;
+}
+
+function resetChat(push = true) {
+  if (pendingTask || chatRestoring) return;
+  chatLoadVersion += 1;
+  activeChatId = null; chatLegacy = false; messages.length = 0;
+  $('conversation').replaceChildren();
+  const welcome = node('div', undefined, 'welcome');
+  welcome.append(node('h2', '有什么想一起完成的？'), node('p', '发送消息开始新对话；历史会话仍保留。'));
+  $('conversation').append(welcome);
+  $('chat-title').textContent = '新对话';
+  $('chat-input').value = ''; $('scene-task-selector').value = '';
+  setChatAddress(null, push); showNotice(''); resizeComposer();
+  if (!$('chat-history').hidden) loadChatHistory();
+}
+
+async function loadChatHistory() {
+  const version = ++historySearchVersion;
+  const root = $('chat-history-list');
+  try {
+    const result = await api('/api/chats?q=' + encodeURIComponent($('chat-history-search').value.trim()));
+    if (version !== historySearchVersion) return;
+    root.replaceChildren();
+    for (const chat of result.conversations || []) {
+      const button = node('button', undefined, 'chat-history-item'); button.type = 'button';
+      button.setAttribute('aria-current', String(chat.id === activeChatId));
+      const time = chat.updated_at ? new Date(chat.updated_at).toLocaleString('zh-CN') : '时间未记录';
+      button.append(node('strong', chat.title), node('span', time + ' · ' + statusLabel(chat.status) +
+        ' · ' + chat.turns + ' 轮' + (chat.legacy ? ' · 仅保存回答' : '')));
+      button.disabled = Boolean(pendingTask) || chatRestoring;
+      button.onclick = () => loadConversation(chat.id, true);
+      const row = node('div', undefined, 'chat-history-row');
+      const remove = node('button', '删除', 'icon-button chat-history-delete'); remove.type = 'button';
+      remove.setAttribute('aria-label', '删除会话：' + chat.title);
+      remove.disabled = Boolean(pendingTask) || chatRestoring || chat.status === 'RUNNING';
+      remove.onclick = () => deleteConversation(chat.id, remove);
+      row.append(button, remove); root.append(row);
+    }
+    if (!root.childElementCount) empty(root, '没有匹配的历史会话。');
+  } catch (error) { if (version === historySearchVersion) root.replaceChildren(node('p', error.message, 'message-error')); }
+}
+
+async function deleteConversation(identity, button) {
+  button.disabled = true;
+  const feedback = $('chat-history-feedback');
+  try {
+    await api('/api/chats/delete', {conversation_id: identity});
+    if (identity === activeChatId) resetChat(false);
+    feedback.replaceChildren(node('span', '会话已从历史删除，任务执行记录保留。'));
+    const undo = node('button', '撤销删除', 'icon-button'); undo.type = 'button';
+    undo.onclick = async () => {
+      undo.disabled = true;
+      try {
+        await api('/api/chats/restore', {conversation_id: identity});
+        feedback.replaceChildren(node('span', '会话已恢复。')); await loadChatHistory();
+      } catch (error) { feedback.replaceChildren(node('span', error.message, 'message-error')); }
+    };
+    feedback.append(undo); await loadChatHistory();
+  } catch (error) {
+    feedback.replaceChildren(node('span', error.message, 'message-error')); button.disabled = false;
+  }
+}
+
+async function loadConversation(identity, push = false) {
+  if (pendingTask || chatRestoring) return;
+  const version = ++chatLoadVersion;
+  chatRestoring = true; updateComposer();
+  try {
+    const chat = await api('/api/chats/' + encodeURIComponent(identity));
+    if (version !== chatLoadVersion) return;
+    activeChatId = chat.id; chatLegacy = chat.legacy; messages.splice(0, messages.length, ...chat.messages);
+    $('conversation').replaceChildren();
+    for (const message of messages) appendMessage(message.role, responseText(message.content));
+    const first = messages.find(message => message.role === 'user');
+    $('chat-title').textContent = chat.legacy ? '旧对话记录' : first ? responseText(first.content).slice(0, 32) : '对话';
+    $('chat-input').value = ''; $('scene-task-selector').value = '';
+    const task = chat.task;
+    if (task.status === 'RUNNING') {
+      const output = appendMessage('assistant', '正在运行…'); output.item.classList.add('message-pending');
+      pendingTask = {id: task.id, output, sceneTaskId: null};
+    } else if (!['COMPLETED', 'SUCCEEDED'].includes(task.status)) {
+      const output = appendMessage('assistant', task.error || statusLabel(task.status)); output.item.classList.add('message-error');
+    }
+    setChatAddress(chat.id, push);
+    showNotice(chat.legacy ? '这条旧记录只保存了回答，原问题无法恢复。请新建对话继续。' : '');
+    $('chat-history').hidden = true; $('toggle-chat-history').setAttribute('aria-expanded', 'false');
+  } catch (error) { showNotice(error.message); }
+  finally { if (version === chatLoadVersion) { chatRestoring = false; resizeComposer(); } }
+}
+
+function restoreChatFromLocation() {
+  const identity = new URLSearchParams(location.search).get('chat');
+  if (pendingTask && identity !== activeChatId) { setChatAddress(activeChatId); return; }
+  if (identity && identity !== activeChatId) loadConversation(identity);
+  else if (!identity && activeChatId && !pendingTask) resetChat(false);
+}
+
 function hydrateSceneTasks() {
   const selector = $('scene-task-selector');
   const active = researchState().active_checkpoint;
   const tasks = Array.isArray(active?.task_ids) ? active.task_ids : [];
+  $('scene-task-label').hidden = tasks.length === 0;
   const signature = JSON.stringify([active?.run_id, active?.scene_id, tasks]);
   if (selector.dataset.options !== signature) {
     const selected = selector.dataset.binding === active?.run_id ? selector.value : '';
@@ -408,11 +521,14 @@ function updateComposer() {
   const selectedSceneTask = $('scene-task-selector').value;
   const active = researchState().active_checkpoint;
   const ready = connected && (selectedSceneTask ? Boolean(active?.run_id) : isReady(state?.models?.chat));
-  $('send-message').disabled = !ready || Boolean(pendingTask) || !$('chat-input').value.trim();
+  $('send-message').disabled = !ready || Boolean(pendingTask) || chatRestoring || (chatLegacy && !selectedSceneTask) || !$('chat-input').value.trim();
+  $('new-chat').disabled = Boolean(pendingTask) || chatRestoring;
   $('scene-task-selector').disabled = Boolean(pendingTask);
   $('send-message').querySelector('.send-label').textContent = pendingTask ? '运行中' : selectedSceneTask ? '运行任务' : '发送';
   $('chat-input').placeholder = selectedSceneTask ? '如：运行所选任务（文字仅作为本次运行附言）' : '发送消息…';
   $('composer-hint').textContent = selectedSceneTask ? '执行已保存场景任务，不改写原任务；文字作为运行附言记录。' : 'Enter 发送 · Shift + Enter 换行';
+  if (chatRestoring) $('composer-hint').textContent = '正在读取历史会话…';
+  else if (chatLegacy && !selectedSceneTask) $('composer-hint').textContent = '此旧记录没有保存问题，请点击“新对话”。';
   $('chat-model-name').textContent = selectedSceneTask ? '冻结策略 · ' + (active?.scene_id || '已保存场景') :
     isReady(state?.models?.chat) ? state.models.chat.model : '对话模型未配置';
   $('chat-model-name').className = 'status-pill ' + ((selectedSceneTask ? active?.run_id : isReady(state?.models?.chat)) ? 'ready' : 'pending');
@@ -432,7 +548,8 @@ async function sendMessage(event) {
   const content = $('chat-input').value.trim();
   const sceneTaskId = $('scene-task-selector').value;
   const sceneRunId = researchState().active_checkpoint?.run_id;
-  if (!content || pendingTask || !connected || (sceneTaskId ? !sceneRunId : !isReady(state?.models?.chat))) return;
+  if (!content || pendingTask || chatRestoring || (chatLegacy && !sceneTaskId) || !connected ||
+      (sceneTaskId ? !sceneRunId : !isReady(state?.models?.chat))) return;
   if (!sceneTaskId) messages.push({role: 'user', content});
   const user = appendMessage('user', content);
   if (sceneTaskId) user.meta.textContent = '运行附言 · 已保存任务 ' + sceneTaskId + ' · 不改写原任务';
@@ -444,10 +561,15 @@ async function sendMessage(event) {
   updateComposer();
   showNotice('');
   try {
-    const body = sceneTaskId ? {scene_task_id: sceneTaskId, scene_run_id: sceneRunId, messages: [{role: 'user', content}]} : {messages};
+    const body = sceneTaskId ? {scene_task_id: sceneTaskId, scene_run_id: sceneRunId, messages: [{role: 'user', content}]} :
+      {messages, ...(activeChatId ? {conversation_id: activeChatId} : {})};
     const result = await api('/api/chat', body);
     if (!result.task_id) throw new Error('平台未返回任务 ID');
     pendingTask.id = result.task_id;
+    if (!sceneTaskId && result.conversation_id) {
+      activeChatId = result.conversation_id; setChatAddress(activeChatId);
+      $('chat-title').textContent = responseText(messages.find(message => message.role === 'user')?.content || '对话').slice(0, 32);
+    }
     output.body.textContent = '正在运行…';
     await refresh();
   } catch (error) {
@@ -455,6 +577,7 @@ async function sendMessage(event) {
     output.item.classList.remove('message-pending');
     output.item.classList.add('message-error');
     pendingTask = null;
+    if (!$('chat-history').hidden) loadChatHistory();
     updateComposer();
   }
 }
@@ -482,6 +605,7 @@ function synchronizeTask() {
     }
     pendingTask = null;
     updateComposer();
+    if (!$('chat-history').hidden) loadChatHistory();
   }
   if (nearBottom) output.item.scrollIntoView({block: 'end', behavior: 'auto'});
 }
@@ -1047,6 +1171,62 @@ function renderDeployments() {
   }
 }
 
+function updateAnalysisClocks() {
+  for (const element of document.querySelectorAll('[data-analysis-operation-start]')) {
+    const started = Date.parse(element.dataset.analysisOperationStart);
+    if (Number.isFinite(started)) element.textContent = element.dataset.analysisOperationLabel +
+      ' · 已等待 ' + (Math.max(0, Date.now() - started) / 1000).toFixed(0) + ' 秒';
+  }
+}
+
+function analysisTimingDetails(root, job, timings) {
+  const models = timings.filter(item => item.phase === 'model_request');
+  const records = Array.isArray(job.usage) ? job.usage : [];
+  if (models.length) {
+    const slowest = [...models].sort((left, right) => (right.duration_ms || 0) - (left.duration_ms || 0))[0];
+    root.append(node('p', '最慢模型请求：第 ' + slowest.round + ' 轮 · ' +
+      ((slowest.duration_ms || 0) / 1000).toFixed(1) + ' 秒', 'card-meta'));
+    const detail = node('details'); detail.append(node('summary', '逐轮模型耗时与输出 · ' + models.length + ' 次请求'));
+    const table = node('table', undefined, 'research-metrics analysis-usage');
+    const head = node('tr');
+    for (const name of ['轮次 / 阶段', '等待秒', '输出 token', '其中推理', '工具数']) head.append(node('th', name));
+    const thead = node('thead'); thead.append(head); table.append(thead);
+    const body = node('tbody');
+    models.forEach((item, index) => {
+      const usage = records[index] || {};
+      const output = item.output_tokens ?? usage.completion_tokens ?? usage.output_tokens;
+      const reasoning = item.reasoning_tokens ?? usage.completion_tokens_details?.reasoning_tokens ?? usage.output_tokens_details?.reasoning_tokens;
+      const row = node('tr');
+      row.append(node('td', item.round + ' / ' + ({preprocessing: '预处理', analysis: '拆分'}[item.stage] || item.stage || '未记录')),
+        node('td', ((item.duration_ms || 0) / 1000).toFixed(1)),
+        node('td', Number.isFinite(output) ? output.toLocaleString('zh-CN') : '未报告'),
+        node('td', Number.isFinite(reasoning) ? reasoning.toLocaleString('zh-CN') : '未报告'),
+        node('td', Number.isFinite(item.tool_calls) ? item.tool_calls : '未记录'));
+      body.append(row);
+    });
+    table.append(body); detail.append(table,
+      node('p', '请求等待包含服务端排队、网络传输与生成；非流式记录无法将三者分别计时。', 'card-note'));
+    root.append(detail);
+  }
+  const tools = timings.filter(item => item.tool).sort((left, right) => (right.duration_ms || 0) - (left.duration_ms || 0));
+  if (tools.length) {
+    const detail = node('details'); detail.append(node('summary', '工具耗时 · 按耗时降序'));
+    const table = node('table', undefined, 'research-metrics analysis-usage');
+    const head = node('tr');
+    for (const name of ['轮次', '工具', '耗时秒', '结果']) head.append(node('th', name));
+    const thead = node('thead'); thead.append(head); table.append(thead);
+    const body = node('tbody');
+    for (const item of tools) {
+      const row = node('tr');
+      row.append(node('td', item.round), node('td', item.tool), node('td', ((item.duration_ms || 0) / 1000).toFixed(3)),
+        node('td', {completed: '已返回', failed: '失败', cancelled: '已取消'}[item.outcome] || '未记录'));
+      body.append(row);
+    }
+    table.append(body); detail.append(table); root.append(detail);
+  }
+  detailValue(root, '耗时原始字段', timings);
+}
+
 function analysisProgress(job) {
   const root = node('div', undefined, 'analysis-progress');
   const preparation = job.preprocessing || {};
@@ -1067,9 +1247,20 @@ function analysisProgress(job) {
     stages.append(step);
   }
   root.append(stages);
-  if (job.phase) root.append(node('p', '当前操作：' + ({model_request: '等待模型响应', source_tools: '读取源码与核对候选',
+  if (job.phase) root.append(node('p', (active || job.status === 'CANCELLING' ? '当前操作：' : '最后操作：') + ({model_request: '等待模型响应', source_tools: '读取源码与核对候选',
     binding_installation: '安装资源绑定', installation: '安装能力入口'}[job.phase] || job.phase), 'card-meta'));
   if (job.status === 'CANCELLING') root.append(node('p', '正在结束本次分析；取消后保留已保存进度，不再安装本次候选。', 'card-note'));
+  const operation = job.active_operation;
+  if (operation?.started_at && active) {
+    const clock = node('p', undefined, 'card-meta');
+    clock.dataset.analysisOperationStart = operation.started_at;
+    clock.dataset.analysisOperationLabel = operation.phase === 'model_request' ? '第 ' + operation.round + ' 轮模型请求' :
+      operation.tool ? '正在执行 ' + operation.tool : '正在核对 ' + (operation.phase || '分析条件');
+    root.append(clock);
+    const started = Date.parse(operation.started_at);
+    clock.textContent = clock.dataset.analysisOperationLabel + (Number.isFinite(started) ?
+      ' · 已等待 ' + (Math.max(0, Date.now() - started) / 1000).toFixed(0) + ' 秒' : '');
+  }
   const timings = Array.isArray(job.timings) ? job.timings : [];
   if (timings.length) {
     const milliseconds = value => (value / 1000).toFixed(1) + ' 秒';
@@ -1078,9 +1269,13 @@ function analysisProgress(job) {
     const latest = timings.filter(item => item.phase === 'model_request').at(-1);
     root.append(node('p', '模型累计等待 ' + milliseconds(modelTime) + ' · 工具累计 ' + milliseconds(toolTime) +
       (latest ? ' · 最近一轮模型 ' + milliseconds(latest.duration_ms || 0) : ''), 'card-meta'));
-    if (inspectPage) detailValue(root, '分阶段耗时记录（毫秒）', timings);
+    if (inspectPage) analysisTimingDetails(root, job, timings);
   }
   const usage = Array.isArray(job.usage) ? job.usage : [];
+  if (!usage.length && reusedCandidate) {
+    root.append(node('p', '本次沿用已有候选，仅检查或安装接入结果；未调用分析模型。', 'card-note'));
+    return root;
+  }
   const table = node('table', undefined, 'research-metrics analysis-usage');
   const header = node('tr');
   for (const label of ['阶段', '响应记录', '输入 token', '输出 token', '总 token']) header.append(node('th', label));
@@ -1258,10 +1453,12 @@ function renderRevisionWorkspace(card, harness, job) {
     detailValue(workspace, '已保存候选相对父候选的差异', revision.candidate_diff);
     if (stale) workspace.append(node('p', revision.stale_reason || '父分析或来源条件已改变，此草稿只读；请从当前分析创建新修订。', 'card-note'));
     if (draft.dirty) detailValue(workspace, '服务器已保存的完整候选（本地未保存编辑另行保留）', revision.candidate);
-    const editor = revisionInput(workspace, '完整候选 JSON（人工编辑）', draft.candidate, id + ':candidate', value => {
+    const advanced = node('details'); advanced.append(node('summary', '高级：编辑完整候选 JSON'));
+    const editor = revisionInput(advanced, '完整候选 JSON（人工编辑）', draft.candidate, id + ':candidate', value => {
       draft.candidate = value; changed();
     }, true);
     editor.classList.add('revision-candidate'); editor.spellcheck = false;
+    workspace.append(advanced);
     const guidance = revisionInput(workspace, '局部修复提示／关注范围', draft.guidance, id + ':guidance', value => {
       draft.guidance = value; changed();
     }, true);
@@ -1289,7 +1486,7 @@ function renderRevisionWorkspace(card, harness, job) {
     workspace.append(node('p', '局部修复会调用当前配置的分析模型：' + (state.models?.analysis?.model || '尚未配置') +
       '。保存和机械重检不调用模型。', 'card-note'));
     if (revision.error) workspace.append(node('p', textValue(revision.error), 'message-error'));
-    detailValue(workspace, '当前完整检查报告（逐项条件与失败原因）', revision.report, true);
+    detailValue(workspace, '当前完整检查报告（逐项条件与失败原因）', revision.report);
     const attempt = (state.analyses || []).find(item => item.id === revision.analysis_id);
     if (attempt) {
       workspace.append(node('p', '本次模型尝试：' + attempt.id + ' · ' + statusLabel(attempt.status), 'card-meta'), analysisProgress(attempt));
@@ -1300,6 +1497,183 @@ function renderRevisionWorkspace(card, harness, job) {
     if (revision.installed_analysis_id) workspace.append(node('p', '安装后的分析身份：' + revision.installed_analysis_id, 'card-meta'));
   }
   card.append(workspace);
+}
+
+function issueText(issue) {
+  if (typeof issue === 'string') return ({
+    'configurable dependency needs original parameter mappings': '已发现资源需求，但尚未建立到原代码参数的有效映射',
+    'required source resource mapping is unresolved': '必需资源与原代码参数的映射未解决',
+    'no functional target was discovered': '尚未识别到原功能目标',
+    'no native entry candidate was discovered': '尚未找到原生入口候选'
+  })[issue] || issue;
+  if (!issue || typeof issue !== 'object') return '条件尚未确定';
+  return [issue.path || issue.id || issue.field, issue.reason || issue.description || issue.detail || issue.message || issue.condition]
+    .filter(value => typeof value === 'string').map(issueText).join(' · ') || '查看原始记录中的条件说明';
+}
+
+async function refreshPreparationSummaries() {
+  if (!inspectPage || inspectView !== 'analyses') return;
+  const jobs = (state.analyses || []).filter(job => !selectedSource() || job.harness_id === selectedSource());
+  const ids = [...new Set(jobs.map(job => job.preprocessing?.artifact_id).filter(Boolean))];
+  await Promise.allSettled(ids.filter(id => !preparationSummaries.has(id) && !preparationErrors.has(id)).map(async id => {
+    try { preparationSummaries.set(id, await api('/api/preprocessing/' + encodeURIComponent(id) + '/summary')); }
+    catch (error) { preparationErrors.set(id, error.message); }
+  }));
+}
+
+function preprocessingSummary(job) {
+  const prep = job.preprocessing;
+  if (!prep) return null;
+  const root = node('section', undefined, 'preprocessing-summary');
+  root.append(node('h4', '预处理：先了解仓库'));
+  root.append(node('p', '分析器先查找原功能入口、初始化方式和外部依赖，再把这些发现交给后续拆分分析。保存的“工件”就是这份中间结果。', 'card-note'));
+  root.append(node('p', ({api: '本次自动分析源码', replay: '复用已保存的发现', none: '本次跳过预处理'}[prep.mode] || prep.mode) +
+    ' · ' + statusLabel(prep.status) + '；本阶段不运行原功能，也不接入能力池。', 'card-note'));
+  const summary = preparationSummaries.get(prep.artifact_id);
+  if (summary) {
+    if (summary.goal) root.append(node('p', '识别目标（分析器描述）：' + summary.goal, 'card-note'));
+    root.append(node('p', '发现 ' + summary.targets.length + ' 个功能位置、提出 ' + summary.entries.length +
+      ' 个入口候选、记录 ' + summary.dependency_count + ' 项外部依赖。候选会在后续阶段继续检查和调整。', 'card-note'));
+    const detail = node('details'); detail.append(node('summary', '发现的原功能与候选入口'));
+    const table = node('table', undefined, 'research-metrics');
+    const head = node('tr');
+    for (const text of ['原功能（分析器描述）', '源码位置', '用途类别']) head.append(node('th', text));
+    const thead = node('thead'); thead.append(head); table.append(thead);
+    const body = node('tbody');
+    const roles = {online: '在线调用', offline: '离线处理／评测', initialization: '初始化', cleanup: '清理', mixed: '混合', unknown: '未确定'};
+    for (const target of summary.targets) {
+      const row = node('tr'); row.append(node('td', target.purpose || target.symbol),
+        node('td', (target.path || '') + ' · ' + (target.symbol || '')), node('td', roles[target.execution_role] || '未确定')); body.append(row);
+    }
+    table.append(body); detail.append(table);
+    for (const entry of summary.entries) detail.append(node('p', entry.symbol + ' · ' +
+      (entry.status === 'READY' ? '预处理时静态可绑定' : '预处理时仍缺条件') +
+      (entry.reason ? '：' + issueText(entry.reason) : ''), 'card-note'));
+    root.append(detail);
+    const issues = [...summary.missing, ...summary.issues];
+    if (issues.length) {
+      const gaps = node('details'); gaps.append(node('summary', '预处理时未解决的条件 · ' + issues.length));
+      const list = node('ul'); for (const issue of issues) list.append(node('li', issueText(issue)));
+      gaps.append(list, node('p', '这些是当时的发现；当前接入状态请看分析结论和下方补齐指引。', 'card-note')); root.append(gaps);
+    }
+  } else if (preparationErrors.has(prep.artifact_id)) {
+    root.append(node('p', '摘要暂时无法读取：' + preparationErrors.get(prep.artifact_id), 'card-note'));
+    const retry = node('button', '重新读取摘要', 'secondary-button'); retry.onclick = async () => {
+      preparationErrors.delete(prep.artifact_id); await refresh();
+    }; root.append(retry);
+  }
+  if (inspectPage) {
+    const original = node('details'); original.append(node('summary', '预处理技术记录'));
+    if (prep.artifact_id) {
+      original.append(node('p', '记录编号：' + prep.artifact_id, 'card-meta'));
+      const link = node('a', '查看完整预处理 JSON'); link.href = '/api/preprocessing/' + encodeURIComponent(prep.artifact_id);
+      link.target = '_blank'; original.append(link);
+    }
+    detailValue(original, '原始检查反馈', prep.report); root.append(original);
+  }
+  return root;
+}
+
+async function prepareRepair(harness, job) {
+  if (revisionBusy.has(job.id)) return;
+  revisionBusy.add(job.id);
+  try {
+    const created = await api('/api/analysis/revisions', {analysis_id: job.id, mode: 'refine'});
+    const guidance = '请沿已发现的原目标检查未解决的依赖、原参数映射及受控边界。补充原源码证据和现有规则支持的映射；不能通过无关辅助入口、假资源或手写来源包装消除缺口。不能覆盖的条件保留具体 MISSING。';
+    const saved = await api('/api/analysis/revisions/save', {revision_id: created.revision.id,
+      candidate: created.revision.candidate, guidance, reason: '补齐当前来源的接入缺口'});
+    acceptRevision(saved.revision); revisionSelected.set(job.id, saved.revision.id);
+    showNotice('修复草稿和缺口提示已准备。请在下方工作台补充信息，再点击“调用当前分析模型局部修复”；修复后完整重检并独立安装。');
+  } catch (error) { showNotice(error.message); }
+  finally { revisionBusy.delete(job.id); renderedSections.delete('analyses'); await refresh(); }
+}
+
+function analysisNextSteps(harness, job) {
+  if (job?.id !== harness.analysis_id || job?.status !== 'COMPLETED' || !job.submitted?.candidate) return null;
+  const root = node('section', undefined, 'analysis-next-steps'); root.append(node('h4', '补齐条件与接入'));
+  const list = node('ol');
+  list.append(node('li', '缺服务或权重：先在配置中登记并检查资源，再在下方“依赖配置”选择对应资源。保存选择会重新核对并接入满足条件的入口，不再调用分析模型。'),
+    node('li', '缺参数映射、源码依据或宿主支持：先修复候选；仅选择资源不能解决。可创建带缺口提示的修复草稿，用分析模型修复后完整重检，再独立安装。宿主规则未覆盖时须修通用实现，不能强行接入。'),
+    node('li', '文件位置或运行环境已补齐：重新检查现有候选并接入。成功后到能力池查看具体入口；静态可绑定之后仍需实际调用核对。'));
+  root.append(list);
+  const actions = node('div', undefined, 'harness-actions');
+  for (const [section, text] of [['services', '配置服务连接'], ['weights', '配置权重资源'], ['harnesses', '配置运行环境']]) {
+    const link = node('a', text, 'secondary-button'); link.href = '/configuration?section=' + section; actions.append(link);
+  }
+  const repair = node('button', '创建接入修复草稿', 'secondary-button'); repair.type = 'button';
+  repair.disabled = revisionBusy.has(job.id) || ['DETACHED', 'ANALYZING'].includes(harness.status); repair.onclick = () => prepareRepair(harness, job);
+  const recheck = node('button', '重新检查并接入可用入口', 'secondary-button'); recheck.type = 'button';
+  recheck.disabled = revisionBusy.has(job.id) || ['DETACHED', 'ANALYZING'].includes(harness.status);
+  recheck.onclick = async () => {
+    if (revisionBusy.has(job.id)) return;
+    revisionBusy.add(job.id); recheck.disabled = true; recheck.textContent = '正在完整检查…';
+    try {
+      const created = await api('/api/analysis/revisions', {analysis_id: job.id, mode: 'refine'});
+      revisionSelected.set(job.id, created.revision.id);
+      const checked = await api('/api/analysis/revisions/check', {revision_id: created.revision.id});
+      acceptRevision(checked.revision);
+      if (checked.revision.status !== 'CHECKED') throw new Error(checked.revision.error || '候选检查未完成，请查看修订反馈');
+      await api('/api/analysis/revisions/install', {revision_id: created.revision.id});
+      showNotice('已按当前资源重新检查并安装；满足条件的入口可在能力池查看，仍缺条件的入口继续显示待接入。本次未调用分析模型。');
+    } catch (error) { showNotice(error.message); }
+    finally { revisionBusy.delete(job.id); renderedSections.delete('analyses'); await refresh(); }
+  };
+  const pool = inspectLink('units', {harness: harness.id}); pool.textContent = '查看该来源的能力池';
+  actions.append(repair, recheck, pool); root.append(actions);
+  return root;
+}
+
+function analysisResultSummary(job) {
+  const candidate = job.submitted?.candidate;
+  const report = job.submitted?.report;
+  const bindings = report?.entry_bindings;
+  if (!candidate || !bindings || !Array.isArray(bindings.entries)) return null;
+  const root = node('section', undefined, 'analysis-result-summary');
+  root.append(node('h4', '本次分析结论'));
+  const ready = bindings.entries.filter(entry => entry.status === 'READY').length;
+  const missing = bindings.entries.filter(entry => entry.status === 'MISSING').length;
+  root.append(node('p', '发现 ' + bindings.entries.length + ' 个入口：' + ready + ' 个静态可绑定，' + missing +
+    ' 个缺少执行条件。' + (['COMPLETED', 'FAILED', 'CANCELLED', 'INTERRUPTED'].includes(job.status) ?
+      '分析任务已结束。' : '分析仍在进行。'), 'card-note'));
+  root.append(node('p', '静态可绑定表示源码与绑定条件已核对；实际初始化、执行结果和任务效果另见任务记录。', 'card-note'));
+  const entries = new Map((candidate.entries || []).map(entry => [entry.id, entry]));
+  const reasons = {'required source resource mapping is unresolved': '必需资源与原参数的映射未解决',
+    'no bindable native entry was discovered': '尚未找到可绑定的原生入口'};
+  const table = node('table', undefined, 'research-metrics analysis-usage');
+  const header = node('tr');
+  for (const title of ['入口与用途（分析器描述）', '静态绑定', '当前条件']) header.append(node('th', title));
+  const thead = node('thead'); thead.append(header); table.append(thead);
+  const body = node('tbody');
+  for (const result of bindings.entries) {
+    const entry = entries.get(result.id) || {};
+    const cell = node('td');
+    const title = entry.capability?.goal || entry.description || result.id;
+    cell.append(node('p', String(title).split(/[。\n]/)[0]), node('code', (result.path || entry.path || '') +
+      ((result.symbol || entry.symbol) ? ' · ' + (result.symbol || entry.symbol) : '')));
+    const row = node('tr');
+    row.append(cell, node('td', {READY: '静态可绑定', MISSING: '缺少条件'}[result.status] || statusLabel(result.status)),
+      node('td', result.reason ? reasons[result.reason] || result.reason : bindings.initialization === 'NOT_RUN' ? '本报告未执行初始化' : '查看具体检查结果'));
+    body.append(row);
+  }
+  table.append(body); root.append(table);
+  const modes = {W: '整体包装', H: '原生交接', R: '有限局部重构'};
+  const boundaries = Array.isArray(candidate.boundaries) ? candidate.boundaries : [];
+  if (boundaries.length) {
+    const counts = {};
+    for (const boundary of boundaries) counts[boundary.mode] = (counts[boundary.mode] || 0) + 1;
+    root.append(node('p', '受控边界：' + Object.entries(counts).map(([mode, count]) => count + ' 处' +
+      (modes[mode] || mode) + '（' + mode + '）').join('；') + '。边界数不等于可独立调用的入口数。', 'card-note'));
+  }
+  if (!boundaries.length) root.append(node('p', '本次候选未提出受控边界；入口识别结果不代表已完成有效拆分。', 'card-note'));
+  const grouping = bindings.runtime_groups;
+  if (Array.isArray(grouping?.groups)) {
+    root.append(node('p', '模型建议 ' + (candidate.runtime_groups || []).length + ' 个运行组，规则检查后为 ' +
+      grouping.groups.length + ' 个。' + (grouping.proposal_status === 'REPAIRED_CONSERVATIVELY' ?
+        '分组建议存在未决条件，检查器按当前规则保守归组。' : ''), 'card-note'));
+    for (const group of grouping.groups) root.append(node('p', (group.same_process ? '保留同一进程' : '按检查后的组运行') +
+      ' · ' + statusLabel(group.status) + ' · ' + (group.entries || []).length + ' 个入口', 'card-meta'));
+  }
+  return root;
 }
 
 function renderAnalyses() {
@@ -1319,26 +1693,15 @@ function renderAnalyses() {
     const head = node('div', undefined, 'card-heading');
     head.append(node('strong', harness.name || harness.address), pill(harness.status === 'DETACHED' ? 'DETACHED' : job?.status || harness.status));
     card.append(head, node('p', harness.address, 'card-meta'));
+    if ((!job || job.id === harness.analysis_id) && harness.root) card.append(node('p', '当前本地源码目录：' + harness.root, 'resource-path'));
     const files = entryCount(harness.files);
     if (files !== null) card.append(node('p', files + ' 份可读文件' + (typeof harness.inventory_count === 'number' ? ' · 仓库共 ' + harness.inventory_count + ' 项文件' : ''), 'card-meta'));
     if (job?.rounds !== undefined) card.append(node('p', '分析模型响应 ' + job.rounds + ' 轮', 'card-meta'));
     if (job) card.append(analysisProgress(job));
-    if (job?.preprocessing) {
-      const prep = job.preprocessing;
-      card.append(node('p', '自动预处理：' + prep.mode + ' · ' + statusLabel(prep.status) +
-        (job.pipeline_stage === 'preprocessing' ? ' · 当前运行' : ''), 'card-meta'));
-      if (prep.artifact_id) card.append(node('p', '预处理工件：' + prep.artifact_id, 'card-meta'));
-      if (inspectPage) {
-        detailValue(card, '预处理绑定候选反馈', prep.report);
-        detailValue(card, '预处理／拆分分别用量', job.usage_by_stage);
-        if (prep.artifact_id) {
-          const artifact = node('a', '查看预处理原始工件');
-          artifact.href = '/api/preprocessing/' + encodeURIComponent(prep.artifact_id);
-          artifact.target = '_blank';
-          card.append(artifact);
-        }
-      }
-    }
+    const resultSummary = job && analysisResultSummary(job);
+    if (resultSummary) card.append(resultSummary);
+    const preparation = job && preprocessingSummary(job);
+    if (preparation) card.append(preparation);
     if (inspectPage) {
       const sourceVersion = job?.submitted?.report?.source_version || job?.source_version;
       card.append(node('p', '本记录冻结源码版本：' + (sourceVersion || '未提供；以原分析工件为准'), 'card-meta'));
@@ -1373,7 +1736,11 @@ function renderAnalyses() {
     const entryReport = job?.submitted?.report?.entry_bindings;
     if (entryReport) detailValue(card, '入口绑定与缺失判断', entryReport);
     if (inspectPage && job?.submitted?.report) detailValue(card, '边界检查完整报告', job.submitted.report);
-    if (inspectPage && (!job || job.id === harness.analysis_id)) harnessDependencies(card, harness);
+    if (inspectPage && (!job || job.id === harness.analysis_id)) {
+      const next = analysisNextSteps(harness, job);
+      if (next) card.append(next);
+      harnessDependencies(card, harness);
+    }
     const actions = node('div', undefined, 'harness-actions');
     if (!inspectPage) actions.append(inspectLink('analyses', {harness: harness.id}));
     if (job?.id) actions.append(analysisExportButton(job));
@@ -2171,6 +2538,7 @@ function renderWeights() {
 function harnessDependencies(card, harness) {
   const dependencies = entries(resourceState().dependencies).filter(item => (item.source_id || item.harness_id) === harness.id);
   const detail = node('details', undefined, 'dependency-details');
+  detail.open = dependencies.some(dependency => dependency.status !== 'MAPPING_CHECKED');
   detail.append(node('summary', '依赖配置 · ' + dependencies.length + ' 项分析器需求'));
   if (!dependencies.length) {
     detail.append(node('p', '尚未形成依赖需求。先由分析器读取原库；已登记的服务或权重不会自动制造入口或参数映射。', 'card-note'));
@@ -2184,9 +2552,16 @@ function harnessDependencies(card, harness) {
     row.append(node('h4', dependency.description || dependency.name || id), node('p',
       (dependency.kind === 'service' ? '原 API 服务' : '原加载器的权重') + ' · 需求 ' + id, 'card-meta'));
     const statuses = node('div', undefined, 'resource-states');
-    resourceStatus(statuses, '依赖绑定', readableResourceStatus(binding?.status || dependency.status || 'NOT_CONFIGURED'), binding?.reason || dependency.reason);
+    const bindingReason = binding?.reason || dependency.reason;
+    resourceStatus(statuses, '依赖绑定', readableResourceStatus(binding?.status || dependency.status || 'NOT_CONFIGURED'), bindingReason ? issueText(bindingReason) : undefined);
     resourceStatus(statuses, '原目标执行', readableResourceStatus(resourceExecution(dependency)));
     row.append(statuses);
+    const mappingReady = dependency.status === 'MAPPING_CHECKED';
+    const bindingAllowed = mappingReady && !['DETACHED', 'ANALYZING'].includes(harness.status);
+    row.append(node('p', mappingReady ? '原源码映射已核对；接下来准备并选择资源。' :
+      '原源码映射尚未通过核对；请先修复候选，当前不能通过选择资源直接接入。', 'card-note'));
+    if (dependency.reason) row.append(node('p', '待解决：' + issueText(dependency.reason), 'card-note'));
+    if (dependency.entry_ids?.length) row.append(node('p', '影响入口：' + dependency.entry_ids.join('、'), 'card-meta'));
     detailValue(row, '原源码依据、读取时点与 owner', {anchor: dependency.anchor || dependency.evidence,
       original_configuration: dependency.configuration || dependency.config_field,
       read_time: dependency.read_time || dependency.read_at,
@@ -2209,6 +2584,7 @@ function harnessDependencies(card, harness) {
       if (dependency.check) detailValue(row, '源库要求位置的最近检查', dependency.check);
       row.append(node('p', '按原位置准备后重新检查；登记另一路径不会改变原加载方式。', 'card-note'));
       const check = node('button', '检查源库要求的位置', 'secondary-button'); check.type = 'button';
+      check.disabled = !bindingAllowed || !placement.resolved_path;
       check.onclick = () => resourceAction(check, '/api/harnesses/check-dependency', {harness_id: harness.id, dependency_id: id},
         '已核对源库要求的位置及文件。本次未覆盖路径或加载模型。');
       row.append(check);
@@ -2217,11 +2593,22 @@ function harnessDependencies(card, harness) {
       const select = node('select'); select.required = true; select.setAttribute('aria-label', '为 ' + (dependency.description || id) + ' 选择资源');
       const none = node('option', '选择已登记的' + (dependency.kind === 'service' ? '连接' : '权重')); none.value = ''; select.append(none);
       const records = entries(dependency.kind === 'service' ? resourceState().connections : resourceState().weights);
+      const noun = dependency.kind === 'service' ? '服务连接' : '权重';
+      const selectionReason = !mappingReady ? '需先修复原参数映射' : !bindingAllowed ?
+        '来源正在分析或已摘除' : !records.length ? '尚未登记' + noun : '';
+      if (selectionReason) none.textContent = '暂不能选择：' + selectionReason;
+      row.append(node('p', '已登记' + noun + '：' + records.length + ' 项' +
+        (selectionReason ? '。当前不可选择：' + selectionReason + '。' : '。可在下方选择。'), 'card-note dependency-selection-note'));
+      const register = node('a', dependency.kind === 'service' ? '登记／管理服务连接' : '登记／管理权重', 'detail-link');
+      register.href = '/configuration?section=' + (dependency.kind === 'service' ? 'services' : 'weights'); row.append(register);
       for (const resource of records) {
         const option = node('option', resource.name || resourceId(resource)); option.value = resourceId(resource); select.append(option);
       }
       select.value = binding?.connection_id || binding?.resource_id || '';
-      const button = node('button', '保存依赖选择', 'secondary-button'); button.type = 'submit';
+      const button = node('button', '保存选择并重新接入', 'secondary-button'); button.type = 'submit';
+      select.disabled = !bindingAllowed || !records.length;
+      button.disabled = !bindingAllowed || !records.length;
+      if (!records.length) row.append(node('p', '尚无已登记资源；先使用上方配置入口登记。', 'card-note'));
       const status = node('span', '', 'form-status'); status.setAttribute('role', 'status');
       form.append(select, button, status);
       form.onsubmit = async event => {
@@ -2229,9 +2616,11 @@ function harnessDependencies(card, harness) {
         try {
           const body = {harness_id: harness.id, dependency_id: id};
           body[dependency.kind === 'service' ? 'connection_id' : 'resource_id'] = select.value;
-          await api('/api/harnesses/bind-dependency', body); status.textContent = '选择已保存，执行状态另行记录'; await refresh();
+          await api('/api/harnesses/bind-dependency', body);
+          showNotice('资源选择已保存，并重新核对接入条件；请在最新分析结论和能力池查看结果。实际调用尚未执行。');
+          await refresh();
         } catch (error) { status.textContent = error.message; }
-        finally { button.disabled = false; }
+        finally { button.disabled = !bindingAllowed || !records.length; }
       };
       row.append(form);
     }
@@ -2279,6 +2668,7 @@ function renderHarnesses() {
     const head = node('div', undefined, 'card-heading');
     head.append(node('strong', harness.name || harness.address), pill(harness.status));
     card.append(head, node('p', harness.address, 'card-note'));
+    if (harness.root) card.append(node('p', '本地源码目录：' + harness.root, 'resource-path'));
     if (harness.error) card.append(node('p', textValue(harness.error), 'card-note message-error'));
     const job = (state.analyses || []).find(item => item.id === harness.analysis_id);
     const detached = harness.status === 'DETACHED';
@@ -2496,6 +2886,7 @@ async function refresh() {
   try {
     state = await api('/api/state');
     await refreshRevisionDetails();
+    await refreshPreparationSummaries();
     connected = true;
     $('connection').textContent = '已连接';
     $('version').textContent = state.version ? '核心 ' + state.version : '';
@@ -2516,7 +2907,8 @@ async function refresh() {
     renderSection('deployments', [state.runtime_groups, state.deployments, state.deployment_backend,
       state.runtime_controller, selectedSource()], renderDeployments, ['deployment-list']);
     renderSection('analyses', [state.analyses, state.harnesses, state.analysis_revisions, state.models?.analysis,
-      resourceState(), selectedSource(), [...sourceUpdating], [...revisionSelected], [...revisionDetails], [...revisionErrors], [...revisionBusy]], renderAnalyses, ['analysis-list']);
+      resourceState(), selectedSource(), [...sourceUpdating], [...revisionSelected], [...revisionDetails], [...revisionErrors], [...revisionBusy],
+      [...preparationSummaries], [...preparationErrors]], renderAnalyses, ['analysis-list']);
     renderSection('harnesses', [state.harnesses, state.analyses, state.models?.analysis, resourceState(), [...analysisSubmitting], [...sourceUpdating]], renderHarnesses, ['harness-list']);
   } catch (error) {
     connected = false;
@@ -2543,6 +2935,15 @@ function observerOpen(open) {
 }
 
 $('chat-form').onsubmit = sendMessage;
+$('new-chat').onclick = () => resetChat();
+$('toggle-chat-history').onclick = () => {
+  $('chat-history').hidden = !$('chat-history').hidden;
+  $('toggle-chat-history').setAttribute('aria-expanded', String(!$('chat-history').hidden));
+  if (!$('chat-history').hidden) { loadChatHistory(); $('chat-history-search').focus(); }
+};
+$('chat-history-search').oninput = () => {
+  clearTimeout(historySearchTimer); historySearchTimer = setTimeout(loadChatHistory, 180);
+};
 $('scene-task-selector').onchange = updateComposer;
 $('chat-input').oninput = resizeComposer;
 $('chat-input').onkeydown = event => {
@@ -2588,6 +2989,10 @@ $('connection-credential-form').elements.connection_id.onchange = () => {
 };
 $('connection-clear-credential').onclick = clearConnectionCredential;
 $('weight-form').onsubmit = saveWeight;
+$('weight-create').onclick = () => {
+  $('weight-new').click(); $('weight-form').scrollIntoView({block: 'start'});
+  $('weight-form').elements.name.focus({preventScroll: true});
+};
 $('weight-new').onclick = () => {
   const form = $('weight-form'); form.reset(); form.elements.id.value = '';
   $('weight-form-title').textContent = '新增权重资源'; $('weight-form-status').textContent = '';
@@ -2687,5 +3092,7 @@ document.addEventListener('keydown', event => {
   if (event.key === 'Escape') observerOpen(false);
 });
 updateInspectPage();
+if (!inspectPage && !configurationPage) restoreChatFromLocation();
 refresh();
 setInterval(refresh, 1500);
+setInterval(updateAnalysisClocks, 1000);

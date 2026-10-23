@@ -465,9 +465,16 @@ class AnalysisJobs:
         """
         self._raise_cancelled(cancellation)
         finished, result = threading.Event(), {}
+        operation_record = dict(stage=job.get("pipeline_stage", "analysis"), phase=phase,
+                                round=job["rounds"] + (phase == "model_request"), started_at=now())
+        if tool:
+            operation_record["tool"] = tool
+        job["active_operation"] = operation_record
+        self._save_job(job, cancellation, "operation_started")
 
         def execute():
             try:
+                self._raise_cancelled(cancellation)
                 result["value"] = operation()
             except BaseException as error:
                 result["error"] = error
@@ -475,8 +482,9 @@ class AnalysisJobs:
                 finished.set()
 
         started, outcome = time.perf_counter(), "failed"
-        threading.Thread(target=execute, daemon=True).start()
         try:
+            self._raise_cancelled(cancellation)
+            threading.Thread(target=execute, daemon=True).start()
             while not finished.wait(0.05):
                 self._raise_cancelled(cancellation)
             self._raise_cancelled(cancellation)
@@ -488,12 +496,10 @@ class AnalysisJobs:
             outcome = "cancelled"
             raise
         finally:
-            item = dict(stage=job.get("pipeline_stage", "analysis"), phase=phase,
-                        round=job["rounds"] + (phase == "model_request"), outcome=outcome,
+            item = dict(operation_record, outcome=outcome,
                         duration_ms=round((time.perf_counter() - started) * 1000, 3))
-            if tool:
-                item["tool"] = tool
             job.setdefault("timings", []).append(item)
+            job.pop("active_operation", None)
 
     def _check_candidate(self, inspector, candidate):
         report = check_candidate(inspector, candidate)
@@ -508,7 +514,6 @@ class AnalysisJobs:
             if not profile.get("capabilities") and profile.get("provider") == "deepseek":
                 try:
                     job["phase"] = "model_metadata"
-                    self._save_job(job, cancellation, "model_metadata")
                     metadata = self._await_operation(lambda: self.transport.send(profile["base_url"] + "/models", key),
                                                      cancellation, job, "model_metadata")
                     models = metadata.get("data", [])
@@ -520,7 +525,6 @@ class AnalysisJobs:
                 self._raise_cancelled(cancellation)
                 job["phase"] = "model_request"
                 job["model_binding"] = self.model_binding(profile)
-                self._save_job(job, cancellation, "model_request")
                 stage = job.get("pipeline_stage", "analysis")
                 tools = SOURCE_TOOLS + PREPROCESS_TOOLS if stage == "preprocessing" else TOOLS
                 if job.get("revision_id"):
@@ -538,6 +542,19 @@ class AnalysisJobs:
                 choice = choices[0]
                 message = {k:v for k,v in choice["message"].items()
                            if k in {"role", "content", "tool_calls", "reasoning_content"}}
+                timing = job["timings"][-1]
+                usage = response.get("usage") or {}
+                if isinstance(usage, dict):
+                    for target, names in (("input_tokens", ("prompt_tokens", "input_tokens")),
+                                          ("output_tokens", ("completion_tokens", "output_tokens"))):
+                        value = next((usage[name] for name in names if type(usage.get(name)) is int), None)
+                        if value is not None and value >= 0:
+                            timing[target] = value
+                    details = usage.get("completion_tokens_details") or usage.get("output_tokens_details") or {}
+                    value = details.get("reasoning_tokens") if isinstance(details, dict) else None
+                    if type(value) is int and value >= 0:
+                        timing["reasoning_tokens"] = value
+                timing["tool_calls"] = len(message.get("tool_calls") or [])
                 job["messages"].append(message)
                 job["last_finish_reason"] = choice.get("finish_reason")
                 self._save_job(job, cancellation, "provider_response")

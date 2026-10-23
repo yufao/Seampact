@@ -51,6 +51,23 @@ class Store:
                                    (kind,)).fetchall()
         return [json.loads(row[0]) for row in rows]
 
+    def analysis_summaries(self, source_ids):
+        """Read visible history without decoding its full model conversations."""
+        if not source_ids:
+            return []
+        placeholders = ",".join("?" for _ in source_ids)
+        with self.lock:
+            rows = self.db.execute("""
+                SELECT json_remove(a.data, '$.messages', '$.provider_profile')
+                FROM documents AS a
+                LEFT JOIN documents AS r ON r.kind='request'
+                    AND r.id=json_extract(a.data, '$.request_id')
+                WHERE a.kind='analysis'
+                    AND COALESCE(NULLIF(json_extract(a.data, '$.harness_id'), ''),
+                                 json_extract(r.data, '$.source_id')) IN (""" + placeholders + ") ORDER BY a.rowid DESC",
+                tuple(source_ids)).fetchall()
+        return [json.loads(row[0]) for row in rows]
+
     def delete(self, kind, identity):
         with self.lock, self.db:
             self.db.execute("DELETE FROM documents WHERE kind=? AND id=?", (kind, identity))
