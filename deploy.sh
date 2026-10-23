@@ -38,6 +38,7 @@ PARSER.add_argument("--local", action="store_true", help="use the current clean 
 PARSER.add_argument("--port", type=int, help="fresh deployment: host port (default: 8880)")
 PARSER.add_argument("--bind", help="fresh deployment: published address (default: 127.0.0.1)")
 PARSER.add_argument("--data-dir", help="fresh deployment: persistent /data directory")
+PARSER.add_argument("--reuse-data", action="store_true", help="install only: explicitly reuse and back up an existing --data-dir after the old container was removed")
 PARSER.add_argument("--harness-dir", help="fresh deployment: persistent /harnesses directory")
 PARSER.add_argument("--network", help="fresh deployment: shared bridge network (default: seampact-runtime-<deployment-id>)")
 TOOLS = PARSER.add_mutually_exclusive_group()
@@ -198,6 +199,26 @@ def check_state_path(path):
         fail("The state directory cannot contain the Git code directory. Select separate persistent state/code paths.")
 
 
+def check_unmounted_state(data):
+    for row in api("GET", "/containers/json"):
+        for mount in row.get("Mounts", []):
+            source = mount.get("Source")
+            if source and mount.get("RW", True) and (child_of(data, Path(source).resolve()) or child_of(Path(source).resolve(), data)):
+                fail("Another running container can write the selected state directory. Stop that writer before continuing.")
+
+
+def install_data_path():
+    data = Path(ARGS.data_dir or ROOT / "data").expanduser().resolve()
+    check_state_path(data)
+    if ARGS.reuse_data:
+        if not ARGS.data_dir or not data.is_dir() or not (data / "platform.sqlite3").is_file():
+            fail("--reuse-data requires an explicit existing --data-dir containing platform.sqlite3; no empty replacement is created.")
+    elif data.exists() and (not data.is_dir() or any(data.iterdir())):
+        fail("Fresh install requires an empty data directory. If the old container is gone, use install --reuse-data --data-dir PATH; otherwise use update --container NAME.")
+    check_unmounted_state(data)
+    return data
+
+
 def command_option(command, option, default=None):
     if option in command:
         index = command.index(option)
@@ -340,11 +361,8 @@ def add_tools(spec):
 
 
 def fresh_spec(image):
-    data = Path(ARGS.data_dir or ROOT / "data").expanduser().resolve()
+    data = install_data_path()
     harness = Path(ARGS.harness_dir or ROOT / "harnesses").expanduser().resolve()
-    check_state_path(data)
-    if data.exists() and any(data.iterdir()):
-        fail("Fresh install refuses a nonempty data directory. Adopt the existing platform with update --container NAME.")
     for directory in (data, harness):
         directory.mkdir(parents=True, exist_ok=True)
     port, bind = ARGS.port or 8880, ARGS.bind or "127.0.0.1"
@@ -356,9 +374,6 @@ def fresh_spec(image):
         docker("network", "create", "--driver", "bridge", network)
     elif json.loads(result.stdout)[0].get("Driver") != "bridge":
         fail("Fresh deployment requires a user-defined bridge network.")
-    for row in api("GET", "/containers/json"):
-        if any(item.get("Source") == str(data) for item in row.get("Mounts", [])):
-            fail("Another running container uses the selected data directory; adopt it instead.")
     rootless = any("rootless" in item for item in api("GET", "/info").get("SecurityOptions", []))
     user = "0:0" if rootless else str(os.getuid()) + ":" + str(os.getgid())
     defaults = image_info(image)["Config"]
@@ -455,6 +470,8 @@ def main():
         fail("--ready-timeout must be a positive number of seconds.")
     if ARGS.port is not None and not 1 <= ARGS.port <= 65535:
         fail("--port must be between 1 and 65535.")
+    if ARGS.reuse_data and ARGS.action != "install":
+        fail("--reuse-data is only for install after the old container has been removed. Existing containers use update.")
     ROOT.mkdir(parents=True, exist_ok=True, mode=0o700)
     lock = open(ROOT / "deployment.lock", "a+")
     try:
@@ -486,7 +503,7 @@ def main():
     if CONFIG.get("pending"):
         fail("A prior replacement is incomplete. Run status, inspect retained containers and the backup, then resolve it manually. "
              "No old container is automatically restarted against possibly migrated data.")
-    if ARGS.action == "install" and CONFIG.get("current_image"):
+    if ARGS.action == "install" and CONFIG.get("current_image") and not ARGS.reuse_data:
         fail("This workspace is already deployed. Use update.")
     if CONFIG.get("container") and ARGS.container and CONFIG["container"] != ARGS.container:
         fail("--container differs from the saved deployment. Use the original workspace/container pair.")
@@ -499,10 +516,7 @@ def main():
     if ARGS.action == "install" and OLD:
         fail("The requested container already exists. Adopt it with update --container NAME.")
     if not OLD:
-        data_path = Path(ARGS.data_dir or ROOT / "data").expanduser().resolve()
-        check_state_path(data_path)
-        if data_path.exists() and (not data_path.is_dir() or any(data_path.iterdir())):
-            fail("Fresh install requires an empty data directory. Adopt the existing platform with update --container NAME.")
+        install_data_path()
     if OLD:
         if any(value is not None for value in (ARGS.port, ARGS.bind, ARGS.data_dir, ARGS.harness_dir, ARGS.network)):
             fail("Port/path/network flags are fresh-install options. Updates retain the existing container settings exactly.")
@@ -564,6 +578,13 @@ def main():
         if OLD:
             # Remove only this newly-created, never-started candidate if the final idle check fails.
             check_idle()
+        elif ARGS.reuse_data:
+            install_data_path()
+            print("Backing up the existing state directory before the new platform starts.", flush=True)
+            (backup_dir / "data").mkdir(mode=0o700)
+            docker("cp", candidate_id + ":/data/.", str(backup_dir / "data"))
+            CONFIG["latest_backup"] = str(backup_dir)
+            save()
     except Exception:
         api("DELETE", "/containers/" + candidate_id + "?v=0")
         raise
