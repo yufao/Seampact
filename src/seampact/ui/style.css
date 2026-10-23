@@ -376,6 +376,19 @@ body:not(.inspect-page) .research-heading h3 { font-size: 12px; }
 .run-progress progress::-webkit-progress-bar { border-radius: 5px; background: #edf1ee; }
 .run-progress progress::-webkit-progress-value { border-radius: 5px; background: #33785b; }
 .run-progress progress::-moz-progress-bar { border-radius: 5px; background: #33785b; }
+.revision-workspace { margin-top: 22px; padding-top: 18px; border-top: 1px solid var(--line); min-width: 0; }
+.revision-workspace h4 { margin: 0 0 10px; color: #4c6656; font-size: 14px; font-weight: 600; }
+.revision-workspace .card-heading { margin-top: 18px; overflow-wrap: anywhere; }
+.revision-field { display: block; margin: 12px 0; min-width: 0; color: #627166; font-size: 12px; }
+.revision-field > span { display: block; margin-bottom: 6px; }
+.revision-workspace input, .revision-workspace textarea, .revision-workspace select { box-sizing: border-box; width: 100%; max-width: 100%; padding: 9px 11px; border: 1px solid var(--line); border-radius: 6px; color: var(--ink); background: #fcfdfc; font: inherit; font-size: 12px; }
+.revision-workspace textarea { min-height: 76px; resize: vertical; line-height: 1.7; }
+.revision-workspace textarea.revision-candidate { min-height: 360px; font: 12px/1.7 Consolas, "Microsoft YaHei", monospace; tab-size: 2; white-space: pre; overflow: auto; }
+.revision-workspace .revision-field[hidden] { display: none; }
+.revision-workspace .message-error { white-space: pre-wrap; overflow-wrap: anywhere; color: var(--danger); font-size: 12px; }
+.revision-workspace .card-meta { overflow-wrap: anywhere; }
+.revision-workspace input:focus, .revision-workspace textarea:focus, .revision-workspace select:focus { outline: 2px solid #a8c8b6; outline-offset: 1px; }
+.revision-workspace :disabled { opacity: .65; }
 @media (min-width: 641px) and (max-width: 960px) {
   .config-workspace { grid-template-columns: minmax(0, 1fr); grid-template-rows: auto minmax(0, 1fr); }
   .config-navigation { display: flex; gap: 6px; overflow-x: auto; padding: 10px 12px; border-right: 0; border-bottom: 1px solid var(--line); }

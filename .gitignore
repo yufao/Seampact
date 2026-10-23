@@ -37,6 +37,8 @@ dist/
 /docs/历史草案/
 /AGENTS.md
 
+/docs/archive/
+
 # Private notes, machine inventories and original copies stay on this machine.
 .local-private/
 *.local.*

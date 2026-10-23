@@ -2,6 +2,7 @@
 
 import uuid
 import copy
+from contextlib import ExitStack
 import json
 import math
 import re
@@ -10,13 +11,15 @@ import time
 from pathlib import Path, PurePosixPath, PureWindowsPath
 
 from . import __version__
-from .analysis import AnalysisJobs
+from .analysis import AnalysisJobs, content_digest
 from .chat import ChatJobs
 from .inspection import Inspector
 from .intake import RepositoryIntake
 from .providers import Profiles
 from .resources import ResourceRegistry
-from .dependencies import Dependencies
+from .dependencies import Dependencies, check_requirements
+from .verification import check_candidate
+from .revisions import build_review_context, candidate_diff
 from .runtime import Coordinator, OwnerRuntime
 from .scheduler import TwoLayerScheduler
 from .store import Store, now
@@ -124,7 +127,8 @@ class Platform:
         return dict(version=__version__, models=self.profiles.public_roles(), harnesses=harnesses,
             resources=dict(connections=self.public_connections(), weights=self.resources.public_weights(),
                            dependencies=requirements, bindings=selections),
-            analyses=jobs, units=self.catalog.public(), tasks=tasks, rules=RULESET, entry_profile=NATIVE_PROFILE,
+            analyses=jobs, analysis_revisions=self.revision_summaries(),
+            units=self.catalog.public(), tasks=tasks, rules=RULESET, entry_profile=NATIVE_PROFILE,
             runtime_groups=self.deployments.public(), deployments=self.store.list("deployment"),
             deployment_backend=self.deployments.backend(),
             runtime_controller=self.deployments.controller_state(),
@@ -233,6 +237,8 @@ class Platform:
     def _environment_guard(self, source):
         if source.get("status") in {"DETACHED", "ANALYZING"} or (source.get("target_runtime") or {}).get("status") == "PREPARING":
             raise ValueError("请先结束当前分析或环境准备，再调整运行环境")
+        if self._source_analysis_running(source["id"]):
+            raise ValueError("该来源仍有模型分析或修订正在进行，请等待完成")
         if self.catalog.source_running(source["id"]):
             raise ValueError("请等原调用结束后再调整运行环境")
         for group in self.store.list("runtime_group"):
@@ -341,8 +347,7 @@ class Platform:
             raise ValueError("Harness地址尚未接入")
         if source.get("status") == "DETACHED":
             raise ValueError("来源已摘除，请先重新接入")
-        if any(job["status"] == "RUNNING" and job.get("request_id") == source.get("request_id")
-               for job in self.store.list("analysis")):
+        if self._source_analysis_running(identity):
             raise ValueError("这个来源正在分析")
         self._environment_guard(source)
         request_id = uuid.uuid4().hex
@@ -377,6 +382,9 @@ class Platform:
 
     def _connect_units(self, inspector, job):
         with self.source_lock:
+            if job.get("completion_scope") == "candidate_and_report_only":
+                self._complete_revision(inspector, job)
+                return []
             source = self.store.get("harness", inspector.request["source_id"])
             if not source or source.get("status") == "DETACHED" or source.get("analysis_id") != job["id"]:
                 job["status"] = "CANCELLED"
@@ -394,6 +402,8 @@ class Platform:
             previous = self.store.get("analysis", identity)
             if not previous or not self.analysis.can_resume(previous):
                 raise ValueError("这次分析没有可直接续接的完整模型请求边界，请重新分析")
+            if previous.get("revision_id"):
+                return self._resume_revision(previous)
             request = self.store.get("request", previous["request_id"])
             source = self.store.get("harness", (request or {}).get("source_id"))
             if not request or not source:
@@ -429,6 +439,372 @@ class Platform:
                 self.store.save("harness", source["id"], source)
                 raise
             return dict(analysis_id=analysis_id, resumed_from=identity)
+
+    def _source_analysis_running(self, source_id):
+        return any(job.get("status") in {"RUNNING", "CANCELLING"}
+            and (self.store.get("request", job.get("request_id")) or {}).get("source_id") == source_id
+            for job in self.store.list("analysis"))
+
+    @staticmethod
+    def _revision_source_basis(source):
+        return content_digest({key: source.get(key) for key in
+            ("id", "analysis_id", "request_id", "root", "address", "revision", "entry",
+             "configuration", "user_resources", "runtime_environment")})
+
+    def _revision_source(self, revision):
+        source = self.store.get("harness", revision["harness_id"])
+        if not source or source.get("status") == "DETACHED":
+            raise ValueError("来源已摘除；保留修订历史，请先重新接入后创建修订")
+        if source.get("status") == "ANALYZING":
+            raise ValueError("来源正在重新分析，请等待完成后创建修订")
+        base = self.store.get("analysis", source.get("analysis_id")) or {}
+        if (self._revision_source_basis(source) != revision["base_source_basis"]
+                or content_digest((base.get("submitted") or {}).get("candidate")) != revision["base_candidate_digest"]):
+            raise ValueError("父分析、绑定或运行环境已改变；当前草稿保留，请从最新分析创建修订")
+        return source
+
+    def _revision_inspector(self, revision):
+        source = self._revision_source(revision)
+        request = copy.deepcopy(self.store.get("request", revision["request_id"]))
+        if not request or request.get("rules") != RULESET or request.get("entry_profile") != NATIVE_PROFILE:
+            raise ValueError("修订源码快照或当前规则不匹配，请创建新修订")
+        inspector = Inspector(revision["proposed_source"]["root"], self.home / "snapshots", request)
+        selected = environment_selection(source.get("runtime_environment") or {})
+        if selected != environment_selection(request.get("runtime_environment") or {}):
+            raise ValueError("运行环境与草稿不一致，请重新创建修订")
+        if selected:
+            normalize_environment(selected, inspector)
+            record = source.get("target_runtime") or {}
+            if record.get("identity") != checker_identity(selected):
+                raise ValueError("目标解释器与当前平台不一致，请重新准备环境后创建修订")
+            attach_target(inspector, record, self.deployments.backend()["operation_timeout_s"])
+        request.update(resource_catalog=self.resource_catalog(),
+                       dependency_bindings=self.dependencies.selections(source["id"]))
+        for path in inspector.files:
+            inspector.data(path)
+        self._refresh_revision_scope(revision, inspector)
+        return inspector
+
+    def _refresh_revision_scope(self, revision, inspector):
+        if inspector.request["source_version"] == revision["source_version"]:
+            return
+        # add_source persists its expanded request even when the model later fails.
+        # Manual checks and a new attempt must use that same scope and materials.
+        base = self.store.get("analysis", revision["base_analysis_id"])
+        prior = self.store.get("request", base["request_id"])
+        context = build_review_context(Inspector(revision["proposed_source"]["root"],
+            self.home / "snapshots", prior), inspector, self.store)
+        revision.update(source_version=inspector.request["source_version"],
+            source_diff=context["source_diff"], materials=context, reuse=context["reuse"], updated_at=now())
+        self.store.save("analysis_revision", revision["id"], revision)
+
+    def create_revision(self, body):
+        with self.source_lock:
+            base = self.store.get("analysis", body.get("analysis_id"))
+            if not base or base.get("status") != "COMPLETED" or not (base.get("submitted") or {}).get("candidate"):
+                raise ValueError("请选择已有完整候选的当前分析")
+            original = self.store.get("request", base["request_id"])
+            source = self.store.get("harness", (original or {}).get("source_id"))
+            if not source or source.get("analysis_id") != base["id"] or source.get("status") in {"DETACHED", "ANALYZING"}:
+                raise ValueError("请选择当前已接入来源的最新分析；历史记录保持只读")
+            if self._source_analysis_running(source["id"]):
+                raise ValueError("该来源还有模型分析正在进行")
+            mode = body.get("mode", "refine")
+            if mode not in {"refine", "update"}:
+                raise ValueError("修订模式只能为 refine 或 update")
+            proposed = copy.deepcopy(source)
+            rid, request_id = uuid.uuid4().hex, uuid.uuid4().hex
+            if mode == "update":
+                entry = source.get("entry")
+                if isinstance(entry, dict) and entry.get("status") == "STATIC_CANDIDATES":
+                    entry = None
+                refreshed = self.intake.prepare(source["address"], body.get("revision") or None,
+                    entry, source.get("user_resources") or [])
+                proposed.update({key: refreshed[key] for key in
+                    ("root", "revision", "entry", "files", "inventory", "resources")})
+                inspector = Inspector.freeze_repository(proposed, self.home / "snapshots", request_id,
+                    original["observation"])
+            else:
+                request = copy.deepcopy(original)
+                request["id"] = request_id
+                inspector = Inspector(source["root"], self.home / "snapshots", request)
+            inspector.request.update(rules=copy.deepcopy(RULESET), entry_profile=copy.deepcopy(NATIVE_PROFILE),
+                revision_id=rid, preprocessing_mode="revision", resource_catalog=self.resource_catalog(),
+                dependency_bindings=self.dependencies.selections(source["id"]))
+            environment = source.get("runtime_environment") or {}
+            if environment:
+                normalized = normalize_environment(environment, inspector)
+                proposed["runtime_environment"] = normalized
+                proposed["environment_discovery"] = normalized["discovery"]
+                inspector.request["runtime_environment"] = environment_selection(normalized)
+                record = source.get("target_runtime") or {}
+                inspector.request["target_runtime"] = {key: record.get(key) for key in
+                    ("status", "identity", "image", "image_id", "python", "base_image")}
+                attach_target(inspector, record, self.deployments.backend()["operation_timeout_s"])
+            else:
+                import sys
+                normalize_environment(dict(python=".".join(map(str, sys.version_info[:2]))), inspector)
+            self.store.create("request", request_id, inspector.request)
+            old_inspector = Inspector(source["root"], self.home / "snapshots", original)
+            # Prime reusable file facts, then resolve the new scope by content and parser identity.
+            if original.get("runtime_environment"):
+                record = source.get("target_runtime") or {}
+                frozen = original.get("target_runtime") or {}
+                if (environment_selection(original["runtime_environment"]) == environment_selection(environment)
+                        and record.get("status") == "READY"
+                        and all(frozen.get(key) == record.get(key) for key in ("identity", "image_id"))):
+                    attach_target(old_inspector, record, self.deployments.backend()["operation_timeout_s"])
+            build_review_context(old_inspector, old_inspector, self.store)
+            context = build_review_context(old_inspector, inspector, self.store)
+            implementation = self.analysis.freeze_implementation(inspector)
+            candidate = copy.deepcopy(base["submitted"]["candidate"])
+            revision = dict(schema="analysis-revision/1", id=rid, harness_id=source["id"],
+                base_analysis_id=base["id"], base_candidate_digest=content_digest(candidate),
+                base_source_basis=self._revision_source_basis(source), base_candidate=candidate,
+                base_source_version=original["source_version"], source_version=inspector.request["source_version"],
+                request_id=request_id, proposed_source=proposed, mode=mode, status="DRAFT",
+                candidate=copy.deepcopy(candidate), candidate_digest=content_digest(candidate),
+                candidate_diff=candidate_diff(candidate, candidate), source_diff=context["source_diff"],
+                materials=context, reuse=context["reuse"], implementation=implementation,
+                guidance="", reason="", provenance=[dict(kind="BASE_CANDIDATE", analysis_id=base["id"], at=now())],
+                analysis_attempts=[], analysis_id=None, created_at=now(), updated_at=now(),
+                report=None, checked_digest=None, error=None)
+            self.store.create("analysis_revision", rid, revision)
+            return dict(revision=self._public_revision(revision))
+
+    def _sync_revision(self, revision):
+        job = self.store.get("analysis", revision.get("analysis_id"))
+        if (job and job["id"] != revision.get("processed_analysis_id")
+                and job.get("status") not in {"RUNNING", "CANCELLING"}):
+            revision.update(processed_analysis_id=job["id"], usage=job.get("usage", []),
+                status=job["status"] if job.get("status") in {"INTERRUPTED", "CANCELLED", "FAILED"} else "FAILED",
+                error=job.get("error") or "模型修订未交付完整候选，可保留草稿重新检查或发起新尝试", updated_at=now())
+            for field in ("unreported_usage", "error_kind", "failure_phase"):
+                if field in job:
+                    revision[field] = copy.deepcopy(job[field])
+            self.store.save("analysis_revision", revision["id"], revision)
+        return revision
+
+    def _revision_stale(self, revision):
+        try:
+            self._revision_source(revision)
+        except ValueError as error:
+            return dict(stale=True, stale_reason=str(error))
+        return dict(stale=False, stale_reason=None)
+
+    def _public_revision(self, revision):
+        return dict({key: copy.deepcopy(value) for key, value in revision.items() if key not in
+            {"proposed_source", "base_source_basis", "base_candidate", "materials"}},
+            **self._revision_stale(revision))
+
+    def revision_detail(self, identity):
+        with self.source_lock:
+            revision = self.store.get("analysis_revision", identity)
+            if not revision:
+                raise ValueError("没有这份修订草稿")
+            return self._public_revision(self._sync_revision(revision))
+
+    def revision_summaries(self):
+        with self.source_lock:
+            return [dict({key: value for key, value in self._sync_revision(revision).items() if key in
+                {"id", "harness_id", "base_analysis_id", "mode", "status", "updated_at", "analysis_id",
+                 "installed_analysis_id", "candidate_digest", "checked_digest", "error"}},
+                **self._revision_stale(revision))
+                for revision in self.store.list("analysis_revision")]
+
+    def _editable_revision(self, identity):
+        revision = self.store.get("analysis_revision", identity)
+        if not revision:
+            raise ValueError("没有这份修订草稿")
+        self._sync_revision(revision)
+        if revision["status"] in {"INSTALLED", "ANALYZING"}:
+            raise ValueError("此修订已安装或正在模型修复，请创建新修订或等待完成")
+        self._revision_source(revision)
+        return revision
+
+    def _save_revision(self, revision, body):
+        if "candidate" in body:
+            if not isinstance(body["candidate"], dict):
+                raise ValueError("候选需要 JSON 对象")
+            revision["candidate"] = json.loads(json.dumps(body["candidate"], allow_nan=False, ensure_ascii=False))
+        for field in ("guidance", "reason"):
+            if field in body:
+                if not isinstance(body[field], str):
+                    raise ValueError("提示和修改理由需要文字")
+                revision[field] = body[field]
+        revision.update(candidate_digest=content_digest(revision["candidate"]),
+            candidate_diff=candidate_diff(revision["base_candidate"], revision["candidate"]),
+            status="DRAFT", checked_digest=None, report=None, error=None, updated_at=now())
+        revision["provenance"].append(dict(kind="HUMAN_EDIT" if any(revision["candidate_diff"]["counts"].values())
+            else "USER_GUIDANCE", at=now(), candidate_digest=revision["candidate_digest"],
+            guidance=revision["guidance"], reason=revision["reason"]))
+        self.store.save("analysis_revision", revision["id"], revision)
+
+    def save_revision(self, body):
+        with self.source_lock:
+            revision = self._editable_revision(body.get("revision_id"))
+            self._save_revision(revision, body)
+            return dict(revision=self._public_revision(revision))
+
+    def _check_revision(self, revision):
+        started = time.perf_counter()
+        inspector = self._revision_inspector(revision)
+        candidate = revision["candidate"]
+        if (not isinstance(candidate.get("runtime_groups"), list)
+                or (candidate.get("entries") and not candidate["runtime_groups"])):
+            raise ValueError("完整候选需要 runtime_groups 数组，存在入口时必须列出完整运行组")
+        report = check_candidate(inspector, candidate)
+        report["dependencies"] = check_requirements(inspector, candidate)
+        report["entry_bindings"] = self.catalog.inspect_candidate(inspector, candidate)
+        revision.update(status="CHECKED", report=report, checked_digest=content_digest(candidate),
+            implementation=self.analysis.freeze_implementation(inspector), error=None,
+            check_duration_ms=round((time.perf_counter() - started) * 1000, 3), updated_at=now())
+        self.store.save("request", inspector.request["id"], inspector.request)
+        self.store.save("analysis_revision", revision["id"], revision)
+        return inspector
+
+    def check_revision(self, body):
+        with self.source_lock:
+            revision = self._editable_revision(body.get("revision_id"))
+            self._save_revision(revision, body)
+            try:
+                self._check_revision(revision)
+            except Exception as error:
+                revision.update(status="FAILED", error=str(error), checked_digest=None, updated_at=now())
+                self.store.save("analysis_revision", revision["id"], revision)
+            return dict(revision=self._public_revision(revision))
+
+    def refine_revision(self, body):
+        with self.source_lock:
+            revision = self._editable_revision(body.get("revision_id"))
+            if self._source_analysis_running(revision["harness_id"]):
+                raise ValueError("该来源还有模型分析正在进行")
+            prior_report = revision.get("report") or (
+                (self.store.get("analysis", revision["base_analysis_id"]) or {}).get("submitted") or {}).get("report")
+            self._save_revision(revision, body)
+            try:
+                inspector = self._revision_inspector(revision)
+                # Parse/host constraints must fail before a paid model request.
+                inspector.entry_candidates(path="")
+            except Exception as error:
+                revision.update(status="FAILED", error=str(error), updated_at=now())
+                self.store.save("analysis_revision", revision["id"], revision)
+                raise
+            materials = revision["materials"]
+            facts = {key: materials.get(key) for key in
+                ("changed_symbols", "related_candidates", "reuse", "coverage", "permissions")}
+            facts["changed_files"] = materials.get("facts", [])
+            repair = dict(revision_id=revision["id"], base_analysis_id=revision["base_analysis_id"],
+                base_candidate_digest=revision["base_candidate_digest"], candidate=revision["candidate"],
+                mode=revision["mode"], guidance=revision["guidance"], reason=revision["reason"],
+                source_diff=revision["source_diff"], facts=facts, prior_report=prior_report)
+            aid = uuid.uuid4().hex
+            prior_analysis_id = revision.get("analysis_id")
+            revision.update(status="ANALYZING", analysis_id=aid, error=None, updated_at=now())
+            revision["analysis_attempts"].append(aid)
+            self.store.save("request", inspector.request["id"], inspector.request)
+            self.store.save("analysis_revision", revision["id"], revision)
+            self.inspectors[inspector.request["id"]] = inspector
+            try:
+                self.analysis.start(inspector, self.profiles.role_identity("analysis"), identity=aid,
+                                    preprocessing="none", repair=repair)
+            except Exception as error:
+                if not self.store.get("analysis", aid):
+                    revision["analysis_attempts"].remove(aid)
+                    revision["analysis_id"] = prior_analysis_id
+                revision.update(status="FAILED", error=str(error), updated_at=now())
+                self.store.save("analysis_revision", revision["id"], revision)
+                raise
+            return dict(analysis_id=aid, revision=self._public_revision(revision))
+
+    def _complete_revision(self, inspector, job):
+        revision = self.store.get("analysis_revision", job["revision_id"])
+        if not revision or revision.get("analysis_id") != job["id"]:
+            job["status"] = "CANCELLED"
+            return
+        candidate = copy.deepcopy(job["submitted"]["candidate"])
+        revision.update(candidate=candidate, candidate_digest=content_digest(candidate),
+            candidate_diff=candidate_diff(revision["base_candidate"], candidate),
+            report=job["submitted"]["report"], status="CHECKED", checked_digest=content_digest(candidate),
+            processed_analysis_id=job["id"], usage=job.get("usage", []), updated_at=now(), error=None)
+        revision["provenance"].append(dict(kind="MODEL_REFINEMENT", analysis_id=job["id"],
+            candidate_digest=revision["candidate_digest"], at=now()))
+        self._refresh_revision_scope(revision, inspector)
+        self.store.save("request", inspector.request["id"], inspector.request)
+        self.store.save("analysis_revision", revision["id"], revision)
+
+    def _resume_revision(self, previous):
+        revision = self.store.get("analysis_revision", previous["revision_id"])
+        if not revision or revision.get("analysis_id") != previous["id"]:
+            raise ValueError("这次修订已被后续尝试替代，请从当前草稿重新修复")
+        repair = previous.get("repair") or {}
+        if (revision["candidate_digest"] != content_digest(repair.get("candidate"))
+                or any(revision.get(key, "") != (repair.get(key) or "") for key in ("guidance", "reason"))):
+            raise ValueError("草稿或提示已修改，请从当前草稿发起新的模型修复，不能续接旧请求")
+        self._revision_source(revision)
+        if self._source_analysis_running(revision["harness_id"]):
+            raise ValueError("该来源还有模型分析正在进行")
+        inspector = self._revision_inspector(revision)
+        aid = uuid.uuid4().hex
+        revision.update(status="ANALYZING", analysis_id=aid, error=None, updated_at=now())
+        revision["analysis_attempts"].append(aid)
+        self.store.save("analysis_revision", revision["id"], revision)
+        try:
+            self.analysis.start(inspector, self.profiles.role_identity("analysis"), identity=aid, resume=previous)
+        except Exception as error:
+            if not self.store.get("analysis", aid):
+                revision["analysis_attempts"].remove(aid)
+                revision["analysis_id"] = previous["id"]
+            revision.update(status="FAILED", error=str(error), updated_at=now())
+            self.store.save("analysis_revision", revision["id"], revision)
+            raise
+        return dict(analysis_id=aid)
+
+    def install_revision(self, body):
+        with self.source_lock:
+            revision = self._editable_revision(body.get("revision_id"))
+            if revision.get("checked_digest") != revision["candidate_digest"]:
+                raise ValueError("请先完整重检当前候选，再独立安装")
+            source = self._revision_source(revision)
+            self._environment_guard(source)
+            inspector = self._check_revision(revision)
+            aid = uuid.uuid4().hex
+            job = dict(id=aid, request_id=inspector.request["id"], harness_id=source["id"],
+                kind="CANDIDATE_REVISION_INSTALL", revision_id=revision["id"],
+                prior_analysis_id=revision["base_analysis_id"], status="COMPLETED",
+                completion_scope="installed_catalog", submitted=dict(candidate=copy.deepcopy(revision["candidate"]),
+                    report=copy.deepcopy(revision["report"])), implementation=revision["implementation"],
+                rounds=0, model_calls=0, usage=[], messages=[], started_at=now(),
+                analysis_attempts=list(revision["analysis_attempts"]), provenance=copy.deepcopy(revision["provenance"]))
+            proposed = copy.deepcopy(revision["proposed_source"])
+            proposed.update(analysis_id=aid, request_id=inspector.request["id"], status="ANALYZED", error=None,
+                files=[item["path"] for item in inspector.request["files"]], inventory=inspector.request["inventory"])
+            self.store.create("analysis", aid, job)
+            try:
+                # Recheck after slow source checks. Old owner locks close the gap
+                # between this guard and retiring their unused frozen bindings.
+                with self.catalog.lock, ExitStack() as held:
+                    old_bindings = {id(binding): binding for binding in self.catalog.bindings.values()
+                        if binding.inspector.request.get("source_id") == source["id"]}
+                    for binding in old_bindings.values():
+                        if not binding.lock.acquire(blocking=False):
+                            raise ValueError("旧版本原调用已开始，请等待结束后再安装修订")
+                        held.callback(binding.lock.release)
+                    self._environment_guard(source)
+                    self.store.save("harness", source["id"], proposed)
+                    job["units"] = self._connect_units(inspector, job)
+                    for binding in old_bindings.values():
+                        binding.detached = True
+            except Exception as error:
+                self.store.save("harness", source["id"], source)
+                job.update(status="FAILED", error=str(error), finished_at=now())
+                self.store.save("analysis", aid, job)
+                raise
+            job.update(finished_at=now(), check_duration_ms=revision.get("check_duration_ms"))
+            self.store.save("analysis", aid, job)
+            revision.update(status="INSTALLED", installed_analysis_id=aid, updated_at=now())
+            self.store.save("analysis_revision", revision["id"], revision)
+            return dict(analysis_id=aid, units=job["units"], revision=self._public_revision(revision))
 
     def configure_harness(self, body):
         """Bind explicit resources to an existing analysis, without another model call."""
@@ -834,6 +1210,10 @@ class Platform:
             source.update(status="DETACHED", detached_at=now(), error=None)
             self.store.save("harness", identity, source)
             self.analysis.cancel(source.get("analysis_id"))
+            for job in self.store.list("analysis"):
+                if (job.get("revision_id") and job.get("status") in {"RUNNING", "CANCELLING"}
+                        and (self.store.get("request", job.get("request_id")) or {}).get("source_id") == identity):
+                    self.analysis.cancel(job["id"])
             count = self.catalog.detach(identity)
             self.deployments.mark_source_detached(identity)
         print("[SeamPact] source_detached " + identity, flush=True)
@@ -851,6 +1231,7 @@ class Platform:
                 raise ValueError("已开始的原调用仍在收尾，结束后可重新接入")
             job = next((item for item in self.store.list("analysis")
                         if item.get("status") == "COMPLETED" and item.get("submitted")
+                        and item.get("completion_scope") != "candidate_and_report_only"
                         and (self.store.get("request", item["request_id"]) or {}).get("source_id") == identity), None)
             self._checker_record(source)
             self.runtime.call("restore_source", identity)

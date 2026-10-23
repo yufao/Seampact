@@ -103,6 +103,8 @@ TOOLS = [
     function("submit_candidate", "结束分析并保存候选及独立报告；不自动执行源代码", {"candidate":{"type":"object"}}, ["candidate"])]
 
 SOURCE_TOOLS = [tool for tool in TOOLS if tool["function"]["name"] not in {"check_candidate", "submit_candidate"}]
+REVISION_FACT_TOOL = function("read_revision_facts", "按修订索引的冻结路径读取已缓存结构事实；核对内容摘要，不授予执行许可", {
+    "path": {"type": "string"}}, ["path"])
 
 
 def preparation_input(inspector):
@@ -139,7 +141,7 @@ class AnalysisJobs:
         self.implementation_bytes = {name: Path(__file__).with_name(name).read_bytes() for name in
             ("analysis.py", "preprocessing.py", "inspection.py", "units.py", "verification.py",
              "lowering.py", "callsite.py", "deployment.py", "dependencies.py", "resources.py", "providers.py",
-             "service.py", "environments.py", "target_runtime.py")}
+             "service.py", "environments.py", "target_runtime.py", "revisions.py")}
         self.implementation = {name: digest(data) for name, data in self.implementation_bytes.items()}
         for old in store.list("analysis"):
             if old["status"] in {"RUNNING", "CANCELLING"}:
@@ -215,11 +217,36 @@ class AnalysisJobs:
                     model=profile.get("model"), output_configuration=configuration)
 
     def start(self, inspector, provider, identity=None, previous=None, resume=None,
-              preprocessing="api", preprocessing_id=None):
+              preprocessing="api", preprocessing_id=None, repair=None):
         profile = self.profiles.profile(provider)
         key = self.profiles.key(provider)
         if not profile["model"] or not key:
             raise ValueError("configure the provider model and credential first")
+        if resume is not None and (resume.get("revision_id") or resume.get("kind") == "CANDIDATE_REFINEMENT"):
+            if not isinstance(resume.get("repair"), dict):
+                raise ValueError("修订续接缺少原修复请求，请从草稿发起新的模型修复")
+            if repair is not None and repair != resume.get("repair"):
+                raise ValueError("修订续接必须保留原修复请求；修改提示或候选时请发起新的模型修复")
+            repair = copy.deepcopy(resume.get("repair"))
+            binding = resume.get("model_binding") or {}
+            if any(binding.get(name) != profile.get(name) for name in ("provider", "base_url", "model")):
+                raise ValueError("修订续接的模型连接已改变，请使用当前模型发起新的修复尝试")
+        if repair is not None:
+            if not isinstance(repair, dict) or any(not isinstance(repair.get(name), str) or not repair[name]
+                    for name in ("revision_id", "base_analysis_id", "base_candidate_digest")):
+                raise ValueError("repair requires revision_id, base_analysis_id and base_candidate_digest")
+            if not isinstance(repair.get("candidate"), dict) or repair.get("mode") not in {"refine", "update"}:
+                raise ValueError("repair requires a structured candidate and refine or update mode")
+            if resume is not None and not resume.get("revision_id"):
+                raise ValueError("普通分析续接不能改为修订请求，请发起新的模型修复")
+            if resume is not None and repair["revision_id"] != resume["revision_id"]:
+                raise ValueError("修订续接记录与原草稿不匹配")
+            # Keep only the structured repair contract. Completed conversations
+            # and provider reasoning are never materials for a new attempt.
+            repair = {name: copy.deepcopy(repair.get(name)) for name in
+                      ("revision_id", "base_analysis_id", "base_candidate_digest", "candidate",
+                       "guidance", "reason", "source_diff", "facts", "prior_report", "mode")}
+            preprocessing = "none"
         if preprocessing not in {"api", "none", "replay"}:
             raise ValueError("preprocessing must be api, none or replay")
         if preprocessing == "replay" and not preprocessing_id:
@@ -248,7 +275,21 @@ class AnalysisJobs:
         refinement = None
         via_binding = []
         context = previous
-        if resume is None and preprocessing == "none":
+        if resume is None and repair is not None:
+            messages[1] = dict(role="user", content=json.dumps(dict(
+                task="依据当前冻结请求和结构化材料修复完整候选。先处理变化与失败反馈，按需补读完整来源；"
+                     "repair.facts.related_candidates中的缓存引用可用read_revision_facts(path)读取完整结构事实，"
+                     "缓存缺失或摘要不匹配时仍用原source tools核对。"
+                     "旧候选可被纠正，不固定旧分区，不把旧报告的READY或已解除义务作为新许可。"
+                     "人工提示只引导注意或提出待核实主张，必须回查源码，不删除必要依赖，"
+                     "不直接签发READY，不改写原算法或规则。源码更新时重查入口、导入和注册范围；"
+                     "若任务要求发现新能力，不能只维护旧候选。最终提交完整candidate并接受完整机械检查；"
+                     "本次仅保存草稿和报告，正式安装由独立动作处理。",
+                request=request, repair=repair,
+                material_authority=dict(candidate="unverified proposal", facts="source evidence material",
+                    prior_report="feedback only; all candidate checks must run again")), ensure_ascii=False))
+            refinement = repair["base_analysis_id"]
+        if resume is None and repair is None and preprocessing == "none":
             # Resource selection installs the unchanged API candidate without
             # model messages. Recover its completed analysis, not a fresh
             # source-discovery conversation, only across checked identity links.
@@ -286,7 +327,7 @@ class AnalysisJobs:
             if stage == "preprocessing":
                 preparation["prior_started_at"] = preparation.get("started_at")
                 preparation["started_at"] = now()
-        elif preprocessing == "none" and context and context.get("preprocessing", {}).get("mode", "none") == "none" and context.get("status") == "COMPLETED" and context.get("messages") and context.get("submitted"):
+        elif repair is None and preprocessing == "none" and context and context.get("preprocessing", {}).get("mode", "none") == "none" and context.get("status") == "COMPLETED" and context.get("messages") and context.get("submitted"):
             old_request = self.store.get("request", context["request_id"])
             if old_request and old_request["source_version"] == inspector.request["source_version"]:
                 messages = [dict(role="system", content=RULES)] + copy.deepcopy(context["messages"][1:])
@@ -300,6 +341,18 @@ class AnalysisJobs:
             messages=messages, refinement_of=refinement, phase="model_request",
             model_binding=self.model_binding(profile), pipeline_stage=stage, preprocessing=preparation,
             usage_by_stage={"preprocessing": [], "analysis": []}, implementation=dict(self.implementation))
+        if repair is not None:
+            job.update(kind="CANDIDATE_REFINEMENT", revision_id=repair["revision_id"], repair=repair,
+                refinement_of=repair["base_analysis_id"], completion_scope="candidate_and_report_only",
+                reuse_scope=dict(schema="candidate-material-reuse/1", mode=repair["mode"],
+                    base_analysis_id=repair["base_analysis_id"],
+                    base_candidate_digest=repair["base_candidate_digest"],
+                    draft_candidate_digest=content_digest(repair["candidate"]),
+                    structured_candidate=True, source_facts=repair.get("facts") is not None,
+                    source_diff=repair.get("source_diff") is not None,
+                    prior_report=repair.get("prior_report") is not None, historical_messages=False,
+                    prior_ready=False, per_obligation_results=False),
+                recheck_scope="complete_candidate_boundaries_dependencies_entries_and_runtime_groups")
         if refinement and via_binding:
             job["via_binding"] = via_binding
         if resume is not None:
@@ -359,6 +412,21 @@ class AnalysisJobs:
         request["resource_access"] = "list_resources读取完整资源引用；list_structure返回目录位置。不将存在文件等同加载兼容。"
         return request
 
+    def _read_revision_facts(self, inspector, job, path):
+        facts = (job.get("repair") or {}).get("facts") or {}
+        references = facts.get("related_candidates", []) if isinstance(facts, dict) else []
+        reference = next((item for item in references if isinstance(item, dict) and item.get("path") == path), None)
+        record = inspector.files.get(path) if isinstance(path, str) else None
+        fact_id = reference.get("fact_id") if reference else None
+        cached = self.store.get("source_fact", fact_id) if isinstance(fact_id, str) and fact_id else None
+        if (not record or not isinstance(cached, dict) or cached.get("path") != path
+                or cached.get("sha256") != record["sha256"]):
+            return dict(schema="revision-source-facts/1", status="UNKNOWN", path=path,
+                reason="source_fact_unavailable_or_content_mismatch", admission_granted=False,
+                detail="Use the original source tools to inspect the current frozen source.")
+        return dict(schema="revision-source-facts/1", status="AVAILABLE", path=path,
+                    fact_id=fact_id, fact=copy.deepcopy(cached), admission_granted=False)
+
     def _run(self, inspector, profile, key, job, cancellation):
         stage_started = time.perf_counter()
         try:
@@ -376,6 +444,8 @@ class AnalysisJobs:
                 self.store.save("analysis", job["id"], job, "model_request")
                 stage = job.get("pipeline_stage", "analysis")
                 tools = SOURCE_TOOLS + PREPROCESS_TOOLS if stage == "preprocessing" else TOOLS
+                if job.get("revision_id"):
+                    tools = tools + [REVISION_FACT_TOOL]
                 response = self.transport.send(profile["base_url"] + "/chat/completions", key,
                                                 completion_body(profile, job["messages"], tools))
                 job["phase"] = "response_processing"
@@ -438,6 +508,8 @@ class AnalysisJobs:
                                 (inspector.request.get("runtime_environment") or {}).get("project", "")),
                                 selected=inspector.request.get("runtime_environment"),
                                 target_runtime=inspector.request.get("target_runtime"), execution="NOT_RUN")
+                        elif name == "read_revision_facts" and job.get("revision_id"):
+                            result = self._read_revision_facts(inspector, job, **args)
                         elif name in {"list_source", "read_file", "inspect_symbols", "inspect_construction", "add_source", "list_structure", "inspect_imports", "entry_candidates", "list_resources"}:
                             result = getattr(inspector, name)(**args)
                         else:
@@ -462,13 +534,15 @@ class AnalysisJobs:
                     continue
                 if submitted:
                     candidate = job["submitted"]["candidate"]
+                    checked_at = time.perf_counter()
                     report = check_candidate(inspector, candidate)
                     report["dependencies"] = check_requirements(inspector, candidate)
                     if self.check_entries:
                         report["entry_bindings"] = self.check_entries(inspector, candidate)
+                    job["final_check_duration_ms"] = round((time.perf_counter() - checked_at) * 1000, 3)
                     job["submitted"]["report"] = report
                     job["status"] = "COMPLETED"
-                    job["phase"] = "installation"
+                    job["phase"] = "candidate_refinement_complete" if job.get("revision_id") else "installation"
                     if self.on_complete:
                         job["units"] = self.on_complete(inspector, job)
                     break
@@ -486,6 +560,7 @@ class AnalysisJobs:
                 job["preprocessing"].update(status=job["status"], finished_at=now(), duration_ms=duration)
             else:
                 job["analysis_duration_ms"] = duration
+            job["model_calls"] = len(job["usage"])
             job["finished_at"] = now()
             if not self.closed:
                 self.store.save("analysis", job["id"], job, "analysis_finished")

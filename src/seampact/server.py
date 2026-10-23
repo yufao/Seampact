@@ -40,6 +40,8 @@ def make_server(platform, port=8880, host="127.0.0.1", public_port=None):
                     return self.send(200, platform.state())
                 if path == "/api/runtime/session":
                     return self.send(200, dict(session=platform.deployments.session))
+                if path.startswith("/api/analysis/revisions/"):
+                    return self.send(200, dict(revision=platform.revision_detail(path.rsplit("/", 1)[1])))
                 if path.startswith("/api/analysis/") and path.endswith("/snapshot"):
                     return self.send(200, platform.analysis_snapshot(path.split("/")[-2]))
                 if path.startswith("/api/analysis/"):
@@ -95,6 +97,16 @@ def make_server(platform, port=8880, host="127.0.0.1", public_port=None):
                                               body.get("preprocessing_id"))
                 elif path == "/api/analysis/resume":
                     result = platform.resume_analysis(body["analysis_id"])
+                elif path == "/api/analysis/revisions":
+                    result = platform.create_revision(body)
+                elif path == "/api/analysis/revisions/save":
+                    result = platform.save_revision(body)
+                elif path == "/api/analysis/revisions/check":
+                    result = platform.check_revision(body)
+                elif path == "/api/analysis/revisions/refine":
+                    result = platform.refine_revision(body)
+                elif path == "/api/analysis/revisions/install":
+                    result = platform.install_revision(body)
                 elif path == "/api/harnesses/detach":
                     result = platform.detach_harness(body["harness_id"])
                 elif path == "/api/harnesses/clear":

@@ -13,6 +13,13 @@ let refreshing = false;
 let connected = false;
 const analysisSubmitting = new Set();
 const sourceUpdating = new Set();
+const revisionDetails = new Map();
+const revisionDrafts = new Map();
+const revisionSelected = new Map();
+const revisionCreation = new Map();
+const revisionBusy = new Set();
+const revisionErrors = new Map();
+const revisionVersions = new Map();
 const deploymentDrafts = new Map();
 const deploymentSubmitting = new Set();
 let inspectPage = location.pathname === '/inspect';
@@ -55,7 +62,7 @@ const statusNames = {
   LOCAL_ONLY: '保留本地', EXPORTED: '运行包已导出', LOCAL: '本地进程', REMOTE: '独立运行进程',
   HOST_CHECKED: '宿主条件已核对', ARTIFACT_READY: '构建工件已生成', BUILT: '已构建', PUBLISHED: '已发布',
   NOT_REQUIRED: '无需发布', OPERATOR_REPORTED: '操作者报告', BACKEND_UNAVAILABLE: '后端不可用',
-  ENVIRONMENT_DEFERRED: '环境条件由宿主核对'
+  ENVIRONMENT_DEFERRED: '环境条件由宿主核对', DRAFT: '修订草稿', CHECKED: '已完整检查', INSTALLED: '已安装'
 };
 
 function inspectLink(view, parameters = {}) {
@@ -1063,6 +1070,186 @@ function analysisExportButton(job, candidate = false) {
   return button;
 }
 
+function acceptRevision(revision) {
+  revisionDetails.set(revision.id, revision);
+  const prior = revisionDrafts.get(revision.id);
+  if (!prior?.dirty) revisionDrafts.set(revision.id, {
+    candidate: textValue(revision.candidate), guidance: revision.guidance || '', reason: revision.reason || '', dirty: false
+  });
+}
+
+async function refreshRevisionDetails() {
+  if (!inspectPage || inspectView !== 'analyses') return;
+  const selected = new Set(revisionSelected.values());
+  const results = await Promise.allSettled((state.analysis_revisions || []).filter(item => selected.has(item.id)).map(async item => {
+    const version = JSON.stringify(item);
+    if (revisionVersions.get(item.id) === version || revisionBusy.has(item.id)) return;
+    try {
+      const result = await api('/api/analysis/revisions/' + encodeURIComponent(item.id));
+      acceptRevision(result.revision || result);
+      revisionVersions.set(item.id, version);
+      revisionErrors.delete(item.id);
+    } catch (error) { revisionErrors.set(item.id, error.message); }
+  }));
+  for (const result of results) if (result.status === 'rejected') showNotice(result.reason?.message || String(result.reason));
+}
+
+function revisionInput(root, label, value, key, oninput, multiline = false) {
+  const wrapper = node('label', undefined, 'revision-field');
+  wrapper.append(node('span', label));
+  const input = node(multiline ? 'textarea' : 'input');
+  input.value = value;
+  input.dataset.deploymentField = 'revision:' + key;
+  input.oninput = () => oninput(input.value);
+  wrapper.append(input); root.append(wrapper);
+  return input;
+}
+
+async function revisionAction(id, operation) {
+  if (revisionBusy.has(id)) return;
+  revisionBusy.add(id); revisionErrors.delete(id);
+  renderedSections.delete('analyses');
+  await refresh();
+  try {
+    const draft = revisionDrafts.get(id);
+    const candidate = JSON.parse(draft.candidate);
+    if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate)) throw new Error('候选必须是 JSON 对象。');
+    const body = operation === 'install' ? {revision_id: id} :
+      {revision_id: id, candidate, guidance: draft.guidance, reason: draft.reason};
+    const result = await api('/api/analysis/revisions/' + operation, body);
+    draft.dirty = false;
+    if (result.revision) acceptRevision(result.revision);
+    revisionVersions.delete(id);
+    showNotice(operation === 'check' && result.revision?.status !== 'CHECKED' ?
+      '草稿已保存，但完整重检失败：' + (textValue(result.revision?.error) || '请查看检查反馈。') :
+      {save: '草稿已保存，当前能力池未变。', check: '已保存并完成完整重检；逐项可用条件请查看报告。',
+      refine: '已启动模型局部修复；本次使用当前分析模型，用量单独记录，完成后仍需检查和安装。',
+      install: '新候选已独立安装，原分析历史保留。'}[operation]);
+  } catch (error) { revisionErrors.set(id, error.message); }
+  finally {
+    revisionBusy.delete(id); renderedSections.delete('analyses'); await refresh();
+  }
+}
+
+function renderRevisionWorkspace(card, harness, job) {
+  const summaries = (state.analysis_revisions || []).filter(item => item.base_analysis_id === job.id);
+  const isCurrent = job.id === harness.analysis_id;
+  const eligible = isCurrent && job.status === 'COMPLETED' && job.submitted?.candidate;
+  if (!eligible && !summaries.length) return;
+  const workspace = node('section', undefined, 'revision-workspace');
+  workspace.append(node('h4', '候选修订工作台'));
+  workspace.append(node('p', '编辑、保存和检查只作用于草稿。模型修复后仍对完整候选重检，再独立安装；跨源码版本重新检查全部条件。', 'card-note'));
+  if (!isCurrent) workspace.append(node('p', '此分析为只读历史；可回到已创建的修订查看反馈与后续尝试。', 'card-note'));
+  if (eligible) {
+    if (!revisionCreation.has(job.id)) revisionCreation.set(job.id, {mode: 'refine', revision: ''});
+    const creation = revisionCreation.get(job.id);
+    const controls = node('div', undefined, 'revision-create');
+    const modeLabel = node('label', undefined, 'revision-field'); modeLabel.append(node('span', '修订模式'));
+    const mode = node('select');
+    for (const [value, label] of [['refine', '同源修复：沿用冻结源码'], ['update', '源码更新：重新冻结当前本地目录或拉取 URL']]) {
+      const option = node('option', label); option.value = value; mode.append(option);
+    }
+    mode.value = creation.mode;
+    mode.onchange = () => { creation.mode = mode.value; revisionField.hidden = mode.value !== 'update'; };
+    modeLabel.append(mode); controls.append(modeLabel);
+    const revision = revisionInput(controls, 'URL revision（可选；本地目录读取当前内容）', creation.revision,
+      job.id + ':source', value => { creation.revision = value; });
+    const revisionField = revision.parentElement; revisionField.hidden = creation.mode !== 'update';
+    const create = node('button', revisionBusy.has(job.id) ? '冻结来源中…' : '创建独立修订', 'secondary-button');
+    create.disabled = revisionBusy.has(job.id) || harness.status === 'DETACHED' || harness.status === 'ANALYZING';
+    create.onclick = async () => {
+      revisionBusy.add(job.id); create.disabled = true; create.textContent = '冻结来源中…';
+      revisionErrors.delete(job.id);
+      try {
+        const body = {analysis_id: job.id, mode: creation.mode};
+        if (creation.mode === 'update' && creation.revision.trim()) body.revision = creation.revision.trim();
+        const result = await api('/api/analysis/revisions', body);
+        acceptRevision(result.revision); revisionSelected.set(job.id, result.revision.id);
+        showNotice('已创建独立草稿，原分析与当前能力池保留。');
+      } catch (error) { revisionErrors.set(job.id, error.message); }
+      finally { revisionBusy.delete(job.id); renderedSections.delete('analyses'); await refresh(); }
+    };
+    controls.append(create); workspace.append(controls);
+  }
+  if (revisionErrors.has(job.id)) workspace.append(node('p', revisionErrors.get(job.id), 'message-error'));
+  if (summaries.length) {
+    const selector = node('select'); selector.setAttribute('aria-label', '选择已有修订');
+    selector.append(node('option', '选择已有修订…'));
+    selector.firstChild.value = '';
+    for (const summary of summaries) {
+      const option = node('option', summary.id + ' · ' + statusLabel(summary.status) + ' · ' + (summary.updated_at || ''));
+      option.value = summary.id; selector.append(option);
+    }
+    selector.value = revisionSelected.get(job.id) || '';
+    selector.onchange = async () => {
+      revisionSelected.set(job.id, selector.value);
+      renderedSections.delete('analyses'); await refresh();
+    };
+    workspace.append(selector);
+  }
+  const id = revisionSelected.get(job.id);
+  const revision = revisionDetails.get(id);
+  if (id && revisionErrors.has(id)) workspace.append(node('p', revisionErrors.get(id), 'message-error'));
+  if (id && !revision) workspace.append(node('p', '正在读取修订…', 'card-note'));
+  if (revision) {
+    const draft = revisionDrafts.get(id);
+    const stale = !isCurrent || revision.stale === true || revision.current_basis_matches === false;
+    const locked = revisionBusy.has(id) || stale || harness.status === 'DETACHED' || ['ANALYZING', 'INSTALLED'].includes(revision.status);
+    const head = node('div', undefined, 'card-heading'); head.append(node('strong', id), pill(revision.status)); workspace.append(head);
+    workspace.append(node('p', '模式：' + (revision.mode === 'update' ? '源码更新' : '同源修复') +
+      ' · 父候选摘要：' + (revision.base_candidate_digest || '未提供'), 'card-meta'));
+    detailValue(workspace, '父来源版本', revision.base_source_version);
+    detailValue(workspace, '本次冻结来源版本', revision.source_version);
+    detailValue(workspace, '人工修改／提示与材料来源记录', revision.provenance);
+    detailValue(workspace, '材料复用范围（不沿用旧版本放行结论）', revision.reuse);
+    detailValue(workspace, '源码差异与覆盖说明', revision.source_diff, revision.mode === 'update');
+    detailValue(workspace, '已保存候选相对父候选的差异', revision.candidate_diff);
+    if (stale) workspace.append(node('p', revision.stale_reason || '父分析或来源条件已改变，此草稿只读；请从当前分析创建新修订。', 'card-note'));
+    if (draft.dirty) detailValue(workspace, '服务器已保存的完整候选（本地未保存编辑另行保留）', revision.candidate);
+    const editor = revisionInput(workspace, '完整候选 JSON（人工编辑）', draft.candidate, id + ':candidate', value => {
+      draft.candidate = value; changed();
+    }, true);
+    editor.classList.add('revision-candidate'); editor.spellcheck = false;
+    const guidance = revisionInput(workspace, '局部修复提示／关注范围', draft.guidance, id + ':guidance', value => {
+      draft.guidance = value; changed();
+    }, true);
+    const reason = revisionInput(workspace, '修改理由', draft.reason, id + ':reason', value => {
+      draft.reason = value; changed();
+    }, true);
+    for (const input of [editor, guidance, reason]) input.disabled = locked;
+    const feedback = node('p', undefined, 'card-note'); workspace.append(feedback);
+    const actions = node('div', undefined, 'harness-actions');
+    const buttons = {};
+    for (const [operation, label] of [['save', '保存草稿'], ['check', '保存并完整重检'], ['refine', '调用当前分析模型局部修复'], ['install', '独立安装新候选']]) {
+      const button = node('button', label, 'secondary-button'); button.type = 'button';
+      button.onclick = () => revisionAction(id, operation); buttons[operation] = button; actions.append(button);
+    }
+    function updateControls() {
+      const checked = !draft.dirty && revision.report && revision.checked_digest && revision.checked_digest === revision.candidate_digest;
+      feedback.textContent = draft.dirty ? '有未保存编辑，差异与检查报告对应上次保存内容；请保存或完整重检。' :
+        checked ? '完整检查已对应当前候选；仍以逐项反馈和安装时环境核对为准。' : '当前候选尚无匹配的完整检查，请先完整重检。';
+      for (const button of Object.values(buttons)) button.disabled = locked || harness.status === 'DETACHED';
+      buttons.refine.disabled ||= !isReady(state.models?.analysis);
+      buttons.install.disabled ||= !checked || harness.status === 'ANALYZING';
+    }
+    function changed() { draft.dirty = true; updateControls(); }
+    updateControls(); workspace.append(actions);
+    workspace.append(node('p', '局部修复会调用当前配置的分析模型：' + (state.models?.analysis?.model || '尚未配置') +
+      '。保存和机械重检不调用模型。', 'card-note'));
+    if (revision.error) workspace.append(node('p', textValue(revision.error), 'message-error'));
+    detailValue(workspace, '当前完整检查报告（逐项条件与失败原因）', revision.report, true);
+    const attempt = (state.analyses || []).find(item => item.id === revision.analysis_id);
+    if (attempt) {
+      workspace.append(node('p', '本次模型尝试：' + attempt.id + ' · ' + statusLabel(attempt.status), 'card-meta'), analysisProgress(attempt));
+      if (attempt.error) workspace.append(node('p', textValue(attempt.error), 'message-error'));
+      detailValue(workspace, '本次模型与实际请求参数', attempt.model_binding);
+    }
+    detailValue(workspace, '本次用量记录', attempt?.usage ?? revision.usage);
+    if (revision.installed_analysis_id) workspace.append(node('p', '安装后的分析身份：' + revision.installed_analysis_id, 'card-meta'));
+  }
+  card.append(workspace);
+}
+
 function renderAnalyses() {
   const harnesses = (state.harnesses || []).filter(source => !selectedSource() || source.id === selectedSource());
   const analyses = state.analyses || [];
@@ -1101,7 +1288,9 @@ function renderAnalyses() {
       }
     }
     if (inspectPage) {
-      card.append(node('p', '源码版本：' + (harness.revision || '本地内容版本'), 'card-meta'));
+      const sourceVersion = job?.submitted?.report?.source_version || job?.source_version;
+      card.append(node('p', '本记录冻结源码版本：' + (sourceVersion || '未提供；以原分析工件为准'), 'card-meta'));
+      if (!job || job.id === harness.analysis_id) card.append(node('p', '来源 revision：' + (harness.revision || '本地内容版本'), 'card-meta'));
       if (job) {
         card.append(node('p', '分析 ' + job.id + ' · ' + statusLabel(job.status) +
           (job.id === harness.analysis_id ? ' · 当前记录' : ' · 历史记录'), 'card-meta'));
@@ -1158,6 +1347,7 @@ function renderAnalyses() {
     }
     actions.append(sourceButton(harness));
     card.append(actions);
+    if (inspectPage && job) renderRevisionWorkspace(card, harness, job);
     root.append(card);
     }
   }
@@ -2248,6 +2438,7 @@ async function refresh() {
   refreshing = true;
   try {
     state = await api('/api/state');
+    await refreshRevisionDetails();
     connected = true;
     $('connection').textContent = '已连接';
     $('version').textContent = state.version ? '核心 ' + state.version : '';
@@ -2267,7 +2458,8 @@ async function refresh() {
     renderSection('units', [visibleUnits(), state.harnesses, selectedSource()], renderUnits, ['unit-list']);
     renderSection('deployments', [state.runtime_groups, state.deployments, state.deployment_backend,
       state.runtime_controller, selectedSource()], renderDeployments, ['deployment-list']);
-    renderSection('analyses', [state.analyses, state.harnesses, resourceState(), selectedSource(), [...sourceUpdating]], renderAnalyses, ['analysis-list']);
+    renderSection('analyses', [state.analyses, state.harnesses, state.analysis_revisions, state.models?.analysis,
+      resourceState(), selectedSource(), [...sourceUpdating], [...revisionSelected], [...revisionDetails], [...revisionErrors], [...revisionBusy]], renderAnalyses, ['analysis-list']);
     renderSection('harnesses', [state.harnesses, state.analyses, state.models?.analysis, resourceState(), [...analysisSubmitting], [...sourceUpdating]], renderHarnesses, ['harness-list']);
   } catch (error) {
     connected = false;
