@@ -36,7 +36,7 @@
 
 上一段为六项修复前的历史过程：FAILED 预热不构成暖态实验，worker 进程退出也不构成后端对象已释放的证据。
 
-bridge 平台的同机 worker 采用[Compose 同网络方案](Docker部署.md#3-bridge-平台怎样接-worker)。host 网络与 SSH 跨机方式要求双方 daemon 支持对应网络语义；rootless 挂载私有目录的容器用户按服务器指南配置。实际机器环境、服务状态和集群探查记录保留本地。
+bridge 平台的同机 worker 采用[共享网络方案](Docker部署.md#3-bridge-平台怎样接-worker)。host 网络与 SSH 跨机方式要求双方 daemon 支持对应网络语义；rootless 挂载私有目录的容器用户按服务器指南配置。实际机器环境、服务状态和集群探查记录保留本地。
 
 Unit 是分析后的能力和调度入口；运行组是这些入口必须共同保留的原生执行环境；实例是某个运行组的一次具体进程。三者不是一一对应关系。一个组中可以有多个 Unit，K8S 部署的是承载该组的进程。仅把多个容器放在同一个 Pod，不会让它们共享 Python 对象。
 
@@ -129,7 +129,7 @@ flowchart LR
 
 docker 后端使用 `docker_network`（同一用户自建网络中按容器名访问），或 `publish_host`／`advertise_host` 发布到一个空闲端口；`mounts` 为 `{source, target, read_only}`，`gpus` 原样传给 `--gpus`，`pass_env` 只列变量名，值来自平台进程环境。K8S 后端为每个实例生成一个副本数 1、`Recreate` 的 Deployment（名称 `<组>-g<代次>`），保存在工件目录 `instances/`；Pod 以 downward API 取得自身 IP 并登记 `http://$(POD_IP):8890`，按实例标签观测，停止时删除该 Deployment。凭据以 `env_secret` 中同名键注入；权重须挂载到与平台登记相同的路径。
 
-平台通过 docker／kubectl／kind 命令行执行，不经 shell。客户端或守护进程不可用时报告 `BACKEND_UNAVAILABLE` 并给出 `manual_commands`；操作者在宿主执行后，带 `--instance-id` 的进程登记时绑定到平台预先创建的同一实例。默认平台镜像不含 docker／kubectl；需要容器内自动调用 Docker 时，选择 [Docker 工具镜像与 socket 配置](Docker部署.md#6-可选容器内使用-docker-自动准备与部署)。平台直接运行在已有 docker／kubectl 的宿主时，由平台执行。容器中的 `/data/...` 与宿主数据挂载目录是两个路径视角，手动命令须按实际映射执行。
+平台通过 docker／kubectl／kind 命令行执行，不经 shell。客户端或守护进程不可用时报告 `BACKEND_UNAVAILABLE` 并给出 `manual_commands`；操作者在宿主执行后，带 `--instance-id` 的进程登记时绑定到平台预先创建的同一实例。平台基础镜像不含 docker／kubectl；0.11.1 部署脚本新安装默认选用 [Docker 工具镜像与 socket 配置](Docker部署.md#6-可选容器内使用-docker-自动准备与部署)，工具镜像不增加 kubectl／kind。平台直接运行在已有 docker／kubectl 的宿主时，由平台执行。容器中的 `/data/...` 与宿主数据挂载目录是两个路径视角，手动命令须按实际映射执行。
 
 registry 发布成功后优先保存并使用实际 `RepoDigest`；本机 Docker 构建则使用返回的镜像 ID，减少可变标签和节点缓存造成的混淆。K8S 继续以 `IfNotPresent` 拉取目标镜像。私有镜像仓库可在后端 JSON 加 `"image_pull_secrets": ["registry-secret"]`，引用同一命名空间内已有的仓库 Secret；对应语义见 [Kubernetes 镜像文档](https://kubernetes.io/docs/concepts/containers/images/)。平台不创建仓库账号或凭据；节点仍需实际可访问仓库。
 
@@ -177,7 +177,7 @@ registry 发布成功后优先保存并使用实际 `RepoDigest`；本机 Docker
 | `~/seampact-workspace/seampact-data` | `/data` | 模型配置、能力池、分析记录、冻结源码和构建工件 |
 | `~/seampact-workspace/harnesses` | `/harnesses` | SFTP 上传的来源和实际资源 |
 
-同机 Docker 与跨机器的手动启动命令见[服务器部署](服务器部署.md)第 5–7 节。
+同机 Docker、跨机器 SSH 与 worker 更新命令见[运行组远端操作](运行组远端操作.md)。平台首次安装与更新统一见[服务器部署](服务器部署.md)。
 
 ### K8S：专用 KIND 中启动平台
 
@@ -211,7 +211,8 @@ export SEAMPACT_HARNESS_DIR="$HOME/seampact-workspace/harnesses"
 export SEAMPACT_K8S_DIR="$PWD/.local-private/deployment/k8s"
 mkdir -p "$SEAMPACT_DATA_DIR" "$SEAMPACT_HARNESS_DIR" "$SEAMPACT_K8S_DIR"
 export SEAMPACT_REVISION="$(git rev-parse --short HEAD)"
-export SEAMPACT_CORE_IMAGE="seampact-core:0.10.0-$SEAMPACT_REVISION"
+export SEAMPACT_VERSION="$(PYTHONPATH=src python3 -B -c 'from seampact import __version__; print(__version__)')"
+export SEAMPACT_CORE_IMAGE="seampact-core:$SEAMPACT_REVISION"
 python3 -I -B - <<'PY'
 import json
 import os
@@ -245,6 +246,7 @@ KIND 节点容器的 `extraMounts` 先接入宿主目录，Pod 的 `hostPath` �
 
 ```bash
 docker build -f deploy/Dockerfile --build-arg SEAMPACT_REVISION="$SEAMPACT_REVISION" \
+  --build-arg SEAMPACT_VERSION="$SEAMPACT_VERSION" \
   --build-arg SEAMPACT_EXTRAS="${SEAMPACT_EXTRAS:-}" -t "$SEAMPACT_CORE_IMAGE" .
 ```
 

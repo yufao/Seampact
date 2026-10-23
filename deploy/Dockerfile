@@ -12,6 +12,7 @@ RUN apt-get update \
 # Empty SEAMPACT_EXTRAS keeps the light platform; "rl" adds the three learners.
 ARG SEAMPACT_EXTRAS=
 ARG SEAMPACT_REVISION=UNKNOWN
+ARG SEAMPACT_VERSION=UNKNOWN
 ARG SEAMPACT_PIP_EXTRA_INDEX_URL=
 COPY pyproject.toml ./
 COPY src ./src
@@ -24,7 +25,7 @@ RUN python -c "import sys; assert sys.version_info[:2] == (3, 11), 'platform ima
 ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 \
     SEAMPACT_RUNTIME_LOCK=/app/runtime-lock.txt \
     SEAMPACT_REVISION=${SEAMPACT_REVISION} SEAMPACT_EXTRAS=${SEAMPACT_EXTRAS}
-LABEL org.opencontainers.image.version="0.10.0" org.opencontainers.image.revision="${SEAMPACT_REVISION}"
+LABEL org.opencontainers.image.version="${SEAMPACT_VERSION}" org.opencontainers.image.revision="${SEAMPACT_REVISION}"
 EXPOSE 8880
 ENTRYPOINT ["python", "-B", "-m", "seampact"]
 CMD ["serve", "--home", "/data", "--host", "0.0.0.0", "--port", "8880"]

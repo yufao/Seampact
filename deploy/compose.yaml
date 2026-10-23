@@ -2,13 +2,14 @@ name: seampact-prototype
 
 services:
   platform:
-    image: "seampact-core:0.10.0${SEAMPACT_IMAGE_SUFFIX:-}"
+    image: "${SEAMPACT_PLATFORM_IMAGE:-seampact-core:local}"
     build:
       context: ..
       dockerfile: deploy/Dockerfile
       args:
         SEAMPACT_EXTRAS: "${SEAMPACT_EXTRAS:-}"
         SEAMPACT_REVISION: "${SEAMPACT_REVISION:-UNKNOWN}"
+        SEAMPACT_VERSION: "${SEAMPACT_VERSION:-UNKNOWN}"
         SEAMPACT_PIP_EXTRA_INDEX_URL: "${SEAMPACT_PIP_EXTRA_INDEX_URL:-}"
     user: "${SEAMPACT_UID:-1000}:${SEAMPACT_GID:-1000}"
     init: true
