@@ -1627,6 +1627,8 @@ class Deployments:
         else:
             payload = encode_port(arguments)
         with self.lock:
+            if record["state"] != "READY" or not record.get("accepting") or record.get("source_detached"):
+                raise ProtocolError("实例已停止接单或来源已摘除，不能开始新的根请求")
             record["in_flight"] += 1
             record["last_activity_wall"] = time.time()
         started = time.perf_counter()

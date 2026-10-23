@@ -290,7 +290,7 @@ class Profiles:
         except ValueError:
             valid = False
         if not valid:
-            raise ValueError("analysis requires a cloud HTTPS base URL" if cloud else
+            raise ValueError("use an HTTPS service base URL without credentials or query" if cloud else
                              "use an HTTP or HTTPS service base URL without credentials or query")
         return base
 
@@ -379,7 +379,7 @@ class Profiles:
         key_present = bool(auth.get("credential_ref") or (auth["mode"] == "environment" and
                            os.environ.get(auth.get("env", ""))))
         stored_mode = self.credentials.get(auth.get("credential_ref"), {}).get("mode", "saved")
-        ready = configured and not error and (usable or (auth["mode"] == "none" and identity != "analysis"))
+        ready = configured and not error and (usable or auth["mode"] == "none")
         return dict(profile, identity=identity, max_output_tokens=output_capability(profile),
                     configured=configured, ready=ready, key_present=key_present,
                     key_usable=usable, credential_error=error,
@@ -486,7 +486,7 @@ class Profiles:
             connection = self.connections[selected]
             if connection["protocol"] != "openai-compatible" or not connection.get("model"):
                 raise ValueError("platform model roles require an OpenAI-compatible connection with a model ID")
-            self._url(connection["base_url"], cloud=role == "analysis")
+            self._url(connection["base_url"])
             completion_parameters(connection)
             self.roles[role] = selected
             self._save()
@@ -512,7 +512,7 @@ class Profiles:
         with self.lock:
             if body.get("connection_id"):
                 return self.select_role(role, body["connection_id"])
-            self._update(identity, body, cloud=role == "analysis")
+            self._update(identity, body, cloud=False)
             return self._public(identity)
 
     def save(self, identity, body):

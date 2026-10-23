@@ -76,6 +76,7 @@ check_candidate.entry_bindings.runtime_groups返回引擎按源码核对的分�
 
 RULES += DEPENDENCY_RULES
 RULES += "\n运行环境由inspect_environment返回原库声明、推荐、冲突与用户选择。entry_profile保留平台本地基线，runtime_environment为明确选择的独立目标解释器，具体语法与构造仍须通过引擎核对。先核对环境事实；不自行升级依赖、执行安装命令或以镜像存在证明原能力可用。需要不同Python/依赖时说明来源依据和缺口，交由运行环境配置，不改变原算法或拆分规则。\n"
+RULES += "\n同一响应可以提出多个互不依赖的源码读取工具请求，减少逐项等待模型的往返。已有预处理工件中的源锚点、构造候选和反馈应先消费；按需补读与拆分有关的证据，无需重复读取未改变且已有完整证据的文件。最终候选仍须接受完整机械核验。\n"
 
 
 def function(name, description, properties, required):
@@ -125,6 +126,10 @@ def source_io_error(tool, error):
                 error=type(error).__name__, reason=reason, admission_granted=False,
                 detail="Source evidence is unavailable in the registered/frozen scope. "
                        "Refine the source request or record the dependency as UNKNOWN.")
+
+
+class AnalysisCancelled(Exception):
+    """Stop local analysis work; an already sent provider request may finish."""
 
 
 class AnalysisJobs:
@@ -220,8 +225,10 @@ class AnalysisJobs:
               preprocessing="api", preprocessing_id=None, repair=None):
         profile = self.profiles.profile(provider)
         key = self.profiles.key(provider)
-        if not profile["model"] or not key:
-            raise ValueError("configure the provider model and credential first")
+        if not profile["model"]:
+            raise ValueError("configure the provider model first")
+        if profile.get("auth", {}).get("mode") != "none" and not key:
+            raise ValueError("configure the provider credential or select no authentication first")
         if resume is not None and (resume.get("revision_id") or resume.get("kind") == "CANDIDATE_REFINEMENT"):
             if not isinstance(resume.get("repair"), dict):
                 raise ValueError("修订续接缺少原修复请求，请从草稿发起新的模型修复")
@@ -366,10 +373,14 @@ class AnalysisJobs:
         threading.Thread(target=self._run, args=(inspector, profile, key, job, cancellation), daemon=True).start()
         return job["id"]
 
-    def _finish_preprocessing(self, inspector, job, content, report):
+    def _finish_preprocessing(self, inspector, job, content, report, checked_input, cancellation):
         # A tool batch can extend source after an earlier check or submission.
-        # Recheck against the final scope before binding the artifact's identity.
-        report = check_preprocessing(inspector, content, self.check_entries)
+        # Recheck a changed scope, but retain the complete submission check when
+        # no source/configuration changed during this same tool response.
+        if checked_input != content_digest(preparation_input(inspector)):
+            report = self._await_operation(lambda: check_preprocessing(inspector, content, self.check_entries),
+                                           cancellation, job, "preprocessing_check")
+        self._raise_cancelled(cancellation)
         for name, data in self.implementation_bytes.items():
             sha = self.implementation[name]
             target = inspector.snapshots / sha
@@ -397,7 +408,7 @@ class AnalysisJobs:
         job["messages"] = [dict(role="system", content=RULES),
                            dict(role="user", content=json.dumps(request, ensure_ascii=False))]
         job["pipeline_stage"] = "analysis"
-        self.store.save("analysis", job["id"], job, "preprocessing_finished")
+        self._save_job(job, cancellation, "preprocessing_finished")
 
     @staticmethod
     def source_request(inspector):
@@ -427,27 +438,96 @@ class AnalysisJobs:
         return dict(schema="revision-source-facts/1", status="AVAILABLE", path=path,
                     fact_id=fact_id, fact=copy.deepcopy(cached), admission_granted=False)
 
+    def _raise_cancelled(self, cancellation):
+        if cancellation.is_set() or self.closed:
+            raise AnalysisCancelled()
+
+    def _save_job(self, job, cancellation, event):
+        # Serialize cancellation with state writes so a late tool result cannot
+        # replace the user-visible CANCELLING state with RUNNING.
+        with self.lock:
+            if self.closed:
+                return
+            if cancellation.is_set():
+                job["status"] = "CANCELLED" if event == "analysis_finished" or job["status"] == "CANCELLED" else "CANCELLING"
+            if cancellation.is_set() and not job.get("cancel_requested_at"):
+                saved = self.store.get("analysis", job["id"]) or {}
+                if saved.get("cancel_requested_at"):
+                    job["cancel_requested_at"] = saved["cancel_requested_at"]
+            self.store.save("analysis", job["id"], job, event)
+
+    def _await_operation(self, operation, cancellation, job, phase, tool=None):
+        """Wait cancellably for a provider/read-only tool without using its late result.
+
+        HTTP providers and target checkers may continue their already accepted
+        operation. Only the waiting thread handles messages, state and installs.
+        Source mutations and completion callbacks must not use this wrapper.
+        """
+        self._raise_cancelled(cancellation)
+        finished, result = threading.Event(), {}
+
+        def execute():
+            try:
+                result["value"] = operation()
+            except BaseException as error:
+                result["error"] = error
+            finally:
+                finished.set()
+
+        started, outcome = time.perf_counter(), "failed"
+        threading.Thread(target=execute, daemon=True).start()
+        try:
+            while not finished.wait(0.05):
+                self._raise_cancelled(cancellation)
+            self._raise_cancelled(cancellation)
+            if "error" in result:
+                raise result["error"]
+            outcome = "completed"
+            return result["value"]
+        except AnalysisCancelled:
+            outcome = "cancelled"
+            raise
+        finally:
+            item = dict(stage=job.get("pipeline_stage", "analysis"), phase=phase,
+                        round=job["rounds"] + (phase == "model_request"), outcome=outcome,
+                        duration_ms=round((time.perf_counter() - started) * 1000, 3))
+            if tool:
+                item["tool"] = tool
+            job.setdefault("timings", []).append(item)
+
+    def _check_candidate(self, inspector, candidate):
+        report = check_candidate(inspector, candidate)
+        report["dependencies"] = check_requirements(inspector, candidate)
+        if self.check_entries:
+            report["entry_bindings"] = self.check_entries(inspector, candidate)
+        return report
+
     def _run(self, inspector, profile, key, job, cancellation):
-        stage_started = time.perf_counter()
+        started = stage_started = time.perf_counter()
         try:
             if not profile.get("capabilities") and profile.get("provider") == "deepseek":
                 try:
-                    metadata = self.transport.send(profile["base_url"] + "/models", key)
+                    job["phase"] = "model_metadata"
+                    self._save_job(job, cancellation, "model_metadata")
+                    metadata = self._await_operation(lambda: self.transport.send(profile["base_url"] + "/models", key),
+                                                     cancellation, job, "model_metadata")
                     models = metadata.get("data", [])
                     profile["capabilities"] = dict(models=models,
                         selected=next((m for m in models if m.get("id") == profile["model"]), None))
                 except ProviderError:
                     pass
             while not cancellation.is_set():
+                self._raise_cancelled(cancellation)
                 job["phase"] = "model_request"
                 job["model_binding"] = self.model_binding(profile)
-                self.store.save("analysis", job["id"], job, "model_request")
+                self._save_job(job, cancellation, "model_request")
                 stage = job.get("pipeline_stage", "analysis")
                 tools = SOURCE_TOOLS + PREPROCESS_TOOLS if stage == "preprocessing" else TOOLS
                 if job.get("revision_id"):
                     tools = tools + [REVISION_FACT_TOOL]
-                response = self.transport.send(profile["base_url"] + "/chat/completions", key,
-                                                completion_body(profile, job["messages"], tools))
+                body = completion_body(profile, job["messages"], tools)
+                response = self._await_operation(lambda: self.transport.send(
+                    profile["base_url"] + "/chat/completions", key, body), cancellation, job, "model_request")
                 job["phase"] = "response_processing"
                 job["rounds"] += 1
                 job["usage"].append(response.get("usage"))
@@ -460,19 +540,20 @@ class AnalysisJobs:
                            if k in {"role", "content", "tool_calls", "reasoning_content"}}
                 job["messages"].append(message)
                 job["last_finish_reason"] = choice.get("finish_reason")
-                self.store.save("analysis", job["id"], job, "provider_response")
-                if cancellation.is_set() or self.closed:
-                    job["status"] = "CANCELLED"
-                    break
+                self._save_job(job, cancellation, "provider_response")
+                self._raise_cancelled(cancellation)
                 calls = message.get("tool_calls", [])
                 if choice.get("finish_reason") not in {"stop", "tool_calls"}:
                     raise ProviderError("模型响应未完成：" + str(choice.get("finish_reason")))
                 if not calls:
                     raise ProviderError("模型未提交结构化接入结果")
                 job["phase"] = "source_tools"
+                self._save_job(job, cancellation, "source_tools_started")
                 submitted = False
+                submitted_input = None
                 prepared = None
                 for call in calls:
+                    self._raise_cancelled(cancellation)
                     name = call.get("function", {}).get("name")
                     try:
                         args = json.loads(call["function"]["arguments"])
@@ -480,11 +561,12 @@ class AnalysisJobs:
                             if stage != "preprocessing":
                                 raise ValueError("preprocessing is already frozen")
                             artifact = args["artifact"]
-                            result = check_preprocessing(inspector, artifact, self.check_entries)
+                            result = self._await_operation(lambda: check_preprocessing(inspector, artifact, self.check_entries),
+                                                           cancellation, job, "source_tools", name)
                             if name == "submit_preprocessing":
                                 if prepared is not None:
                                     raise ValueError("one preprocessing submission per response")
-                                prepared = (artifact, result)
+                                prepared = (artifact, result, content_digest(preparation_input(inspector)))
                         elif name in {"check_candidate", "submit_candidate"}:
                             if stage != "analysis":
                                 raise ValueError("submit preprocessing before proposing split boundaries")
@@ -493,25 +575,39 @@ class AnalysisJobs:
                                 raise ValueError("最终交付缺少runtime_groups数组。按引擎反馈提出完整运行组；未决对象/共享状态/控制依赖留在原进程，不能仅文字声称已经分组。")
                             if name == "submit_candidate" and candidate.get("entries") and not candidate["runtime_groups"]:
                                 raise ValueError("存在入口时运行组不能留空，须完整列出所有入口的原进程分组。")
-                            result = check_candidate(inspector, candidate)
-                            result["dependencies"] = check_requirements(inspector, candidate)
-                            if self.check_entries:
-                                result["entry_bindings"] = self.check_entries(inspector, candidate)
+                            result = self._await_operation(lambda: self._check_candidate(inspector, candidate),
+                                                           cancellation, job, "source_tools", name)
                             if name == "submit_candidate":
                                 if submitted:
                                     raise ValueError("one final submission per response")
                                 job["submitted"] = dict(candidate=candidate, report=result)
+                                submitted_input = content_digest(preparation_input(inspector))
                                 submitted = True
                         elif name == "inspect_environment":
                             from .environments import discover_environment
-                            result = dict(discovery=discover_environment(inspector,
+                            result = self._await_operation(lambda: dict(discovery=discover_environment(inspector,
                                 (inspector.request.get("runtime_environment") or {}).get("project", "")),
                                 selected=inspector.request.get("runtime_environment"),
-                                target_runtime=inspector.request.get("target_runtime"), execution="NOT_RUN")
+                                target_runtime=inspector.request.get("target_runtime"), execution="NOT_RUN"),
+                                cancellation, job, "source_tools", name)
                         elif name == "read_revision_facts" and job.get("revision_id"):
-                            result = self._read_revision_facts(inspector, job, **args)
+                            result = self._await_operation(lambda: self._read_revision_facts(inspector, job, **args),
+                                                           cancellation, job, "source_tools", name)
                         elif name in {"list_source", "read_file", "inspect_symbols", "inspect_construction", "add_source", "list_structure", "inspect_imports", "entry_candidates", "list_resources"}:
-                            result = getattr(inspector, name)(**args)
+                            if name == "add_source":
+                                # This tool changes the frozen request; finish the
+                                # small local mutation before honoring cancellation.
+                                tool_started, tool_outcome = time.perf_counter(), "failed"
+                                try:
+                                    result = inspector.add_source(**args)
+                                    tool_outcome = "completed"
+                                finally:
+                                    job.setdefault("timings", []).append(dict(stage=stage, phase="source_tools",
+                                        tool=name, round=job["rounds"], outcome=tool_outcome,
+                                        duration_ms=round((time.perf_counter() - tool_started) * 1000, 3)))
+                            else:
+                                result = self._await_operation(lambda: getattr(inspector, name)(**args),
+                                                               cancellation, job, "source_tools", name)
                         else:
                             raise ValueError("unsupported tool")
                     except OSError as error:
@@ -521,37 +617,54 @@ class AnalysisJobs:
                     else:
                         if name == "add_source":
                             self.store.save("request", inspector.request["id"], inspector.request, "source_extended")
+                    self._raise_cancelled(cancellation)
                     job["messages"].append(dict(role="tool", tool_call_id=call["id"],
                                                 content=json.dumps(result, ensure_ascii=False)))
-                    self.store.save("analysis", job["id"], job, "source_tool_result")
-                if cancellation.is_set() or self.closed:
-                    job["status"] = "CANCELLED"
-                    break
+                    self._save_job(job, cancellation, "source_tool_result")
+                self._raise_cancelled(cancellation)
                 if prepared is not None:
                     job["preprocessing"]["duration_ms"] = round((time.perf_counter() - stage_started) * 1000, 3)
-                    self._finish_preprocessing(inspector, job, *prepared)
+                    self._finish_preprocessing(inspector, job, *prepared, cancellation)
                     stage_started = time.perf_counter()
                     continue
                 if submitted:
                     candidate = job["submitted"]["candidate"]
                     checked_at = time.perf_counter()
-                    report = check_candidate(inspector, candidate)
-                    report["dependencies"] = check_requirements(inspector, candidate)
-                    if self.check_entries:
-                        report["entry_bindings"] = self.check_entries(inspector, candidate)
+                    if submitted_input == content_digest(preparation_input(inspector)):
+                        report = job["submitted"]["report"]
+                        job["final_check_reused_submission"] = True
+                    else:
+                        report = self._await_operation(lambda: self._check_candidate(inspector, candidate),
+                                                       cancellation, job, "candidate_check")
+                        job["final_check_reused_submission"] = False
                     job["final_check_duration_ms"] = round((time.perf_counter() - checked_at) * 1000, 3)
                     job["submitted"]["report"] = report
+                    self._raise_cancelled(cancellation)
                     job["status"] = "COMPLETED"
                     job["phase"] = "candidate_refinement_complete" if job.get("revision_id") else "installation"
                     if self.on_complete:
-                        job["units"] = self.on_complete(inspector, job)
+                        installed_at, install_outcome = time.perf_counter(), "failed"
+                        try:
+                            job["units"] = self.on_complete(inspector, job)
+                            install_outcome = "cancelled" if cancellation.is_set() or job["status"] == "CANCELLED" else "completed"
+                        finally:
+                            job.setdefault("timings", []).append(dict(stage=stage, phase="installation", round=job["rounds"],
+                                duration_ms=round((time.perf_counter() - installed_at) * 1000, 3),
+                                outcome=install_outcome))
                     break
             else:
                 job["status"] = "CANCELLED"
+        except AnalysisCancelled:
+            job.update(status="CANCELLED", cancelled_at=now())
+            if job.get("phase") == "model_request":
+                job["unreported_usage"] = dict(status="UNKNOWN", reason="cancelled_before_model_response")
         except Exception as error:
-            job.update(status="FAILED", error=str(error),
-                       error_kind=getattr(error, "kind", type(error).__name__),
-                       failure_phase=job.get("phase"))
+            if cancellation.is_set() or self.closed:
+                job.update(status="CANCELLED", cancelled_at=now())
+            else:
+                job.update(status="FAILED", error=str(error),
+                           error_kind=getattr(error, "kind", type(error).__name__),
+                           failure_phase=job.get("phase"))
             if job.get("phase") == "model_request":
                 job["unreported_usage"] = dict(status="UNKNOWN", reason="model_response_unavailable")
         finally:
@@ -562,8 +675,10 @@ class AnalysisJobs:
                 job["analysis_duration_ms"] = duration
             job["model_calls"] = len(job["usage"])
             job["finished_at"] = now()
-            if not self.closed:
-                self.store.save("analysis", job["id"], job, "analysis_finished")
+            job["duration_ms"] = round((time.perf_counter() - started) * 1000, 3)
+            if cancellation.is_set():
+                job["status"] = "CANCELLED"
+            self._save_job(job, cancellation, "analysis_finished")
             with self.lock:
                 self.cancels.pop(job["id"], None)
 
@@ -571,7 +686,12 @@ class AnalysisJobs:
         with self.lock:
             cancellation = self.cancels.get(identity)
             if cancellation:
+                job = self.store.get("analysis", identity)
+                if not job or job.get("status") not in {"RUNNING", "CANCELLING"}:
+                    return False
                 cancellation.set()
+                job.update(status="CANCELLING", cancel_requested_at=now())
+                self.store.save("analysis", identity, job, "analysis_cancelling")
                 return True
             return False
 

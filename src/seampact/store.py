@@ -51,6 +51,10 @@ class Store:
                                    (kind,)).fetchall()
         return [json.loads(row[0]) for row in rows]
 
+    def delete(self, kind, identity):
+        with self.lock, self.db:
+            self.db.execute("DELETE FROM documents WHERE kind=? AND id=?", (kind, identity))
+
     def events(self, after=0):
         return []
 

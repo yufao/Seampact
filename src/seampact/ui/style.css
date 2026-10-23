@@ -78,6 +78,7 @@ button, input, select, textarea { -webkit-tap-highlight-color: transparent; }
 .primary-button:hover:not(:disabled) { background: var(--accent-hover); border-color: var(--accent-hover); }
 .secondary-button { border: 1px solid var(--line); background: white; color: #55685b; }
 .secondary-button:hover:not(:disabled) { background: #f1f5f2; }
+.secondary-button.danger-button { color: var(--danger); }
 #send-message { min-width: 78px; padding: 7px 12px; }
 .chat-footnote { margin-top: 9px; color: #969e98; font-size: 10px; text-align: center; }
 

@@ -49,7 +49,7 @@ const researchModeNames = {train: '新训练', freeze: '冻结评价', warmstart
 const terminalStatuses = new Set(['COMPLETED', 'SUCCEEDED', 'FAILED', 'CANCELLED', 'INTERRUPTED', 'BLOCKED']);
 const statusNames = {
   RUNNING: '运行中', QUEUED: '排队中', WAITING: '等待中', COMPLETED: '已完成',
-  SUCCEEDED: '已完成', FAILED: '失败', CANCELLED: '已取消', INTERRUPTED: '已中断',
+  SUCCEEDED: '已完成', FAILED: '失败', CANCELLED: '已取消', CANCELLING: '正在取消', INTERRUPTED: '已中断',
   READY: '源码已绑定', AVAILABLE: '可用', BLOCKED: '待接入', PENDING: '待确认',
   THEORY_PENDING: '理论待确认', IDLE: '空闲', ANALYZING: '分析中', ANALYZED: '已分析',
   REGISTERED: '已登记', CONNECTED: '已接入', MISSING: '待接入', NOT_CONFIGURED: '未配置', ENABLED: '已使能',
@@ -160,6 +160,47 @@ function sourceButton(harness) {
     button.disabled = true;
     button.textContent = '处理中…';
     changeSource(harness);
+  };
+  return button;
+}
+
+function cancelAnalysisButton(harness, job) {
+  if (!job || !['RUNNING', 'CANCELLING'].includes(job.status)) return null;
+  const button = node('button', job.status === 'CANCELLING' ? '正在取消…' : '取消本次分析', 'secondary-button');
+  button.type = 'button';
+  button.disabled = sourceUpdating.has(harness.id) || job.status === 'CANCELLING';
+  button.onclick = async () => {
+    if (sourceUpdating.has(harness.id)) return;
+    sourceUpdating.add(harness.id); button.disabled = true;
+    try {
+      const result = await api('/api/analysis/cancel', {analysis_id: job.id});
+      showNotice(result.status === 'CANCELLED' ? '本次分析已取消，来源与已有能力保留。' :
+        result.status === 'CANCELLING' ? '已请求取消，本次分析结束后状态会更新；来源与已有能力保留。' :
+        '本次分析已结束：' + statusLabel(result.status));
+    } catch (error) { showNotice(error.message); }
+    finally { sourceUpdating.delete(harness.id); await refresh(); }
+  };
+  return button;
+}
+
+function deleteSourceButton(harness) {
+  const button = node('button', '删除来源记录', 'secondary-button danger-button');
+  button.type = 'button';
+  button.disabled = sourceUpdating.has(harness.id) || analysisSubmitting.has(harness.id);
+  button.onclick = async () => {
+    if (sourceUpdating.has(harness.id)) return;
+    if (!window.confirm('删除“' + (harness.name || harness.address) + '”的来源记录？\n\n正在进行的分析会取消，相关能力会退出能力池，来源与分析将从列表移除，无法直接恢复。原始文件、平台缓存及已有任务的历史依据保留。正在执行任务时，请先结束任务。')) return;
+    sourceUpdating.add(harness.id); button.disabled = true;
+    try {
+      await api('/api/harnesses/delete', {harness_id: harness.id});
+      showNotice('来源记录已删除；原始文件、平台缓存与已有任务历史保留。');
+      if (selectedSource() === harness.id) {
+        inspectQuery.delete('harness');
+        history.replaceState({}, '', '/inspect?' + inspectQuery);
+        activePageUrl = location.pathname + location.search;
+      }
+    } catch (error) { showNotice(error.message); }
+    finally { sourceUpdating.delete(harness.id); await refresh(); }
   };
   return button;
 }
@@ -744,7 +785,7 @@ function sourceEnvironment(card, harness) {
   const job = (state.analyses || []).find(item => item.id === harness.analysis_id);
   const locked = (state.runtime_groups || []).some(group => group.source_id === harness.id && group.locked_by_run);
   const busy = harness.status === 'DETACHED' || analysisSubmitting.has(harness.id) || sourceUpdating.has(harness.id) ||
-    ['RUNNING', 'QUEUED'].includes(job?.status) || target.status === 'PREPARING' || locked || deploymentSubmitting.has(key);
+    ['RUNNING', 'QUEUED', 'CANCELLING'].includes(job?.status) || target.status === 'PREPARING' || locked || deploymentSubmitting.has(key);
   for (const field of Object.values(fields)) field.disabled = busy;
   form.append(node('p', '表单用于选择环境。保存不会修改原库源码或已有研究记录；准备解释器不安装原库。仓库建议不会自动执行 Dockerfile，也不会把多份依赖清单全部合并。', 'card-note'));
   const actions = node('div', undefined, 'harness-actions');
@@ -1028,6 +1069,17 @@ function analysisProgress(job) {
   root.append(stages);
   if (job.phase) root.append(node('p', '当前操作：' + ({model_request: '等待模型响应', source_tools: '读取源码与核对候选',
     binding_installation: '安装资源绑定', installation: '安装能力入口'}[job.phase] || job.phase), 'card-meta'));
+  if (job.status === 'CANCELLING') root.append(node('p', '正在结束本次分析；取消后保留已保存进度，不再安装本次候选。', 'card-note'));
+  const timings = Array.isArray(job.timings) ? job.timings : [];
+  if (timings.length) {
+    const milliseconds = value => (value / 1000).toFixed(1) + ' 秒';
+    const modelTime = timings.filter(item => item.phase === 'model_request').reduce((sum, item) => sum + (item.duration_ms || 0), 0);
+    const toolTime = timings.filter(item => item.tool).reduce((sum, item) => sum + (item.duration_ms || 0), 0);
+    const latest = timings.filter(item => item.phase === 'model_request').at(-1);
+    root.append(node('p', '模型累计等待 ' + milliseconds(modelTime) + ' · 工具累计 ' + milliseconds(toolTime) +
+      (latest ? ' · 最近一轮模型 ' + milliseconds(latest.duration_ms || 0) : ''), 'card-meta'));
+    if (inspectPage) detailValue(root, '分阶段耗时记录（毫秒）', timings);
+  }
   const usage = Array.isArray(job.usage) ? job.usage : [];
   const table = node('table', undefined, 'research-metrics analysis-usage');
   const header = node('tr');
@@ -1325,6 +1377,8 @@ function renderAnalyses() {
     const actions = node('div', undefined, 'harness-actions');
     if (!inspectPage) actions.append(inspectLink('analyses', {harness: harness.id}));
     if (job?.id) actions.append(analysisExportButton(job));
+    const cancel = cancelAnalysisButton(harness, job);
+    if (cancel) actions.append(cancel);
     if (job?.status === 'COMPLETED' && job.submitted?.candidate) actions.append(analysisExportButton(job, true));
     if (job?.resumable) {
       const resume = node('button', '继续这次分析', 'secondary-button');
@@ -1345,7 +1399,7 @@ function renderAnalyses() {
       };
       actions.append(resume);
     }
-    actions.append(sourceButton(harness));
+    actions.append(sourceButton(harness), deleteSourceButton(harness));
     card.append(actions);
     if (inspectPage && job) renderRevisionWorkspace(card, harness, job);
     root.append(card);
@@ -2206,11 +2260,11 @@ function hydrateModels() {
       form.dataset.hydrated = 'true';
     }
     form.elements.api_key.placeholder = profile?.key_present ? '留空保留；点击单独保存凭据才会写入' :
-      role !== 'analysis' ? '本地接口可留空' : '填写云端 API Key';
+      '无鉴权接口可留空；认证方式在服务连接中选择';
     const readiness = $(role + '-model-readiness');
     readiness.textContent = profile?.credential_error || (isReady(profile) ?
       '配置可用 · ' + (profile.key_present ? '凭据已配置' : '认证按所选连接') :
-      profile?.configured ? '地址与模型已保存，请填写云端 API Key。' : '尚未配置');
+      profile?.configured ? '地址与模型已保存，请检查服务连接的认证方式与凭据。' : '尚未配置');
     readiness.classList.toggle('message-error', Boolean(profile?.credential_error));
   }
 }
@@ -2228,7 +2282,7 @@ function renderHarnesses() {
     if (harness.error) card.append(node('p', textValue(harness.error), 'card-note message-error'));
     const job = (state.analyses || []).find(item => item.id === harness.analysis_id);
     const detached = harness.status === 'DETACHED';
-    const busy = analysisSubmitting.has(harness.id) || ['RUNNING', 'QUEUED', 'ANALYZING'].includes(String(job?.status || harness.status).toUpperCase());
+    const busy = analysisSubmitting.has(harness.id) || ['RUNNING', 'QUEUED', 'ANALYZING', 'CANCELLING'].includes(String(job?.status || harness.status).toUpperCase());
     const action = node('button', busy ? '分析中…' : '分析 Harness', 'secondary-button');
     action.type = 'button';
     action.disabled = detached || busy || harness.target_runtime?.status === 'PREPARING' || deploymentSubmitting.has('source/' + harness.id) ||
@@ -2246,7 +2300,10 @@ function renderHarnesses() {
     };
     const actions = node('div', undefined, 'harness-actions');
     actions.append(action);
-    actions.append(inspectLink('analyses', {harness: harness.id}), sourceButton(harness));
+    const activeJob = (state.analyses || []).find(item => item.harness_id === harness.id && ['RUNNING', 'CANCELLING'].includes(item.status));
+    const cancel = cancelAnalysisButton(harness, activeJob);
+    if (cancel) actions.append(cancel);
+    actions.append(inspectLink('analyses', {harness: harness.id}), sourceButton(harness), deleteSourceButton(harness));
     if (detached) card.append(node('p', '已摘除；重新接入会使用已有分析，不重复调用分析模型。', 'card-note'));
     if (!isReady(state.models?.analysis)) actions.append(node('span', '先配置分析模型', 'form-note'));
     card.append(actions);

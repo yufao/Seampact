@@ -97,6 +97,8 @@ def make_server(platform, port=8880, host="127.0.0.1", public_port=None):
                                               body.get("preprocessing_id"))
                 elif path == "/api/analysis/resume":
                     result = platform.resume_analysis(body["analysis_id"])
+                elif path == "/api/analysis/cancel":
+                    result = platform.cancel_analysis(body["analysis_id"])
                 elif path == "/api/analysis/revisions":
                     result = platform.create_revision(body)
                 elif path == "/api/analysis/revisions/save":
@@ -109,6 +111,8 @@ def make_server(platform, port=8880, host="127.0.0.1", public_port=None):
                     result = platform.install_revision(body)
                 elif path == "/api/harnesses/detach":
                     result = platform.detach_harness(body["harness_id"])
+                elif path == "/api/harnesses/delete":
+                    result = platform.delete_harness(body["harness_id"])
                 elif path == "/api/harnesses/clear":
                     result = platform.clear_pool()
                 elif path == "/api/harnesses/restore":

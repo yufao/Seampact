@@ -91,11 +91,11 @@
             <div class="form-actions"><button class="secondary-button save-role-credential" type="button">单独保存凭据</button><button class="primary-button" type="submit">保存对话配置</button><span class="form-status" role="status"></span></div>
           </form>
           <form id="analysis-model-form" class="model-form" data-role="analysis">
-            <h4>分析模型</h4><p class="form-note">使用云端 API 分析 Harness 源码。</p><p id="analysis-model-readiness" class="form-note">正在读取配置。</p>
+            <h4>分析模型</h4><p class="form-note">支持本地或远程 HTTP／HTTPS 兼容 API 分析 Harness 源码，模型需支持工具调用。无鉴权接口请在“服务连接”选择无鉴权。</p><p id="analysis-model-readiness" class="form-note">正在读取配置。</p>
             <label>命名服务连接<select name="connection_id" aria-label="分析命名服务连接"><option value="">选择连接</option></select></label><button type="button" class="secondary-button select-role-connection">应用到分析入口</button>
             <label>接口地址<input name="base_url" type="url" placeholder="https://提供方地址/v1" required></label>
             <label>模型 ID<input name="model" type="text" placeholder="填写分析模型 ID" required></label>
-            <label>API Key<input name="api_key" type="password" autocomplete="new-password" placeholder="已有密钥留空保持"></label>
+            <label>API Key<input name="api_key" type="password" autocomplete="new-password" placeholder="无鉴权可留空；已有密钥留空保持"></label>
             <label>最大输出 token（可选）<input name="max_output_tokens" type="number" min="1" step="1" placeholder="按模型能力填写"></label>
             <label>服务／模型版本（可选）<input name="service_version" type="text" placeholder="填可核对版本；未知可留空"></label>
             <div class="form-actions"><button class="secondary-button save-role-credential" type="button">单独保存凭据</button><button class="primary-button" type="submit">保存分析配置</button><span class="form-status" role="status"></span></div>

@@ -123,6 +123,8 @@ class Platform:
             if not job.get("harness_id"):
                 request = self.store.get("request", job.get("request_id"))
                 job["harness_id"] = (request or {}).get("source_id")
+        source_ids = {source["id"] for source in harnesses}
+        jobs = [job for job in jobs if job.get("harness_id") in source_ids]
         requirements, selections = self.dependencies.public()
         return dict(version=__version__, models=self.profiles.public_roles(), harnesses=harnesses,
             resources=dict(connections=self.public_connections(), weights=self.resources.public_weights(),
@@ -382,11 +384,19 @@ class Platform:
 
     def _connect_units(self, inspector, job):
         with self.source_lock:
+            source = self.store.get("harness", inspector.request["source_id"])
+            stored = self.store.get("analysis", job["id"]) or {}
+            cancellation = self.analysis.cancels.get(job["id"])
+            if (not source or source.get("status") == "DETACHED"
+                    or stored.get("status") in {"CANCELLING", "CANCELLED"}
+                    or (cancellation and cancellation.is_set())):
+                job["status"] = "CANCELLED"
+                return []
             if job.get("completion_scope") == "candidate_and_report_only":
                 self._complete_revision(inspector, job)
+                self.store.save("analysis", job["id"], job)
                 return []
-            source = self.store.get("harness", inspector.request["source_id"])
-            if not source or source.get("status") == "DETACHED" or source.get("analysis_id") != job["id"]:
+            if source.get("analysis_id") != job["id"]:
                 job["status"] = "CANCELLED"
                 return []
             self.dependencies.record(inspector, job["submitted"]["candidate"])
@@ -394,6 +404,9 @@ class Platform:
             source.update(status="ANALYZED", analysis_id=job["id"], installation_id=job["id"], error=None,
                           environment_pending_recheck=False)
             self.store.save("harness", source["id"], source)
+            # Publish completion under the same source lock as installation so
+            # a later cancel cannot report success after Units were connected.
+            self.store.save("analysis", job["id"], job)
         print("[SeamPact] units_connected " + str(len(units)), flush=True)
         return [unit["id"] for unit in units]
 
@@ -410,11 +423,8 @@ class Platform:
                 raise ValueError("原分析的源码快照或来源记录缺失")
             if source.get("status") == "DETACHED":
                 raise ValueError("来源已摘除，请先重新接入，再继续这次分析")
-            for job in self.store.list("analysis"):
-                if job.get("status") == "RUNNING":
-                    current = self.store.get("request", job["request_id"]) or {}
-                    if current.get("source_id") == source["id"]:
-                        raise ValueError("这个来源正在分析")
+            if self._source_analysis_running(source["id"]):
+                raise ValueError("这个来源正在分析或取消分析")
             if request.get("rules") != RULESET or request.get("entry_profile") != NATIVE_PROFILE:
                 raise ValueError("分析规则或宿主范围已变化，请重新分析")
             bindings = {"source_revision": "revision", "entry": "entry",
@@ -444,6 +454,22 @@ class Platform:
         return any(job.get("status") in {"RUNNING", "CANCELLING"}
             and (self.store.get("request", job.get("request_id")) or {}).get("source_id") == source_id
             for job in self.store.list("analysis"))
+
+    def cancel_analysis(self, identity):
+        with self.source_lock:
+            job = self.store.get("analysis", identity)
+            if not job:
+                raise ValueError("没有这次分析")
+            if job.get("status") not in {"RUNNING", "CANCELLING"}:
+                return dict(analysis_id=identity, status=job["status"])
+            self.analysis.cancel(identity)
+            job = self.store.get("analysis", identity)
+            source = self.store.get("harness", job.get("harness_id") or
+                                    (self.store.get("request", job.get("request_id")) or {}).get("source_id"))
+            if source and source.get("analysis_id") == identity and source.get("status") == "ANALYZING":
+                source.update(status="ANALYZED" if source.get("installation_id") else "CONNECTED", error=None)
+                self.store.save("harness", source["id"], source)
+            return dict(analysis_id=identity, status=job["status"], history="RETAINED")
 
     @staticmethod
     def _revision_source_basis(source):
@@ -610,7 +636,8 @@ class Platform:
                 {"id", "harness_id", "base_analysis_id", "mode", "status", "updated_at", "analysis_id",
                  "installed_analysis_id", "candidate_digest", "checked_digest", "error"}},
                 **self._revision_stale(revision))
-                for revision in self.store.list("analysis_revision")]
+                for revision in self.store.list("analysis_revision")
+                if self.store.get("harness", revision.get("harness_id"))]
 
     def _editable_revision(self, identity):
         revision = self.store.get("analysis_revision", identity)
@@ -900,6 +927,18 @@ class Platform:
                     if (key in token_fields and type(item) is int and item >= 0)
                     or (key in detail_fields and isinstance(item, dict))}
 
+        def timing(value):
+            if not isinstance(value, dict):
+                return None
+            result = {key: item for key, item in value.items()
+                      if key in {"stage", "phase", "tool", "outcome"} and isinstance(item, str)
+                      and re.fullmatch(r"[A-Za-z][A-Za-z0-9_/-]{0,95}", item)}
+            for key in ("round", "duration_ms"):
+                item = value.get(key)
+                if type(item) in {int, float} and math.isfinite(item) and item >= 0:
+                    result[key] = item
+            return result
+
         def report_summary(report):
             if not isinstance(report, dict):
                 return None
@@ -1023,6 +1062,8 @@ class Platform:
             rounds=job.get("rounds", 0), prior_rounds=job.get("prior_rounds", 0),
             refinement_of=job.get("refinement_of"), resumed_from=job.get("resumed_from"),
             started_at=job.get("started_at"), finished_at=job.get("finished_at"),
+            duration_ms=job.get("duration_ms"),
+            timings=[timing(item) for item in job.get("timings", []) if isinstance(item, dict)],
             usage=[usage(item) for item in job.get("usage", [])],
             usage_by_stage={stage: [usage(item) for item in job.get("usage_by_stage", {}).get(stage, [])]
                             for stage in ("preprocessing", "analysis")},
@@ -1209,9 +1250,8 @@ class Platform:
                 raise ValueError("没有这个Harness来源")
             source.update(status="DETACHED", detached_at=now(), error=None)
             self.store.save("harness", identity, source)
-            self.analysis.cancel(source.get("analysis_id"))
             for job in self.store.list("analysis"):
-                if (job.get("revision_id") and job.get("status") in {"RUNNING", "CANCELLING"}
+                if (job.get("status") in {"RUNNING", "CANCELLING"}
                         and (self.store.get("request", job.get("request_id")) or {}).get("source_id") == identity):
                     self.analysis.cancel(job["id"])
             count = self.catalog.detach(identity)
@@ -1219,6 +1259,37 @@ class Platform:
         print("[SeamPact] source_detached " + identity, flush=True)
         return dict(harness_id=identity, status="DETACHED", detached_units=count,
                     history="RETAINED", started_calls="ALLOW_FINISH")
+
+    def delete_harness(self, identity):
+        # Existing tasks keep their frozen Unit/request evidence. Only the
+        # source registration is removed; original files and caches are retained.
+        with self.training.lock, self.source_lock:
+            source = self.store.get("harness", identity)
+            if not source:
+                raise ValueError("没有这个Harness来源")
+            if (source.get("target_runtime") or {}).get("status") == "PREPARING":
+                raise ValueError("目标解释器仍在准备，请结束后再删除来源")
+            if self.catalog.source_running(identity):
+                raise ValueError("该来源仍有调用在执行，请结束后再删除；也可先摘除来源以停止后续调用")
+            if any(run.get("status") in {"RUNNING", "QUEUED"} and identity in run.get("source_ids", [])
+                   for run in self.store.list("scheduler_run")):
+                raise ValueError("该来源仍被研究运行使用，请结束运行后再删除")
+            for group in self.store.list("runtime_group"):
+                if group.get("source_id") != identity:
+                    continue
+                with self.deployments.lock:
+                    self.deployments._guard(group["id"], None)
+                    if any(item.get("in_flight") or self.deployments._held(item)
+                           for item in self.deployments._instances(group["id"])):
+                        raise ValueError("该来源仍有运行实例或远程调用，请先排空并停止实例，再删除来源")
+                artifact = self.store.get("deployment", group["id"]) or {}
+                if any((artifact.get(field) or {}).get("status") == "RUNNING" for field in ("build", "publish")):
+                    raise ValueError("该来源正在构建或发布，请结束后再删除")
+            self.detach_harness(identity)
+            if self.catalog.source_running(identity):
+                raise ValueError("来源已摘除，已开始的调用仍在收尾，结束后可删除")
+            self.store.delete("harness", identity)
+        return dict(harness_id=identity, status="DELETED", history="RETAINED", source_files="RETAINED")
 
     def restore_harness(self, identity):
         with self.source_lock:
