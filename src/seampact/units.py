@@ -28,7 +28,7 @@ from pathlib import Path
 
 from .handoff import ToolListHandoff, install_method_proxy
 from .callsite import lower_callsites
-from .dependencies import DependencyBindings, reference as resource_reference
+from .dependencies import DependencyBindings, has_reference as has_resource_reference, reference as resource_reference
 from .inspection import Inspector, digest, native_ast, python_runtime_issue, units
 from .lowering import lower_loop
 from .runtime import ProtocolError
@@ -159,6 +159,19 @@ def _same_literal(left, right):
     if isinstance(left, (list, tuple)):
         return len(left) == len(right) and all(_same_literal(a, b) for a, b in zip(left, right))
     return left == right
+
+
+def _configured_resource_literals(value, configured):
+    """Only checked resource leaves may differ from explicit user literals."""
+    if resource_reference(value) is not None:
+        return True
+    if isinstance(value, dict) and isinstance(configured, dict):
+        return value.keys() == configured.keys() and all(
+            _configured_resource_literals(child, configured[key]) for key, child in value.items())
+    if isinstance(value, list) and isinstance(configured, list):
+        return len(value) == len(configured) and all(
+            _configured_resource_literals(child, original) for child, original in zip(value, configured))
+    return _same_literal(value, configured)
 
 
 def _literal_defaults(node, receiver=False):
@@ -509,6 +522,10 @@ class NativeBindings:
                 source, evidence = "USER_RESOURCE_REFERENCE", copy.deepcopy(reference)
             elif isinstance(configured, dict) and parameter in configured and _same_literal(value, configured[parameter]):
                 source, evidence = "USER_CONFIGURATION", "configuration.entries." + str(entry.get("id")) + "." + location + "." + parameter
+            elif (isinstance(configured, dict) and parameter in configured and has_resource_reference(value)
+                  and _configured_resource_literals(value, configured[parameter])):
+                self._resource_values(entry, location, {parameter: value})
+                source, evidence = "USER_CONFIGURATION_AND_RESOURCE_REFERENCES", "configuration.entries." + str(entry.get("id")) + "." + location + "." + parameter
             elif parameter in (call_literals or {}) and _same_literal(value, call_literals[parameter]["value"]):
                 source, evidence = "ORIGINAL_REQUEST_LITERAL", call_literals[parameter]["line"]
             elif parameter in defaults and _same_literal(value, defaults[parameter]["value"]):
@@ -532,7 +549,7 @@ class NativeBindings:
             raise MissingBinding(location + " must be a parameter mapping")
         if self.resource_binding is not None:
             return self.resource_binding.values(values, entry["id"], location, runtime=runtime)
-        if any(resource_reference(value) is not None for value in values.values()):
+        if has_resource_reference(values):
             raise MissingBinding("resource dependency registry is unavailable")
         return dict(values)
 

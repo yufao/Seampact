@@ -57,7 +57,9 @@ class RepositoryIntake:
         elif remote:
             root = self.home / "repositories" / identity
             root.parent.mkdir(parents=True, exist_ok=True)
-            self._git(["clone", "--", address, str(root)])
+            # Native artifact manifests hash the original bytes. Windows Git
+            # must not rewrite their JSON files to CRLF during checkout.
+            self._git(["clone", "-c", "core.autocrlf=false", "--", address, str(root)])
             if revision:
                 commit = self._git(["-C", str(root), "rev-parse", "--verify", "--end-of-options",
                                    revision.strip() + "^{commit}"])

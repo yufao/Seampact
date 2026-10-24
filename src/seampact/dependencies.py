@@ -19,6 +19,7 @@ dependency格式：{id:"ASCII需求标识",kind:"service或weight",description:"
 service与本地weight不得互换。原本地from_pretrained/torch.load等必须保留原模型对象路径；不能因为有API连接而改成HTTP或手写包装。service的base_url与model等只填真实原配置入口；credential只能映射到源码可核对的原认证调用参数，秘密从不进入分析上下文。原代码只在导入读环境时，当前同进程宿主不能临时改os.environ；保留MISSING。environment仅支持原CLI process_start且有原os.getenv/os.environ.get依据，值经子进程env传递不进命令行。
 每个mapping的evidence必须同时覆盖原参数定义和该参数进入原调用的位置；base_url/model/parameters.xxx须有同名原调用keyword，base_url也可进入原requests/httpx等HTTP调用的URL位置参数；credential须有原认证keyword（api_key/token/password/access_token/auth_token）。权重path须进入原from_pretrained/torch.load/safetensors加载调用；原构造参数还允许同一作用域顺序中的单赋值局部变量或receiver直接属性，以及已核对pathlib.Path导入的透明包装、参数唯一一次同名Path(parameter)规范化、已为Path的值与字面相对子路径的/连接、一层固定等长tuple/list字面解包。构造函数内已核对且未遮蔽的joblib.load也可作原加载依据。evidence须覆盖参数、每次赋值及加载调用。除此以外的重赋、删除、动态下标、分支赋值、嵌套作用域、跨方法或自定义转换不属于该有限规则；不推断任意对象属性或动态配置数据流，覆盖不了则保留具体MISSING。CLI environment须覆盖原环境读取，服务或加载调用也须有上述字段依据。依赖引用必须实际出现在所映射的entry字段，不能仅列mappings。
 参数值可引用用户所选资源：{"$dependency":{"id":"需求id","field":"base_url/model/credential/path/parameters.xxx"}}，只能放在该需求mappings已列的原参数位置。引用不是原函数参数类型；运行边界由引擎解析为原值。资源未选择仍提交真实需求与MISSING，不自选连接、模型或假权重。
+原函数通过配置字典读服务字段时，可在entry.fixed_arguments映射增加parameter_path:["原固定键", "原子键"]，parameter仍为原显式函数参数；引用放在该参数字典的同一键路径。仅支持1至8层字符串字面键、同一原函数或未遮蔽的词法闭包读取、单赋值局部别名；evidence须覆盖原参数、每个别名赋值和原字段调用。base_url允许保留原字符串字面后缀拼接，平台不自动增删后缀，所选连接必须符合原代码期望的基址。配置字典其余值仍须来自用户明确配置或现有值来源规则，不能自行编造整份配置。原字典的重赋、变更、动态键、字典前缀外传、类/lambda作用域或跨函数传参仍不支持；CLI/YAML文件参数不能冒充原函数字典参数。无需认证时，个别原SDK要求的非密钥占位符须由用户配置明确提供，不能把真实凭据写成候选字面值。
 原固定权重路径使用configurable:false,mappings:[]，placement:{expression:"来自evidence内的实际原AST表达式字符串",required_files:["原必要相对文件"]}。有限检查支持原字面路径、Path(__file__).parent及/连接、os.path.join/dirname/abspath；路径名变量/动态计算不能猜位置。引擎显示原执行cwd/文件基准下实际放置位置，不覆盖路径或省掉原必需加载。未覆盖位置保留MISSING。
 resource_catalog只提供非敏感连接、权重状态及已有选择；配置存在不等于服务能力、权重完整或原目标已运行。用户选择不改变入口与边界，W/H/R及生命周期规则继续适用。
 """
@@ -42,6 +43,13 @@ def reference(value):
     if set(ref) != {"id", "field"} or not all(isinstance(v, str) and v for v in ref.values()):
         raise ValueError("resource reference requires dependency id and field")
     return ref
+
+
+def has_reference(value):
+    if reference(value) is not None:
+        return True
+    children = value.values() if isinstance(value, dict) else value if isinstance(value, list) else ()
+    return any(has_reference(child) for child in children)
 
 
 def _source(inspector, path, cell="file"):
@@ -82,7 +90,7 @@ def _covered(evidence, path, cell, node):
         for item in evidence)
 
 
-def _destination(entry, location, parameter):
+def _destination(entry, location, parameter, parameter_path=()):
     if location == "entry.fixed_arguments":
         values = entry.get("fixed_arguments", {})
     elif location == "constructor.arguments":
@@ -100,7 +108,12 @@ def _destination(entry, location, parameter):
         raise ValueError("unsupported original dependency parameter location")
     if not isinstance(values, dict) or parameter not in values:
         raise ValueError("dependency reference is absent from its actual destination")
-    return values[parameter]
+    value = values[parameter]
+    for key in parameter_path:
+        if not isinstance(value, dict) or key not in value:
+            raise ValueError("dependency dictionary field is absent from its actual destination")
+        value = value[key]
+    return value
 
 
 def _loader(call):
@@ -140,6 +153,117 @@ def _calls(node):
         if isinstance(current, ast.Call):
             yield current
         stack.extend(ast.iter_child_nodes(current))
+
+
+def _dictionary_field_call(node, parameter, keys, field, evidence, path, cell):
+    """Literal dictionary reads, lexical captures and single-assignment aliases.
+
+    This checks an original resource destination, not callback execution or
+    scheduling. No source or resource value is transformed by this rule.
+    """
+    parents = {child: parent for parent in ast.walk(node) for child in ast.iter_child_nodes(parent)}
+
+    def owners(value):
+        result = []
+        while value in parents:
+            value = parents[value]
+            if isinstance(value, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
+                result.append(value)
+        return result
+
+    def dictionary_read(value):
+        parts, dynamic = [], False
+        while isinstance(value, ast.Subscript):
+            if not isinstance(value.slice, ast.Constant) or not isinstance(value.slice.value, str):
+                dynamic = True
+            else:
+                parts.insert(0, value.slice.value)
+            value = value.value
+        if isinstance(value, ast.Name) and value.id == parameter:
+            if dynamic:
+                raise ValueError("dictionary resource reads require literal string keys")
+            return tuple(parts)
+        return None
+
+    writes, assignments = {}, {}
+    for item in ast.walk(node):
+        if isinstance(item, ast.Name) and isinstance(item.ctx, (ast.Store, ast.Del)):
+            writes[item.id] = writes.get(item.id, 0) + 1
+            if item.id == parameter:
+                raise ValueError("dictionary resource parameter is reassigned")
+        if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and item.name == parameter:
+            raise ValueError("dictionary resource parameter is shadowed")
+        if item is not node and isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            writes[item.name] = writes.get(item.name, 0) + 1
+        if isinstance(item, (ast.Import, ast.ImportFrom)):
+            for alias in item.names:
+                name = alias.asname or alias.name.split('.')[0]
+                writes[name] = writes.get(name, 0) + 1
+        if isinstance(item, ast.ExceptHandler) and item.name:
+            if item.name == parameter:
+                raise ValueError("dictionary resource parameter is shadowed")
+            writes[item.name] = writes.get(item.name, 0) + 1
+        if isinstance(item, (ast.Import, ast.ImportFrom)) and any(
+                (alias.asname or alias.name.split('.')[0]) == parameter for alias in item.names):
+            raise ValueError("dictionary resource parameter is shadowed")
+        if isinstance(item, (ast.Global, ast.Nonlocal)) and parameter in item.names:
+            raise ValueError("dictionary resource parameter has an unsupported scope declaration")
+        if item is not node and isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+            args = item.args.posonlyargs + item.args.args + item.args.kwonlyargs
+            args += [arg for arg in (item.args.vararg, item.args.kwarg) if arg is not None]
+            if any(arg.arg == parameter for arg in args):
+                raise ValueError("nested callable shadows the dictionary resource parameter")
+        if isinstance(item, ast.Name) and item.id == parameter and isinstance(item.ctx, ast.Load):
+            parent = parents.get(item)
+            if not isinstance(parent, ast.Subscript) or parent.value is not item or any(
+                    isinstance(owner, (ast.ClassDef, ast.Lambda)) for owner in owners(item)):
+                raise ValueError("dictionary resource parameter escapes its literal-key reads")
+        if isinstance(item, ast.Subscript) and dictionary_read(item) is not None:
+            if not isinstance(item.ctx, ast.Load):
+                raise ValueError("dictionary resource fields are mutated")
+            parent = parents.get(item)
+            parts = dictionary_read(item)
+            if (len(parts) < len(keys) and tuple(keys[:len(parts)]) == parts
+                    and not (isinstance(parent, ast.Subscript) and parent.value is item)):
+                raise ValueError("dictionary resource prefix escapes its literal-key reads")
+        if isinstance(item, ast.Assign) and len(item.targets) == 1 and isinstance(item.targets[0], ast.Name):
+            assignments[item.targets[0].id] = item
+        elif isinstance(item, ast.AnnAssign) and isinstance(item.target, ast.Name) and item.value is not None:
+            assignments[item.target.id] = item
+
+    def matches(value, call, seen=()):
+        if dictionary_read(value) == tuple(keys):
+            return True
+        # An original fixed endpoint suffix remains in the source call. The
+        # selected connection must already use the source's expected base.
+        if (field == "base_url" and isinstance(value, ast.BinOp) and isinstance(value.op, ast.Add)
+                and isinstance(value.right, ast.Constant) and isinstance(value.right.value, str)):
+            return matches(value.left, call, seen)
+        if not isinstance(value, ast.Name) or value.id in seen or writes.get(value.id) != 1:
+            return False
+        statement = assignments.get(value.id)
+        if statement is None or statement.lineno >= call.lineno or not _covered(evidence, path, cell, statement):
+            return False
+        call_owners = owners(call)
+        statement_owners = owners(statement)
+        if (not statement_owners or statement_owners[0] not in call_owners
+                or statement not in getattr(statement_owners[0], 'body', ())):
+            return False
+        for owner in call_owners:
+            if isinstance(owner, (ast.ClassDef, ast.Lambda)):
+                return False
+            if isinstance(owner, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                args = owner.args.posonlyargs + owner.args.args + owner.args.kwonlyargs
+                args += [arg for arg in (owner.args.vararg, owner.args.kwarg) if arg is not None]
+                if any(arg.arg == value.id for arg in args):
+                    return False
+            if owner is statement_owners[0]:
+                break
+        return matches(statement.value, call, seen + (value.id,))
+
+    return any(isinstance(call, ast.Call) and _covered(evidence, path, cell, call)
+               and not any(isinstance(owner, (ast.ClassDef, ast.Lambda)) for owner in owners(call))
+               and _field_call(call, field, lambda value: matches(value, call)) for call in ast.walk(node))
 
 
 def _constructor_path_call(inspector, node, path, cell, parameter, evidence):
@@ -376,7 +500,13 @@ def check_requirements(inspector, candidate):
                     raise ValueError("unsupported resource field")
                 if (row["kind"] == "weight") != (field == "path"):
                     raise ValueError("weight paths and service fields cannot be interchanged")
-                ref = reference(_destination(entry, location, parameter))
+                keys = mapping.get("parameter_path", [])
+                if not isinstance(keys, list) or len(keys) > 8 or any(
+                        not isinstance(key, str) or not key or key == "$dependency" for key in keys):
+                    raise ValueError("dependency parameter_path must contain literal dictionary string keys")
+                if keys and (row["kind"] != "service" or location != "entry.fixed_arguments"):
+                    raise ValueError("dictionary resource fields currently require an original function argument and service")
+                ref = reference(_destination(entry, location, parameter, keys))
                 if ref != {"id": identity, "field": field}:
                     raise ValueError("dependency reference does not occupy its declared original destination")
                 if location == "environment":
@@ -422,7 +552,8 @@ def check_requirements(inspector, candidate):
                     if not _covered(evidence, path, cell, original):
                         raise ValueError("dependency evidence must cover its original parameter definition")
                     matches = lambda value: isinstance(value, ast.Name) and value.id == parameter
-                    direct = any(_field_call(call, field, matches) and _covered(evidence, path, cell, call) for call in _calls(node))
+                    direct = (_dictionary_field_call(node, parameter, keys, field, evidence, path, cell) if keys else
+                              any(_field_call(call, field, matches) and _covered(evidence, path, cell, call) for call in _calls(node)))
                     path_flow = (field == "path" and location == "constructor.arguments" and
                                  _constructor_path_call(inspector, node, path, cell, parameter, evidence))
                     reassigned = any(
@@ -520,13 +651,14 @@ class DependencyBindings:
             raise ValueError("resource dependency is unselected or its original mapping has changed")
         return row, selection
 
-    def value(self, value, entry_id, location, parameter, runtime=False):
+    def value(self, value, entry_id, location, parameter, runtime=False, parameter_path=()):
         ref = reference(value)
         if ref is None:
             return value
         row, selection = self._selection(ref["id"])
         if not any(m.get("entry_id") == entry_id and m.get("location") == location and
-                   m.get("parameter") == parameter and m.get("field") == ref["field"] for m in row["mappings"]):
+                   m.get("parameter") == parameter and m.get("field") == ref["field"]
+                   and tuple(m.get("parameter_path", [])) == tuple(parameter_path) for m in row["mappings"]):
             raise ValueError("resource reference does not match its checked original parameter")
         if row["kind"] == "weight":
             check = (self.host_check(selection["resource"]) if self.host_check
@@ -556,8 +688,15 @@ class DependencyBindings:
         return result
 
     def values(self, values, entry_id, location, runtime=False):
-        return {parameter: self.value(value, entry_id, location, parameter, runtime)
-                for parameter, value in values.items()}
+        def resolve(value, parameter, keys=()):
+            if reference(value) is not None:
+                return self.value(value, entry_id, location, parameter, runtime, parameter_path=keys)
+            if isinstance(value, dict):
+                return {key: resolve(child, parameter, keys + (key,)) for key, child in value.items()}
+            if isinstance(value, list):
+                return [resolve(child, parameter, keys + (index,)) for index, child in enumerate(value)]
+            return value
+        return {parameter: resolve(value, parameter) for parameter, value in values.items()}
 
     def check_entry(self, entry_id):
         for identity, row in self.rows.items():
@@ -570,7 +709,8 @@ class DependencyBindings:
                 for mapping in row["mappings"]:
                     if mapping["entry_id"] == entry_id:
                         value = {"$dependency": {"id": identity, "field": mapping["field"]}}
-                        self.value(value, entry_id, mapping["location"], mapping["parameter"], runtime=False)
+                        self.value(value, entry_id, mapping["location"], mapping["parameter"], runtime=False,
+                                   parameter_path=mapping.get("parameter_path", []))
             else:
                 placement = row["placement"]
                 target = Path(placement["resolved_path"])

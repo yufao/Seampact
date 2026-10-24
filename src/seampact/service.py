@@ -17,7 +17,7 @@ from .inspection import Inspector
 from .intake import RepositoryIntake
 from .providers import Profiles
 from .resources import ResourceRegistry
-from .dependencies import Dependencies, check_requirements
+from .dependencies import Dependencies, check_requirements, reference as resource_reference
 from .verification import check_candidate
 from .revisions import build_review_context, candidate_diff
 from .runtime import Coordinator, OwnerRuntime
@@ -851,9 +851,18 @@ class Platform:
             configuration = copy.deepcopy(source.get("configuration") or {})
             for eid, values in supplied.get("entries", {}).items():
                 configuration.setdefault("entries", {}).setdefault(eid, {}).update(values)
-            encoded = str(configuration).lower().replace("_", "").replace("-", "")
-            if "apikey" in encoded:
-                raise ValueError("密钥请使用模型配置或原生环境变量")
+            def check_credentials(value):
+                if isinstance(value, dict):
+                    for key, child in value.items():
+                        if key.lower().replace("_", "").replace("-", "") == "apikey":
+                            ref = resource_reference(child)
+                            if child != "EMPTY" and not (ref and ref["field"] == "credential"):
+                                raise ValueError("密钥请使用服务凭据引用；无认证原 SDK 的显式非密钥占位符可使用 EMPTY")
+                        check_credentials(child)
+                elif isinstance(value, list):
+                    for child in value:
+                        check_credentials(child)
+            check_credentials(configuration)
             candidate = copy.deepcopy(previous["submitted"]["candidate"])
             entries = {entry["id"]: entry for entry in candidate["entries"]}
             for eid, values in configuration.get("entries", {}).items():
