@@ -158,7 +158,7 @@
         </form>
       </section>
       <section id="weight-configuration" class="config-section" data-config-section="weights" hidden>
-        <h2>权重资源</h2><p class="form-note">路径属于平台实际执行环境：Windows 填 Windows 路径，Linux 填 Linux 路径，Docker 填容器内路径。登记远端机器的目录不会把文件同步到此处；原库直接加载模型对象时仍须由原宿主读取。</p>
+        <h2>权重资源</h2><p class="form-note">路径属于平台实际执行环境：Windows 填 Windows 路径，Linux 填 Linux 路径，Docker 填容器内路径。权重放在独立目录，例如平台 models 目录；不要登记平台克隆的来源目录，来源删除时该目录会一起清掉。登记远端机器的目录不会把文件同步到此处；原库直接加载模型对象时仍须由原宿主读取。</p>
         <ol class="resource-guide"><li>先把原 Harness 所需的模型文件准备在平台可见的位置。此页登记已有路径，不下载权重。</li><li>在下方填写名称、选择“目录”或“单个文件”，再填写完整路径。多文件模型通常登记整个目录；格式以原加载器要求为准。</li><li>目录的必要文件每行填写一个相对文件名；保存后点击该资源卡片的“检查资源”。文件存在不等于模型已加载或调用成功。</li><li>回到<a href="/inspect?view=analyses">来源与分析</a>的“依赖配置”选择权重。若原参数映射尚未通过，需先修复候选；登记路径不会绕过这个条件。</li></ol>
         <div class="config-section-actions"><button id="weight-create" class="primary-button" type="button">新增权重资源</button></div>
         <div id="weight-list" class="status-list resource-list"></div>

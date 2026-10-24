@@ -2,12 +2,63 @@
 
 import os
 import re
+import shutil
+import stat
 import subprocess
 import uuid
 from pathlib import Path
 from urllib.parse import urlsplit
 
 from .inspection import inventory_repository
+
+
+def inside_platform_checkout(home, path):
+    """A weight path inside a platform clone is not a durable resource location."""
+    if not isinstance(path, str) or not path.strip():
+        return False
+    try:
+        resolved = Path(path).expanduser().resolve(strict=False)
+        base = (Path(home).resolve() / "repositories").resolve()
+    except OSError:
+        return False
+    return resolved == base or base in resolved.parents
+
+
+def managed_checkout(home, root):
+    """Return a platform clone at home/repositories/<id>, never a user directory."""
+    if not isinstance(root, str) or not root.strip():
+        return None
+    try:
+        path = Path(root).expanduser().resolve(strict=False)
+        base = (Path(home).resolve() / "repositories").resolve()
+    except OSError:
+        return None
+    if path == base:
+        return None
+    try:
+        relative = path.relative_to(base)
+    except ValueError:
+        return None
+    if len(relative.parts) != 1 or relative.parts[0] in {".", ".."}:
+        return None
+    return path
+
+
+def remove_checkout(path):
+    """Delete one platform clone. Git marks some metadata read-only on Windows."""
+    path = Path(path)
+    if not path.exists():
+        return False
+
+    def onerror(function, failed, exc_info):
+        try:
+            os.chmod(failed, stat.S_IWRITE)
+            function(failed)
+        except OSError:
+            raise exc_info[1]
+
+    shutil.rmtree(path, onerror=onerror)
+    return True
 
 
 class RepositoryIntake:
@@ -59,14 +110,21 @@ class RepositoryIntake:
             root.parent.mkdir(parents=True, exist_ok=True)
             # Native artifact manifests hash the original bytes. Windows Git
             # must not rewrite their JSON files to CRLF during checkout.
-            self._git(["clone", "-c", "core.autocrlf=false", "--", address, str(root)])
-            if revision:
-                commit = self._git(["-C", str(root), "rev-parse", "--verify", "--end-of-options",
-                                   revision.strip() + "^{commit}"])
-                self._git(["-C", str(root), "checkout", "--detach", commit])
-            head = self._git(["-C", str(root), "rev-parse", "--verify", "HEAD"])
-            # Even a branch URL is represented by the actual checked-out commit.
-            self._git(["-C", str(root), "checkout", "--detach", head])
+            try:
+                self._git(["clone", "-c", "core.autocrlf=false", "--", address, str(root)])
+                if revision:
+                    commit = self._git(["-C", str(root), "rev-parse", "--verify", "--end-of-options",
+                                       revision.strip() + "^{commit}"])
+                    self._git(["-C", str(root), "checkout", "--detach", commit])
+                head = self._git(["-C", str(root), "rev-parse", "--verify", "HEAD"])
+                # Even a branch URL is represented by the actual checked-out commit.
+                self._git(["-C", str(root), "checkout", "--detach", head])
+            except Exception:
+                try:
+                    remove_checkout(root)
+                except OSError:
+                    pass
+                raise
         else:
             raise ValueError("local source directory does not exist")
 

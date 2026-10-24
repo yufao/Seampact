@@ -13,6 +13,72 @@ from . import inspection
 EXTRACTOR_VERSION = "source-fact/1"
 
 
+def _object(value, fields, label):
+    if not isinstance(value, dict) or set(value) - set(fields):
+        raise ValueError(label + "需要对象且只能包含约定字段")
+    return value
+
+
+def _text(value, limit, label):
+    if not isinstance(value, str) or len(value) > limit:
+        raise ValueError(label + "需要不超过 " + str(limit) + " 字的文字")
+    return value.strip()
+
+
+def _choice(value, choices, label):
+    if not isinstance(value, str) or value not in choices:
+        raise ValueError(label + "不在允许范围内")
+    return value
+
+
+def intervention(value=None, previous=None):
+    """Declarations only: no inferred human origin or automatic rule acceptance."""
+    value = _object({} if value is None else value,
+        ("actor", "cause", "change_target", "summary", "evidence", "generalization"), "介入记录")
+    previous = previous or {}
+    actor = _object(value.get("actor", {}), ("kind", "name"), "介入者")
+    general = _object(value.get("generalization", {}),
+        ("disposition", "pattern_key", "target", "status", "resolution", "version", "evidence"), "共性问题")
+    general = dict(previous.get("generalization") or {}, **general)
+    result = dict(actor=dict(kind=_choice(actor.get("kind", "unknown"),
+        {"user", "external_agent", "platform_model", "unknown"}, "介入者类型"),
+        name=_text(actor.get("name", ""), 160, "介入者名称")))
+    for field, choices in (
+            ("cause", {"resource_configuration", "discovery_gap", "unsupported_rule", "checker_defect",
+                       "build_defect", "semantic_mismatch", "unknown"}),
+            ("change_target", {"configuration", "candidate", "source", "platform", "unknown"})):
+        result[field] = _choice(value.get(field, previous.get(field, "unknown")), choices, field)
+    for field in ("summary", "evidence"):
+        result[field] = _text(value.get(field, previous.get(field, "")), 4000 if field == "summary" else 8000, field)
+    result["generalization"] = dict(
+        disposition=_choice(general.get("disposition", "needs_review"),
+            {"case_specific", "needs_review", "generalizable"}, "共性处理范围"),
+        target=_choice(general.get("target", "unknown"),
+            {"analysis", "rule", "checker", "builder", "theory", "unknown"}, "共性处理去向"),
+        status=_choice(general.get("status", "open"), {"open", "implemented", "verified"}, "共性处理状态"),
+        **{field: _text(general.get(field, ""), limit, field) for field, limit in
+           (("pattern_key", 160), ("resolution", 4000), ("version", 256), ("evidence", 8000))})
+    general = result["generalization"]
+    if general["disposition"] == "generalizable" and (not general["pattern_key"] or general["target"] == "unknown"):
+        raise ValueError("通用问题需要 pattern_key 和明确处理去向")
+    if general["status"] != "open":
+        if general["target"] == "unknown" or not general["version"]:
+            raise ValueError("共性问题结案声明需要明确处理去向和版本")
+        required = "resolution" if general["status"] == "implemented" else "evidence"
+        if not general[required]:
+            raise ValueError("共性问题 " + general["status"] + " 声明需要 " + required)
+    return result
+
+
+def declared_result(value=None, previous=None):
+    value = _object({} if value is None else value, ("status", "summary", "evidence"), "目标运行结果声明")
+    value = dict(previous or {}, **value)
+    return dict(status=_choice(value.get("status", "unknown"),
+        {"unknown", "succeeded", "failed", "partial"}, "目标运行结果"),
+        summary=_text(value.get("summary", ""), 4000, "结果说明"),
+        evidence=_text(value.get("evidence", ""), 8000, "结果依据"))
+
+
 def _digest(value):
     return hashlib.sha256(json.dumps(value, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
 

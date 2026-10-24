@@ -14,12 +14,12 @@ from . import __version__
 from .analysis import AnalysisJobs, content_digest
 from .chat import ChatJobs
 from .inspection import Inspector
-from .intake import RepositoryIntake
+from .intake import RepositoryIntake, inside_platform_checkout, managed_checkout, remove_checkout
 from .providers import Profiles
 from .resources import ResourceRegistry
 from .dependencies import Dependencies, check_requirements, reference as resource_reference
 from .verification import check_candidate
-from .revisions import build_review_context, candidate_diff
+from .revisions import build_review_context, candidate_diff, intervention, declared_result
 from .runtime import Coordinator, OwnerRuntime
 from .scheduler import TwoLayerScheduler
 from .store import Store, now
@@ -144,31 +144,38 @@ class Platform:
         return self.resources.public_connections()
 
     def resource_catalog(self):
-        return dict(connections=self.profiles.public_connections(), weights=self.resources.public_weights(),
+        weights = [record for record in self.resources.public_weights()
+                   if not inside_platform_checkout(self.intake.home, record.get("path"))]
+        return dict(connections=self.profiles.public_connections(), weights=weights,
                     execution_environment="platform_process", platform_home=str(self.home))
 
     def add_harness(self, body):
         source = self.intake.prepare(body.get("address", ""), body.get("revision"),
                                     body.get("entry") or None, body.get("resources") or None)
-        source["entry_profile"] = dict(NATIVE_PROFILE)
-        configuration = body.get("configuration") or {}
-        if not isinstance(configuration, dict):
-            raise ValueError("初始化配置需要JSON对象")
-        def contains_api_key(value):
-            if isinstance(value, dict):
-                return any(str(key).lower().replace("-", "").replace("_", "") == "apikey"
-                           or contains_api_key(item) for key, item in value.items())
-            return isinstance(value, list) and any(contains_api_key(item) for item in value)
-        if contains_api_key(configuration):
-            raise ValueError("初始化配置不接收API密钥，请使用模型配置或原生环境变量")
-        source["configuration"] = configuration
-        source["user_resources"] = body.get("resources") or []
-        source["status"] = "CONNECTED"
-        inspector = self._environment_inspector(source)
-        source["environment_discovery"] = discover_environment(inspector)
-        if body.get("environment"):
-            source["runtime_environment"] = normalize_environment(body["environment"], inspector)
-        self.store.save("harness", source["id"], source)
+        try:
+            source["entry_profile"] = dict(NATIVE_PROFILE)
+            configuration = body.get("configuration") or {}
+            if not isinstance(configuration, dict):
+                raise ValueError("初始化配置需要JSON对象")
+            def contains_api_key(value):
+                if isinstance(value, dict):
+                    return any(str(key).lower().replace("-", "").replace("_", "") == "apikey"
+                               or contains_api_key(item) for key, item in value.items())
+                return isinstance(value, list) and any(contains_api_key(item) for item in value)
+            if contains_api_key(configuration):
+                raise ValueError("初始化配置不接收API密钥，请使用模型配置或原生环境变量")
+            source["configuration"] = configuration
+            source["user_resources"] = body.get("resources") or []
+            source["status"] = "CONNECTED"
+            inspector = self._environment_inspector(source)
+            source["environment_discovery"] = discover_environment(inspector)
+            if body.get("environment"):
+                source["runtime_environment"] = normalize_environment(body["environment"], inspector)
+            self._remember_managed_clone(source, source.get("root"))
+            self.store.save("harness", source["id"], source)
+        except Exception:
+            self._discard_unsaved_checkout(source)
+            raise
         print("[SeamPact] source_connected " + source["id"], flush=True)
         return dict(id=source["id"], files=len(source["files"]))
 
@@ -523,9 +530,11 @@ class Platform:
             self.home / "snapshots", prior), inspector, self.store)
         revision.update(source_version=inspector.request["source_version"],
             source_diff=context["source_diff"], materials=context, reuse=context["reuse"], updated_at=now())
+        revision.update(result=declared_result(), result_basis=None)
         self.store.save("analysis_revision", revision["id"], revision)
 
     def create_revision(self, body):
+        attribution = intervention(body.get("intervention"))
         with self.source_lock:
             base = self.store.get("analysis", body.get("analysis_id"))
             if not base or base.get("status") != "COMPLETED" or not (base.get("submitted") or {}).get("candidate"):
@@ -541,63 +550,79 @@ class Platform:
                 raise ValueError("修订模式只能为 refine 或 update")
             proposed = copy.deepcopy(source)
             rid, request_id = uuid.uuid4().hex, uuid.uuid4().hex
-            if mode == "update":
-                entry = source.get("entry")
-                if isinstance(entry, dict) and entry.get("status") == "STATIC_CANDIDATES":
-                    entry = None
-                refreshed = self.intake.prepare(source["address"], body.get("revision") or None,
-                    entry, source.get("user_resources") or [])
-                proposed.update({key: refreshed[key] for key in
-                    ("root", "revision", "entry", "files", "inventory", "resources")})
-                inspector = Inspector.freeze_repository(proposed, self.home / "snapshots", request_id,
-                    original["observation"])
-            else:
-                request = copy.deepcopy(original)
-                request["id"] = request_id
-                inspector = Inspector(source["root"], self.home / "snapshots", request)
-            inspector.request.update(rules=copy.deepcopy(RULESET), entry_profile=copy.deepcopy(NATIVE_PROFILE),
-                revision_id=rid, preprocessing_mode="revision", resource_catalog=self.resource_catalog(),
-                dependency_bindings=self.dependencies.selections(source["id"]))
-            environment = source.get("runtime_environment") or {}
-            if environment:
-                normalized = normalize_environment(environment, inspector)
-                proposed["runtime_environment"] = normalized
-                proposed["environment_discovery"] = normalized["discovery"]
-                inspector.request["runtime_environment"] = environment_selection(normalized)
-                record = source.get("target_runtime") or {}
-                inspector.request["target_runtime"] = {key: record.get(key) for key in
-                    ("status", "identity", "image", "image_id", "python", "base_image")}
-                attach_target(inspector, record, self.deployments.backend()["operation_timeout_s"])
-            else:
-                import sys
-                normalize_environment(dict(python=".".join(map(str, sys.version_info[:2]))), inspector)
-            self.store.create("request", request_id, inspector.request)
-            old_inspector = Inspector(source["root"], self.home / "snapshots", original)
-            # Prime reusable file facts, then resolve the new scope by content and parser identity.
-            if original.get("runtime_environment"):
-                record = source.get("target_runtime") or {}
-                frozen = original.get("target_runtime") or {}
-                if (environment_selection(original["runtime_environment"]) == environment_selection(environment)
-                        and record.get("status") == "READY"
-                        and all(frozen.get(key) == record.get(key) for key in ("identity", "image_id"))):
-                    attach_target(old_inspector, record, self.deployments.backend()["operation_timeout_s"])
-            build_review_context(old_inspector, old_inspector, self.store)
-            context = build_review_context(old_inspector, inspector, self.store)
-            implementation = self.analysis.freeze_implementation(inspector)
-            candidate = copy.deepcopy(base["submitted"]["candidate"])
-            revision = dict(schema="analysis-revision/1", id=rid, harness_id=source["id"],
-                base_analysis_id=base["id"], base_candidate_digest=content_digest(candidate),
-                base_source_basis=self._revision_source_basis(source), base_candidate=candidate,
-                base_source_version=original["source_version"], source_version=inspector.request["source_version"],
-                request_id=request_id, proposed_source=proposed, mode=mode, status="DRAFT",
-                candidate=copy.deepcopy(candidate), candidate_digest=content_digest(candidate),
-                candidate_diff=candidate_diff(candidate, candidate), source_diff=context["source_diff"],
-                materials=context, reuse=context["reuse"], implementation=implementation,
-                guidance="", reason="", provenance=[dict(kind="BASE_CANDIDATE", analysis_id=base["id"], at=now())],
-                analysis_attempts=[], analysis_id=None, created_at=now(), updated_at=now(),
-                report=None, checked_digest=None, error=None)
-            self.store.create("analysis_revision", rid, revision)
-            return dict(revision=self._public_revision(revision))
+            refreshed_root = None
+            try:
+                if mode == "update":
+                    entry = source.get("entry")
+                    if isinstance(entry, dict) and entry.get("status") == "STATIC_CANDIDATES":
+                        entry = None
+                    refreshed = self.intake.prepare(source["address"], body.get("revision") or None,
+                        entry, source.get("user_resources") or [])
+                    refreshed_root = refreshed["root"]
+                    proposed.update({key: refreshed[key] for key in
+                        ("root", "revision", "entry", "files", "inventory", "resources")})
+                    self._remember_managed_clone(source, source.get("root"))
+                    self._remember_managed_clone(source, refreshed_root)
+                    self._remember_managed_clone(proposed, source.get("root"))
+                    self._remember_managed_clone(proposed, refreshed_root)
+                    self.store.save("harness", source["id"], source)
+                    inspector = Inspector.freeze_repository(proposed, self.home / "snapshots", request_id,
+                        original["observation"])
+                else:
+                    request = copy.deepcopy(original)
+                    request["id"] = request_id
+                    inspector = Inspector(source["root"], self.home / "snapshots", request)
+                inspector.request.update(rules=copy.deepcopy(RULESET), entry_profile=copy.deepcopy(NATIVE_PROFILE),
+                    revision_id=rid, preprocessing_mode="revision", resource_catalog=self.resource_catalog(),
+                    dependency_bindings=self.dependencies.selections(source["id"]))
+                environment = source.get("runtime_environment") or {}
+                if environment:
+                    normalized = normalize_environment(environment, inspector)
+                    proposed["runtime_environment"] = normalized
+                    proposed["environment_discovery"] = normalized["discovery"]
+                    inspector.request["runtime_environment"] = environment_selection(normalized)
+                    record = source.get("target_runtime") or {}
+                    inspector.request["target_runtime"] = {key: record.get(key) for key in
+                        ("status", "identity", "image", "image_id", "python", "base_image")}
+                    attach_target(inspector, record, self.deployments.backend()["operation_timeout_s"])
+                else:
+                    import sys
+                    normalize_environment(dict(python=".".join(map(str, sys.version_info[:2]))), inspector)
+                self.store.create("request", request_id, inspector.request)
+                old_inspector = Inspector(source["root"], self.home / "snapshots", original)
+                # Prime reusable file facts, then resolve the new scope by content and parser identity.
+                if original.get("runtime_environment"):
+                    record = source.get("target_runtime") or {}
+                    frozen = original.get("target_runtime") or {}
+                    if (environment_selection(original["runtime_environment"]) == environment_selection(environment)
+                            and record.get("status") == "READY"
+                            and all(frozen.get(key) == record.get(key) for key in ("identity", "image_id"))):
+                        attach_target(old_inspector, record, self.deployments.backend()["operation_timeout_s"])
+                build_review_context(old_inspector, old_inspector, self.store)
+                context = build_review_context(old_inspector, inspector, self.store)
+                implementation = self.analysis.freeze_implementation(inspector)
+                candidate = copy.deepcopy(base["submitted"]["candidate"])
+                revision = dict(schema="analysis-revision/2", id=rid, harness_id=source["id"],
+                    base_analysis_id=base["id"], base_candidate_digest=content_digest(candidate),
+                    base_source_basis=self._revision_source_basis(source), base_candidate=candidate,
+                    base_source_version=original["source_version"], source_version=inspector.request["source_version"],
+                    request_id=request_id, proposed_source=proposed, mode=mode, status="DRAFT",
+                    candidate=copy.deepcopy(candidate), candidate_digest=content_digest(candidate),
+                    candidate_diff=candidate_diff(candidate, candidate), source_diff=context["source_diff"],
+                    materials=context, reuse=context["reuse"], implementation=implementation,
+                    guidance="", reason="", intervention=attribution, result=declared_result(), result_basis=None,
+                    provenance=[dict(kind="BASE_CANDIDATE", analysis_id=base["id"], at=now(),
+                        intervention=intervention(), candidate_snapshot=copy.deepcopy(candidate),
+                        candidate_digest=content_digest(candidate), source_version=original["source_version"])],
+                    analysis_attempts=[], analysis_id=None, created_at=now(), updated_at=now(),
+                    report=None, checked_digest=None, error=None)
+                self._revision_action(revision, "CREATE", attribution)
+                self.store.create("analysis_revision", rid, revision)
+                return dict(revision=self._public_revision(revision))
+            except Exception:
+                if refreshed_root is not None and not self.store.get("analysis_revision", rid):
+                    self._forget_checkout(source["id"], refreshed_root)
+                raise
 
     def _sync_revision(self, revision):
         job = self.store.get("analysis", revision.get("analysis_id"))
@@ -609,6 +634,9 @@ class Platform:
             for field in ("unreported_usage", "error_kind", "failure_phase"):
                 if field in job:
                     revision[field] = copy.deepcopy(job[field])
+            self._revision_action(revision, "MODEL_ATTEMPT_ENDED",
+                intervention(dict(actor=dict(kind="platform_model", name="analysis"))),
+                analysis_id=job["id"], outcome=dict(status=job["status"], error=revision["error"]))
             self.store.save("analysis_revision", revision["id"], revision)
         return revision
 
@@ -620,9 +648,20 @@ class Platform:
         return dict(stale=False, stale_reason=None)
 
     def _public_revision(self, revision):
-        return dict({key: copy.deepcopy(value) for key, value in revision.items() if key not in
+        result = dict({key: copy.deepcopy(value) for key, value in revision.items() if key not in
             {"proposed_source", "base_source_basis", "base_candidate", "materials"}},
             **self._revision_stale(revision))
+        result.setdefault("intervention", intervention())
+        result.setdefault("result", declared_result())
+        result.setdefault("result_basis", None)
+        for event in result.get("provenance", []):
+            # Old HUMAN_EDIT/USER_GUIDANCE labels did not establish who sent an API request.
+            if "intervention" not in event:
+                event["intervention"] = intervention()
+                event["origin_status"] = "UNKNOWN"
+            if "request_id" not in event and "candidate_snapshot" not in event:
+                event.setdefault("snapshot_status", "NOT_CAPTURED")
+        return result
 
     def revision_detail(self, identity):
         with self.source_lock:
@@ -633,12 +672,79 @@ class Platform:
 
     def revision_summaries(self):
         with self.source_lock:
-            return [dict({key: value for key, value in self._sync_revision(revision).items() if key in
+            revisions = [self._sync_revision(revision) for revision in self.store.list("analysis_revision")
+                         if self.store.get("harness", revision.get("harness_id"))]
+            patterns = {}
+            for revision in revisions:
+                key = ((revision.get("intervention") or {}).get("generalization") or {}).get("pattern_key")
+                if key:
+                    patterns.setdefault(key, []).append(revision["id"])
+            summaries = []
+            for revision in revisions:
+                attribution = revision.get("intervention") or intervention()
+                pattern = attribution["generalization"]["pattern_key"]
+                compact = {key: copy.deepcopy(attribution[key]) for key in ("actor", "cause", "change_target")}
+                compact["summary"] = attribution["summary"][:240]
+                compact["generalization"] = {key: attribution["generalization"][key] for key in
+                    ("disposition", "pattern_key", "target", "status", "version")}
+                result = revision.get("result") or declared_result()
+                summaries.append(dict({key: value for key, value in revision.items() if key in
                 {"id", "harness_id", "base_analysis_id", "mode", "status", "updated_at", "analysis_id",
                  "installed_analysis_id", "candidate_digest", "checked_digest", "error"}},
-                **self._revision_stale(revision))
-                for revision in self.store.list("analysis_revision")
-                if self.store.get("harness", revision.get("harness_id"))]
+                    intervention=compact, result=dict(status=result["status"], summary=result["summary"][:240]),
+                    result_basis=copy.deepcopy(revision.get("result_basis")),
+                    related_revision_ids=[rid for rid in patterns.get(pattern, []) if rid != revision["id"]],
+                    **self._revision_stale(revision)))
+            return summaries
+
+    def _revision_action(self, revision, action, attribution=None, before=None, **extra):
+        event = dict(kind=action, at=now(), intervention=copy.deepcopy(attribution or intervention()),
+            candidate_digest=revision["candidate_digest"], source_version=revision["source_version"],
+            request_id=revision["request_id"])
+        if before is not None:
+            event.update(before_candidate_digest=content_digest(before),
+                         candidate_diff=candidate_diff(before, revision["candidate"]))
+            captured = {item.get("candidate_digest") for item in revision.get("provenance", [])
+                        if "candidate_snapshot" in item}
+            captured.update(item.get("before_candidate_digest") for item in revision.get("provenance", [])
+                            if "before_candidate_snapshot" in item)
+            if event["before_candidate_digest"] not in captured:
+                event["before_candidate_snapshot"] = copy.deepcopy(before)
+            if event["before_candidate_digest"] != event["candidate_digest"]:
+                event["candidate_snapshot"] = copy.deepcopy(revision["candidate"])
+            else:
+                event["snapshot_status"] = "UNCHANGED"
+        event.update(copy.deepcopy(extra))
+        revision.setdefault("provenance", []).append(event)
+        return event
+
+    def feedback_revision(self, body):
+        """Update declarations even after installation; never change candidate/checks/catalog."""
+        with self.source_lock:
+            revision = self.store.get("analysis_revision", body.get("revision_id"))
+            if not revision:
+                raise ValueError("没有这份修订草稿")
+            if "expected_basis" in body:
+                expected = body["expected_basis"]
+                fields = {"candidate_digest", "source_version", "installed_analysis_id"}
+                if (not isinstance(expected, dict) or set(expected) != fields
+                        or any(value is not None and (not isinstance(value, str) or len(value) > 256)
+                               for value in expected.values())):
+                    raise ValueError("expected_basis 需要完整的候选、源码版本和安装身份")
+                if expected != {key: revision.get(key) for key in fields}:
+                    raise ValueError("候选、源码范围或安装身份已变化；请按最新修订确认结果后再保存记录")
+            if "intervention" not in body and "result" not in body:
+                raise ValueError("请提供介入说明或目标运行结果声明")
+            attribution = intervention(body.get("intervention"), revision.get("intervention"))
+            result = declared_result(body.get("result"), revision.get("result"))
+            revision.update(intervention=attribution, result=result, updated_at=now())
+            if "result" in body:
+                revision["result_basis"] = {key: revision.get(key) for key in
+                    ("candidate_digest", "source_version", "installed_analysis_id")}
+            self._revision_action(revision, "FEEDBACK", attribution, result=result,
+                result_basis=revision.get("result_basis"))
+            self.store.save("analysis_revision", revision["id"], revision)
+            return dict(revision=self._public_revision(revision))
 
     def _editable_revision(self, identity):
         revision = self.store.get("analysis_revision", identity)
@@ -650,22 +756,30 @@ class Platform:
         self._revision_source(revision)
         return revision
 
-    def _save_revision(self, revision, body):
+    def _save_revision(self, revision, body, action="SAVE"):
+        attribution = intervention(body.get("intervention"), revision.get("intervention"))
+        before = copy.deepcopy(revision["candidate"])
+        updates = {}
         if "candidate" in body:
             if not isinstance(body["candidate"], dict):
                 raise ValueError("候选需要 JSON 对象")
-            revision["candidate"] = json.loads(json.dumps(body["candidate"], allow_nan=False, ensure_ascii=False))
+            updates["candidate"] = json.loads(json.dumps(body["candidate"], allow_nan=False, ensure_ascii=False))
         for field in ("guidance", "reason"):
             if field in body:
-                if not isinstance(body[field], str):
-                    raise ValueError("提示和修改理由需要文字")
-                revision[field] = body[field]
+                if not isinstance(body[field], str) or len(body[field]) > 16000:
+                    raise ValueError("提示和修改理由需要不超过 16000 字的文字")
+                updates[field] = body[field]
+        revision.update(updates)
+        if "intervention" in body:
+            revision["intervention"] = attribution
         revision.update(candidate_digest=content_digest(revision["candidate"]),
             candidate_diff=candidate_diff(revision["base_candidate"], revision["candidate"]),
             status="DRAFT", checked_digest=None, report=None, error=None, updated_at=now())
-        revision["provenance"].append(dict(kind="HUMAN_EDIT" if any(revision["candidate_diff"]["counts"].values())
-            else "USER_GUIDANCE", at=now(), candidate_digest=revision["candidate_digest"],
-            guidance=revision["guidance"], reason=revision["reason"]))
+        if content_digest(before) != revision["candidate_digest"]:
+            revision.update(result=declared_result(), result_basis=None)
+        revision.pop("check_identity", None)
+        self._revision_action(revision, action, attribution, before,
+            guidance=revision["guidance"], reason=revision["reason"])
         self.store.save("analysis_revision", revision["id"], revision)
 
     def save_revision(self, body):
@@ -674,19 +788,45 @@ class Platform:
             self._save_revision(revision, body)
             return dict(revision=self._public_revision(revision))
 
-    def _check_revision(self, revision):
+    def _revision_check_identity(self, revision, inspector):
+        import sys
+        target = inspector.request.get("target_runtime") or {}
+        return dict(request_id=inspector.request["id"], source_version=inspector.request["source_version"],
+            candidate_digest=revision["candidate_digest"], implementation=copy.deepcopy(revision["implementation"]),
+            rules_digest=content_digest(inspector.request.get("rules")),
+            entry_profile_digest=content_digest(inspector.request.get("entry_profile")),
+            environment_digest=content_digest(inspector.request.get("runtime_environment") or {}),
+            interpreter={key: target.get(key) for key in ("identity", "image_id", "python")} if target else
+                dict(kind="platform", python=sys.version, implementation=sys.implementation.cache_tag))
+
+    def _check_revision(self, revision, attribution=None):
         started = time.perf_counter()
-        inspector = self._revision_inspector(revision)
-        candidate = revision["candidate"]
-        if (not isinstance(candidate.get("runtime_groups"), list)
-                or (candidate.get("entries") and not candidate["runtime_groups"])):
-            raise ValueError("完整候选需要 runtime_groups 数组，存在入口时必须列出完整运行组")
-        report = check_candidate(inspector, candidate)
-        report["dependencies"] = check_requirements(inspector, candidate)
-        report["entry_bindings"] = self.catalog.inspect_candidate(inspector, candidate)
+        revision.pop("check_identity", None)
+        try:
+            inspector = self._revision_inspector(revision)
+            revision["implementation"] = self.analysis.freeze_implementation(inspector)
+            revision["check_identity"] = self._revision_check_identity(revision, inspector)
+            candidate = revision["candidate"]
+            if (not isinstance(candidate.get("runtime_groups"), list)
+                    or (candidate.get("entries") and not candidate["runtime_groups"])):
+                raise ValueError("完整候选需要 runtime_groups 数组，存在入口时必须列出完整运行组")
+            report = check_candidate(inspector, candidate)
+            report["dependencies"] = check_requirements(inspector, candidate)
+            report["entry_bindings"] = self.catalog.inspect_candidate(inspector, candidate)
+        except Exception as error:
+            revision.update(status="FAILED", error=str(error), checked_digest=None, updated_at=now())
+            self._revision_action(revision, "CHECK_FAILED", attribution,
+                check_identity=revision.get("check_identity"),
+                outcome=dict(status="FAILED", error=str(error)))
+            self.store.save("analysis_revision", revision["id"], revision)
+            raise
         revision.update(status="CHECKED", report=report, checked_digest=content_digest(candidate),
-            implementation=self.analysis.freeze_implementation(inspector), error=None,
+            error=None,
             check_duration_ms=round((time.perf_counter() - started) * 1000, 3), updated_at=now())
+        revision["check_identity"] = self._revision_check_identity(revision, inspector)
+        self._revision_action(revision, "CHECK", attribution,
+            check_identity=revision["check_identity"], report=report,
+            outcome=dict(status="CHECK_COMPLETED", target_runtime="NOT_EXECUTED"))
         self.store.save("request", inspector.request["id"], inspector.request)
         self.store.save("analysis_revision", revision["id"], revision)
         return inspector
@@ -694,9 +834,9 @@ class Platform:
     def check_revision(self, body):
         with self.source_lock:
             revision = self._editable_revision(body.get("revision_id"))
-            self._save_revision(revision, body)
+            self._save_revision(revision, body, "CHECK_REQUEST")
             try:
-                self._check_revision(revision)
+                self._check_revision(revision, intervention(body.get("intervention"), revision.get("intervention")))
             except Exception as error:
                 revision.update(status="FAILED", error=str(error), checked_digest=None, updated_at=now())
                 self.store.save("analysis_revision", revision["id"], revision)
@@ -709,13 +849,15 @@ class Platform:
                 raise ValueError("该来源还有模型分析正在进行")
             prior_report = revision.get("report") or (
                 (self.store.get("analysis", revision["base_analysis_id"]) or {}).get("submitted") or {}).get("report")
-            self._save_revision(revision, body)
+            self._save_revision(revision, body, "REFINE_REQUEST")
             try:
                 inspector = self._revision_inspector(revision)
                 # Parse/host constraints must fail before a paid model request.
                 inspector.entry_candidates(path="")
             except Exception as error:
                 revision.update(status="FAILED", error=str(error), updated_at=now())
+                self._revision_action(revision, "REFINE_FAILED", intervention(body.get("intervention")),
+                    outcome=dict(status="FAILED", error=str(error)))
                 self.store.save("analysis_revision", revision["id"], revision)
                 raise
             materials = revision["materials"]
@@ -741,6 +883,8 @@ class Platform:
                     revision["analysis_attempts"].remove(aid)
                     revision["analysis_id"] = prior_analysis_id
                 revision.update(status="FAILED", error=str(error), updated_at=now())
+                self._revision_action(revision, "REFINE_FAILED", intervention(body.get("intervention")),
+                    analysis_id=aid, outcome=dict(status="FAILED", error=str(error)))
                 self.store.save("analysis_revision", revision["id"], revision)
                 raise
             return dict(analysis_id=aid, revision=self._public_revision(revision))
@@ -750,14 +894,21 @@ class Platform:
         if not revision or revision.get("analysis_id") != job["id"]:
             job["status"] = "CANCELLED"
             return
+        before = copy.deepcopy(revision["candidate"])
         candidate = copy.deepcopy(job["submitted"]["candidate"])
         revision.update(candidate=candidate, candidate_digest=content_digest(candidate),
             candidate_diff=candidate_diff(revision["base_candidate"], candidate),
             report=job["submitted"]["report"], status="CHECKED", checked_digest=content_digest(candidate),
             processed_analysis_id=job["id"], usage=job.get("usage", []), updated_at=now(), error=None)
-        revision["provenance"].append(dict(kind="MODEL_REFINEMENT", analysis_id=job["id"],
-            candidate_digest=revision["candidate_digest"], at=now()))
+        if content_digest(before) != revision["candidate_digest"]:
+            revision.update(result=declared_result(), result_basis=None)
         self._refresh_revision_scope(revision, inspector)
+        revision["implementation"] = copy.deepcopy(job["implementation"])
+        revision["check_identity"] = self._revision_check_identity(revision, inspector)
+        self._revision_action(revision, "MODEL_REFINEMENT",
+            intervention(dict(actor=dict(kind="platform_model", name="analysis"))), before,
+            analysis_id=job["id"], check_identity=revision["check_identity"], report=revision["report"],
+            outcome=dict(status="CHECK_COMPLETED", target_runtime="NOT_EXECUTED"))
         self.store.save("request", inspector.request["id"], inspector.request)
         self.store.save("analysis_revision", revision["id"], revision)
 
@@ -776,6 +927,8 @@ class Platform:
         aid = uuid.uuid4().hex
         revision.update(status="ANALYZING", analysis_id=aid, error=None, updated_at=now())
         revision["analysis_attempts"].append(aid)
+        self._revision_action(revision, "RESUME_REQUEST", analysis_id=aid,
+            outcome=dict(status="ANALYZING"))
         self.store.save("analysis_revision", revision["id"], revision)
         try:
             self.analysis.start(inspector, self.profiles.role_identity("analysis"), identity=aid, resume=previous)
@@ -789,13 +942,16 @@ class Platform:
         return dict(analysis_id=aid)
 
     def install_revision(self, body):
+        attribution = intervention(body.get("intervention"))
         with self.source_lock:
             revision = self._editable_revision(body.get("revision_id"))
             if revision.get("checked_digest") != revision["candidate_digest"]:
                 raise ValueError("请先完整重检当前候选，再独立安装")
             source = self._revision_source(revision)
             self._environment_guard(source)
-            inspector = self._check_revision(revision)
+            inspector = self._check_revision(revision, attribution)
+            install_event = self._revision_action(revision, "INSTALL", attribution,
+                check_identity=revision["check_identity"], outcome=dict(status="INSTALLING"))
             aid = uuid.uuid4().hex
             job = dict(id=aid, request_id=inspector.request["id"], harness_id=source["id"],
                 kind="CANDIDATE_REVISION_INSTALL", revision_id=revision["id"],
@@ -807,6 +963,11 @@ class Platform:
             proposed = copy.deepcopy(revision["proposed_source"])
             proposed.update(analysis_id=aid, request_id=inspector.request["id"], status="ANALYZED", error=None,
                 files=[item["path"] for item in inspector.request["files"]], inventory=inspector.request["inventory"])
+            clones = self._merge_managed_clones(source, proposed)
+            if clones:
+                proposed["managed_clones"] = clones
+            else:
+                proposed.pop("managed_clones", None)
             self.store.create("analysis", aid, job)
             try:
                 # Recheck after slow source checks. Old owner locks close the gap
@@ -826,11 +987,17 @@ class Platform:
             except Exception as error:
                 self.store.save("harness", source["id"], source)
                 job.update(status="FAILED", error=str(error), finished_at=now())
+                install_event["outcome"] = dict(status="FAILED", error=str(error))
+                job["provenance"] = copy.deepcopy(revision["provenance"])
                 self.store.save("analysis", aid, job)
+                self.store.save("analysis_revision", revision["id"], revision)
                 raise
+            install_event["outcome"] = dict(status="INSTALLED", analysis_id=aid, target_runtime="NOT_EXECUTED")
+            job["provenance"] = copy.deepcopy(revision["provenance"])
             job.update(finished_at=now(), check_duration_ms=revision.get("check_duration_ms"))
             self.store.save("analysis", aid, job)
             revision.update(status="INSTALLED", installed_analysis_id=aid, updated_at=now())
+            revision.update(result=declared_result(), result_basis=None)
             self.store.save("analysis_revision", revision["id"], revision)
             return dict(analysis_id=aid, units=job["units"], revision=self._public_revision(revision))
 
@@ -1290,9 +1457,117 @@ class Platform:
         return dict(harness_id=identity, status="DETACHED", detached_units=count,
                     history="RETAINED", started_calls="ALLOW_FINISH")
 
+    def _remember_managed_clone(self, record, root):
+        path = managed_checkout(self.intake.home, root)
+        if path is None:
+            return False
+        clones = record.setdefault("managed_clones", [])
+        text = str(path)
+        if text in clones:
+            return False
+        clones.append(text)
+        return True
+
+    def _merge_managed_clones(self, *records):
+        clones = []
+        for record in records:
+            roots = [record.get("root"), *(record.get("managed_clones") or [])]
+            for root in roots:
+                path = managed_checkout(self.intake.home, root)
+                if path is not None and str(path) not in clones:
+                    clones.append(str(path))
+        return clones
+
+    def _path_inside_checkout(self, checkout, raw):
+        if not isinstance(raw, str) or not raw.strip():
+            return False
+        try:
+            path = Path(raw).expanduser().resolve(strict=False)
+        except OSError:
+            return False
+        return path == checkout or checkout in path.parents
+
+    def _drop_weights_inside(self, checkout):
+        """A registered weight inside a disposable checkout is removed with that checkout."""
+        removed = []
+        identities = set()
+        for record in self.store.list("weight_resource"):
+            if not self._path_inside_checkout(checkout, record.get("path")):
+                continue
+            identities.add(record["id"])
+            self.store.delete("weight_resource", record["id"])
+            removed.append(dict(id=record["id"], name=record.get("name"), path=record.get("path")))
+        for binding in self.store.list("dependency_binding"):
+            resource = binding.get("resource") or {}
+            if binding.get("resource_id") in identities or self._path_inside_checkout(checkout, resource.get("path")):
+                self.store.delete("dependency_binding", binding.get("dependency_id") or binding.get("id"))
+        return removed
+
+    def _source_checkouts(self, source):
+        roots = [source.get("root"), *(source.get("managed_clones") or [])]
+        for revision in self.store.list("analysis_revision"):
+            if revision.get("harness_id") == source.get("id"):
+                roots.append((revision.get("proposed_source") or {}).get("root"))
+        found = []
+        for root in roots:
+            path = managed_checkout(self.intake.home, root)
+            if path is not None and path not in found:
+                found.append(path)
+        return found
+
+    def _checkout_used_elsewhere(self, checkout, source_id):
+        for other in self.store.list("harness"):
+            if other.get("id") == source_id:
+                continue
+            if checkout in self._source_checkouts(other):
+                return other.get("id")
+        return None
+
+    def _remove_source_checkouts(self, source):
+        removed, retained, removed_weights = [], [], []
+        for path in self._source_checkouts(source):
+            owner = self._checkout_used_elsewhere(path, source.get("id"))
+            if owner:
+                retained.append(dict(path=str(path), reason="still_used", harness_id=owner))
+                continue
+            removed_weights.extend(self._drop_weights_inside(path))
+            if path.exists():
+                remove_checkout(path)
+            removed.append(str(path))
+        return removed, retained, removed_weights
+
+    def _discard_unsaved_checkout(self, source):
+        if self.store.get("harness", source.get("id")):
+            return
+        path = managed_checkout(self.intake.home, source.get("root"))
+        if path is None or not path.exists():
+            return
+        self._drop_weights_inside(path)
+        remove_checkout(path)
+
+    def _forget_checkout(self, source_id, root):
+        path = managed_checkout(self.intake.home, root)
+        if path is None:
+            return
+        current = self.store.get("harness", source_id)
+        if current:
+            clones = [item for item in current.get("managed_clones") or [] if item != str(path)]
+            if clones:
+                current["managed_clones"] = clones
+            else:
+                current.pop("managed_clones", None)
+            self.store.save("harness", source_id, current)
+            if managed_checkout(self.intake.home, current.get("root")) == path:
+                return
+        if self._checkout_used_elsewhere(path, source_id):
+            return
+        self._drop_weights_inside(path)
+        if path.exists():
+            remove_checkout(path)
+
     def delete_harness(self, identity):
-        # Existing tasks keep their frozen Unit/request evidence. Only the
-        # source registration is removed; original files and caches are retained.
+        # Frozen analysis bytes and task evidence stay in snapshots. A checkout
+        # this platform cloned is removed; a directory the user supplied is not.
         with self.training.lock, self.source_lock:
             source = self.store.get("harness", identity)
             if not source:
@@ -1318,8 +1593,17 @@ class Platform:
             self.detach_harness(identity)
             if self.catalog.source_running(identity):
                 raise ValueError("来源已摘除，已开始的调用仍在收尾，结束后可删除")
+            removed, retained, removed_weights = self._remove_source_checkouts(source)
             self.store.delete("harness", identity)
-        return dict(harness_id=identity, status="DELETED", history="RETAINED", source_files="RETAINED")
+        if removed and retained:
+            source_files = "PARTIAL"
+        elif removed:
+            source_files = "REMOVED"
+        else:
+            source_files = "RETAINED"
+        return dict(harness_id=identity, status="DELETED", history="RETAINED", snapshots="RETAINED",
+                    source_files=source_files, removed_clones=removed, retained_clones=retained,
+                    removed_weights=removed_weights)
 
     def restore_harness(self, identity):
         with self.source_lock:

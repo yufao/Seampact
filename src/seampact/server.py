@@ -124,6 +124,8 @@ def make_server(platform, port=8880, host="127.0.0.1", public_port=None):
                     result = platform.refine_revision(body)
                 elif path == "/api/analysis/revisions/install":
                     result = platform.install_revision(body)
+                elif path == "/api/analysis/revisions/feedback":
+                    result = platform.feedback_revision(body)
                 elif path == "/api/harnesses/detach":
                     result = platform.detach_harness(body["harness_id"])
                 elif path == "/api/harnesses/delete":

@@ -9,17 +9,19 @@ import re
 from pathlib import Path, PurePosixPath, PureWindowsPath
 
 from .inspection import units
+from .intake import inside_platform_checkout
 from .store import now
 
 DEPENDENCY_RULES = """
 资源配置由用户保存，依赖需求和原参数映射必须由你从原源码提出。预处理工件和最终候选必须提供dependencies数组，逐项枚举已发现的原必需及可选外部服务、权重和配套模型资源；已有用户字面配置、原签名默认值、固定路径或尚未提供资源，均不是省略需求的理由。只在已检查的目标及原初始化范围确实没有发现此类需求时填[]，并在missing说明仍未覆盖的范围；[]本身不证明资源发现完整。
 资源发现与可执行映射分别提交。已发现需求即使没有当前有限规则支持的映射，也必须保留其源码证据、受影响entry_ids、原读取时点和owner，保留未核对/空mappings及具体missing，由检查器返回MISSING；不得为使入口READY而删除需求、改用用户字面配置绕过，或用无关辅助入口代替原目标。不要编造参数、引用或加载依据来消除MISSING。
+可配置依赖按受影响入口逐项核对，每个entry_ids中的入口都需自己的原参数映射和证据；一个入口通过不能替另一个入口放行。检查反馈的entry_checks给出逐入口状态与原因，selection_allowed只表示至少有入口可选择资源，不表示所有入口就绪，也不表示原服务已启动。
 沿原目标的构造、初始化及请求路径检查依赖，区分基座、adapter、processor/checkpoint等实际资源及其原配置关系，不把其中一项代替整组。required按原owner实际的无条件加载或分支条件填写；拆分不能省略原初始化必需工作。最终候选应保留预处理发现且仍影响所选入口的需求；因入口范围改变而不再适用的需求须在missing说明源码依据，不能静默丢弃。资源未发现完整、映射未覆盖及资源尚未配置要分别说明。
 dependency格式：{id:"ASCII需求标识",kind:"service或weight",description:"实际用途",configurable:true或false,required:true或false,entry_ids:["依赖它的候选entry.id"],read_time:"constructor或call或process_start",owner_scope:"原对象/模块/请求作用域说明",evidence:[{path,unit:"file",start,end}],mappings:[{entry_id,location:"constructor.arguments或entry.fixed_arguments或initializers.原方法或binding_program.arguments或environment",parameter:"原真实参数/变量",field:"base_url或model或credential或path或parameters.非敏感参数"}]}。
 service与本地weight不得互换。原本地from_pretrained/torch.load等必须保留原模型对象路径；不能因为有API连接而改成HTTP或手写包装。service的base_url与model等只填真实原配置入口；credential只能映射到源码可核对的原认证调用参数，秘密从不进入分析上下文。原代码只在导入读环境时，当前同进程宿主不能临时改os.environ；保留MISSING。environment仅支持原CLI process_start且有原os.getenv/os.environ.get依据，值经子进程env传递不进命令行。
 每个mapping的evidence必须同时覆盖原参数定义和该参数进入原调用的位置；base_url/model/parameters.xxx须有同名原调用keyword，base_url也可进入原requests/httpx等HTTP调用的URL位置参数；credential须有原认证keyword（api_key/token/password/access_token/auth_token）。权重path须进入原from_pretrained/torch.load/safetensors加载调用；原构造参数还允许同一作用域顺序中的单赋值局部变量或receiver直接属性，以及已核对pathlib.Path导入的透明包装、参数唯一一次同名Path(parameter)规范化、已为Path的值与字面相对子路径的/连接、一层固定等长tuple/list字面解包。构造函数内已核对且未遮蔽的joblib.load也可作原加载依据。evidence须覆盖参数、每次赋值及加载调用。除此以外的重赋、删除、动态下标、分支赋值、嵌套作用域、跨方法或自定义转换不属于该有限规则；不推断任意对象属性或动态配置数据流，覆盖不了则保留具体MISSING。CLI environment须覆盖原环境读取，服务或加载调用也须有上述字段依据。依赖引用必须实际出现在所映射的entry字段，不能仅列mappings。
 参数值可引用用户所选资源：{"$dependency":{"id":"需求id","field":"base_url/model/credential/path/parameters.xxx"}}，只能放在该需求mappings已列的原参数位置。引用不是原函数参数类型；运行边界由引擎解析为原值。资源未选择仍提交真实需求与MISSING，不自选连接、模型或假权重。
-原函数通过配置字典读服务字段时，可在entry.fixed_arguments映射增加parameter_path:["原固定键", "原子键"]，parameter仍为原显式函数参数；引用放在该参数字典的同一键路径。仅支持1至8层字符串字面键、同一原函数或未遮蔽的词法闭包读取、单赋值局部别名；evidence须覆盖原参数、每个别名赋值和原字段调用。base_url允许保留原字符串字面后缀拼接，平台不自动增删后缀，所选连接必须符合原代码期望的基址。配置字典其余值仍须来自用户明确配置或现有值来源规则，不能自行编造整份配置。原字典的重赋、变更、动态键、字典前缀外传、类/lambda作用域或跨函数传参仍不支持；CLI/YAML文件参数不能冒充原函数字典参数。无需认证时，个别原SDK要求的非密钥占位符须由用户配置明确提供，不能把真实凭据写成候选字面值。
+原函数通过配置字典读服务字段时，可在entry.fixed_arguments映射增加parameter_path:["原固定键", "原子键"]，parameter仍为原显式函数参数；引用放在该参数字典的同一键路径。仅支持1至8层字符串字面键、同一原函数或未遮蔽的词法闭包读取、单赋值局部别名；evidence须覆盖原参数、每个别名赋值和原字段调用。base_url允许保留原字符串字面后缀拼接，平台不自动增删后缀，所选连接必须符合原代码期望的基址。配置字典其余值仍须来自用户明确配置或现有值来源规则，不能自行编造整份配置。原字典的重赋、变更、动态键、字典前缀外传、类/lambda作用域或跨函数传参仍不支持；动态代码、命名空间/栈帧反射、动态调用目标、资源别名变更或外传不属于有限静态规则，须保留MISSING。该核对仅证明可见原语法中的参数来源，不证明任意外部Python调用不会反射改写。CLI/YAML文件参数不能冒充原函数字典参数。无需认证时，个别原SDK要求的非密钥占位符须由用户配置明确提供，不能把真实凭据写成候选字面值。
 原固定权重路径使用configurable:false,mappings:[]，placement:{expression:"来自evidence内的实际原AST表达式字符串",required_files:["原必要相对文件"]}。有限检查支持原字面路径、Path(__file__).parent及/连接、os.path.join/dirname/abspath；路径名变量/动态计算不能猜位置。引擎显示原执行cwd/文件基准下实际放置位置，不覆盖路径或省掉原必需加载。未覆盖位置保留MISSING。
 resource_catalog只提供非敏感连接、权重状态及已有选择；配置存在不等于服务能力、权重完整或原目标已运行。用户选择不改变入口与边界，W/H/R及生命周期规则继续适用。
 """
@@ -155,12 +157,71 @@ def _calls(node):
         stack.extend(ast.iter_child_nodes(current))
 
 
-def _dictionary_field_call(node, parameter, keys, field, evidence, path, cell):
+def _finite_dictionary_scope(node, tree):
+    """Reject visible dynamic namespace access, including imported aliases.
+
+    This is a finite source rule, not a claim about arbitrary Python callees.
+    Static named external calls retain their original, unproved semantics.
+    """
+    reflective = {"exec", "eval", "compile", "globals", "locals", "vars", "dir",
+                  "getattr", "setattr", "delattr", "__import__", "__builtins__",
+                  "currentframe", "_getframe", "getframeinfo", "getouterframes",
+                  "getinnerframes", "getattr_static", "getmembers", "attrgetter"}
+    namespaces = {"builtins", "inspect", "importlib", "ctypes"}
+    frame_attributes = {"f_locals", "f_globals", "f_builtins", "gi_frame", "cr_frame", "tb_frame"}
+    bindings = {}
+    for statement in tree.body:
+        if isinstance(statement, (ast.Import, ast.ImportFrom)):
+            for alias in statement.names:
+                name = alias.asname or alias.name.split(".")[0]
+                origin = ((statement.module or "").split(".")[0]
+                          if isinstance(statement, ast.ImportFrom) else alias.name.split(".")[0])
+                bindings.setdefault(name, []).append(origin in namespaces or alias.name in reflective)
+        elif isinstance(statement, (ast.Assign, ast.AnnAssign)) and statement.value is not None:
+            targets = statement.targets if isinstance(statement, ast.Assign) else [statement.target]
+            for target in targets:
+                if isinstance(target, ast.Name):
+                    bindings.setdefault(target.id, []).append(statement.value)
+
+    def unsafe_name(name, seen=()):
+        if name in reflective or name in namespaces:
+            return True
+        if name in seen:
+            return False
+        return any(origin is True or isinstance(origin, ast.AST) and unsafe(origin, seen + (name,))
+                   for origin in bindings.get(name, ()))
+
+    def unsafe(value, seen=()):
+        for item in ast.walk(value):
+            if isinstance(item, ast.Name) and isinstance(item.ctx, ast.Load) and unsafe_name(item.id, seen):
+                return True
+            if isinstance(item, ast.Attribute) and (item.attr in reflective | frame_attributes
+                    or item.attr.startswith("__")):
+                return True
+            if isinstance(item, (ast.Import, ast.ImportFrom)) and any(
+                    alias.name.split(".")[0] in namespaces or alias.name in reflective
+                    or isinstance(item, ast.ImportFrom) and (item.module or "").split(".")[0] in namespaces
+                    for alias in item.names):
+                return True
+            if isinstance(item, ast.Call):
+                target = item.func
+                while isinstance(target, ast.Attribute):
+                    target = target.value
+                if not isinstance(target, ast.Name):
+                    return True
+        return False
+
+    if unsafe(node):
+        raise ValueError("dictionary resource binding excludes dynamic code, namespace reflection and dynamic call targets")
+
+
+def _dictionary_field_call(node, parameter, keys, field, evidence, path, cell, tree):
     """Literal dictionary reads, lexical captures and single-assignment aliases.
 
     This checks an original resource destination, not callback execution or
     scheduling. No source or resource value is transformed by this rule.
     """
+    _finite_dictionary_scope(node, tree)
     parents = {child: parent for parent in ast.walk(node) for child in ast.iter_child_nodes(parent)}
 
     def owners(value):
@@ -231,6 +292,47 @@ def _dictionary_field_call(node, parameter, keys, field, evidence, path, cell):
         elif isinstance(item, ast.AnnAssign) and isinstance(item.target, ast.Name) and item.value is not None:
             assignments[item.target.id] = item
 
+    # Collect only aliases of this exact field. Prefix dictionaries may never
+    # escape above; leaf aliases must likewise keep their visible original use.
+    aliases = set()
+    def field_value(value):
+        if dictionary_read(value) == tuple(keys):
+            return True
+        if isinstance(value, ast.Name):
+            return value.id in aliases
+        return (field == "base_url" and isinstance(value, ast.BinOp) and isinstance(value.op, ast.Add)
+                and isinstance(value.right, ast.Constant) and isinstance(value.right.value, str)
+                and field_value(value.left))
+    changed = True
+    while changed:
+        changed = False
+        for name, statement in assignments.items():
+            if name not in aliases and field_value(statement.value):
+                aliases.add(name)
+                changed = True
+    for item in ast.walk(node):
+        if isinstance(item, (ast.Global, ast.Nonlocal)) and aliases.intersection(item.names):
+            raise ValueError("dictionary resource alias has an unsupported scope declaration")
+        if isinstance(item, ast.Name) and item.id in aliases and isinstance(item.ctx, (ast.Store, ast.Del)):
+            if writes.get(item.id) != 1 or parents.get(item) is not assignments.get(item.id):
+                raise ValueError("dictionary resource alias is reassigned or deleted")
+        if not ((isinstance(item, ast.Name) and item.id in aliases and isinstance(item.ctx, ast.Load))
+                or isinstance(item, ast.Subscript) and dictionary_read(item) == tuple(keys)):
+            continue
+        value, parent = item, parents.get(item)
+        while (field == "base_url" and isinstance(parent, ast.BinOp) and isinstance(parent.op, ast.Add)
+                and parent.left is value and isinstance(parent.right, ast.Constant)
+                and isinstance(parent.right.value, str)):
+            value, parent = parent, parents.get(parent)
+        if isinstance(parent, (ast.Assign, ast.AnnAssign)) and parent.value is value:
+            target = parent.targets[0] if isinstance(parent, ast.Assign) and len(parent.targets) == 1 else getattr(parent, "target", None)
+            if isinstance(target, ast.Name) and target.id in aliases:
+                continue
+        call = parents.get(parent) if isinstance(parent, ast.keyword) else parent
+        if isinstance(call, ast.Call) and _field_call(call, field, lambda candidate: candidate is value):
+            continue
+        raise ValueError("dictionary resource field or alias escapes its original field call")
+
     def matches(value, call, seen=()):
         if dictionary_read(value) == tuple(keys):
             return True
@@ -243,6 +345,8 @@ def _dictionary_field_call(node, parameter, keys, field, evidence, path, cell):
             return False
         statement = assignments.get(value.id)
         if statement is None or statement.lineno >= call.lineno or not _covered(evidence, path, cell, statement):
+            return False
+        if seen and statement.lineno >= assignments[seen[-1]].lineno:
             return False
         call_owners = owners(call)
         statement_owners = owners(statement)
@@ -446,6 +550,100 @@ def _path_expression(node, root, file):
     raise ValueError("fixed resource location is outside the finite original path-expression rule")
 
 
+def _mapping_shape(entries, row, mapping):
+    if not isinstance(mapping, dict):
+        raise ValueError("dependency mappings must contain parameter mapping objects")
+    if not isinstance(mapping.get("entry_id"), str):
+        raise ValueError("dependency mapping needs its original entry id")
+    entry = entries.get(mapping.get("entry_id"))
+    if entry is None:
+        raise ValueError("dependency mapping entry is absent")
+    location, parameter, field = mapping.get("location", ""), mapping.get("parameter"), mapping.get("field")
+    if not isinstance(location, str) or (location not in {
+            "constructor.arguments", "entry.fixed_arguments", "binding_program.arguments", "environment"}
+            and not location.startswith("initializers.")):
+        raise ValueError("unsupported original dependency parameter location")
+    if not isinstance(parameter, str) or not parameter.isidentifier():
+        raise ValueError("dependency needs an original explicit parameter name")
+    if not isinstance(field, str) or (field not in {"base_url", "model", "credential", "path", "service_version"}
+            and not (field.startswith("parameters.") and field[len("parameters."):])):
+        raise ValueError("unsupported resource field")
+    if (row["kind"] == "weight") != (field == "path"):
+        raise ValueError("weight paths and service fields cannot be interchanged")
+    keys = mapping.get("parameter_path", [])
+    if not isinstance(keys, list) or len(keys) > 8 or any(
+            not isinstance(key, str) or not key or key == "$dependency" for key in keys):
+        raise ValueError("dependency parameter_path must contain literal dictionary string keys")
+    if keys and (row["kind"] != "service" or location != "entry.fixed_arguments"):
+        raise ValueError("dictionary resource fields currently require an original function argument and service")
+    return entry, location, parameter, field, keys
+
+
+def _check_mapping(inspector, entries, identity, row, mapping, evidence):
+    entry, location, parameter, field, keys = _mapping_shape(entries, row, mapping)
+    ref = reference(_destination(entry, location, parameter, keys))
+    if ref != {"id": identity, "field": field}:
+        raise ValueError("dependency reference does not occupy its declared original destination")
+    if location == "environment":
+        if entry.get("kind") != "cli" or row.get("read_time") != "process_start":
+            raise ValueError("environment injection requires an original CLI process-start binding; in-process environment is never changed")
+        tree = ast.parse(_source(inspector, entry["path"], entry.get("unit", "file")))
+        reads = [n for n in ast.walk(tree) if isinstance(n, ast.Call) and ast.unparse(n.func)
+            in {"os.getenv", "os.environ.get"} and n.args and isinstance(n.args[0], ast.Constant)
+            and n.args[0].value == parameter]
+        if not reads:
+            raise ValueError("original environment read is not anchored")
+        checked_read = False
+        for read in reads:
+            if not _covered(evidence, entry["path"], entry.get("unit", "file"), read):
+                continue
+            scopes = [n for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+                      and n.lineno <= read.lineno <= n.end_lineno]
+            scope = min(scopes, key=lambda n: n.end_lineno - n.lineno) if scopes else tree
+            aliases = set()
+            for statement in ast.walk(scope):
+                if isinstance(statement, (ast.Assign, ast.AnnAssign)) and statement.value is read:
+                    targets = statement.targets if isinstance(statement, ast.Assign) else [statement.target]
+                    if _covered(evidence, entry["path"], entry.get("unit", "file"), statement):
+                        aliases.update(target.id for target in targets if isinstance(target, ast.Name))
+            writes = {name: sum(isinstance(n, ast.Name) and n.id == name and isinstance(n.ctx, (ast.Store, ast.Del))
+                               for n in ast.walk(scope)) for name in aliases}
+            aliases = {name for name in aliases if writes[name] == 1}
+            matches = lambda value: value is read or isinstance(value, ast.Name) and value.id in aliases
+            if any(_field_call(call, field, matches) and
+                   _covered(evidence, entry["path"], entry.get("unit", "file"), call) for call in _calls(scope)):
+                checked_read = True
+                break
+        if not checked_read:
+            raise ValueError("environment evidence must cover its read and original field/loader/authentication call")
+    else:
+        if location not in {"constructor.arguments", "entry.fixed_arguments", "binding_program.arguments"} and not location.startswith("initializers."):
+            raise ValueError("unsupported original dependency parameter location")
+        node, path, cell = _callable(inspector, entry, location)
+        args = node.args.posonlyargs + node.args.args + node.args.kwonlyargs
+        original = next((arg for arg in args if arg.arg == parameter), None)
+        if original is None:
+            raise ValueError("dependency destination is not an original explicit parameter")
+        if not _covered(evidence, path, cell, original):
+            raise ValueError("dependency evidence must cover its original parameter definition")
+        matches = lambda value: isinstance(value, ast.Name) and value.id == parameter
+        direct = (_dictionary_field_call(node, parameter, keys, field, evidence, path, cell,
+                    ast.parse(_source(inspector, path, cell))) if keys else
+                  any(_field_call(call, field, matches) and _covered(evidence, path, cell, call) for call in _calls(node)))
+        path_flow = (field == "path" and location == "constructor.arguments" and
+                     _constructor_path_call(inspector, node, path, cell, parameter, evidence))
+        reassigned = any(
+            isinstance(n, ast.Name) and n.id == parameter and isinstance(n.ctx, (ast.Store, ast.Del))
+            or isinstance(n, (ast.Import, ast.ImportFrom)) and any(
+                (alias.asname or alias.name.split(".")[0]) == parameter for alias in n.names)
+            or n is not node and isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+                and n.name == parameter for n in ast.walk(node))
+        if reassigned and not path_flow:
+            raise ValueError("reassigned resource parameter needs a separate original data-flow binding")
+        if not direct and not path_flow:
+            raise ValueError("dependency evidence must cover the original field/loader/authentication call")
+
+
 def check_requirements(inspector, candidate):
     """Check source anchors, parameter destinations and fixed path expressions."""
     if getattr(inspector, "target_runtime", None):
@@ -460,12 +658,33 @@ def check_requirements(inspector, candidate):
         row = copy.deepcopy(requirement)
         if not isinstance(row.get("id"), str) or not row["id"]:
             row["id"] = "invalid-dependency-" + str(index)
-        row.update(status="MISSING", reason=None, execution="NOT_RUN")
+        row.update(status="MISSING", reason=None, execution="NOT_RUN", entry_checks={},
+                   selection_allowed=False, selection_reason="original dependency mapping is unresolved")
+        scope_checked = False
+        affected = []
         try:
             identity = requirement.get("id")
             if not isinstance(identity, str) or not re.fullmatch(r"[A-Za-z0-9_-]+", identity) or identity in seen:
                 raise ValueError("dependency needs a unique nonempty id")
             seen.add(identity)
+            mappings = row.get("mappings", [])
+            if not isinstance(mappings, list):
+                raise ValueError("dependency mappings must be an array")
+            declared = row.get("entry_ids", [])
+            if (not isinstance(declared, list) or any(not isinstance(entry_id, str) for entry_id in declared)
+                    or set(declared) - set(entries)):
+                raise ValueError("dependency entry_ids must reference proposed entries")
+            affected = list(dict.fromkeys(declared))
+            for mapping in mappings:
+                if (not isinstance(mapping, dict) or not isinstance(mapping.get("entry_id"), str)
+                        or mapping["entry_id"] not in entries):
+                    raise ValueError("dependency mapping entry is absent or ambiguous")
+                if mapping["entry_id"] not in affected:
+                    affected.append(mapping["entry_id"])
+            if not affected:
+                raise ValueError("dependency must identify its affected original entries")
+            scope_checked = True
+            row["entry_ids"] = affected
             if row.get("kind") not in {"service", "weight"}:
                 raise ValueError("dependency kind must be service or weight")
             if type(row.get("configurable")) is not bool or type(row.get("required", True)) is not bool:
@@ -482,95 +701,17 @@ def check_requirements(inspector, candidate):
                         1 <= item["start"] <= item["end"] <= len(text.splitlines())):
                     raise ValueError("dependency evidence line range is invalid")
                 texts.append((item, text))
-            mappings = row.get("mappings", [])
-            if not isinstance(mappings, list):
-                raise ValueError("dependency mappings must be an array")
-            affected = row.get("entry_ids", [])
-            if not isinstance(affected, list) or set(affected) - set(entries):
-                raise ValueError("dependency entry_ids must reference proposed entries")
+            # Malformed fields are row-level errors. Only checks of an identified
+            # entry's actual source/destination may leave another entry usable.
             for mapping in mappings:
-                entry = entries.get(mapping.get("entry_id"))
-                if entry is None:
-                    raise ValueError("dependency mapping entry is absent")
-                location, parameter, field = mapping.get("location", ""), mapping.get("parameter"), mapping.get("field")
-                if not isinstance(parameter, str) or not parameter.isidentifier():
-                    raise ValueError("dependency needs an original explicit parameter name")
-                if field not in {"base_url", "model", "credential", "path", "service_version"} and not (
-                        isinstance(field, str) and field.startswith("parameters.")):
-                    raise ValueError("unsupported resource field")
-                if (row["kind"] == "weight") != (field == "path"):
-                    raise ValueError("weight paths and service fields cannot be interchanged")
-                keys = mapping.get("parameter_path", [])
-                if not isinstance(keys, list) or len(keys) > 8 or any(
-                        not isinstance(key, str) or not key or key == "$dependency" for key in keys):
-                    raise ValueError("dependency parameter_path must contain literal dictionary string keys")
-                if keys and (row["kind"] != "service" or location != "entry.fixed_arguments"):
-                    raise ValueError("dictionary resource fields currently require an original function argument and service")
-                ref = reference(_destination(entry, location, parameter, keys))
-                if ref != {"id": identity, "field": field}:
-                    raise ValueError("dependency reference does not occupy its declared original destination")
-                if location == "environment":
-                    if entry.get("kind") != "cli" or row.get("read_time") != "process_start":
-                        raise ValueError("environment injection requires an original CLI process-start binding; in-process environment is never changed")
-                    tree = ast.parse(_source(inspector, entry["path"], entry.get("unit", "file")))
-                    reads = [n for n in ast.walk(tree) if isinstance(n, ast.Call) and ast.unparse(n.func)
-                        in {"os.getenv", "os.environ.get"} and n.args and isinstance(n.args[0], ast.Constant)
-                        and n.args[0].value == parameter]
-                    if not reads:
-                        raise ValueError("original environment read is not anchored")
-                    checked_read = False
-                    for read in reads:
-                        if not _covered(evidence, entry["path"], entry.get("unit", "file"), read):
-                            continue
-                        scopes = [n for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
-                                  and n.lineno <= read.lineno <= n.end_lineno]
-                        scope = min(scopes, key=lambda n: n.end_lineno - n.lineno) if scopes else tree
-                        aliases = set()
-                        for statement in ast.walk(scope):
-                            if isinstance(statement, (ast.Assign, ast.AnnAssign)) and statement.value is read:
-                                targets = statement.targets if isinstance(statement, ast.Assign) else [statement.target]
-                                if _covered(evidence, entry["path"], entry.get("unit", "file"), statement):
-                                    aliases.update(target.id for target in targets if isinstance(target, ast.Name))
-                        writes = {name: sum(isinstance(n, ast.Name) and n.id == name and isinstance(n.ctx, (ast.Store, ast.Del))
-                                           for n in ast.walk(scope)) for name in aliases}
-                        aliases = {name for name in aliases if writes[name] == 1}
-                        matches = lambda value: value is read or isinstance(value, ast.Name) and value.id in aliases
-                        if any(_field_call(call, field, matches) and
-                               _covered(evidence, entry["path"], entry.get("unit", "file"), call) for call in _calls(scope)):
-                            checked_read = True
-                            break
-                    if not checked_read:
-                        raise ValueError("environment evidence must cover its read and original field/loader/authentication call")
-                else:
-                    if location not in {"constructor.arguments", "entry.fixed_arguments", "binding_program.arguments"} and not location.startswith("initializers."):
-                        raise ValueError("unsupported original dependency parameter location")
-                    node, path, cell = _callable(inspector, entry, location)
-                    args = node.args.posonlyargs + node.args.args + node.args.kwonlyargs
-                    original = next((arg for arg in args if arg.arg == parameter), None)
-                    if original is None:
-                        raise ValueError("dependency destination is not an original explicit parameter")
-                    if not _covered(evidence, path, cell, original):
-                        raise ValueError("dependency evidence must cover its original parameter definition")
-                    matches = lambda value: isinstance(value, ast.Name) and value.id == parameter
-                    direct = (_dictionary_field_call(node, parameter, keys, field, evidence, path, cell) if keys else
-                              any(_field_call(call, field, matches) and _covered(evidence, path, cell, call) for call in _calls(node)))
-                    path_flow = (field == "path" and location == "constructor.arguments" and
-                                 _constructor_path_call(inspector, node, path, cell, parameter, evidence))
-                    reassigned = any(
-                        isinstance(n, ast.Name) and n.id == parameter and isinstance(n.ctx, (ast.Store, ast.Del))
-                        or isinstance(n, (ast.Import, ast.ImportFrom)) and any(
-                            (alias.asname or alias.name.split(".")[0]) == parameter for alias in n.names)
-                        or n is not node and isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
-                            and n.name == parameter for n in ast.walk(node))
-                    if reassigned and not path_flow:
-                        raise ValueError("reassigned resource parameter needs a separate original data-flow binding")
-                    if not direct and not path_flow:
-                        raise ValueError("dependency evidence must cover the original field/loader/authentication call")
-                if mapping["entry_id"] not in affected:
-                    affected.append(mapping["entry_id"])
-            row["entry_ids"] = affected
-            if row["configurable"] and not mappings:
-                raise ValueError("configurable dependency needs original parameter mappings")
+                _mapping_shape(entries, row, mapping)
+            errors = {}
+            for mapping in mappings:
+                try:
+                    _check_mapping(inspector, entries, identity, row, mapping, evidence)
+                except (ValueError, KeyError, TypeError, SyntaxError, OSError) as error:
+                    reason = str(error) if isinstance(error, ValueError) else "original source parameter mapping could not be checked"
+                    errors.setdefault(mapping["entry_id"], []).append(reason)
             if not row["configurable"]:
                 if row["kind"] != "weight" or mappings:
                     raise ValueError("fixed placement supports original weight locations without parameter overrides")
@@ -605,14 +746,52 @@ def check_requirements(inspector, candidate):
                 path = (inspector.root / path).resolve() if not path.is_absolute() else path.resolve()
                 row["placement"] = dict(placement, resolved_path=str(path), execution_environment="platform_process",
                     original_cwd=str(inspector.root), contents="NOT_LOADED")
-            row.update(status="MAPPING_CHECKED", source_version=inspector.request["source_version"],
-                       semantic_match="SOURCE_AND_PARAMETER_BOUND; capability compatibility remains unverified")
+            for entry_id in affected:
+                count = sum(mapping["entry_id"] == entry_id for mapping in mappings)
+                reasons = errors.get(entry_id, [])
+                if row["configurable"] and not count:
+                    reasons = ["configurable dependency has no original parameter mapping for this affected entry"]
+                row["entry_checks"][entry_id] = dict(status="MISSING" if reasons else "MAPPING_CHECKED",
+                    reason="; ".join(dict.fromkeys(reasons)) if reasons else None, mapping_count=count)
+            missing = [entry_id + ": " + check["reason"] for entry_id, check in row["entry_checks"].items()
+                       if check["status"] != "MAPPING_CHECKED"]
+            row.update(status="MISSING" if missing else "MAPPING_CHECKED", reason="; ".join(missing) if missing else None,
+                source_version=inspector.request["source_version"],
+                semantic_match="SOURCE_AND_PARAMETER_BOUND_PER_ENTRY; capability compatibility remains unverified")
+            row["selection_allowed"] = row["configurable"] and any(
+                check["status"] == "MAPPING_CHECKED" for check in row["entry_checks"].values())
+            row["selection_reason"] = (None if row["selection_allowed"] else
+                "original fixed resource must be prepared in place" if not row["configurable"] else row["reason"])
         except (ValueError, KeyError, TypeError, SyntaxError, OSError) as error:
             # Keep source-derived details but never echo runtime credentials.
             row["reason"] = str(error) if isinstance(error, ValueError) else "source requirement, original destination or finite placement could not be checked"
+            if not scope_checked:
+                # An unresolvable required scope must not silently affect no entry.
+                affected = [entry_id for entry_id in entries if isinstance(entry_id, str)]
+                row["entry_ids"] = affected
+            invalid_mappings = row.get("mappings", [])
+            invalid_mappings = invalid_mappings if isinstance(invalid_mappings, list) else []
+            row["entry_checks"] = {entry_id: dict(status="MISSING", reason=row["reason"],
+                mapping_count=sum(isinstance(mapping, dict) and mapping.get("entry_id") == entry_id
+                                  for mapping in invalid_mappings))
+                for entry_id in affected}
+            row["selection_reason"] = row["reason"]
         row["definition_digest"] = fingerprint(requirement)
         result.append(row)
     return result
+
+
+def _entry_mapping_check(row, entry_id):
+    checks = row.get("entry_checks")
+    if isinstance(checks, dict):
+        return checks.get(entry_id, dict(status="MISSING", reason="entry has no checked original resource mapping"))
+    # Persisted records from before per-entry reporting keep their old meaning;
+    # actual candidate binding always recomputes the current finite checks.
+    return dict(status=row.get("status"), reason=row.get("reason"))
+
+
+def _selection_allowed(row):
+    return row.get("selection_allowed", row.get("status") == "MAPPING_CHECKED") is True
 
 
 class DependencyBindings:
@@ -642,10 +821,12 @@ class DependencyBindings:
         return copy.deepcopy(dict(requirements=list(rows.values()),
                                   bindings={k:v for k,v in self.selected.items() if k in rows}))
 
-    def _selection(self, identity):
+    def _selection(self, identity, entry_id):
         row = self.rows.get(identity)
-        if not row or row["status"] != "MAPPING_CHECKED":
-            raise ValueError("resource dependency has no checked original mapping")
+        checked = _entry_mapping_check(row, entry_id) if row else {}
+        if not row or checked.get("status") != "MAPPING_CHECKED":
+            raise ValueError("resource dependency " + identity + " is unresolved for entry " + str(entry_id)
+                             + ": " + str(checked.get("reason") or "no checked original mapping"))
         selection = self.selected.get(identity)
         if not selection or selection.get("definition_digest") != row["definition_digest"]:
             raise ValueError("resource dependency is unselected or its original mapping has changed")
@@ -655,7 +836,7 @@ class DependencyBindings:
         ref = reference(value)
         if ref is None:
             return value
-        row, selection = self._selection(ref["id"])
+        row, selection = self._selection(ref["id"], entry_id)
         if not any(m.get("entry_id") == entry_id and m.get("location") == location and
                    m.get("parameter") == parameter and m.get("field") == ref["field"]
                    and tuple(m.get("parameter_path", [])) == tuple(parameter_path) for m in row["mappings"]):
@@ -700,17 +881,21 @@ class DependencyBindings:
 
     def check_entry(self, entry_id):
         for identity, row in self.rows.items():
-            if entry_id not in row.get("entry_ids", []) or not row.get("required", True):
+            if entry_id not in row.get("entry_ids", []) or row.get("required", True) is False:
                 continue
-            if row["status"] != "MAPPING_CHECKED":
-                raise ValueError("required source resource mapping is unresolved")
+            checked = _entry_mapping_check(row, entry_id)
+            if checked.get("status") != "MAPPING_CHECKED":
+                raise ValueError("required resource " + identity + " is unresolved for entry " + str(entry_id)
+                                 + ": " + str(checked.get("reason") or "no checked original mapping"))
             if row["configurable"]:
-                self._selection(identity)
-                for mapping in row["mappings"]:
-                    if mapping["entry_id"] == entry_id:
-                        value = {"$dependency": {"id": identity, "field": mapping["field"]}}
-                        self.value(value, entry_id, mapping["location"], mapping["parameter"], runtime=False,
-                                   parameter_path=mapping.get("parameter_path", []))
+                mappings = [mapping for mapping in row["mappings"] if mapping["entry_id"] == entry_id]
+                if not mappings:
+                    raise ValueError("required resource " + identity + " has no original parameter mapping for entry " + str(entry_id))
+                self._selection(identity, entry_id)
+                for mapping in mappings:
+                    value = {"$dependency": {"id": identity, "field": mapping["field"]}}
+                    self.value(value, entry_id, mapping["location"], mapping["parameter"], runtime=False,
+                               parameter_path=mapping.get("parameter_path", []))
             else:
                 placement = row["placement"]
                 target = Path(placement["resolved_path"])
@@ -761,7 +946,7 @@ class Dependencies:
         selections = []
         for selection in self.store.list("dependency_binding"):
             row = current.get(selection.get("dependency_id"))
-            if (row and row.get("status") == "MAPPING_CHECKED" and selection.get("status") == "SELECTED"
+            if (row and _selection_allowed(row) and selection.get("status") == "SELECTED"
                     and selection.get("source_id") == row.get("source_id")
                     and selection.get("definition_digest") == row.get("definition_digest")):
                 selections.append(selection)
@@ -838,7 +1023,7 @@ class Dependencies:
     def select(self, body):
         row = self.store.get("resource_dependency", body["dependency_id"])
         if (not row or not row.get("active", True) or row["source_id"] != body["harness_id"]
-                or row["status"] != "MAPPING_CHECKED"):
+                or not _selection_allowed(row)):
             raise ValueError("dependency has no current checked original source requirement")
         if not row["configurable"]:
             raise ValueError("original fixed resource location must be prepared in place")
@@ -854,6 +1039,8 @@ class Dependencies:
             resource = next((w for w in self.resources.public_weights() if w["id"] == body["resource_id"]), None)
             if resource is None:
                 raise ValueError("weight resource is absent")
+            if inside_platform_checkout(self.resources.home / "sources", resource.get("path")):
+                raise ValueError("这份权重的路径在平台来源克隆里，不能绑定到当前来源。请改登记到独立目录。")
             item.update(resource_id=resource["id"], resource=resource)
         item["revision_digest"] = fingerprint(item)
         self.store.save("dependency_binding", row["id"], item)

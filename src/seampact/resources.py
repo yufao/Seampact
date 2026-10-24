@@ -19,6 +19,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path, PurePosixPath
 
+from .intake import inside_platform_checkout
 from .store import now
 from .providers import ProviderError, Transport, completion_body, completion_parameters, embedding_body, image_evidence
 
@@ -43,6 +44,8 @@ class ResourceRegistry:
                 not (os.name == "nt" and re.match(r"^[A-Za-z]:[\\/]", value))):
             raise ValueError("weight paths belong to this execution environment; remote machine paths are unsupported")
         path = Path(value).expanduser().resolve(strict=False)
+        if inside_platform_checkout(self.home / "sources", str(path)):
+            raise ValueError("权重不要登记在平台克隆的来源目录里。请把文件放到独立目录（例如平台 models 目录）后再填写路径。")
         private = getattr(self.profiles, "private_directory", None)
         if private and (path.is_relative_to(Path(private).resolve()) or
                         Path(private).resolve().is_relative_to(path)):
