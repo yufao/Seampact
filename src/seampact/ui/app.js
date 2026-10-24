@@ -1927,26 +1927,64 @@ function analysisResultSummary(job) {
   return root;
 }
 
+function analysisOperationLabel(job) {
+  if (!job) return '尚未分析';
+  if (job.resumed_from) return '继续未完成的分析';
+  const named = {
+    ENVIRONMENT_RECHECK: '按当前环境重新核对已有候选',
+    CANDIDATE_REVISION_INSTALL: '安装修订后的候选',
+    EXPLICIT_RESOURCE_BINDING: '保存显式配置并重新接入',
+    ANALYZER_RESOURCE_BINDING: '保存依赖选择并重新接入',
+    IMPORTED_ANALYSIS: '导入已有分析',
+    CANDIDATE_REFINEMENT: '用分析模型修订候选'
+  };
+  if (named[job.kind]) return named[job.kind];
+  if (job.refinement_of) return '沿用已有分析继续完善';
+  if ((job.rounds || job.model_calls || 0) > 0) return '分析源码并形成接入结果';
+  return '检查并安装接入结果';
+}
+
+function sourceIdentity(harness) {
+  const block = node('div', undefined, 'analysis-source-heading');
+  block.append(node('h3', harness.name || harness.address || '未命名来源'));
+  const remote = typeof harness.address === 'string' && harness.address.includes('://');
+  if (harness.address) block.append(node('p', (remote ? '远端地址：' : '来源地址：') + harness.address, 'card-meta'));
+  if (harness.root) block.append(node('p', '本地位置：' + harness.root, 'resource-path'));
+  const files = entryCount(harness.files);
+  if (files !== null) block.append(node('p', files + ' 份可读文件' +
+    (typeof harness.inventory_count === 'number' ? ' · 仓库共 ' + harness.inventory_count + ' 项文件' : ''), 'card-meta'));
+  return block;
+}
+
 function renderAnalyses() {
   const harnesses = (state.harnesses || []).filter(source => !selectedSource() || source.id === selectedSource());
   const analyses = state.analyses || [];
   const root = $('analysis-list');
+  const heading = $('analysis-heading');
   root.replaceChildren();
+  if (heading) heading.replaceChildren(inspectPage && harnesses.length === 1 ? sourceIdentity(harnesses[0]) : node('h3', '来源与分析'));
   $('analysis-count').textContent = analyses.filter(job => harnesses.some(source => source.id === job.harness_id)).length;
   if (!harnesses.length) return empty(root, '配置 Harness 地址后可开始分析。');
   for (const harness of harnesses) {
     const history = analyses.filter(item => item.harness_id === harness.id);
     const jobs = inspectPage ? history.length ? history : [null] :
       [analyses.find(item => item.id === harness.analysis_id) || history[0] || null];
+    const steps = new Map([...history].reverse().map((job, index) => [job.id, index + 1]));
+    if (inspectPage && harnesses.length !== 1) root.append(sourceIdentity(harness));
     for (const job of jobs) {
     const card = node('article', undefined, 'status-card');
     card.dataset.itemId = harness.id + ':' + (job?.id || 'source');
     const head = node('div', undefined, 'card-heading');
-    head.append(node('strong', harness.name || harness.address), pill(harness.status === 'DETACHED' ? 'DETACHED' : job?.status || harness.status));
-    card.append(head, node('p', harness.address, 'card-meta'));
-    if ((!job || job.id === harness.analysis_id) && harness.root) card.append(node('p', '当前本地源码目录：' + harness.root, 'resource-path'));
-    const files = entryCount(harness.files);
-    if (files !== null) card.append(node('p', files + ' 份可读文件' + (typeof harness.inventory_count === 'number' ? ' · 仓库共 ' + harness.inventory_count + ' 项文件' : ''), 'card-meta'));
+    const title = inspectPage ? (job ? '第' + steps.get(job.id) + '次操作：' + analysisOperationLabel(job) : '尚未分析') :
+      (harness.name || harness.address);
+    head.append(node('strong', title), pill(harness.status === 'DETACHED' ? 'DETACHED' : job?.status || harness.status));
+    card.append(head);
+    if (!inspectPage) {
+      card.append(node('p', harness.address, 'card-meta'));
+      if ((!job || job.id === harness.analysis_id) && harness.root) card.append(node('p', '当前本地源码目录：' + harness.root, 'resource-path'));
+      const files = entryCount(harness.files);
+      if (files !== null) card.append(node('p', files + ' 份可读文件' + (typeof harness.inventory_count === 'number' ? ' · 仓库共 ' + harness.inventory_count + ' 项文件' : ''), 'card-meta'));
+    }
     if (job?.rounds !== undefined) card.append(node('p', '分析模型响应 ' + job.rounds + ' 轮', 'card-meta'));
     if (job) card.append(analysisProgress(job));
     const resultSummary = job && analysisResultSummary(job);
@@ -2106,7 +2144,10 @@ function readResearchConfig() {
   const independent = jsonField('research-independent', '独立评价', true);
   if (independent) config.evaluation_criteria = independent;
   else delete config.evaluation_criteria;
-  if (config.mode !== 'train' && !config.parent_run_id) throw new Error('冻结、继续训练或条件重评需要选择来源运行');
+  const referenceFreeze = config.mode === 'freeze' && algorithms.every(algorithm =>
+    ['required_only', 'all_applicable', 'simple'].includes(algorithm));
+  if (config.mode !== 'train' && !config.parent_run_id && !referenceFreeze)
+    throw new Error('学习器冻结评价、继续训练或条件重评需要选择来源运行');
   if ($('research-scheduling-mode').value === 'joint/1') {
     config.joint = jsonField('research-joint', '联合配置', true);
     if (!config.joint) throw new Error('joint/1 需要联合配置');
