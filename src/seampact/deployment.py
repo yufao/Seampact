@@ -32,6 +32,7 @@ from .runtime import ProtocolError, _task_context
 from .store import now
 from .verification import source_unit
 from .environments import normalize_environment
+from .image_build import worker_dockerfile
 from .target_runtime import core_identity, environment_selection
 
 REMOTE_PROFILE = dict(id="python-native-scalar-worker/2", confirmed=True, python_versions=["3.10", "3.11", "3.12", "3.13"],
@@ -680,7 +681,7 @@ class Deployments:
                 result.append(group)
         return result
 
-    def _start_gap(self, group, artifact):
+    def _artifact_gap(self, group, artifact):
         if not artifact:
             return "先生成构建工件并构建镜像"
         if (artifact.get("contract_digest") != group["contract"]["digest"]
@@ -688,6 +689,12 @@ class Deployments:
             return "构建工件与当前运行组契约/接入版本不一致，请重新生成"
         if artifact.get("platform_core") != core_identity():
             return "构建工件与当前平台核心代码不同，请重新生成并构建 worker"
+        return None
+
+    def _start_gap(self, group, artifact):
+        artifact_gap = self._artifact_gap(group, artifact)
+        if artifact_gap:
+            return artifact_gap
         if any(artifact.get(field, {}).get("status") == "RUNNING" for field in ("build", "publish")):
             return "该运行组正在构建或发布镜像"
         if (artifact.get("build") or {}).get("status") not in {"BUILT", "OPERATOR_REPORTED"}:
@@ -712,6 +719,7 @@ class Deployments:
                 return dict(enabled=False, reason="运行 " + lock["run_id"] + " 正在使用该组；手动启停会改变冻结执行条件")
             return dict(enabled=reason is None, reason=reason)
         built = (artifact or {}).get("build", {}).get("status") in {"BUILT", "OPERATOR_REPORTED"}
+        artifact_gap = self._artifact_gap(group, artifact)
         gap = self._start_gap(group, artifact)
         single = None if not held else "已有实例或待释放对象；该组只允许一个实例，先排空停止" if not contract["replicas"]["replicable"] else "已有实例或待释放对象；请先核对，再用增加副本"
         editing = ("运行 " + lock["run_id"] + " 正在使用该组" if lock else
@@ -721,8 +729,9 @@ class Deployments:
         return dict(
             export=dict(enabled=not editing and group.get("host_status") == "HOST_CHECKED",
                         reason=editing or (None if group.get("host_status") == "HOST_CHECKED" else "没有通过宿主核对的成员")),
-            build=dict(enabled=not editing and bool(artifact), reason=editing or (None if artifact else "先生成构建工件")),
-            publish=dict(enabled=not editing and built, reason=editing or (None if built else "镜像尚未构建成功")),
+            build=dict(enabled=not editing and artifact_gap is None, reason=editing or artifact_gap),
+            publish=dict(enabled=not editing and artifact_gap is None and built,
+                         reason=editing or artifact_gap or (None if built else "镜像尚未构建成功")),
             start=gate("start", gap or single), prewarm=gate("prewarm", None if ready else "没有就绪实例"),
             pause_intake=gate("pause_intake", None if any(item["accepting"] for item in ready) else "没有正在接单的实例"),
             drain_stop=dict(enabled=bool(held) and not lock, reason=None if held and not lock else
@@ -976,39 +985,17 @@ class Deployments:
             json.dumps([fingerprint, environment], sort_keys=True).encode())[:16]
         (destination / "worker.json").write_text(json.dumps(spec, ensure_ascii=False, indent=2), encoding="utf-8")
         (destination / "environment.json").write_text(json.dumps(environment, ensure_ascii=False, indent=2), encoding="utf-8")
-        index = '${PIP_EXTRA_INDEX_URL:+--extra-index-url "$PIP_EXTRA_INDEX_URL"} '
         check_python = ("import sys; from seampact.environments import check_python_version; "
             "assert '.'.join(map(str,sys.version_info[:2])) == " + repr(environment["python"]) + "; "
             "r=check_python_version('.'.join(map(str,sys.version_info[:3])), " + repr(environment["python_requirements"]) +
             "); assert r['status'] == 'SUPPORTED', r['missing']")
-        preparation = []
-        if environment["python"] == "3.10":
-            preparation.append("python -m pip install --no-cache-dir " + index + "'tomli>=2,<3'")
-        preparation.append("python -c " + shlex.quote(check_python))
-        steps = ["python -m pip install --no-cache-dir " + index + "-r " + shlex.quote(path) for path in environment["requirements"]]
-        if environment["project"]:
-            project = "." if environment["project"] == "." else "./" + environment["project"]
-            steps.append("python -m pip install --no-cache-dir " + index + shlex.quote(project))
-        if environment["packages"]:
-            steps.append("python -m pip install --no-cache-dir " + index + " ".join(shlex.quote(item) for item in environment["packages"]))
-        steps += ["python -m pip check", "python -m pip freeze --all > /work/environment.lock"]
-        (destination / "Dockerfile").write_text(
-            "# Generated runtime-group image: frozen source, checked binding and declared environment only.\n"
-            "# Weights, configuration and credentials are mounted/injected at start, never copied here.\n"
-            "ARG BASE_IMAGE=" + environment["base_image"] + "\nFROM ${BASE_IMAGE}\nARG PIP_EXTRA_INDEX_URL=\n"
-            "COPY core /app\nENV PYTHONPATH=/app PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1\n"
-            "WORKDIR /work\nRUN " + " \\\n && ".join(preparation) + "\n"
-            "COPY source /work/source\nWORKDIR /work/source\nRUN " + " \\\n && ".join(steps) + "\n"
-            "COPY snapshots /work/snapshots\nCOPY worker.json /work/worker.json\nWORKDIR /work\n"
-            "ENV SEAMPACT_ENVIRONMENT_LOCK=/work/environment.lock\n"
-            'ENTRYPOINT ["python","-B","-m","seampact","worker","--spec","/work/worker.json","--host","0.0.0.0","--port","8890"]\n',
-            encoding="utf-8")
+        reuse = worker_dockerfile(destination, binding.inspector, environment, check_python)
         archive = shutil.make_archive(str(destination), "zip", root_dir=destination)
         record = dict(id=identity, status="ARTIFACT_READY", folder=str(destination), archive=archive, image=image,
             profile=spec["profile"], contract_digest=group["contract"]["digest"], binding_fingerprint=fingerprint,
             installation_id=group["installation_id"], analysis_id=group.get("analysis_id"), environment=environment,
             source_runtime_environment=environment_selection(binding.inspector.request.get("runtime_environment") or {}),
-            platform_core=spec["platform_core"],
+            platform_core=spec["platform_core"], build_reuse=reuse,
             created_at=now(), source_version=group["source_version"], build=dict(status="NOT_RUN"),
             publish=dict(status="NOT_RUN"), deployment="NOT_APPLIED", copies_original_code=True, resource_downloads=0)
         self.platform.store.save("runtime_group", identity, group)
@@ -1019,6 +1006,9 @@ class Deployments:
         artifact = self.platform.store.get("deployment", identity)
         if not artifact or artifact.get("status") != "ARTIFACT_READY":
             raise ValueError("先生成该运行组的构建工件")
+        gap = self._artifact_gap(self._group(identity), artifact)
+        if gap:
+            raise ValueError(gap)
         return artifact
 
     def _background(self, identity, field, work):
@@ -1059,7 +1049,8 @@ class Deployments:
                 return artifact
             config = self.backend()
             return self._background(identity, "build", lambda artifact: backends.build(
-                artifact["folder"], artifact["image"], artifact["environment"], config))
+                artifact["folder"], artifact["image"], artifact["environment"], config,
+                dependency_image=artifact["build_reuse"]["dependency_image"]))
         return self._once(body, "build:" + identity, action)
 
     def publish(self, identity, body):

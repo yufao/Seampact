@@ -1183,6 +1183,12 @@ function renderDeployments() {
       if (artifact.build?.reason || artifact.publish?.reason) card.append(node('p', textValue(artifact.build?.reason || artifact.publish?.reason), 'card-note'));
       for (const step of [artifact.build, artifact.publish]) if (step?.manual_commands) detailValue(card, '后端不可用 · 手动命令', step.manual_commands);
       detailValue(card, '构建工件', artifact);
+      if (artifact.build_reuse) {
+        const reuse = artifact.build_reuse;
+        card.append(node('p', reuse.dependency_image ?
+          '可复用依赖镜像：' + reuse.dependency_image + '。构建成功后，兼容库可将其选为基础镜像；各库源码仍分别安装。' :
+          '依赖安装需要原源码上下文，保留原安装顺序；下载包通过构建缓存复用。', 'card-note'));
+      }
     }
     card.append(node('p', '真实 worker：' + ((group.instances || []).some(item => item.state === 'READY' && item.accepting) ?
       '已有就绪且接单的实例' : '尚无就绪且接单的实例') + '。生成工件、构建成功、镜像可达与实例就绪分别记录。', 'card-note'));

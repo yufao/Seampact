@@ -126,22 +126,35 @@ def _kubectl(config):
     return argv + ["-n", config["namespace"]]
 
 
-def build(folder, image, environment, config):
+def build(folder, image, environment, config, dependency_image=None):
     argv = ["docker", "build", "-t", image]
     for key, value in (("BASE_IMAGE", environment.get("base_image")),
                        ("PIP_EXTRA_INDEX_URL", environment.get("pip_extra_index_url"))):
         if value:
             argv += ["--build-arg", key + "=" + value]
     argv.append(str(folder))
+    dependencies = None
+    if dependency_image:
+        dependencies = list(argv)
+        dependencies[dependencies.index("-t") + 1] = dependency_image
+        dependencies[-1:-1] = ["--target", "dependencies"]
     gap = docker_available()
     if gap:
-        return manual([argv, ["docker", "image", "inspect", "--format", "{{.Id}}", image]], gap)
-    steps = [run(argv, config["build_timeout_s"])]
+        commands = [dependencies] if dependencies else []
+        return manual(commands + [argv, ["docker", "image", "inspect", "--format", "{{.Id}}", image]], gap)
+    deadline = time.monotonic() + config["build_timeout_s"]
+    steps = []
+    if dependency_image:
+        # Export a source-free dependency image. The worker build reuses this
+        # same stage; compatible later sources may select it as their base.
+        steps.append(run(dependencies, max(1, deadline - time.monotonic())))
+    if not steps or steps[-1]["returncode"] == 0:
+        steps.append(run(argv, max(1, deadline - time.monotonic())))
     image_id = None
-    if steps[0]["returncode"] == 0:
+    if all(step["returncode"] == 0 for step in steps):
         steps.append(run(["docker", "image", "inspect", "--format", "{{.Id}}", image], config["operation_timeout_s"]))
         image_id = steps[-1]["stdout"].strip() if steps[-1]["returncode"] == 0 else None
-    return _result(steps, "BUILT", image=image, image_id=image_id)
+    return _result(steps, "BUILT", image=image, image_id=image_id, dependency_image=dependency_image)
 
 
 def publish(image, config, image_id=None):
