@@ -94,7 +94,7 @@ docker info --format '{{.ServerVersion}}'
 
 若设置了 `DOCKER_HOST`，它可能覆盖 context，应先确认其实际目标。本机 socket 通常为 `unix:///var/run/docker.sock`，rootless 默认位于自己的运行目录；以实际返回为准，不猜用户名或 UID。[Docker rootless 客户端说明](https://docs.docker.com/engine/security/rootless/tips/#client)。SSH／TCP context 不使用本机 socket 挂载方式。
 
-系统 daemon 使用宿主实际 UID/GID，并按 socket 实际 GID 配补充组；rootless 新部署使用容器 `0:0` 映射当前 daemon 用户，避免把宿主数字 UID 再映射一次。已有数据的拥有者和旧容器用户以接管结果为准，不为更新递归修改共享目录拥有者。
+系统 daemon 使用宿主实际 UID/GID，并按 socket 实际 GID 配补充组。rootless 新部署使用容器 `0:0` 映射当前 daemon 用户，不把宿主 socket 的数字 GID 直接追加到容器 `GroupAdd`：宿主 subordinate GID 可能超出容器映射，导致 runc 在程序启动前报 `setgroups: invalid argument`。已有显式附加组保留；接管自定义非 root 用户时需明确其 socket 访问方式，不自动改用户。已有数据的拥有者和旧容器用户以接管结果为准，不为更新递归修改共享目录拥有者。
 
 客户端不存在、socket 不可用、socket 无权限与原依赖安装失败分别处理，不能以一种错误掩盖另一种。镜像构建网络依赖、平台数据备份及旧镜像清理只按[服务器部署](服务器部署.md)操作；不运行全局 prune，不自动清理运行组、来源镜像、共享网络或卷。
 

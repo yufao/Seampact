@@ -353,6 +353,17 @@ def add_tools(spec):
     env = inspect_environment(spec.get("Env"))
     env.update(DOCKER_HOST="unix:///var/run/docker.sock", DOCKER_CONFIG="/data/docker-client")
     spec["Env"] = [key + "=" + value for key, value in env.items()]
+    rootless = any("rootless" in item for item in api("GET", "/info").get("SecurityOptions", []))
+    if rootless:
+        # Container root maps to the rootless daemon owner and can use that
+        # owner's socket. A host-side subordinate GID is not a container GID:
+        # copying it into GroupAdd may exceed the user-namespace mapping and
+        # make runc fail with setgroups(EINVAL) before the app starts.
+        # Retain explicitly configured groups, but add no host numeric GID.
+        if str(spec.get("User") or "").split(":", 1)[0] not in {"", "0", "root"}:
+            fail("Adding Docker tools to a rootless container requires its daemon-owner mapping (container user 0). "
+                 "The existing custom user is preserved; configure its socket access explicitly before adoption.")
+        return
     groups = host.get("GroupAdd") or []
     gid = str(SOCKET_PATH.stat().st_gid)
     if gid not in groups:
