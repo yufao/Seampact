@@ -103,7 +103,7 @@ def host_weight_check(root):
         record.setdefault("required_files", [])
         try:
             registry.store.save("weight_resource", record["id"], record)
-            return registry.check_weight(record["id"])
+            return registry.check_weight(record["id"])["check"]
         except (ValueError, KeyError, OSError) as error:
             return dict(status="missing", reason=str(error))
     return check
@@ -281,9 +281,13 @@ class Worker:
             results = {}
             for unit_id in body.get("units", []):
                 rule = self.prepare_rules.get(unit_id, {})
-                if unit_id not in self.units or rule.get("status") != "SUPPORTED":
+                if unit_id not in self.units:
                     results[unit_id] = dict(status="NOT_PREPARED", initialization_ready=False,
-                                           reason=rule.get("basis") or "该成员未在本实例登记")
+                                           reason=self.missing.get(unit_id) or "该成员未在本实例登记")
+                    continue
+                if rule.get("status") != "SUPPORTED":
+                    results[unit_id] = dict(status="NOT_PREPARED", initialization_ready=False,
+                                           reason=rule.get("basis") or "该成员不支持提前准备")
                     continue
                 binding, entry = self.catalog.bindings[unit_id], self.catalog.entry_specs[unit_id]
                 unit = self.store.get("unit", unit_id)
