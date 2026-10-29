@@ -13,6 +13,17 @@ from urllib.parse import urlsplit
 from .inspection import digest, safe_path
 
 
+RECIPE_LABEL = "io.seampact.environment.recipe"
+BASE_LABEL = "io.seampact.environment.base"
+
+
+def dependency_image_reference(recipe_sha256, base_image_id):
+    """A tag is a lookup hint; callers must also verify its image labels."""
+    identity = dict(schema="seampact-dependency-image/2", recipe_sha256=recipe_sha256,
+                    base_image_id=base_image_id)
+    return "seampact-environment:" + digest(json.dumps(identity, sort_keys=True).encode())
+
+
 def _remote(value):
     if re.search(r"\s", value):
         return False
@@ -106,43 +117,65 @@ def worker_dockerfile(destination, inspector, environment, check_python):
     cached_run = "RUN --mount=type=cache,id=seampact-pip-v1,target=/root/.cache/pip,sharing=locked "
     index = '${PIP_EXTRA_INDEX_URL:+--extra-index-url "$PIP_EXTRA_INDEX_URL"} '
     install = "python -m pip install " + index
-    early = [install + "-r " + shlex.quote(path) for path in environment["requirements"]] if files else []
-    late = [] if files else [install + "-r " + shlex.quote(path) for path in environment["requirements"]]
+    independent = plan["status"] == "DEPENDENCY_ONLY"
+    early = [install + "-r " + shlex.quote(path) for path in environment["requirements"]] if independent else []
+    late = [] if independent else [install + "-r " + shlex.quote(path) for path in environment["requirements"]]
+    installation = dict(early=[], late=[])
+    if environment["requirements"]:
+        installation["early" if independent else "late"].append(dict(kind="requirements",
+            inputs=list(environment["requirements"]), reason=("全部引用均为冻结的外部依赖清单" if independent else plan["reason"])))
     if environment["project"]:
         project = "." if environment["project"] == "." else "./" + environment["project"]
         late.append(install + shlex.quote(project))
+        installation["late"].append(dict(kind="project", inputs=[environment["project"]],
+            reason="原项目安装可能读取源码或动态生成依赖；保持 requirements → project → packages 顺序"))
     if environment["packages"]:
-        late.append(install + " ".join(shlex.quote(item) for item in environment["packages"]))
+        extra_early = not late and all(_external_requirement(item) for item in environment["packages"])
+        (early if extra_early else late).append(install + " ".join(shlex.quote(item) for item in environment["packages"]))
+        installation["early" if extra_early else "late"].append(dict(kind="packages", inputs=list(environment["packages"]),
+            reason=("外部包且前序安装均不需要源码，保持原安装顺序" if extra_early else
+                    "保留前序源码依赖／项目安装之后的顺序，或额外包本身需要源码上下文")))
     late += ["python -m pip check", "python -m pip freeze --all > /work/environment.lock"]
     python_check = "import sys; assert '.'.join(map(str, sys.version_info[:2])) == " + repr(environment["python"])
-    dockerfile = (
-        "# Generated runtime-group image; frozen manifests and original installation order.\n"
-        "# Weights and credentials are supplied at start. BuildKit package cache stays outside the image.\n"
-        "ARG BASE_IMAGE=" + environment["base_image"] + "\nFROM ${BASE_IMAGE} AS dependencies\n"
+    dependency_recipe = (
         "ARG PIP_EXTRA_INDEX_URL=\nENV PIP_CACHE_DIR=/root/.cache/pip\n"
         "WORKDIR /work/source\nRUN python -c " + shlex.quote(python_check) + "\n")
     if environment["python"] == "3.10":
-        dockerfile += cached_run + install + "'tomli>=2,<3'\n"
+        dependency_recipe += cached_run + install + "'tomli>=2,<3'\n"
+        installation["early"].insert(0, dict(kind="worker-parser", inputs=["tomli>=2,<3"],
+            reason="Python 3.10 的平台解析器依赖，不读取 Harness 源码"))
+    if files:
+        dependency_recipe += "COPY dependency-inputs/ /work/source/\n"
     if early:
-        dockerfile += "COPY dependency-inputs/ /work/source/\n" + cached_run + " \\\n && ".join(early) + "\n"
+        dependency_recipe += cached_run + " \\\n && ".join(early) + "\n"
+    # Late project/source changes cannot alter this recipe. The resolved base
+    # image ID is added by the backend, after Docker has inspected it.
+    dependency_key = dict(schema="seampact-dependency-recipe/2", files=plan["files"],
+        pip_extra_index_url=environment["pip_extra_index_url"], recipe=dependency_recipe)
+    recipe_sha256 = digest(json.dumps(dependency_key, sort_keys=True).encode())
+    dockerfile = (
+        "# syntax=docker/dockerfile:1\n"
+        "# Generated runtime-group image; frozen manifests and original installation order.\n"
+        "# Weights and credentials are supplied at start. BuildKit package cache stays outside the image.\n"
+        "ARG BASE_IMAGE=" + environment["base_image"] + "\nARG DEPENDENCY_IMAGE=dependencies\n"
+        "FROM ${BASE_IMAGE} AS dependencies\n"
+        "ARG SEAMPACT_ENVIRONMENT_RECIPE\nARG SEAMPACT_ENVIRONMENT_BASE\n"
+        "LABEL " + RECIPE_LABEL + '="${SEAMPACT_ENVIRONMENT_RECIPE}" ' + BASE_LABEL + '="${SEAMPACT_ENVIRONMENT_BASE}"\n' +
+        dependency_recipe)
     dockerfile += (
-        "FROM dependencies AS worker\nARG PIP_EXTRA_INDEX_URL=\nCOPY core /app\n"
+        "FROM ${DEPENDENCY_IMAGE} AS worker\nARG PIP_EXTRA_INDEX_URL=\nCOPY core /app\n"
         "ENV PYTHONPATH=/app PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1\nWORKDIR /work\n" +
         "RUN python -c " + shlex.quote(check_python) + "\n"
         "COPY source /work/source\nWORKDIR /work/source\n" + cached_run + " \\\n && ".join(late) + "\n"
         "COPY snapshots /work/snapshots\nCOPY worker.json /work/worker.json\nWORKDIR /work\n"
         "ENV SEAMPACT_ENVIRONMENT_LOCK=/work/environment.lock\n"
-        'ENTRYPOINT ["python","-B","-m","seampact","worker","--spec","/work/worker.json","--host","0.0.0.0","--port","8890"]\n')
+        'ENTRYPOINT ["python","-B","-m","seampact.worker","--spec","/work/worker.json","--host","0.0.0.0","--port","8890"]\n')
     (destination / "Dockerfile").write_text(dockerfile, encoding="utf-8")
-    dependency_key = dict(schema="seampact-dependency-image/1", base_image=environment["base_image"],
-        python=environment["python"], requirements=environment["requirements"], files=plan["files"],
-        pip_extra_index_url=environment["pip_extra_index_url"],
-        recipe_sha256=digest(dockerfile.split("FROM dependencies AS worker", 1)[0].encode()))
-    dependency_image = ("seampact-environment:" + digest(json.dumps(dependency_key, sort_keys=True).encode())[:24]
-        if files else None)
-    reuse = dict(schema="seampact-build-reuse/1", dependency_stage="dependencies", dependency_image=dependency_image, requirements=plan,
+    dependency_image = "seampact-environment:recipe-" + recipe_sha256[:24]
+    reuse = dict(schema="seampact-build-reuse/2", dependency_stage="dependencies", dependency_image=dependency_image,
+        recipe_sha256=recipe_sha256, requested_base_image=environment["base_image"], requirements=plan, installation=installation,
         package_cache=dict(kind="buildkit-cache-mount", id="seampact-pip-v1", in_worker_image=False),
-        scope="same builder/base and identical dependency inputs may reuse installed layers; other compatible downloads use pip cache",
+        scope="verified recipe and resolved base ID select an installed environment; final worker uses a local reference verified against that image ID",
         observed_cache_hit="NOT_CHECKED")
     (destination / "build-reuse.json").write_text(json.dumps(reuse, ensure_ascii=False, indent=2), encoding="utf-8")
     return reuse

@@ -5,13 +5,14 @@ is transported as frozen bytes and parsed; it is never imported or installed by
 this protocol. Harness dependencies belong to the later runtime-group image.
 """
 
+import ast
 import base64
 import copy
 import json
 import os
-import shutil
 import sys
 import tempfile
+from functools import lru_cache
 from pathlib import Path
 from types import MethodType, SimpleNamespace
 
@@ -29,22 +30,174 @@ def environment_selection(environment):
     return {key: copy.deepcopy(environment[key]) for key in ENV_FIELDS if key in environment}
 
 
-def core_identity():
-    return {path.name: digest(path.read_bytes()) for path in sorted(Path(__file__).parent.glob("*.py"))}
+CORE_SCOPES = {"worker": "worker", "checker": "target_runtime"}
+
+
+@lru_cache(maxsize=128)
+def _implementation_source(data, relative):
+    """Cache parsing by exact bytes, so same-size/mtime edits remain visible."""
+    tree = ast.parse(data, filename=relative)
+    native_calls = set()
+    if relative == "units.py":
+        # Only this explicit frozen-source loader is outside the platform
+        # module closure. Other dynamic imports, even in units.py, must fail.
+        for owner in tree.body:
+            if isinstance(owner, ast.ClassDef) and owner.name == "NativeBindings":
+                for method in owner.body:
+                    if isinstance(method, ast.FunctionDef) and method.name == "_namespace":
+                        native_calls.update(id(node) for node in ast.walk(method)
+                            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                            and isinstance(node.func.value, ast.Name) and node.func.value.id == "importlib"
+                            and node.func.attr == "import_module" and len(node.args) == 1
+                            and isinstance(node.args[0], ast.Name) and node.args[0].id == "module"
+                            and not node.keywords)
+    imports, reads_version, metadata_hash = [], False, None
+    version_name = "__" + "version__"
+    for node in ast.walk(tree):
+        if relative != "__init__.py" and (
+                isinstance(node, ast.Name) and node.id == version_name
+                or isinstance(node, ast.Attribute) and node.attr == version_name
+                or isinstance(node, ast.Constant) and node.value == version_name):
+            reads_version = True
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            imports.append(node)
+        elif isinstance(node, ast.Call) and isinstance(node.func, (ast.Name, ast.Attribute)):
+            name = node.func.id if isinstance(node.func, ast.Name) else node.func.attr
+            if name in {"import_module", "__import__"} and id(node) not in native_calls:
+                imports.append(node)
+    if relative == "__init__.py":
+        # Only a metadata-only initializer can omit its literal package version.
+        metadata = all(
+            isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant) and isinstance(node.value.value, str)
+            or isinstance(node, ast.Assign) and len(node.targets) == 1
+            and isinstance(node.targets[0], ast.Name) and node.targets[0].id == version_name
+            and isinstance(node.value, ast.Constant) and isinstance(node.value.value, str)
+            for node in tree.body)
+        if metadata:
+            normalized = ast.Module(body=[node for node in tree.body if not isinstance(node, ast.Assign)], type_ignores=[])
+            metadata_hash = digest(ast.dump(normalized, include_attributes=False).encode())
+    return digest(data), tuple(imports), reads_version, metadata_hash
+
+
+def core_identity(scope="worker"):
+    """Hash the complete local import closure of the actual image entrypoint.
+
+    Imports in every branch/function are included, not just modules imported by
+    the current process. Native source loaded by Unit bindings has its separate
+    frozen-source identity; it does not select platform implementation modules.
+    No coordinator, UI or training module is excluded if the closure imports it.
+    """
+    if scope not in CORE_SCOPES:
+        raise ValueError("unknown platform implementation scope")
+    root = Path(__file__).parent
+    package = root.name
+    pending, sources = [CORE_SCOPES[scope], ""], {}
+    reads_version = False
+    metadata_hash = None
+
+    def path_for(module):
+        if not module:
+            return root / "__init__.py"
+        path = root.joinpath(*module.split("."))
+        initializer = path / "__init__.py"
+        return initializer if initializer.is_file() else path.with_suffix(".py")
+
+    def add(module):
+        path = path_for(module)
+        if not path.is_file():
+            raise ValueError("platform import has no source file: " + package + "." + module)
+        pending.append(module)
+        parts = module.split(".")[:-1]
+        while parts:
+            pending.append(".".join(parts))
+            parts.pop()
+
+    while pending:
+        module = pending.pop()
+        path = path_for(module)
+        relative = path.relative_to(root).as_posix()
+        if relative in sources:
+            continue
+        source_hash, imports, observes_version, normalized = _implementation_source(path.read_bytes(), relative)
+        sources[relative] = source_hash
+        reads_version = reads_version or observes_version
+        if relative == "__init__.py":
+            metadata_hash = normalized
+        parts = module.split(".") if module else []
+        current_package = parts if path.name == "__init__.py" else parts[:-1]
+        for node in imports:
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    if alias.name == package or alias.name.startswith(package + "."):
+                        add(alias.name[len(package):].lstrip("."))
+                        reads_version = reads_version or alias.name == package
+            elif isinstance(node, ast.ImportFrom):
+                if node.level:
+                    if node.level > len(current_package) + 1:
+                        raise ValueError("platform relative import leaves package: " + relative)
+                    prefix = current_package[:len(current_package) + 1 - node.level]
+                    imported = ".".join(prefix + ([node.module] if node.module else []))
+                elif node.module == package or (node.module or "").startswith(package + "."):
+                    imported = node.module[len(package):].lstrip(".")
+                else:
+                    continue
+                add(imported)
+                for alias in node.names:
+                    child = ".".join(part for part in (imported, alias.name) if part)
+                    if alias.name != "*" and path_for(child).is_file():
+                        add(child)
+                    elif not imported:
+                        # Package attributes (including star imports) observe
+                        # initializer metadata, unlike `from . import module`.
+                        reads_version = True
+            elif isinstance(node, ast.Call) and isinstance(node.func, (ast.Name, ast.Attribute)):
+                name = node.func.id if isinstance(node.func, ast.Name) else node.func.attr
+                if name not in {"import_module", "__import__"}:
+                    continue
+                argument = node.args[0] if node.args else None
+                if isinstance(argument, ast.Constant) and isinstance(argument.value, str):
+                    imported = argument.value
+                    if imported == package or imported.startswith(package + "."):
+                        add(imported[len(package):].lstrip("."))
+                        reads_version = reads_version or imported == package
+                    elif imported.startswith("."):
+                        raise ValueError("dynamic relative platform imports need an explicit import: " + relative)
+                else:
+                    raise ValueError("dynamic platform import needs an explicit source dependency: " + relative)
+
+    files = dict(sorted(sources.items()))
+    if metadata_hash is not None and not reads_version:
+        files["__init__.py"] = metadata_hash
+    return dict(schema="seampact-executable-closure/1", scope=scope,
+                entrypoint=package + "." + CORE_SCOPES[scope], files=files)
 
 
 def checker_identity(environment):
     # Dependencies/weights are deliberately not installed by an analysis tool.
-    specification = dict(python=environment["python"], base_image=environment["base_image"], core=core_identity())
+    specification = dict(python=environment["python"], base_image=environment["base_image"], core=core_identity("checker"))
     return digest(json.dumps(specification, sort_keys=True).encode())
+
+
+def copy_core(destination, implementation):
+    """Bundle only identity-covered modules; leave full research archives alone."""
+    if implementation != core_identity(implementation["scope"]):
+        raise ValueError("平台执行代码已改变；请重新生成构建工件")
+    root = Path(__file__).parent
+    for relative, expected in implementation["files"].items():
+        data = safe_path(root, relative).read_bytes()
+        source_hash, _, _, metadata_hash = _implementation_source(data, relative)
+        if expected not in {source_hash, metadata_hash}:
+            raise ValueError("平台执行代码在生成构建工件时改变：" + relative)
+        target = safe_path(destination, relative)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(data)
 
 
 def prepare_checker(home, environment, config):
     identity = checker_identity(environment)
     folder = Path(home) / "deployments" / "interpreters" / identity
     folder.mkdir(parents=True, exist_ok=True)
-    shutil.copytree(Path(__file__).parent, folder / "core" / "seampact", dirs_exist_ok=True,
-                    ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+    copy_core(folder / "core" / "seampact", core_identity("checker"))
     minor = tuple(map(int, environment["python"].split(".")))
     steps = ["python -c " + json.dumps("import sys; assert sys.version_info[:2] == " + repr(minor))]
     if minor == (3, 10):

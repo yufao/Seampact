@@ -1,8 +1,8 @@
 # 从能力池到原生运行组
 
-更新：2026-10-25，SeamPact 0.13.0。首次远端部署从[服务器部署](服务器部署.md)开始；本页说明运行组宿主、运行组契约、部署后端、实例生命周期和功能调度模式下的运行组执行。建设范围来自[部署前建设与调度动作方案](部署前建设与调度动作方案.md)的 P1–P8；新增独立 Python、环境证据及零模型重新核对见 [0.10 异构运行环境](0.10_异构运行环境.md)。旧 worker 工件需重新生成与构建，历史分析和实验材料保留。
+更新：2026-10-29，SeamPact 0.14.0。首次远端部署从[服务器部署](服务器部署.md)开始；本页说明运行组宿主、运行组契约、部署后端、实例生命周期和功能调度模式下的运行组执行。建设范围来自[部署前建设与调度动作方案](部署前建设与调度动作方案.md)的 P1–P8；新增独立 Python、环境证据及零模型重新核对见 [0.10 异构运行环境](0.10_异构运行环境.md)。旧 worker 工件需重新生成与构建，历史分析和实验材料保留。
 
-0.13.0 的第三方依赖镜像、BuildKit 包缓存和已有工件更新规则见[统一构建说明](0.13_依赖镜像复用与统一构建.md)。平台与 worker 的核心身份仍须一致；同名镜像、镜像构建成功和真实 GPU／K8S 原目标调用分别记录。
+当前第三方依赖镜像、BuildKit 包缓存和已有工件更新规则见[统一构建说明](镜像构建与依赖复用.md)。平台与 worker 的核心身份仍须一致；同名镜像、镜像构建成功和真实 GPU／K8S 原目标调用分别记录。
 
 **联合模式目标更新：** [部署前方案第 5.2—5.3 节](部署前建设与调度动作方案.md#52-功能派发与生命周期联合模式本轮建设目标)已将合法就绪学习派发、prepare、scale_out、scale_in 和保留等待列为本轮建设目标，工作区已有代码实现，尚无真实联合运行；Linux／GPU／K8S 仍为 NOT_RUN。scale_out／scale_in 是运行组级水平扩缩，现有每实例一个 Deployment 可继续承载；不要求改为共享 Deployment，也不同时启用 HPA 控制同一组。FIFO 保留为基线，节点放置、垂直伸缩和现场恢复仍不在本轮动作内。
 
@@ -247,9 +247,10 @@ KIND 节点容器的 `extraMounts` 先接入宿主目录，Pod 的 `hostPath` �
 构建镜像；不存在同名集群时创建；再向明确的项目集群加载镜像、应用平台清单：
 
 ```bash
-docker build -f deploy/Dockerfile --build-arg SEAMPACT_REVISION="$SEAMPACT_REVISION" \
-  --build-arg SEAMPACT_VERSION="$SEAMPACT_VERSION" \
-  --build-arg SEAMPACT_EXTRAS="${SEAMPACT_EXTRAS:-}" -t "$SEAMPACT_CORE_IMAGE" .
+python3 deploy/build_platform.py \
+  --state-dir "$HOME/seampact-workspace/platform-environments" \
+  --revision "$SEAMPACT_REVISION" --extras "${SEAMPACT_EXTRAS:-}" \
+  --image "$SEAMPACT_CORE_IMAGE"
 ```
 
 仅新建集群执行：

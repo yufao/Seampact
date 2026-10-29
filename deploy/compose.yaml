@@ -7,10 +7,10 @@ services:
       context: ..
       dockerfile: deploy/Dockerfile
       args:
+        DEPENDENCY_IMAGE: "${SEAMPACT_DEPENDENCY_IMAGE:?Run deploy/build_platform.py and pass its --compose-env file}"
         SEAMPACT_EXTRAS: "${SEAMPACT_EXTRAS:-}"
         SEAMPACT_REVISION: "${SEAMPACT_REVISION:-UNKNOWN}"
         SEAMPACT_VERSION: "${SEAMPACT_VERSION:-UNKNOWN}"
-        SEAMPACT_PIP_EXTRA_INDEX_URL: "${SEAMPACT_PIP_EXTRA_INDEX_URL:-}"
     user: "${SEAMPACT_UID:-1000}:${SEAMPACT_GID:-1000}"
     init: true
     command: [serve, --home, /data, --host, 0.0.0.0, --port, "8880", --public-port, "${SEAMPACT_PORT:-8880}"]

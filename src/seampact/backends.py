@@ -15,10 +15,15 @@ import subprocess
 import time
 from pathlib import Path
 
+from .image_build import BASE_LABEL, RECIPE_LABEL, dependency_image_reference
+
 KINDS = {"none", "docker", "kubernetes"}
 IMAGE_ACCESS = {"local", "kind", "registry", "preloaded"}
 NAME = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?")
 ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+IMAGE_IDENTITY_FORMAT = ('{"Id":{{json .Id}},"Config":{"Labels":{'
+    + ",".join('"' + label + '":{{if .Config.Labels}}{{json (index .Config.Labels "' + label +
+               '")}}{{else}}null{{end}}' for label in (RECIPE_LABEL, BASE_LABEL)) + "}}}")
 
 
 def validate_config(body):
@@ -95,7 +100,7 @@ def manual(commands, reason):
 
 
 def _result(steps, success, **facts):
-    failed = next((step for step in steps if step["returncode"] != 0), None)
+    failed = next((step for step in steps if step["returncode"] != 0 and not step.get("expected_absence")), None)
     # Full machine output is used only by the caller; persisted/displayed receipts
     # keep bounded logs and preserve the two output channels separately.
     logs = [dict({key: value for key, value in step.items() if key not in {"stdout", "stderr"}},
@@ -126,35 +131,162 @@ def _kubectl(config):
     return argv + ["-n", config["namespace"]]
 
 
+def _inspect_image(reference, timeout):
+    # Select identity facts only: an image's complete Config can contain Env.
+    step = run(["docker", "image", "inspect", "--format", IMAGE_IDENTITY_FORMAT, reference], timeout)
+    info = None
+    if step["returncode"] == 0:
+        try:
+            candidate = json.loads(step["stdout"])
+            if isinstance(candidate, dict) and re.fullmatch(r"sha256:[0-9a-f]{64}", candidate.get("Id", "")):
+                info = candidate
+        except (ValueError, TypeError):
+            pass
+    return step, info
+
+
 def build(folder, image, environment, config, dependency_image=None):
-    argv = ["docker", "build", "-t", image]
-    for key, value in (("BASE_IMAGE", environment.get("base_image")),
-                       ("PIP_EXTRA_INDEX_URL", environment.get("pip_extra_index_url"))):
-        if value:
-            argv += ["--build-arg", key + "=" + value]
-    argv.append(str(folder))
-    dependencies = None
+    """Resolve actual image content before selecting any installed environment."""
+    recipe = None
     if dependency_image:
-        dependencies = list(argv)
-        dependencies[dependencies.index("-t") + 1] = dependency_image
-        dependencies[-1:-1] = ["--target", "dependencies"]
+        plan = json.loads((Path(folder) / "build-reuse.json").read_text(encoding="utf-8"))
+        recipe = plan.get("recipe_sha256")
+        if plan.get("schema") != "seampact-build-reuse/2" or not re.fullmatch(r"[0-9a-f]{64}", recipe or ""):
+            raise ValueError("依赖镜像工件缺少当前构建配方；请重新导出运行组")
+    requested_base = environment["base_image"]
+    reuse = dict(status="NOT_CHECKED", candidate_image=dependency_image, recipe_sha256=recipe,
+                 requested_base_image=requested_base, resolved_base_id=None,
+                 dependency_image=None, dependency_image_id=None, observed_cache_hit="NOT_CHECKED")
+    facts = dict(image=image, image_id=None, dependency_image=None, requested_base_image=requested_base,
+                 resolved_base_id=None, base_resolution=None, dependency_reuse=reuse)
+
+    def command(tag, base, **arguments):
+        # The daemon's default builder uses its image store. A selected custom
+        # builder may not see the exact local IDs verified immediately above.
+        argv = ["docker", "buildx", "build", "--load", "--builder", "default", "-t", tag,
+                "--build-arg", "BASE_IMAGE=" + base]
+        if environment.get("pip_extra_index_url"):
+            argv += ["--build-arg", "PIP_EXTRA_INDEX_URL=" + environment["pip_extra_index_url"]]
+        for key, value in arguments.items():
+            argv += ["--build-arg", key + "=" + value]
+        return argv + [str(folder)]
+
     gap = docker_available()
     if gap:
-        commands = [dependencies] if dependencies else []
-        return manual(commands + [argv, ["docker", "image", "inspect", "--format", "{{.Id}}", image]], gap)
+        reuse["reason"] = "Docker 不可用；手动命令执行完整分阶段构建，未核对或复用已安装环境"
+        return dict(manual([
+            ["docker", "image", "inspect", "--format", IMAGE_IDENTITY_FORMAT, requested_base],
+            command(image, requested_base),
+            ["docker", "image", "inspect", "--format", IMAGE_IDENTITY_FORMAT, image]], gap), **facts)
+
     deadline = time.monotonic() + config["build_timeout_s"]
     steps = []
+
+    def remaining():
+        return max(1, deadline - time.monotonic())
+
+    def failure(reason):
+        return dict(_result(steps, "BUILT", **facts), status="FAILED", reason=reason)
+
+    def build_reference(image_id):
+        # BuildKit does not accept a bare Docker config ID in FROM. Bind a
+        # content-named local reference to the checked image and verify it.
+        reference = "seampact-build-input:sha256-" + image_id.split(":", 1)[1]
+        steps.append(run(["docker", "tag", image_id, reference], remaining()))
+        if steps[-1]["returncode"] != 0:
+            return None
+        step, inspected = _inspect_image(reference, min(config["operation_timeout_s"], remaining()))
+        steps.append(step)
+        return reference if inspected and inspected["Id"] == image_id else None
+
+    step, base = _inspect_image(requested_base, min(config["operation_timeout_s"], remaining()))
+    steps.append(step)
+    facts["base_resolution"] = "local-inspect"
+    if step["returncode"] != 0:
+        # A local mutable tag denotes the image already selected by the operator.
+        # Only an absent image is pulled: source-only rebuilds can run offline.
+        step["expected_absence"] = True
+        facts["base_resolution"] = "pull-then-inspect"
+        steps.append(run(["docker", "pull", requested_base], remaining()))
+        if steps[-1]["returncode"] != 0:
+            return _result(steps, "BUILT", **facts)
+        step, base = _inspect_image(requested_base, min(config["operation_timeout_s"], remaining()))
+        steps.append(step)
+    if not base:
+        return failure("无法核对基础镜像的实际 sha256 ID")
+    base_id = facts["resolved_base_id"] = reuse["resolved_base_id"] = base["Id"]
+    base_reference = build_reference(base_id)
+    if not base_reference:
+        return failure("基础镜像构建引用与已核对 ID 不一致")
+    facts["base_build_reference"] = base_reference
+    build_arguments = {}
     if dependency_image:
-        # Export a source-free dependency image. The worker build reuses this
-        # same stage; compatible later sources may select it as their base.
-        steps.append(run(dependencies, max(1, deadline - time.monotonic())))
-    if not steps or steps[-1]["returncode"] == 0:
-        steps.append(run(argv, max(1, deadline - time.monotonic())))
-    image_id = None
-    if all(step["returncode"] == 0 for step in steps):
-        steps.append(run(["docker", "image", "inspect", "--format", "{{.Id}}", image], config["operation_timeout_s"]))
-        image_id = steps[-1]["stdout"].strip() if steps[-1]["returncode"] == 0 else None
-    return _result(steps, "BUILT", image=image, image_id=image_id, dependency_image=dependency_image)
+        resolved_tag = dependency_image_reference(recipe, base_id)
+        facts["dependency_image"] = reuse["dependency_image"] = resolved_tag
+        step, installed = _inspect_image(resolved_tag, min(config["operation_timeout_s"], remaining()))
+        steps.append(step)
+        if step["returncode"] != 0:
+            step["expected_absence"] = True
+        labels = (installed or {}).get("Config", {}).get("Labels") or {}
+        matched = bool(installed and labels.get(RECIPE_LABEL) == recipe and labels.get(BASE_LABEL) == base_id)
+        if matched:
+            reuse["status"] = "REUSED"
+            reuse["reason"] = "已核对配方与基础镜像身份；跳过依赖安装阶段，使用绑定到实际镜像 ID 的本地构建引用"
+        else:
+            reuse["rejection_reason"] = "镜像不存在" if step["returncode"] != 0 else "镜像 ID 或配方／基础镜像标签不匹配"
+            dependencies = command(resolved_tag, base_reference, SEAMPACT_ENVIRONMENT_RECIPE=recipe,
+                                   SEAMPACT_ENVIRONMENT_BASE=base_id)
+            dependencies[-1:-1] = ["--target", "dependencies"]
+            steps.append(run(dependencies, remaining()))
+            if steps[-1]["returncode"] != 0:
+                reuse["status"] = "FAILED"
+                return _result(steps, "BUILT", **facts)
+            step, installed = _inspect_image(resolved_tag, min(config["operation_timeout_s"], remaining()))
+            steps.append(step)
+            labels = (installed or {}).get("Config", {}).get("Labels") or {}
+            if not installed or labels.get(RECIPE_LABEL) != recipe or labels.get(BASE_LABEL) != base_id:
+                reuse["status"] = "FAILED"
+                return failure("依赖镜像构建后身份核对失败；未用于工作镜像")
+            reuse["status"] = "BUILT"
+            reuse["reason"] = "已构建并核对依赖环境；工作镜像使用绑定到实际镜像 ID 的本地构建引用"
+        reuse["dependency_image_id"] = installed["Id"]
+        reference = build_reference(installed["Id"])
+        if not reference:
+            reuse["status"] = "FAILED"
+            return failure("依赖镜像构建引用与已核对 ID 不一致")
+        reuse["build_reference"] = reference
+        build_arguments["DEPENDENCY_IMAGE"] = reference
+    else:
+        reuse.update(status="NOT_APPLICABLE", reason="该构建没有独立依赖环境阶段")
+    steps.append(run(command(image, base_reference, **build_arguments), remaining()))
+    if steps[-1]["returncode"] != 0:
+        return _result(steps, "BUILT", **facts)
+    step, built = _inspect_image(image, min(config["operation_timeout_s"], remaining()))
+    steps.append(step)
+    if not built:
+        return failure("工作镜像构建后无法核对实际 sha256 ID")
+    facts["image_id"] = built["Id"]
+    return _result(steps, "BUILT", **facts)
+
+
+def main(argv=None):
+    """Build an exported worker with the same identity checks as the platform."""
+    import argparse
+    parser = argparse.ArgumentParser(description=main.__doc__)
+    parser.add_argument("folder", type=Path)
+    parser.add_argument("--image", required=True)
+    parser.add_argument("--timeout", type=int, default=7200)
+    args = parser.parse_args(argv)
+    environment = json.loads((args.folder / "environment.json").read_text(encoding="utf-8"))
+    plan = json.loads((args.folder / "build-reuse.json").read_text(encoding="utf-8"))
+    result = build(args.folder, args.image, environment,
+        validate_config(dict(build_timeout_s=args.timeout)), dependency_image=plan["dependency_image"])
+    receipt = args.folder / "build-result.json"
+    receipt.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(result["status"] + "; dependency environment: " + result["dependency_reuse"]["status"])
+    print("Build receipt: " + str(receipt))
+    if result["status"] != "BUILT":
+        raise SystemExit(result.get("reason") or "Worker build failed; inspect the build receipt")
 
 
 def publish(image, config, image_id=None):
@@ -371,3 +503,7 @@ def stop(record, config):
                           manual_commands=[shlex.join(command) for command in (inspect, inspect_pods)])
         return result
     return None
+
+
+if __name__ == "__main__":
+    main()

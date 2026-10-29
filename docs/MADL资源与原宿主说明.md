@@ -1,5 +1,7 @@
 # MADL 资源与原宿主说明
 
+> 历史专项记录：下文状态和操作按原日期理解；当前实现见[当前实现](当前实现.md)，来源现状见[原生运行考察](../../ccfa-workfiles/experiments/harness-paper-design/native-feasibility.md)。
+
 更新：2026-10-20。本文整理固定原库与已保存的公开资源事实，供用户在实验室大显存机器手动准备；不是分析器生成的入口、构造、参数映射或拆分结果。完整 pipeline 仍为 NOT_RUN；独立原 `DualStreamRuntime.predict` 已通过 API 生成的 Harness Unit 完成原 checkpoint 加载和一次真实图片预测。平台本轮分析提出 5 项权重需求，其中 DualStream 映射通过并已绑定，adapter／Qwen 基座／SAM／ranker 4 项仍 MISSING。组件成功不替代原完整初始化，也不构成鉴伪／定位质量结果。原始事实见 `var/prototype/research/original-intake/madl-resources-20261020.json`，原接入反馈见 `var/prototype/research/configuration-checks/resource-intake-results-20261020.json`，当前组件及冻结资源核对见[独立原组件报告](../var/prototype/research/configuration-checks/madl-native-component-result-20261020.md)。
 
 ## 固定来源与资源

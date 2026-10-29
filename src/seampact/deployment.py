@@ -33,7 +33,7 @@ from .store import now
 from .verification import source_unit
 from .environments import normalize_environment
 from .image_build import worker_dockerfile
-from .target_runtime import core_identity, environment_selection
+from .target_runtime import core_identity, copy_core, environment_selection
 from .lifecycle import build_lifecycle_evidence
 
 REMOTE_PROFILE = dict(id="python-native-scalar-worker/2", confirmed=True, python_versions=["3.10", "3.11", "3.12", "3.13"],
@@ -149,7 +149,7 @@ def worker_spec(binding, group, unit):
     return dict(schema="native-worker/1", profile=contract.get("host_profile", REMOTE_PROFILE["id"]),
                 contract_digest=contract.get("digest"), group=group, request=binding.inspector.request,
                 runtime_environment=group.get("runtime_environment") or binding.inspector.request.get("runtime_environment") or {"python": "3.11"},
-                platform_core=core_identity(),
+                platform_core=core_identity("worker"),
                 candidate=candidate, analysis_id=unit["analysis_id"], installation_id=unit["installation_id"])
 
 
@@ -755,7 +755,7 @@ class Deployments:
         if (artifact.get("contract_digest") != group["contract"]["digest"]
                 or artifact.get("installation_id") != group.get("installation_id")):
             return "构建工件与当前运行组契约/接入版本不一致，请重新生成"
-        if artifact.get("platform_core") != core_identity():
+        if artifact.get("platform_core") != core_identity("worker"):
             return "构建工件与当前平台核心代码不同，请重新生成并构建 worker"
         return None
 
@@ -1046,8 +1046,8 @@ class Deployments:
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_bytes(data)
             (snapshots / record["sha256"]).write_bytes(data)
-        shutil.copytree(Path(__file__).parent, destination / "core" / "seampact", ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
         spec = worker_spec(binding, group, unit)
+        copy_core(destination / "core" / "seampact", spec["platform_core"])
         fingerprint = binding_fingerprint(spec)
         image = "seampact-worker-" + identity[3:15] + ":" + digest(
             json.dumps([fingerprint, environment], sort_keys=True).encode())[:16]

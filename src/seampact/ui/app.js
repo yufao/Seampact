@@ -1378,10 +1378,14 @@ function renderDeployments() {
       for (const step of [artifact.build, artifact.publish]) if (step?.manual_commands) detailValue(card, '后端不可用 · 手动命令', step.manual_commands);
       detailValue(card, '构建工件', artifact);
       if (artifact.build_reuse) {
-        const reuse = artifact.build_reuse;
-        card.append(node('p', reuse.dependency_image ?
-          '可复用依赖镜像：' + reuse.dependency_image + '。构建成功后，兼容库可将其选为基础镜像；各库源码仍分别安装。' :
-          '依赖安装需要原源码上下文，保留原安装顺序；下载包通过构建缓存复用。', 'card-note'));
+        const reuse = artifact.build?.dependency_reuse;
+        const result = {REUSED: '已复用安装环境', BUILT: '已构建安装环境', FAILED: '依赖环境准备失败',
+          NOT_CHECKED: '尚未核验安装环境', NOT_APPLICABLE: '无独立依赖环境'};
+        card.append(node('p', '依赖环境：' + (result[reuse?.status] || '待构建核验') +
+          (reuse?.dependency_image_id ? ' · ' + reuse.dependency_image_id : '') +
+          '。下载缓存是否命中需查看实际构建日志。', 'card-note'));
+        if (reuse?.reason) card.append(node('p', reuse.reason, 'card-note'));
+        if (artifact.build_reuse.installation) detailValue(card, '依赖安装顺序及原因', artifact.build_reuse.installation);
       }
     }
     card.append(node('p', '真实 worker：' + ((group.instances || []).some(item => item.state === 'READY' && item.accepting) ?

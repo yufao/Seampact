@@ -136,7 +136,7 @@ class Worker:
         from .target_runtime import core_identity
         if not isinstance(self.spec.get("platform_core"), dict):
             raise ValueError("运行工件缺少平台核对规则版本；请用当前平台重新生成运行工件")
-        if self.spec["platform_core"] != core_identity():
+        if self.spec["platform_core"] != core_identity("worker"):
             raise ValueError("运行镜像的平台核对代码与冻结工件不一致；请重新生成并构建运行镜像")
         self.group = self.spec["group"]
         root = self.spec_path.parent
@@ -360,3 +360,41 @@ def make_worker_server(worker, host, port):
     server = ThreadingHTTPServer((host, port), Handler)
     worker.server = server
     return server
+
+
+def main(argv=None):
+    """Standalone image entrypoint; coordinator/server imports are unnecessary."""
+    import argparse
+    parser = argparse.ArgumentParser(description="SeamPact native runtime-group worker")
+    parser.add_argument("--spec", required=True)
+    parser.add_argument("--coordinator", required=True)
+    parser.add_argument("--host", choices=["127.0.0.1", "0.0.0.0"], default="127.0.0.1")
+    parser.add_argument("--port", type=int, default=8880)
+    parser.add_argument("--advertise-url")
+    parser.add_argument("--instance-id")
+    parser.add_argument("--generation", type=int, default=0)
+    args = parser.parse_args(argv)
+    os.umask(0o077)
+    sys.stdout.reconfigure(encoding="utf-8")
+    worker = Worker(args.spec, args.coordinator, args.instance_id, args.generation)
+    server = make_worker_server(worker, args.host, args.port)
+    if args.advertise_url:
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            json_request(worker.coordinator + "/api/workers/attach", dict(endpoint=args.advertise_url), timeout=120)
+            print("[SeamPact] worker_ready " + worker.instance, flush=True)
+            thread.join()
+        except KeyboardInterrupt:
+            server.shutdown()
+    else:
+        print("[SeamPact] worker_ready " + worker.instance, flush=True)
+        try:
+            server.serve_forever()
+        except KeyboardInterrupt:
+            pass
+    server.server_close()
+
+
+if __name__ == "__main__":
+    main()

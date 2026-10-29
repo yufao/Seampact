@@ -1,0 +1,16 @@
+# syntax=docker/dockerfile:1
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+WORKDIR /opt/seampact-environment
+RUN python -c "import sys; assert sys.version_info[:2] == (3, 11), 'platform requires Python 3.11'" \
+    && apt-get update && apt-get install -y --no-install-recommends git ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+COPY request.json input.lock install_environment.py ./
+ENV PIP_CACHE_DIR=/root/.cache/pip
+ARG RESOLVE_NONCE=
+RUN --mount=type=cache,id=seampact-platform-pip-v1,target=/root/.cache/pip,sharing=locked \
+    python install_environment.py
+ARG ENVIRONMENT_KEY
+ARG RESOLVED_BASE
+LABEL io.seampact.platform-environment="${ENVIRONMENT_KEY}" io.seampact.environment.base="${RESOLVED_BASE}"
+RUN chmod -R a+rX /opt/seampact-environment

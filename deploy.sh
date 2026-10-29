@@ -47,6 +47,13 @@ TOOLS.add_argument("--without-tools", dest="tools", action="store_false", help="
 PARSER.set_defaults(tools=None)
 PARSER.add_argument("--extras", help="package extras to build, e.g. rl; persisted, default empty")
 PARSER.add_argument("--base-image", help="platform Python 3.11 base image; persisted")
+PARSER.add_argument("--pip-index-url", help="platform dependency index; persisted")
+PARSER.add_argument("--pip-extra-index-url", help="additional platform dependency index; persisted")
+PARSER.add_argument("--torch-version", help="exact learner torch version; persisted, no change to Harness environments")
+PARSER.add_argument("--torch-index-url", help="explicit torch wheel channel; persisted")
+DEPENDENCIES = PARSER.add_mutually_exclusive_group()
+DEPENDENCIES.add_argument("--dependency-lock", help="exact platform package lock file; imported and persisted privately")
+DEPENDENCIES.add_argument("--refresh-dependencies", action="store_true", help="explicitly resolve new platform dependency versions")
 PARSER.add_argument("--docker-cli-image", help="official Docker CLI image; persisted, default docker:29-cli")
 PARSER.add_argument("--ready-timeout", type=int, default=120, help="startup wait in seconds (default: 120)")
 ARGS = PARSER.parse_args()
@@ -545,6 +552,18 @@ def main():
     CONFIG["tools"] = ARGS.tools if ARGS.tools is not None else CONFIG.get("tools", True)
     CONFIG["extras"] = ARGS.extras if ARGS.extras is not None else CONFIG.get("extras", "")
     CONFIG["base_image"] = ARGS.base_image or CONFIG.get("base_image") or "python:3.11-slim"
+    for option in ("pip_index_url", "pip_extra_index_url", "torch_version", "torch_index_url"):
+        supplied = getattr(ARGS, option)
+        CONFIG[option] = supplied if supplied is not None else CONFIG.get(option, "")
+    if ARGS.dependency_lock:
+        incoming_lock = Path(ARGS.dependency_lock).expanduser().resolve().read_text(encoding="utf-8")
+        # Copy to deployment storage: future updates do not rely on a temporary input path.
+        target_lock = ROOT / "platform-input.lock"
+        target_lock.write_text(incoming_lock, encoding="utf-8")
+        os.chmod(target_lock, 0o600)
+        CONFIG["dependency_lock"] = str(target_lock)
+    elif ARGS.refresh_dependencies:
+        CONFIG.pop("dependency_lock", None)
     CONFIG["docker_cli_image"] = ARGS.docker_cli_image or CONFIG.get("docker_cli_image") or "docker:29-cli"
     save()
     code = prepare_code()
@@ -559,11 +578,23 @@ def main():
     CONFIG.setdefault("images", []).append(build)
     save()
     print("Building platform " + version + " before stopping the old container.", flush=True)
-    docker("build", "--label", "io.seampact.deployment=" + CONFIG["id"], "--build-arg", "BASE_IMAGE=" + CONFIG["base_image"],
-           "--build-arg", "SEAMPACT_VERSION=" + version, "--build-arg", "SEAMPACT_REVISION=" + revision,
-           "--build-arg", "SEAMPACT_EXTRAS=" + CONFIG["extras"], "-t", core, "-f", str(code / "deploy/Dockerfile"), str(code), visible=True)
+    receipt_path = ROOT / "platform-build.json"
+    command = [sys.executable, str(code / "deploy/build_platform.py"), "--code-dir", str(code),
+        "--state-dir", str(ROOT / "platform-environments"), "--docker-host", ENDPOINT,
+        "--base-image", CONFIG["base_image"], "--extras", CONFIG["extras"],
+        "--image", core, "--revision", revision, "--owner", CONFIG["id"], "--receipt", str(receipt_path)]
+    for option in ("pip_index_url", "pip_extra_index_url", "torch_version", "torch_index_url", "dependency_lock"):
+        if CONFIG.get(option):
+            command += ["--" + option.replace("_", "-"), CONFIG[option]]
+    if ARGS.refresh_dependencies:
+        command.append("--refresh-dependencies")
+    run(command, visible=True)
+    environment_receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    build["dependency_environment"] = dict(image=environment_receipt["image"], image_id=environment_receipt["image_id"],
+        key=environment_receipt["key"], lock_sha256=environment_receipt["lock_sha256"], status=environment_receipt["status"])
+    save()
     if CONFIG["tools"]:
-        docker("build", "--label", "io.seampact.deployment=" + CONFIG["id"], "--build-arg", "PLATFORM_IMAGE=" + core,
+        docker("buildx", "build", "--load", "--builder", "default", "--label", "io.seampact.deployment=" + CONFIG["id"], "--build-arg", "PLATFORM_IMAGE=" + core,
                "--build-arg", "DOCKER_CLI_IMAGE=" + CONFIG["docker_cli_image"], "-t", runtime,
                "-f", str(code / "deploy/Dockerfile.tools"), str(code), visible=True)
     spec = replacement_spec(OLD, runtime) if OLD else fresh_spec(runtime)
