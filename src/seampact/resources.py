@@ -330,6 +330,14 @@ class ResourceRegistry:
             result["expected_bytes"] = expected["bytes"]
             result["size_matches"] = info.st_size == expected["bytes"]
         with path.open("rb") as stream:
+            # A downloaded LFS pointer can itself match a published checksum;
+            # it still is not the declared runtime artifact. Do not import it.
+            prefix = stream.read(128)
+            result["artifact_status"] = ("git_lfs_pointer" if
+                prefix.startswith(b"version https://git-lfs.github.com/spec/v1\n") or
+                prefix.startswith(b"version https://git-lfs.github.com/spec/v1\r\n")
+                else "not_inspected")
+            stream.seek(0)
             if expected.get("sha256"):
                 digest = hashlib.sha256()
                 for chunk in iter(lambda: stream.read(8 * 1024 * 1024), b""):
@@ -350,7 +358,7 @@ class ResourceRegistry:
                 raise ValueError("unknown weight resource")
             result = self._unchecked(record)
             result.update(checked_at=now(), status="present", files=[], missing_files=[],
-                          mismatches=[], unreadable_files=[], index_files=[], errors=[],
+                          mismatches=[], invalid_files=[], unreadable_files=[], index_files=[], errors=[],
                           exists=None, readable=None,
                           identity=dict(basis="path_size_mtime", content_identity="UNKNOWN"),
                           identity_note="Path, size and mtime do not prove unchanged file content.")
@@ -405,11 +413,14 @@ class ResourceRegistry:
                         except OSError:
                             result["unreadable_files"].append(relative)
                 for item in result["files"]:
+                    if item.get("artifact_status") == "git_lfs_pointer":
+                        result["invalid_files"].append(dict(path=item["path"], category="git_lfs_pointer"))
                     if item.get("size_matches") is False or item.get("checksum_matches") is False:
                         result["mismatches"].append(item["path"])
                 if result["status"] == "present":
                     result["status"] = ("invalid_manifest" if result["errors"] else "unreadable" if
-                        result["unreadable_files"] else "missing" if result["missing_files"] else
+                        result["unreadable_files"] else "invalid_artifact" if result["invalid_files"] else
+                        "missing" if result["missing_files"] else
                         "checksum_or_size_mismatch" if result["mismatches"] else "present")
                 if result["files"] and all(item.get("sha256") for item in result["files"]):
                     result["identity"] = dict(basis="checked_file_sha256", content_identity="listed_files_only")

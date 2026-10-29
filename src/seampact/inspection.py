@@ -630,6 +630,13 @@ class Inspector:
             unknown.extend(facts["unknown"])
         return dict(path=path, candidates=candidates, unknown=unknown, selected=None, execution="NOT_RUN")
 
+    def inspect_harness(self, path="", offset=0, count=20):
+        """Read source classification hints without changing binding admission."""
+        if getattr(self, "target_runtime", None):
+            return self.target_runtime.call("inspect_harness", path=path, offset=offset, count=count)
+        from .classification import inspect_harness
+        return inspect_harness(self, path, offset, count)
+
     def add_source(self, path):
         """Explicit dependency extension makes a new version; never silently mutates a freeze."""
         if path.replace("\\", "/") in self.files:

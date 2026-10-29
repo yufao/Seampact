@@ -171,6 +171,8 @@ def make_server(platform, port=8880, host="127.0.0.1", public_port=None):
                     result = platform.deployments.pause(body["group_id"], body)
                 elif path == "/api/deployments/drain-stop":
                     result = platform.deployments.drain_stop(body["group_id"], body)
+                elif path == "/api/deployments/clear-history":
+                    result = platform.deployments.clear_history(body["group_id"], body)
                 elif path == "/api/deployments/add-replica":
                     result = platform.deployments.add_replica(body["group_id"], body)
                 elif path == "/api/deployments/remove-replica":

@@ -20,7 +20,7 @@ from .inspection import Inspector, digest, safe_path
 
 
 TOOLS = {"inspect_symbols", "inspect_construction", "inspect_imports", "entry_candidates",
-         "check_candidate", "check_preprocessing", "check_requirements", "inspect_candidate"}
+         "inspect_harness", "classify_target", "check_candidate", "check_preprocessing", "check_requirements", "inspect_candidate"}
 ENV_FIELDS = ("python", "base_image", "requirements", "project", "packages", "pip_extra_index_url",
               "python_requirements")
 
@@ -255,6 +255,9 @@ def execute(payload):
         elif method == "check_requirements":
             from .dependencies import check_requirements
             result = check_requirements(inspector, arguments["candidate"])
+        elif method == "classify_target":
+            from .classification import classify_target
+            result = classify_target(inspector, arguments["target"])
         else:
             result = getattr(inspector, method)(**arguments)
         return _runtime_paths(result, str(source))

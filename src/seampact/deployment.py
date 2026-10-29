@@ -34,6 +34,7 @@ from .verification import source_unit
 from .environments import normalize_environment
 from .image_build import worker_dockerfile
 from .target_runtime import core_identity, environment_selection
+from .lifecycle import build_lifecycle_evidence
 
 REMOTE_PROFILE = dict(id="python-native-scalar-worker/2", confirmed=True, python_versions=["3.10", "3.11", "3.12", "3.13"],
     process_per_group=1, replicas=1, preserve_original_lifetimes=True,
@@ -464,12 +465,11 @@ def check_group_host(rows, members, scalar):
                 environment_gaps=gaps)
 
 
-def lifecycle_conditions(group):
+def lifecycle_conditions(group, source_evidence=None):
     """Separate proof obligations from host availability; no model-generated permission flags.
 
-    The finite scalar rule discharges these conditions today. Native ownership,
-    external work and model state require additional source rules, not a manual
-    declaration that a loaded model is read-only.
+    The scalar rule or independently built frozen-source evidence discharges
+    these conditions. Candidate/group permission flags are never consulted.
     """
     scalar = group["grouping"] == "CHECKED_STATELESS_ENTRIES"
     obligations = dict(
@@ -481,24 +481,30 @@ def lifecycle_conditions(group):
         basis="scalar-independent-entry/1：原导入闭包及逐调用标量状态已由有限规则核对" if scalar else
               "native group：当前没有覆盖该项的通用源码规则，宿主可调用不能替代生命周期依据")
         for name, requirement in obligations.items()}
+    if not scalar and source_evidence is not None:
+        for name, item in checked.items():
+            evidence = source_evidence["checks"][name]
+            item.update(status=evidence["status"], basis=evidence["basis"],
+                        evidence_digest=source_evidence["digest"], guards=evidence.get("guards", []))
     def permission(names):
         return dict(status="SUPPORTED" if all(checked[n]["status"] == "SUPPORTED" for n in names) else "UNKNOWN",
                     requires=list(names))
     return dict(schema="lifecycle-conditions/1", checks=checked, formal_proof=False,
+        source_evidence=source_evidence,
         replicate=permission(("request_isolation", "repeatable_initialization")),
         reclaim=permission(("request_isolation", "repeatable_initialization", "owner_end", "cleanup")))
 
 
-def group_contract(group, host):
+def group_contract(group, host, source_evidence=None):
     hosted = bool(host["host_entries"])
-    lifecycle = lifecycle_conditions(group)
+    lifecycle = lifecycle_conditions(group, source_evidence)
     replicable = lifecycle["replicate"]["status"] == "SUPPORTED"
     reclaimable = lifecycle["reclaim"]["status"] == "SUPPORTED"
     prepared = [identity for identity in host["host_entries"] if host["members"][identity]["prepare"]["status"] == "SUPPORTED"]
     def operation(allowed, basis, unknown=False):
         return dict(status="SUPPORTED" if allowed else "UNKNOWN" if unknown else "UNSUPPORTED", basis=basis)
     missing = "没有通过宿主核对的成员"
-    replica_basis = ("各成员经 scalar-independent-entry/1 核对：无捕获原生状态、每次调用局部生命周期；新副本是新 owner"
+    replica_basis = ("各成员经冻结源码生命周期规则核对：请求状态隔离、初始化可独立重复；新副本是新 owner；回收仍等待任务 lease、根请求、许可及实际释放"
                      if replicable else "请求隔离、状态／外部效果与原初始化可独立重复尚未经规则核对")
     value = dict(schema=CONTRACT, group_id=group["id"], source_id=group["source_id"],
         source_version=group["source_version"], members=list(group["entries"]), root_entries=host["host_entries"],
@@ -567,7 +573,8 @@ def runtime_groups(inspector, candidate, rows):
         if proposal:
             groups[-1]["api_proposal"] = {key: proposal.get(key) for key in ("id", "rationale")}
         host = check_group_host(rows, members, can_remote)
-        groups[-1].update(host=host, host_status=host["status"], contract=group_contract(groups[-1], host))
+        evidence = None if can_remote else build_lifecycle_evidence(inspector, rows, members)
+        groups[-1].update(host=host, host_status=host["status"], contract=group_contract(groups[-1], host, evidence))
     return dict(schema="runtime-group-report/1", profile=REMOTE_PROFILE, profiles=[REMOTE_PROFILE, GROUP_PROFILE],
                 groups=groups, proposal_gaps=gaps, proposal_status="REPAIRED_CONSERVATIVELY" if gaps else "CHECKED")
 
@@ -654,10 +661,61 @@ class Deployments:
         value["recent_events"] = copy.deepcopy(record.get("events", [])[-8:])
         return value
 
+    def _clear_history_reason(self, record, snapshot):
+        if record.get("history_hidden"):
+            return "该实例记录已清理"
+        if record["state"] not in {"STOPPED", "FAILED"} or record.get("released") is not True:
+            return "仅可清理已停止或失败且已确认释放的实例"
+        if record["group_id"] in self.run_locks:
+            return "研究运行正在使用该运行组，结束后再清理"
+        if record.get("in_flight") or record.get("pending_stop"):
+            return "实例仍有在途工作或待完成的停止操作"
+        if record["id"] in self.affinity.values():
+            return "实例仍被任务绑定"
+        if any(root.get("host") == record["id"] and root["state"] in {"ACTIVE", "UNKNOWN"}
+               for root in snapshot["roots"].values()):
+            return "实例仍有关联的活跃或未决根请求"
+        if any((call.get("unit") or {}).get("instance_id") == record["id"]
+               and call["physical"] in {"ENABLED", "RESERVED", "AUTHORIZED", "STARTED", "UNKNOWN"}
+               for call in snapshot["calls"].values()):
+            return "实例仍有关联的活跃或未决调用"
+        return None
+
+    def clear_history(self, identity, body):
+        """Hide released terminal instances while retaining identity and research evidence."""
+        def action():
+            with self.lock:
+                self._guard(identity, None)
+                if not self.platform.store.get("runtime_group", identity):
+                    raise ValueError("没有这个运行组")
+                instance_id = body.get("instance_id")
+                records = self._instances(identity)
+                if instance_id is not None:
+                    records = [item for item in records if item["id"] == instance_id]
+                    if not records:
+                        raise ValueError("该运行组没有这个实例")
+                snapshot = self.platform.runtime.snapshot()
+                hidden, skipped = [], []
+                for record in records:
+                    if record.get("history_hidden"):
+                        continue
+                    reason = self._clear_history_reason(record, snapshot)
+                    if reason:
+                        if instance_id is not None:
+                            raise ValueError(reason)
+                        skipped.append(dict(instance_id=record["id"], reason=reason))
+                        continue
+                    record.update(history_hidden=True, history_hidden_at=now())
+                    self.platform.store.save("runtime_instance", record["id"], record)
+                    hidden.append(record["id"])
+                return dict(group_id=identity, hidden_instance_ids=hidden, count=len(hidden), skipped=skipped)
+        return self._once(body, "clear_history:" + identity + ":" + str(body.get("instance_id")), action)
+
     def public(self):
         artifacts = {item["id"]: item for item in self.platform.store.list("deployment")}
         result = []
         with self.lock:
+            snapshot = self.platform.runtime.snapshot()
             groups = {group["id"]: group for group in self._current_groups()}
             # Keep older backend objects visible for release after an
             # environment edit, source detachment or platform-code update.
@@ -666,12 +724,22 @@ class Deployments:
                     group["environment_gap"] = "旧接入版本的实例尚待释放；该组只允许排空停止"
                     groups[group["id"]] = group
             for group in groups.values():
-                records = sorted(self._instances(group["id"]), key=lambda item: item["generation"], reverse=True)
+                records = sorted((item for item in self._instances(group["id"]) if not item.get("history_hidden")),
+                                 key=lambda item: item["generation"], reverse=True)
                 shown = [item for item in records if item["state"] in LIVE] + [item for item in records if item["state"] not in LIVE][:3]
+                views = []
+                for item in shown:
+                    reason = self._clear_history_reason(item, snapshot)
+                    views.append(dict(self._view(item), can_cleanup=reason is None, cleanup_reason=reason))
                 ready = [item for item in shown if item["state"] == "READY" and item["accepting"]]
                 lock = self.run_locks.get(group["id"])
+                clearable = sum(self._clear_history_reason(item, snapshot) is None for item in records)
                 group.update(execution="REMOTE" if ready else "LOCAL", instance=self._view(ready[0]) if ready else None,
-                    instances=[self._view(item) for item in shown], artifact=artifacts.get(group["id"]),
+                    instances=views, artifact=artifacts.get(group["id"]),
+                    artifact_gap=self._artifact_gap(group, artifacts.get(group["id"])) if group.get("contract") else "运行组缺少宿主契约",
+                    history_cleanup=dict(count=clearable, enabled=bool(clearable),
+                                         reason="研究运行正在使用该运行组，结束后再清理" if lock else
+                                         None if clearable else "没有可清理的已释放实例记录"),
                     locked_by_run=lock["run_id"] if lock else None,
                     actions=self._actions(group, artifacts.get(group["id"])) if group.get("contract") else {})
                 if group.get("environment_gap"):
@@ -1368,6 +1436,9 @@ class Deployments:
     def _drained(self, record):
         if record["in_flight"]:
             return False
+        if any(task_id and instance_id == record["id"] for (task_id, _), instance_id in self.affinity.items()):
+            record["drain_blocked"] = "原任务/owner lease 尚未结束；Unit 返回不能代替 owner 结束"
+            return False
         snapshot = self.platform.runtime.snapshot()
         if any(root["host"] == record["id"] and root["state"] in {"ACTIVE", "UNKNOWN"} for root in snapshot["roots"].values()):
             return False
@@ -1487,7 +1558,9 @@ class Deployments:
                     continue
                 for item in self._instances(group_id, {"READY"}):
                     idle = time.time() - item.get("last_activity_wall", item.get("ready_wall", time.time()))
-                    if not item["in_flight"] and not item.get("pending_stop") and idle * 1000 >= control["idle_ms"]:
+                    leased = any(task_id and instance_id == item["id"]
+                                 for (task_id, _), instance_id in self.affinity.items())
+                    if not leased and not item["in_flight"] and not item.get("pending_stop") and idle * 1000 >= control["idle_ms"]:
                         due.append((group_id, item["id"], owner["run_id"]))
         for group_id, instance_id, run_id in due:
             try:
@@ -1531,10 +1604,6 @@ class Deployments:
     def _route(self, group_id, unit_id, task_id):
         key = (task_id, group_id)
         bound = self.instances.get(self.affinity.get(key)) if task_id else None
-        if (bound and (bound.get("pending_stop") or {}).get("reason") == "idle_retire/1"
-                and self._idle_rebuild_allowed(self._group(group_id))):
-            self.affinity.pop(key, None)
-            bound = None
         if bound:
             if bound["state"] == "READY":
                 if unit_id in bound.get("units", []):

@@ -17,7 +17,8 @@ from pathlib import Path
 
 from .evaluation import evaluate, validate_criteria, model_binding
 from .learners import Learner, default_config, learner_options
-from .scenarios import SceneSession, FrozenCatalog, arrays, freeze_scene, digest_file
+from .scenarios import (SceneSession, FrozenCatalog, arrays, freeze_scene, digest_file,
+                        scene_task_criteria, route_metric_applicability)
 from .store import now
 from .costs import validate_costs, episode_costs, usage_record, summarize_usage
 from .capabilities import JOINT_OBSERVATION_SCHEMA, JOINT_CANDIDATE_SCHEMA
@@ -218,7 +219,9 @@ class TrainingJobs:
             pool[-1]["placement"] = copy.deepcopy(catalog.placement[uid])
         criteria = validate_criteria(config["criteria"])
         final = validate_criteria(config["evaluation_criteria"]) if config.get("evaluation_criteria") else None
-        for spec in [criteria, final]:
+        route_specs = [r[s] for r in scene.get("routes", {}).values()
+                       for s in ("criteria", "evaluation_criteria") if r.get(s)]
+        for spec in [criteria, final, *route_specs]:
             if spec and any(d["provider"] == "teacher" and d.get("applicable", True) for d in spec["dimensions"]):
                 role = spec.get("teacher", {}).get("role", "teacher")
                 spec.setdefault("teacher", {})["model_binding"] = model_binding(bound.role_profile(role))
@@ -286,7 +289,7 @@ class TrainingJobs:
             manifest.update(runtime_contracts=contracts, **joint.configure(config, scene=scene, tasks=scene["tasks"],
                 task_ids=task_ids, algorithm=algorithm, criteria=criteria, contracts=contracts,
                 groups=catalog.remote_groups(), deployments=self.platform.deployments, learning=LEARNING,
-                references=REFERENCES, mode=manifest["mode"]))
+                references=REFERENCES, mode=manifest["mode"], placements=catalog.placement))
         else:
             manifest.update(scheduling_mode="functional/1", resource_control=resource_control(config.get("resource_control")),
                 feedback_protocol=protocol, reward_timing=protocol["reward_timing"], runtime_contracts=contracts,
@@ -299,10 +302,10 @@ class TrainingJobs:
             if native:
                 raise ValueError("原生有状态运行组须使用 fixed_resident；尚无任务/owner 结束及可重建契约：" + ", ".join(native))
         implementation = Path(__file__).parent
-        manifest["implementation_files"] = [dict(path=name, sha256=digest_file(implementation / name))
-            for name in ("training.py", "learners.py", "scenarios.py", "evaluation.py", "providers.py",
-                         "scheduler.py", "units.py", "runtime.py", "composition.py", "capabilities.py", "costs.py",
-                         "dependencies.py", "resources.py", "deployment.py", "worker.py", "backends.py", "joint.py")]
+        # Freeze every platform Python module, including target execution and
+        # binding/checking helpers; an explicit list silently missed updates.
+        manifest["implementation_files"] = [dict(path=path.name, sha256=digest_file(path))
+            for path in sorted(implementation.glob("*.py"))]
         # Keep the actual code bytes for this uncommitted research workspace.
         # Histories remain interpretable after a later authorized source edit.
         archive = self.directory.parent / "source-archive"
@@ -558,10 +561,11 @@ class TrainingJobs:
         program = dict(event.get("program_metrics", {}), latency_ms=milliseconds,
                        module_calls=len(session.context.calls),
                        module_duration_ms=sum(c["duration_ms"] for c in session.context.calls))
-        applicability = copy.deepcopy(task.get("metric_applicability", {}))
+        applicability = route_metric_applicability(manifest["scene"], task, event)
         called_units = {c["unit_id"] for c in session.context.calls}
-        criterion = task_criteria(manifest["criteria"], applicability, called_units)
-        final_criterion = task_criteria(manifest["evaluation_criteria"], applicability, called_units)
+        criterion = task_criteria(scene_task_criteria(manifest["scene"], task, manifest["criteria"]), applicability, called_units)
+        final_criterion = task_criteria(scene_task_criteria(manifest["scene"], task,
+            manifest["evaluation_criteria"], "evaluation_criteria"), applicability, called_units)
         feedback = evaluate(session.context.profiles, criterion, evidence, program)
         final_program = dict(program)
         final_program.update(event.get("evaluation_metrics", {}))
@@ -582,8 +586,10 @@ class TrainingJobs:
                     transitions[item["transition"]]["transition"]["reward"] += item["reward"]
         groups = {call["group_id"] for call in session.context.calls if call.get("execution") == "REMOTE"}
         events = self.platform.deployments.events_between(groups, window, time.time()) if groups else None
-        costs = episode_costs(session.context, manifest, milliseconds, transitions, feedback, independent, events)
+        costs = episode_costs(session.context, dict(manifest, criteria=criterion, evaluation_criteria=final_criterion),
+                              milliseconds, transitions, feedback, independent, events)
         return dict(task_id=task["id"], episode=number, terminated=event["terminated"], truncated=event["truncated"],
+            route=task.get("route"), task_class=task.get("task_class"),
             costs=costs, exclusion_reason=exclusion,
             module_feedback=self._module_feedback(transitions, session.context.calls, feedback, event),
             reward_components=dict(timing=protocol["reward_timing"], terminal=feedback["reward"],
@@ -633,10 +639,13 @@ class TrainingJobs:
                     if digest_file(image["path"]) != image["sha256"]:
                         raise ValueError("旧图像证据内容已变化，不能重评原经历")
             item["previous_feedback"] = item["feedback"]
-            applicability = item.get("metric_applicability", previous_tasks[item["task_id"]].get("metric_applicability", {}))
+            task = previous_tasks[item["task_id"]]
+            applicability = route_metric_applicability(manifest["scene"], task, item)
             called_units = {c["unit_id"] for c in item.get("calls", [])}
-            criterion = task_criteria(manifest["criteria"], applicability, called_units)
-            final_criterion = task_criteria(manifest["evaluation_criteria"], applicability, called_units)
+            criterion = task_criteria(scene_task_criteria(manifest["scene"], task, manifest["criteria"]),
+                                      applicability, called_units)
+            final_criterion = task_criteria(scene_task_criteria(manifest["scene"], task,
+                manifest["evaluation_criteria"], "evaluation_criteria"), applicability, called_units)
             item["feedback"] = evaluate(bound, criterion, item["evidence"], item["program_metrics"])
             item["eligible"] = item["feedback"]["eligible"]
             item["transitions"][-1]["transition"]["reward"] = item["feedback"]["reward"]
@@ -774,6 +783,7 @@ class TrainingJobs:
         seen_changes = 0
         rewards, totals = [], defaultdict(list)
         counts = defaultdict(lambda: defaultdict(int))
+        populations = defaultdict(int)
         definitions = {}
         cost_records = {"online": [], "evaluation": []}
         run.update(status="RUNNING", started_at=now())
@@ -840,18 +850,20 @@ class TrainingJobs:
                     run["gradient_duration_ms"] = run.get("gradient_duration_ms", 0) + (time.perf_counter() - started) * 1000
                 if item["feedback"]["reward"] is not None:
                     rewards.append(item["feedback"]["reward"])
+                route = item.get("route") or manifest["scene"]["id"]
+                populations[route] += 1
                 for group, feedback in [("training", item["feedback"]), ("independent", item["independent_feedback"])]:
                     for metric in (feedback or {}).get("metrics", []):
                         key = (group, metric["id"], metric.get("version"), metric.get("unit"), metric.get("direction"),
-                               metric.get("level", "system"), metric.get("unit_id"))
+                               metric.get("level", "system"), metric.get("unit_id"), route)
                         counts[key][metric["status"]] += 1
                         definitions[key] = metric.get("definition")
                         if metric["status"] == "KNOWN":
                             totals[key].append(metric["value"])
                 run["metrics"] = [dict(scope=k[0], id=k[1], version=k[2], unit=k[3], direction=k[4],
-                    level=k[5], unit_id=k[6], definition=definitions[k],
+                    level=k[5], unit_id=k[6], route=k[7], definition=definitions[k],
                     value=sum(totals[k]) / len(totals[k]) if totals[k] else None,
-                    denominator=len(totals[k]), population=run["episodes"], status_counts=dict(v)) for k, v in counts.items()]
+                    denominator=len(totals[k]), population=populations[k[7]], status_counts=dict(v)) for k, v in counts.items()]
                 run["reward_mean"] = sum(rewards) / len(rewards) if rewards else None
                 run["reward_denominator"] = len(rewards)
                 costs = run.setdefault("costs", dict(online_wall_ms=0, evaluation_wall_ms=0,

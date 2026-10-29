@@ -50,7 +50,7 @@ SCALES_2 = set(NUMBERS) | {"latency_ms", "coverage_chars", "plan_units", *RUNTIM
 # joint/1: one shared scorer over business, dispatch and resource events. A
 # business event keeps its capability-features/2 vectors; workload facts are only
 # what has arrived or is observable now, never future arrivals.
-JOINT_VERSION = "joint-features/1"
+JOINT_VERSION = "joint-features/2"
 JOINT_DECISIONS = ("business", "dispatch", "resource")
 JOINT_ACTIONS = ("invoke", "continue", "finish", "dispatch", "prepare", "scale_out", "scale_in",
                  "yield_until_next_event")
@@ -64,7 +64,7 @@ WORKLOAD = (("tasks_active", "tasks"), ("tasks_at_decision", "tasks"), ("tasks_d
             ("window_elapsed_ms", "window_ms"))
 DISPATCH_NUMBERS = (("wait_ms", "wait_ms"), ("estimate_ms", "service_ms"), ("task_age_ms", "wait_ms"),
                     ("task_roots", "calls"))
-DISPATCH_FLAGS = ("estimate_missing", "remote", "warm_target", "aged")
+DISPATCH_FLAGS = ("estimate_missing", "remote", "warm_target", "aged", "boundary")
 RESOURCE_NUMBERS = (("held", "instances"), ("ready", "instances"), ("starting", "instances"),
                     ("draining", "instances"), ("cap_remaining", "instances"), ("waiting_roots", "calls"),
                     ("idle_ms", "wait_ms"), ("budget_after", None))
@@ -327,7 +327,7 @@ def joint_candidate(action, scales, business=None, cards=None, dispatch=None, re
                 raise ValueError("dispatch fact is unavailable: " + name)
             values["dispatch:" + name] = 0.0 if value is None else value / scales[scale]
         values["dispatch:estimate_missing"] = int(dispatch.get("estimate_ms") is None)
-        for name in ("remote", "warm_target", "aged"):
+        for name in ("remote", "warm_target", "aged", "boundary"):
             values["dispatch:" + name] = int(bool(dispatch.get(name)))
     if resource is None:
         values["resource:not_applicable"] = 1

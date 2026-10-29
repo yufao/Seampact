@@ -3,7 +3,7 @@
 Original dependencies, owner/session order, protection preconditions and resource
 limits are kept; the cross-task global arrival order is not. A business decision
 submits an approved request without blocking; dispatch chooses among enabled root
-requests; resource decisions prepare, add or release instances. A running call is
+requests and checked internal boundaries; resource decisions prepare, add or release instances. A running call is
 never preempted. Task quality is settled when the task completes; time-integral
 costs accrue between adjacent events. Vertical, node scaling and live migration
 are outside joint/1.
@@ -16,19 +16,23 @@ import queue
 import threading
 import time
 import uuid
+from dataclasses import asdict
 
 from .capabilities import VERSION_2, freeze_joint, joint_candidate, joint_observation
 from .costs import episode_costs, summarize_usage
 from .evaluation import evaluate
 from .runtime import ProtocolError
-from .scenarios import SceneSession
+from .scenarios import (SceneSession, task_unit_ids, scene_task_criteria,
+                        route_metric_applicability, route_metric_report)
+from .residency import freeze_working_sets, WorkingSets
+from .resource_observation import ObservationConfig, WindowObserver
 
 MODE = "joint/1"
 DISPATCH = ("fifo/1", "shortest_estimated/1", "edf/1", "learned_ready/1")
 RESOURCE = ("fixed/1", "queue_threshold/1", "learned/1")
 FIELDS = {"functional_policy", "dispatch_policy", "resource_policy", "retention", "queue_threshold", "age_guard_ms",
           "max_consecutive_resource_ops", "review_interval_ms", "capacity", "workload", "costs", "scales",
-          "initial_state", "start_timeout_s"}
+          "initial_state", "start_timeout_s", "dispatch_scope", "boundary_slots", "warm_groups", "observation"}
 TERMINAL = {"DONE", "FAILED", "UNFINISHED", "NOT_ARRIVED"}
 HELD = {"ACTIVE", "UNKNOWN"}
 
@@ -51,7 +55,7 @@ def _count(value, label, default=None):
 
 
 def configure(config, *, scene, tasks, task_ids, algorithm, criteria, contracts, groups, deployments,
-              learning, references, mode):
+              learning, references, mode, placements=None):
     """Validate and freeze one joint/1 run; every compared policy shares these values."""
     value = copy.deepcopy(config.get("joint") or {})
     if not isinstance(value, dict) or set(value) - FIELDS:
@@ -64,7 +68,9 @@ def configure(config, *, scene, tasks, task_ids, algorithm, criteria, contracts,
         raise ValueError("联合模式在任务完成时结算质量、按事件区间累计时间成本；event_module/1 局部奖励未定义")
     if mode == "rejudge":
         raise ValueError("联合窗口的旧经历重评未定义；请采集新经历")
-    functional = value.get("functional_policy", "learned" if algorithm in learning else algorithm)
+    # Resource experiments preserve the declared functional reference unless
+    # functional learning is explicitly selected in a separate experiment.
+    functional = value.get("functional_policy", "required_only" if algorithm in learning else algorithm)
     dispatch = value.get("dispatch_policy", "fifo/1")
     resource = value.get("resource_policy", "fixed/1")
     if functional not in {"learned", *references}:
@@ -92,9 +98,6 @@ def configure(config, *, scene, tasks, task_ids, algorithm, criteria, contracts,
             if set(retention) != {"mode", "idle_ms"}:
                 raise ValueError("idle_retire/1 只接收 mode 与 idle_ms")
             _positive(retention.get("idle_ms"), "retention.idle_ms")
-            native = [g for g in groups if not deployments._idle_rebuild_allowed(deployments.platform.store.get("runtime_group", g))]
-            if native:
-                raise ValueError("原生有状态运行组须使用 fixed_resident；尚无任务/owner 结束及可重建契约：" + ", ".join(native))
         elif set(retention) != {"mode"}:
             raise ValueError("fixed_resident 不接收其他字段")
     threshold = value.get("queue_threshold")
@@ -123,9 +126,13 @@ def configure(config, *, scene, tasks, task_ids, algorithm, criteria, contracts,
         # Unknown residency demands are not filled with zero.
         if not isinstance(row, dict) or set(row) != set(resources) or any(not _number(v) or v < 0 for v in row.values()):
             raise ValueError("声明资源配额后，每个远程运行组须给出每项资源的实例驻留需求：" + group_id)
-    for name, quota in resources.items():
-        if sum(demands[g][name] for g in groups) > quota:
-            raise ValueError("资源配额不足以让每个运行组各保留一个实例，按需启动会无法满足：" + name)
+    reclaimable = [g for g in groups if deployments._idle_rebuild_allowed(
+        deployments.platform.store.get("runtime_group", g))]
+    placement = placements or {u: dict(kind="LOCAL") for u in scene.get("unit_ids", [])}
+    if groups and placements is None:
+        raise ValueError("联合驻留准入需要实际冻结的 Unit 放置映射")
+    working_sets = freeze_working_sets(scene, [t for t in tasks if t["id"] in task_ids], placement,
+        resources, demands, reclaimable, (retention or {}).get("mode"))
     scalable = [g for g in groups if contracts[g]["replicas"].get("replicable") is True
                 and contracts[g]["operations"].get("add_replica") == "SUPPORTED"]
     if resource != "fixed/1" and capacity["replica_cap"] >= 2 and scalable and capacity["call_slots"] < 2:
@@ -169,14 +176,25 @@ def configure(config, *, scene, tasks, task_ids, algorithm, criteria, contracts,
             not _number(v) or v < 0 for v in costs.values()):
         raise ValueError("joint.costs 须显式给出 task_seconds 与 instance_seconds 的非负权重")
     if costs["task_seconds"] > 0:
-        weights = criteria["objective"]["weights"]
-        doubled = [d["id"] for d in criteria["dimensions"] if d["provider"] == "program"
-                   and d.get("binding") == "latency_ms" and weights.get(d["id"], 0) > 0]
+        specs = [criteria, *[r["criteria"] for r in scene.get("routes", {}).values() if r.get("criteria")]]
+        doubled = sorted({d["id"] for spec in specs for d in spec["dimensions"] if d["provider"] == "program"
+                   and d.get("binding") == "latency_ms" and spec["objective"]["weights"].get(d["id"], 0) > 0})
         if doubled:
             raise ValueError("已用任务数×时间积分计响应代价，判据不再重复加每任务完整时延：" + ", ".join(doubled))
     initial = value.get("initial_state", "cold")
     if initial not in {"cold", "warm"}:
         raise ValueError("initial_state 须为 cold 或 warm")
+    warm_groups = value.get("warm_groups", list(groups) if initial == "warm" else [])
+    if (not isinstance(warm_groups, list) or len(set(warm_groups)) != len(warm_groups)
+            or set(warm_groups) - set(groups) or (initial == "cold" and warm_groups)):
+        raise ValueError("warm_groups 必须是暖态初始驻留组的明确子集")
+    for name, quota in resources.items():
+        if sum(demands[g][name] for g in warm_groups) > quota:
+            raise ValueError("暖态初始驻留组超过容量，请选择可容纳的 warm_groups：" + name)
+    dispatch_scope = value.get("dispatch_scope", "roots_and_boundaries")
+    if dispatch_scope not in {"roots", "roots_and_boundaries"}:
+        raise ValueError("dispatch_scope 须为 roots 或 roots_and_boundaries")
+    observation = ObservationConfig.from_mapping(value.get("observation"))
     timeout = _count(value.get("start_timeout_s"), "start_timeout_s", 900)
     frozen = dict(version=MODE, functional_policy=functional, dispatch_policy=dispatch, resource_policy=resource,
         learned=learned, retention=retention, queue_threshold=threshold,
@@ -184,14 +202,19 @@ def configure(config, *, scene, tasks, task_ids, algorithm, criteria, contracts,
         max_consecutive_resource_ops=_count(value.get("max_consecutive_resource_ops"), "max_consecutive_resource_ops"),
         review_interval_ms=review, capacity=capacity, workload=workload, costs=dict(costs),
         representation=freeze_joint(value.get("scales")), initial_state=initial, start_timeout_s=timeout,
+        working_sets=working_sets, warm_groups=warm_groups, dispatch_scope=dispatch_scope,
+        boundary_slots=_count(value.get("boundary_slots"), "boundary_slots", capacity["call_slots"]),
+        observation=dict(asdict(observation), cgroup_paths=[str(p) for p in observation.cgroup_paths]) if observation else None,
         rules=dict(
             decision_order="at each event: business decisions in arrival order, deterministic on-demand starts, "
-                           "resource decisions (at most max_consecutive_resource_ops non-yield operations), then "
-                           "dispatch while a legal root request and a free root slot exist",
+                           "capacity-pressure releases, resource decisions (at most max_consecutive_resource_ops "
+                           "non-yield operations), root dispatch, then checked internal boundary dispatch",
             single_candidate="executed and recorded; not a learning step",
-            dispatch="legal roots: enabled, host (local process or affinity/accepting instance) free, root slot free",
-            age_guard="age = time since the root request was enabled; when a legal root reaches age_guard_ms the oldest "
-                      "such root is dispatched first; it never lifts host, owner, slot or placement conditions",
+            dispatch="legal roots require a free host and root slot; roots_and_boundaries additionally chooses "
+                     "among original checked, enabled internal calls under active roots and boundary_slots; "
+                     "root host ownership is retained until return",
+            age_guard="age = time since the root or boundary was enabled; the oldest legal aged candidate goes first; "
+                      "host, owner, dependency, slot and placement conditions remain mandatory",
             shortest_estimated="historical mean root duration of the same Unit from completed calls earlier in this "
                                "run; if any candidate lacks an estimate the decision falls back to FIFO",
             edf="earliest task arrival + declared deadline_ms; ties FIFO",
@@ -199,7 +222,9 @@ def configure(config, *, scene, tasks, task_ids, algorithm, criteria, contracts,
                       "candidates for that group are withheld while the start is pending",
             scale_in="READY, accepting, no in-flight or prewarm, no active or waiting root that could use it, no "
                      "unfinished task lease, reclaim allowed by the group contract",
-            capacity="root slots = call_slots; held instances (UNDEPLOYED/STARTING/READY/DRAINING/unreleased) and "
+            capacity="each admitted task reserves its frozen working set plus pinned groups until its owner ends; "
+                     "pool total need not fit, but each required set must fit; root slots = call_slots; held instances "
+                     "(UNDEPLOYED/STARTING/READY/DRAINING/unreleased) and "
                      "starts submitted but not yet registered count toward replica_cap and declared residency quotas; "
                      "the reservation is made before submission and returned on confirmed failure or release",
             outcomes="each resource operation is RUNNING, DONE (READY / prewarmed / released), FAILED (refused, start "
@@ -232,6 +257,19 @@ def configure(config, *, scene, tasks, task_ids, algorithm, criteria, contracts,
 def window_tasks(manifest, number):
     ids, size = manifest["task_ids"], manifest["joint"]["workload"]["tasks_per_window"]
     return [ids[(number * size + index) % len(ids)] for index in range(size)]
+
+
+def service_summary(tasks, span_seconds):
+    arrived = [t for t in tasks if t["arrived_ms"] is not None]
+    completed = [t for t in arrived if t["status"] == "DONE" and t["deadline_status"] != "UNFINISHED"]
+    times = sorted(t["response_ms"] for t in completed if t["response_ms"] is not None)
+    return dict(arrived=len(arrived), completed=len(completed), failed=sum(t["status"] == "FAILED" for t in arrived),
+        unfinished=len(arrived) - len(completed) - sum(t["status"] == "FAILED" for t in arrived),
+        completion_rate=len(completed) / len(arrived) if arrived else None,
+        throughput_per_s=len(completed) / span_seconds if span_seconds else None,
+        response_mean_ms=sum(times) / len(times) if times else None,
+        response_p95_ms=times[max(0, math.ceil(.95 * len(times)) - 1)] if times else None,
+        response_denominator=len(times), latency_scope="completed within deadline; all arrivals retained separately")
 
 
 class TaskRun:
@@ -279,12 +317,22 @@ class Window:
         self.setup, self.release, self.residency = {}, {}, None
         self.start = self.clock = self.done_at = self.horizon_at = self.end_at = None
         self.resource_due, self.consecutive = True, 0
+        self.working = WorkingSets(self.config["working_sets"], self.config["capacity"]["resources"],
+                                   self.config["capacity"]["demands"])
+        self.observation = None
+        self.boundaries_seen = set()
 
     # Window lifecycle.
 
     def run(self):
+        observer = WindowObserver(self.config.get("observation"), run_id=self.wid,
+            arm=self.manifest["algorithm"], runtime_dir=self.jobs.directory / "runtime" / self.rid)
+        self.observer = observer
         try:
+            observer.start()
+            observer.mark_phase("preparation")
             self._setup()
+            observer.mark_phase("workload")
             self._loop()
         except Exception as error:
             if self.execution_error is None:
@@ -292,7 +340,11 @@ class Window:
             self._close("execution_error")
             self._drain_after_error()
         finally:
-            self._teardown()
+            try:
+                self._teardown()
+            finally:
+                if observer._started is not None:
+                    self.observation = observer.finish("FAILED" if self.execution_error else "COMPLETED")
         return self._item()
 
     def _setup(self):
@@ -303,7 +355,8 @@ class Window:
         with deployments.lock:
             self.changes_seen = len(deployments.environment_changes.get(self.rid, []))
         if self.config["initial_state"] == "warm":
-            for group_id, placement in self.groups.items():
+            for group_id in self.config["warm_groups"]:
+                placement = self.groups[group_id]
                 started = time.perf_counter()
                 record = deployments.ensure_ready(placement, self.members[group_id][0])
                 required = self.members[group_id]
@@ -325,6 +378,8 @@ class Window:
                                         profiles=self.bound, catalog=self.catalog)
             task.session.context.admission = self._admission(task)
         self.runtime.call("configure_roots", dict(run_id=self.wid, call_slots=self.config["capacity"]["call_slots"],
+                                                  boundaries=self.config["dispatch_scope"] == "roots_and_boundaries",
+                                                  boundary_slots=self.config["boundary_slots"],
                                                   notify=lambda: self.events.put(("root",))))
         self.roots_configured = True
         with deployments.lock:
@@ -337,6 +392,8 @@ class Window:
     def _admission(self, task):
         @contextlib.contextmanager
         def admit(unit_id):
+            if unit_id not in task_unit_ids(self.manifest["scene"], task.task):
+                raise ValueError("调用超出当前任务冻结工作集")
             placement = self.catalog.placement[unit_id]
             target = dict(kind="LOCAL") if placement["kind"] == "LOCAL" else dict(
                 kind="REMOTE", group_id=placement["group_id"],
@@ -395,22 +452,19 @@ class Window:
                 pass
             now = time.time()
             self._advance(now)
+            # Arrival belongs to the frozen workload clock, even if this event
+            # loop wakes after the horizon. Never lose queued tasks from counts.
+            due = min(now, horizon) if horizon is not None else now
+            while arrivals and arrivals[0][0] <= due and not self.closing:
+                at, task = arrivals.pop(0)
+                task.arrived, task.status = at, "WAITING_CAPACITY"
+                self.resource_due = True
             if not self.closing and (self.jobs.stops[self.rid].is_set() or self.jobs.closed):
                 self._close("stopped")
             if horizon is not None and now >= horizon and not self.closing:
                 self._close("horizon")
             if self.closing:
                 arrivals.clear()
-            while arrivals and arrivals[0][0] <= now:
-                _, task = arrivals.pop(0)
-                if self.closing:
-                    task.status = "NOT_ARRIVED"
-                    continue
-                task.arrived, task.status = now, "STARTING"
-                task.thread = threading.Thread(target=self._task_body, args=(task,), daemon=True,
-                                               name="seampact-joint-task")
-                task.thread.start()
-                self.resource_due = True
             for event in batch:
                 self._handle(event)
             if next_review is not None and now >= next_review:
@@ -438,7 +492,9 @@ class Window:
                 return
             if self.closing:
                 self._cancel_waiting("窗口已收尾：" + self.closing)
+                self._boundary_stage(draining=True)
             elif self.done_at is None:
+                self._admit_tasks()
                 self._decide()
             self._refresh()
 
@@ -455,6 +511,8 @@ class Window:
                 task.event, task.status, task.event_at = scene_event, "DECISION", at
         elif kind == "task_abandoned":
             event[1].status = "UNFINISHED"
+            self.working.release(event[1].context)
+            self.deployments.release_task(event[1].context)
         elif kind == "task_error":
             _, task, error, at = event
             task.error = dict(type=type(error).__name__, message=str(error))
@@ -464,6 +522,7 @@ class Window:
                 task.status = "FAILED"
                 self._fail(dict(type=type(error).__name__, message=str(error), task_id=task.task["id"]))
             self.deployments.release_task(task.context)
+            self.working.release(task.context)
         elif kind == "root":
             self.resource_due = True
         elif kind == "instance":
@@ -514,6 +573,7 @@ class Window:
         if event.get("truncated") and task.deadline_status != "UNFINISHED":
             self.truncated.append(task.task["id"])
         self.deployments.release_task(task.context)
+        self.working.release(task.context)
         self.resource_due = True
         task.evaluating = True
         index = len(self.trajectory) - 1 if self.trajectory else None
@@ -527,10 +587,12 @@ class Window:
                            module_calls=len(calls), module_duration_ms=sum(c["duration_ms"] for c in calls),
                            root_wait_ms=sum((c.get("root") or {}).get("wait_ms") or 0 for c in calls))
             task.program = program
-            applicability = copy.deepcopy(task.task.get("metric_applicability", {}))
+            applicability = route_metric_applicability(self.manifest["scene"], task.task, event)
             called = {c["unit_id"] for c in calls}
-            criterion = task_criteria(self.manifest["criteria"], applicability, called)
-            final = task_criteria(self.manifest["evaluation_criteria"], applicability, called)
+            criterion = task_criteria(scene_task_criteria(self.manifest["scene"], task.task,
+                self.manifest["criteria"]), applicability, called)
+            final = task_criteria(scene_task_criteria(self.manifest["scene"], task.task,
+                self.manifest["evaluation_criteria"], "evaluation_criteria"), applicability, called)
             evidence = event.get("evidence", {})
             feedback = evaluate(task.session.context.profiles, criterion, evidence, program)
             final_program = dict(program)
@@ -558,6 +620,8 @@ class Window:
         for task in self.tasks:
             if task.status == "PENDING":
                 task.status = "NOT_ARRIVED"
+            elif task.status == "WAITING_CAPACITY":
+                task.status = "UNFINISHED"
             elif task.status == "DECISION":
                 task.inbox.put(None)
                 task.status = "ABANDONING"
@@ -574,11 +638,13 @@ class Window:
                 pass
             if getattr(self, "roots_configured", False):
                 self._cancel_waiting("窗口已收尾：" + self.closing)
+                self._boundary_stage(draining=True)
         if self.done_at is None:
             self.done_at = time.time()
 
     def _teardown(self):
         deployments = self.deployments
+        self.observer.mark_phase("release")
         with deployments.lock:
             if self._on_instance_event in deployments.listeners:
                 deployments.listeners.remove(self._on_instance_event)
@@ -589,6 +655,9 @@ class Window:
                 task.thread.join(30)
                 if task.thread.is_alive():
                     task.error = task.error or dict(type="ThreadStillRunning", message="任务线程未在收尾时限内结束")
+                    self.execution_error = self.execution_error or task.error
+                    # A task that can still execute retains its owner lease.
+                    continue
             deployments.release_task(task.context)
         end = self.done_at or time.time()
         if self.start is not None:
@@ -618,6 +687,7 @@ class Window:
         self.end_at = time.time()
         self.release_ms = (self.end_at - released_at) * 1000
         self.release_left = {g: ids for g, ids in left.items() if ids}
+        self.observer.mark_phase("release_unconfirmed" if self.release_left else "resources_released")
         if self.start is not None and self.groups:
             # Occupancy after the last event, drain and release included, up to the common end point.
             tail = deployments.residency(set(self.groups), self.clock, self.end_at)["resident_ms"] / 1000
@@ -627,6 +697,7 @@ class Window:
             self.clock = self.end_at
             self.residency = deployments.residency(set(self.groups), self.start, self.end_at)
         self.window_end = end
+        self.observer.mark_phase("evaluation_tail")
         while any(task.evaluating for task in self.tasks):
             try:
                 self._handle(self.events.get(timeout=1.0))
@@ -666,6 +737,13 @@ class Window:
                     task.roots_done += 1
                 if r["state"] == "RETIRED" and r["receipt"] == "RETURN":
                     self.estimates.setdefault(r["unit_id"], []).append(r["duration_ms"])
+        for call in self.runtime.snapshot()["calls"].values():
+            if (call.get("task_id") in self.by_context and call.get("root_id")
+                    and call["physical"] == "RETIRED" and call["id"] not in self.boundaries_seen):
+                self.boundaries_seen.add(call["id"])
+                if call["receipt"] == "RETURN" and call.get("started_at") is not None:
+                    elapsed = max(0, call["latency_ms"] - (call["started_at"] - call["enabled_at"]) * 1000)
+                    self.estimates.setdefault("boundary:" + str(call["semantic_key"]), []).append(elapsed)
         self.views = views
 
     def _advance(self, now):
@@ -766,8 +844,41 @@ class Window:
         resources = self.config["capacity"]["resources"]
         if not resources:
             return None
-        used, demand = self._resource_use(views), self.config["capacity"]["demands"][group_id]
-        return min((quota - used[name] - demand[name]) / quota for name, quota in resources.items())
+        return self.working.after_start(group_id, self._occupancy(views))
+
+    def _admit_tasks(self):
+        # Waiting time starts at the supplied arrival, including capacity queueing.
+        # No future task or task label is exposed to the learned policy here.
+        for task in sorted((t for t in self.tasks if t.status == "WAITING_CAPACITY"),
+                           key=lambda t: (t.arrived, t.index)):
+            if not self.working.admit(task.context, task.task["id"]):
+                break
+            task.status = "STARTING"
+            task.admitted_at = time.time()
+            task.thread = threading.Thread(target=self._task_body, args=(task,), daemon=True,
+                                           name="seampact-joint-task")
+            task.thread.start()
+
+    def _pressure_release(self):
+        # Claims can replace idle residency only after the backend confirms
+        # release. Same rule for every policy, never kill an active owner.
+        if not self.config["capacity"]["resources"]:
+            return
+        views, roots = self._state()
+        used = self.working.used(self._occupancy(views))
+        pressure = any(used[n] > quota for n, quota in self.config["capacity"]["resources"].items())
+        if not pressure:
+            return
+        options = [o for o in self._resource_options(views, roots, time.time()) if o["action"] == "scale_in"]
+        for option in sorted(options, key=lambda o: (-o["facts"]["idle_ms"], o["instance_id"])):
+            group = option["group_id"]
+            if (group in self.working.groups() and len(views[group]["instances"]) <= 1):
+                continue
+            op = self._execute(option, "capacity_pressure", views)
+            self._record(kind="resource", choice="capacity_pressure", action="scale_in", group_id=group,
+                         instance_id=option["instance_id"], op=op["id"], legal=[o["instance_id"] for o in options])
+            # Reconsider after physical release, not after a stop was requested.
+            return
 
     def _preparable(self, group_id):
         cache = self.__dict__.setdefault("preparable", {})
@@ -823,6 +934,7 @@ class Window:
         for task in sorted(self.tasks, key=lambda item: (item.event_at if item.status == "DECISION" else 0, item.index)):
             if task.status == "DECISION":
                 self._business(task)
+        self._pressure_release()
         self._on_demand()
         if self.resource_due:
             self.resource_due = False
@@ -831,6 +943,52 @@ class Window:
                     or (self.config.get("retention") or {}).get("mode") == "idle_retire/1"):
                 self._resource_stage()
         self._dispatch_stage()
+        self._boundary_stage()
+
+    def _boundary_stage(self, draining=False):
+        if self.config.get("dispatch_scope") != "roots_and_boundaries":
+            return
+        while True:
+            pool = sorted(self.runtime.call("boundary_view", self.wid), key=lambda c: c["enabled_at"])
+            if not pool:
+                return
+            now = time.time()
+            aged = [c for c in pool if (now - c["enabled_at"]) * 1000 >= self.config["age_guard_ms"]]
+            pool = aged or pool
+            views, roots = self._state()
+            by_root = {r["id"]: r for r in roots}
+            def estimate(call):
+                return self._estimate("boundary:" + str(call["semantic_key"]))
+            def facts(call):
+                root = by_root[call["root_id"]]
+                return dict(wait_ms=(now - call["enabled_at"]) * 1000, estimate_ms=estimate(call),
+                            task_age_ms=(now - self.by_context[call["task_id"]].arrived) * 1000,
+                            task_roots=self.by_context[call["task_id"]].roots_done,
+                            remote=root["target"]["kind"] == "REMOTE", warm_target=True, aged=bool(aged), boundary=True)
+            def build():
+                return (joint_observation("dispatch", self.scales, self._workload(views, roots, now)),
+                        [joint_candidate("dispatch", self.scales,
+                            cards=[self.cards.get((c.get("unit") or {}).get("id"),
+                                                  self.cards[by_root[c["root_id"]]["unit_id"]])],
+                            dispatch=facts(c)) for c in pool])
+            def rule():
+                estimates = [estimate(c) for c in pool]
+                if self.config["dispatch_policy"] == "shortest_estimated/1" and all(v is not None for v in estimates):
+                    return min(range(len(pool)), key=lambda i: estimates[i])
+                if self.config["dispatch_policy"] == "edf/1":
+                    return min(range(len(pool)), key=lambda i: self.by_context[pool[i]["task_id"]].arrived +
+                               self.by_context[pool[i]["task_id"]].task["deadline_ms"] / 1000)
+                return 0
+            if draining or aged:
+                index, choice, represented, policy_ms = 0, "drain" if draining else "age_guard", 0, 0
+            else:
+                index, choice, represented, policy_ms = self._choose("dispatch", [True] * len(pool), build, rule)
+            call = pool[index]
+            self.runtime.call("authorize_boundary", call["id"], self.wid)
+            self._record(kind="boundary", choice=choice, call_id=call["id"], root=call["root_id"],
+                         task_id=self.by_context[call["task_id"]].task["id"], semantic_key=call["semantic_key"],
+                         legal=len(pool), wait_ms=(now - call["enabled_at"]) * 1000,
+                         representation_ms=represented, policy_ms=policy_ms)
 
     def _business(self, task):
         event = task.event
@@ -1251,11 +1409,18 @@ class Window:
             if task.session is not None and task.arrived is not None:
                 transitions = [dict(event=dict(representation_duration_ms=d["representation_ms"]),
                                     decision=dict(duration_ms=d["policy_ms"])) for d in task.decisions]
-                ledger = episode_costs(task.session.context, self.manifest, response or 0.0, transitions,
+                cost_manifest = dict(self.manifest,
+                    criteria=scene_task_criteria(self.manifest["scene"], task.task, self.manifest["criteria"]),
+                    evaluation_criteria=scene_task_criteria(self.manifest["scene"], task.task,
+                        self.manifest["evaluation_criteria"], "evaluation_criteria"))
+                ledger = episode_costs(task.session.context, cost_manifest, response or 0.0, transitions,
                                        task.feedback, task.independent)
                 online.extend(ledger["online"]["records"])
                 evaluation.extend(ledger["evaluation"]["records"])
             task_items.append(dict(index=task.index, task_id=task.task["id"], context=task.context,
+                route=task.task.get("route"), task_class=task.task.get("task_class"),
+                capacity_wait_ms=((getattr(task, "admitted_at", None) or self.window_end or time.time()) - task.arrived) * 1000
+                    if task.arrived is not None else None,
                 arrival_offset_ms=task.offset_ms, status=task.status, deadline_status=task.deadline_status,
                 credited=task.deadline_status != "UNFINISHED",
                 arrived_ms=(task.arrived - self.start) * 1000 if task.arrived else None,
@@ -1281,6 +1446,10 @@ class Window:
                       "release_tail_seconds falls after the last event; parallelism counts ACTIVE root requests "
                       "executing at once over span_ms, UNKNOWN roots are reported apart; not the instance count")
         return dict(kind="joint_window", episode=self.number, window_id=self.wid,
+            resource_observation=self.observation,
+            route_metrics=route_metric_report(self.manifest["scene"], task_items, self.manifest["criteria"],
+                                             self.manifest["evaluation_criteria"]),
+            service=service_summary(task_items, span),
             task_ids=[task.task["id"] for task in self.tasks], tasks=task_items, decisions=self.records,
             counters=dict(sorted(self.counters.items())), transitions=self.trajectory,
             resource_ops=self.ops, unknown_outcomes=self.unknown_outcomes, on_demand=self.on_demand, roots=roots,
@@ -1310,7 +1479,7 @@ def run_windows(jobs, rid, run, folder, manifest, catalog, bound, learner):
     """Execute the run's windows; learning happens between windows, never inside one."""
     tasks = {task["id"]: task for task in manifest["scene"]["tasks"]}
     estimates, rewards = {}, []
-    counts, totals, definitions = {}, {}, {}
+    counts, totals, definitions, populations = {}, {}, {}, {}
     records = {"online": [], "evaluation": []}
     summary = run.setdefault("joint", dict(windows=0, tasks=0, unfinished_tasks=0, failed_tasks=0,
                                            max_active_roots=0, mean_active_roots=[], counters={}))
@@ -1336,28 +1505,34 @@ def run_windows(jobs, rid, run, folder, manifest, catalog, bound, learner):
             rewards.append(item["reward"])
         run["reward_mean"] = sum(rewards) / len(rewards) if rewards else None
         run["reward_denominator"] = len(rewards)
-        for task in item["tasks"]:
-            if not task["credited"]:
-                continue
-            for scope, feedback in (("training", task["feedback"]), ("independent", task["independent_feedback"])):
-                for metric in (feedback or {}).get("metrics", []):
-                    key = (scope, metric["id"], metric.get("version"), metric.get("unit"), metric.get("direction"),
-                           metric.get("level", "system"), metric.get("unit_id"))
-                    counts.setdefault(key, {})
-                    counts[key][metric["status"]] = counts[key].get(metric["status"], 0) + 1
-                    definitions[key] = metric.get("definition")
-                    if metric["status"] == "KNOWN":
-                        totals.setdefault(key, []).append(metric["value"])
-        population = summary["tasks"] + len(item["tasks"])
-        run["metrics"] = [dict(scope=k[0], id=k[1], version=k[2], unit=k[3], direction=k[4], level=k[5], unit_id=k[6],
+        for bucket in item["route_metrics"]:
+            route = bucket["route"]
+            populations[route] = populations.get(route, 0) + bucket["tasks"]
+            for row in bucket["metrics"].values():
+                metric = row["definition"]
+                scope = "training" if row["scope"] == "criteria" else "independent"
+                key = (scope, row["id"], metric.get("version"), metric.get("unit"), metric.get("direction"),
+                       metric.get("level", "system"), metric.get("unit_id"), route)
+                statuses = counts.setdefault(key, {})
+                for status in ("KNOWN", "UNKNOWN", "NOT_APPLICABLE"):
+                    statuses[status] = statuses.get(status, 0) + row[status.lower()]
+                definitions[key] = metric.get("definition")
+                totals.setdefault(key, []).extend(row["values"])
+        population = summary["tasks"] + sum(t["arrived_ms"] is not None for t in item["tasks"])
+        run["metrics"] = [dict(scope=k[0], id=k[1], version=k[2], unit=k[3], direction=k[4], level=k[5], unit_id=k[6], route=k[7],
             definition=definitions[k], value=sum(totals[k]) / len(totals[k]) if totals.get(k) else None,
-            denominator=len(totals.get(k, [])), population=population, status_counts=v) for k, v in counts.items()]
+            denominator=len(totals.get(k, [])), population=populations.get(k[7], 0), status_counts=v,
+            timing_scope="observed quality including late completion; see per-route outcomes and service deadline counts")
+            for k, v in counts.items()]
         summary.update(windows=summary["windows"] + 1, tasks=population,
             unfinished_tasks=summary["unfinished_tasks"] + sum(
                 t["deadline_status"] == "UNFINISHED" or t["status"] == "UNFINISHED" for t in item["tasks"]),
             failed_tasks=summary["failed_tasks"] + sum(t["status"] == "FAILED" for t in item["tasks"]),
             max_active_roots=max(summary["max_active_roots"], item["parallelism"]["max_active_roots"]))
         summary["mean_active_roots"].append(item["parallelism"]["mean_active_roots"])
+        summary.setdefault("service_windows", []).append(dict(window_id=item["window_id"], **item["service"]))
+        summary.setdefault("route_windows", []).append(dict(window_id=item["window_id"], routes=item["route_metrics"]))
+        summary.setdefault("resource_windows", []).append(item["resource_observation"])
         for key, value in item["counters"].items():
             summary["counters"][key] = summary["counters"].get(key, 0) + value
         summary["explored"] = summary.get("explored", 0) + sum(t["explored"] for t in item["transitions"])

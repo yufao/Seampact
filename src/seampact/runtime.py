@@ -38,7 +38,7 @@ class Coordinator:
         self.root_control = None
         self.failed = False
         self.detached_sources = set()
-        self.state = dict(schema="runtime/3", quota=quota, gates={}, calls={}, roots={})
+        self.state = dict(schema="runtime/4", quota=quota, gates={}, calls={}, roots={})
 
     def _persist(self, event):
         if self.failed:
@@ -120,6 +120,7 @@ class Coordinator:
             enabled_at=time.time(), started_at=None, latency_ms=None)
         self.waiters[identity] = asyncio.get_running_loop().create_future()
         self._persist("call_enabled")
+        self._notify_roots()
         await self.pump()
         return identity
 
@@ -131,6 +132,8 @@ class Coordinator:
         if c.get("root_id"):
             if self.state["roots"][c["root_id"]]["state"] != "ACTIVE":
                 raise ProtocolError("the covering root request is no longer active")
+            if self._boundary_controlled(c) and self._boundaries_used() + c["slots"] > self.root_control["boundary_slots"]:
+                raise ProtocolError("managed boundary execution slots exhausted")
         elif self.used() + c["slots"] > self.state["quota"]:
             raise ProtocolError("managed quota exhausted")
         elif not (c.get("unit") or {}).get("instance_id") and self._local_held():
@@ -183,6 +186,7 @@ class Coordinator:
             following = self._ready()
             self.policy.feedback(token, receipt == "RETURN", c["latency_ms"], following, self._observation())
         self._persist("physically_retired")
+        self._notify_roots()
         await self.pump()
         return True
 
@@ -272,7 +276,32 @@ class Coordinator:
         slots = control.get("call_slots")
         if type(slots) is not int or slots < 1:
             raise ValueError("call_slots must be a positive integer")
-        self.root_control = dict(run_id=control["run_id"], call_slots=slots, notify=control.get("notify"))
+        boundary_slots = control.get("boundary_slots", slots)
+        if type(boundary_slots) is not int or boundary_slots < 1:
+            raise ValueError("boundary_slots must be a positive integer")
+        self.root_control = dict(run_id=control["run_id"], call_slots=slots, notify=control.get("notify"),
+                                 boundaries=control.get("boundaries", False), boundary_slots=boundary_slots)
+
+    def _boundary_controlled(self, call):
+        root = self.state["roots"].get(call.get("root_id"), {})
+        return bool(self.root_control and self.root_control.get("boundaries")
+                    and root.get("run_id") == self.root_control["run_id"])
+
+    def _boundaries_used(self):
+        return sum(c["slots"] for c in self.state["calls"].values() if self._boundary_controlled(c)
+                   and c["physical"] in {"RESERVED", "AUTHORIZED", "STARTED", "UNKNOWN"})
+
+    async def boundary_view(self, run_id):
+        return [copy.deepcopy(c) for c in self._ready() if self._boundary_controlled(c)
+                and self.state["roots"][c["root_id"]]["run_id"] == run_id]
+
+    async def authorize_boundary(self, identity, run_id):
+        call = self.state["calls"].get(identity)
+        if (not call or not self._boundary_controlled(call)
+                or self.state["roots"][call["root_id"]]["run_id"] != run_id
+                or identity not in {c["id"] for c in self._ready()}):
+            raise ProtocolError("boundary is no longer legally dispatchable")
+        return await self.authorize(identity)
 
     def _notify_roots(self):
         notify = (self.root_control or {}).get("notify")
@@ -352,7 +381,7 @@ class Coordinator:
     async def pump(self):
         if not self.automatic:
             return
-        ready = self._ready()
+        ready = [c for c in self._ready() if not self._boundary_controlled(c)]
         while ready:
             covered = [c for c in ready if c.get("root_id")]
             if covered:
@@ -363,7 +392,7 @@ class Coordinator:
             else:
                 call = ready[0]
             await self.authorize(call["id"])
-            ready = self._ready()
+            ready = [c for c in self._ready() if not self._boundary_controlled(c)]
 
     def _ready(self):
         ready = []
@@ -373,7 +402,9 @@ class Coordinator:
                     or self.owner_busy(c["owner"])):
                 continue
             if c.get("root_id"):
-                if self.state["roots"][c["root_id"]]["state"] == "ACTIVE":
+                if (self.state["roots"][c["root_id"]]["state"] == "ACTIVE"
+                        and (not self._boundary_controlled(c) or
+                             self._boundaries_used() + c["slots"] <= self.root_control["boundary_slots"])):
                     ready.append(c)
             elif (self.used() + c["slots"] <= self.state["quota"]
                   and not (local_held and not (c.get("unit") or {}).get("instance_id"))):

@@ -10,6 +10,7 @@ import json
 
 from .inspection import native_ast, units
 from .dependencies import check_requirements, DEPENDENCY_RULES
+from .intake_feedback import target_classification, entry_readiness
 
 
 RULES = """你是 SeamPact 分析器中的自动源码预处理 Agent。本次任务属于分析器内部，下一次独立的拆分分析会实际消费你的结构化工件。
@@ -40,6 +41,7 @@ def _tool(name, description):
 
 
 RULES += DEPENDENCY_RULES
+RULES += "\n先读输入classification的源码特征和recipes，再按目标相关目录分页调用inspect_harness。功能类别是待核对线索，可多标签或unknown；形态、功能、状态资源分别看，不把仓库名或文件名当类别证据。按配方补查原构造、资源加载、工具注册、活动配置和反馈控制，记录真实控制位置。check_preprocessing会独立返回每个目标的分类及入口准备情况；用具体缺口指导补读与映射修正。分类不代替原绑定检查，不授予拆分/并行/跳过权限。未命中特征不排除目标，不要求清空unknown才能提交。\n"
 
 TOOLS = [
     _tool("check_preprocessing", "核对预处理的冻结源锚点、证据范围及原生绑定候选；不执行源码、不授予许可"),
@@ -190,7 +192,7 @@ def check_preprocessing(inspector, artifact, check_entries=None):
     if not entries:
         issues.append(dict(field="entries", reason="no native entry candidate was discovered"))
     referenced = sum(row["status"] == "SOURCE_REFERENCED" for row in targets)
-    return dict(schema="source-preparation-report/1", source_version=inspector.request["source_version"],
+    report = dict(schema="source-preparation-report/1", source_version=inspector.request["source_version"],
         status="SOURCE_REFERENCED" if not issues else "PARTIAL" if referenced else "MISSING",
         targets=targets, entries=entries, entry_bindings=binding, issues=issues,
         dependencies=dependencies,
@@ -200,3 +202,6 @@ def check_preprocessing(inspector, artifact, check_entries=None):
         scope="frozen source references and existing native binding feedback; semantic preservation remains conditional",
         execution="NOT_RUN", installation="NOT_PERFORMED", admission_granted=False,
         split_permission=False, export_permission=False, parallel=False, remote=False)
+    report["classification"] = target_classification(inspector, artifact["targets"] + artifact["entries"])
+    report["entry_readiness"] = entry_readiness(inspector, candidate, report)
+    return report

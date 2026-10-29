@@ -14,6 +14,7 @@ from .dependencies import check_requirements, DEPENDENCY_RULES
 from .providers import ProviderError, Transport, completion_body, completion_parameters
 from .store import now
 from .verification import check_candidate
+from .intake_feedback import explain_candidate
 
 RULES = """你是异构 Harness 接入分析 Agent。依据冻结入口和观察契约，从源码探索具体能力、边界和原生执行宿主。
 允许 W 包装、H 原生交接、有限 R 局部重构。不要重写原算法、数据或控制策略。
@@ -77,6 +78,7 @@ check_candidate.entry_bindings.runtime_groups返回引擎按源码核对的分�
 RULES += DEPENDENCY_RULES
 RULES += "\n运行环境由inspect_environment返回原库声明、推荐、冲突与用户选择。entry_profile保留平台本地基线，runtime_environment为明确选择的独立目标解释器，具体语法与构造仍须通过引擎核对。先核对环境事实；不自行升级依赖、执行安装命令或以镜像存在证明原能力可用。需要不同Python/依赖时说明来源依据和缺口，交由运行环境配置，不改变原算法或拆分规则。\n"
 RULES += "\n同一响应可以提出多个互不依赖的源码读取工具请求，减少逐项等待模型的往返。已有预处理工件中的源锚点、构造候选和反馈应先消费；按需补读与拆分有关的证据，无需重复读取未改变且已有完整证据的文件。最终候选仍须接受完整机械核验。\n"
+RULES += "\n先消费 classification 中的多轴源码线索及 recipes，按目标相关路径调用 inspect_harness 并按 next_offset 续查。它区分原生形态、Harness 功能结构与状态资源特征；HYPOTHESIS 不是已证明的功能类别。按配方追查构造、模型与索引加载、工具注册、反馈循环和效果；未命中或混合类别仍可继续探索，不能因分类丢弃目标。check_candidate 返回目标范围分类及 entry_readiness，将明确缺口用于下一次补读或修订；说明较细候选为何被拒绝或没有新控制机会。分类不签发 W/H/R、并行、独立导出或远程许可。最终交付应说明目标入口、真实输入与资源、已核对操作和下一步；静态检查不执行原代码，运行状态保留 NOT_RUN。\n"
 
 
 def function(name, description, properties, required):
@@ -86,6 +88,8 @@ def function(name, description, properties, required):
 
 TOOLS = [
     function("inspect_environment", "读取冻结原库的Python/依赖/镜像环境证据与所选环境，不执行安装", {}, []),
+    function("inspect_harness", "按冻结文件分页提取Harness多轴特征、证据及调查配方；功能类别为线索，不授予权限", {
+        "path":{"type":"string"},"offset":{"type":"integer"},"count":{"type":"integer"}}, []),
     function("list_source", "分页列出已冻结工件；页大小可自行选择", {"offset":{"type":"integer"},"count":{"type":"integer"}}, []),
     function("read_file", "读取冻结文件的源码；笔记本只提供源码单元，不发输出", {
         "path":{"type":"string"},"unit":{"type":"string"},"start":{"type":"integer"},"count":{"type":"integer"}}, ["path"]),
@@ -146,7 +150,7 @@ class AnalysisJobs:
         self.implementation_bytes = {name: Path(__file__).with_name(name).read_bytes() for name in
             ("analysis.py", "preprocessing.py", "inspection.py", "units.py", "verification.py",
              "lowering.py", "callsite.py", "deployment.py", "dependencies.py", "resources.py", "providers.py",
-             "service.py", "environments.py", "target_runtime.py", "revisions.py")}
+             "service.py", "environments.py", "target_runtime.py", "revisions.py", "classification.py", "intake_feedback.py")}
         self.implementation = {name: digest(data) for name, data in self.implementation_bytes.items()}
         for old in store.list("analysis"):
             if old["status"] in {"RUNNING", "CANCELLING"}:
@@ -421,6 +425,8 @@ class AnalysisJobs:
             resource_entries=len(inspector.request.get("resources", [])),
             access="list_structure/list_source/read_file；完整来源均可读取，无文件或上下文截断")
         request["resource_access"] = "list_resources读取完整资源引用；list_structure返回目录位置。不将存在文件等同加载兼容。"
+        request["classification"] = inspector.inspect_harness(count=8)
+        request["classification_access"] = "以上仅为首个文件页；按目标相关path及next_offset调用inspect_harness。未扫描范围与未命中特征均不表示不存在能力。"
         return request
 
     def _read_revision_facts(self, inspector, job, path):
@@ -506,7 +512,7 @@ class AnalysisJobs:
         report["dependencies"] = check_requirements(inspector, candidate)
         if self.check_entries:
             report["entry_bindings"] = self.check_entries(inspector, candidate)
-        return report
+        return explain_candidate(inspector, candidate, report)
 
     def _run(self, inspector, profile, key, job, cancellation):
         started = stage_started = time.perf_counter()
@@ -610,7 +616,7 @@ class AnalysisJobs:
                         elif name == "read_revision_facts" and job.get("revision_id"):
                             result = self._await_operation(lambda: self._read_revision_facts(inspector, job, **args),
                                                            cancellation, job, "source_tools", name)
-                        elif name in {"list_source", "read_file", "inspect_symbols", "inspect_construction", "add_source", "list_structure", "inspect_imports", "entry_candidates", "list_resources"}:
+                        elif name in {"list_source", "read_file", "inspect_symbols", "inspect_construction", "inspect_harness", "add_source", "list_structure", "inspect_imports", "entry_candidates", "list_resources"}:
                             if name == "add_source":
                                 # This tool changes the frozen request; finish the
                                 # small local mutation before honoring cancellation.

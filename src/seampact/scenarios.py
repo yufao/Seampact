@@ -31,6 +31,8 @@ def freeze_scene(spec, capabilities=None):
     value = copy.deepcopy(spec)
     if not value.get("id") or not value.get("version"):
         raise ValueError("场景需要 id 与 version")
+    if "routes" in value:
+        return _freeze_mixed_scene(value, capabilities or {})
     freeze_representation(value, capabilities or {})
     for key in ("observation_schema", "candidate_schema"):
         fields = value.get(key)
@@ -60,6 +62,11 @@ def freeze_scene(spec, capabilities=None):
     if any(not isinstance(i, str) or not i for i in ids) or len(set(ids)) != len(ids):
         raise ValueError("每个任务需要不重复的字符串 id")
     value["tasks"] = tasks
+    for task in tasks:
+        selected = task.get("unit_ids", value.get("unit_ids", []))
+        if (not isinstance(selected, list) or any(not isinstance(uid, str) or not uid for uid in selected)
+                or len(set(selected)) != len(selected) or set(selected) - set(value.get("unit_ids", []))):
+            raise ValueError("task unit_ids must be a distinct subset of its frozen scene Units")
     for uid, binding in value.get("native_usage", {}).items():
         if uid not in value.get("unit_ids", []) or not isinstance(binding, dict):
             raise ValueError("native_usage must bind an actual scene Unit")
@@ -83,6 +90,194 @@ def freeze_scene(spec, capabilities=None):
         resources.extend(dict(path=str(p), sha256=digest_file(p)) for p in files)
     value["resource_files"] = resources
     return value
+
+
+def _freeze_mixed_scene(value, capabilities):
+    """Freeze task routes inside the existing arrival/resource window.
+
+    Routes are ordinary scene adapters, with their own installed Unit subset and
+    criteria. The union uses one capability-features/2 schema; route names and
+    task classes are result metadata, never learned features.
+    """
+    routes = value.get("routes")
+    if not isinstance(routes, dict) or not routes or any(
+            not isinstance(key, str) or not key or not isinstance(route, dict)
+            for key, route in routes.items()):
+        raise ValueError("mixed routes must be named scene objects")
+    if (value.get("representation") or {}).get("version") != "capability-features/2":
+        raise ValueError("mixed routes require the shared capability-features/2 representation")
+    tasks = value.get("tasks", [])
+    if value.get("tasks_path"):
+        path = Path(value["tasks_path"]).resolve()
+        tasks = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+        value["tasks_file"] = dict(path=str(path), sha256=digest_file(path))
+    if not isinstance(tasks, list) or not tasks:
+        raise ValueError("mixed scene requires actual tasks")
+    ids = [task.get("id") for task in tasks]
+    if any(not isinstance(i, str) or not i for i in ids) or len(set(ids)) != len(ids):
+        raise ValueError("mixed tasks require unique nonempty string ids")
+    for task in tasks:
+        route_id = task.get("route")
+        if route_id not in routes:
+            raise ValueError("each mixed task must select a frozen route")
+        task_class = task.setdefault("task_class", routes[route_id].get("task_class", route_id))
+        if not isinstance(task_class, str) or not task_class:
+            raise ValueError("task_class must be nonempty text")
+        selected = task.get("unit_ids", routes[route_id].get("unit_ids", []))
+        if (not isinstance(selected, list) or any(not isinstance(uid, str) or not uid for uid in selected)
+                or len(set(selected)) != len(selected)
+                or set(selected) - set(routes[route_id].get("unit_ids", []))):
+            raise ValueError("task unit_ids must be a distinct subset of its frozen route Units")
+    pool = list(dict.fromkeys(uid for route in routes.values() for uid in route.get("unit_ids", [])))
+    if "unit_ids" in value and set(value["unit_ids"]) != set(pool):
+        raise ValueError("mixed unit_ids must equal the union of route Unit subsets")
+    value["unit_ids"], value["tasks"] = pool, tasks
+    frozen_routes = {}
+    for route_id, route in routes.items():
+        if "routes" in route:
+            raise ValueError("nested mixed routes are unsupported")
+        route_tasks = [copy.deepcopy(task) for task in tasks if task["route"] == route_id]
+        if not route_tasks:
+            raise ValueError("every route must have a real task")
+        config = copy.deepcopy(route)
+        config.update(id=route.get("id", value["id"] + ":" + route_id),
+                      version=route.get("version", value["version"]), tasks=route_tasks,
+                      representation=copy.deepcopy(value["representation"]))
+        config.pop("tasks_path", None)
+        config.setdefault("model_roles", value.get("model_roles", ["chat"]))
+        config.setdefault("environment_version", value.get("environment_version", "UNKNOWN"))
+        frozen_routes[route_id] = freeze_scene(config, capabilities)
+        for scope in ("criteria", "evaluation_criteria"):
+            if route.get(scope) is not None:
+                from .evaluation import validate_criteria
+                frozen_routes[route_id][scope] = validate_criteria(route[scope])
+        _applicability(route.get("metric_applicability", {}))
+    # Reuse single-scene validation for the shared feature and resource contract.
+    shared = copy.deepcopy(value)
+    shared.pop("routes")
+    shared.pop("tasks_path", None)
+    shared["adapter"] = copy.deepcopy(next(iter(frozen_routes.values()))["adapter"])
+    shared = freeze_scene(shared, capabilities)
+    all_files = {item["path"]: item for route in frozen_routes.values() for item in route["adapter"]["files"]}
+    shared["adapter"]["files"] = list(all_files.values())
+    all_resources = {item["path"]: item for route in frozen_routes.values() for item in route.get("resource_files", [])}
+    all_resources.update({item["path"]: item for item in shared.get("resource_files", [])})
+    shared["resource_files"] = list(all_resources.values())
+    shared["routes"] = frozen_routes
+    shared["model_roles"] = sorted(set(role for route in frozen_routes.values() for role in route["model_roles"]))
+    shared["routing_contract"] = "task-routes/1"
+    for task in shared["tasks"]:
+        _applicability(task.get("metric_applicability", {}))
+    return shared
+
+
+def _applicability(value):
+    if not isinstance(value, dict) or any(not isinstance(key, str) or not key or type(flag) is not bool
+                                          for key, flag in value.items()):
+        raise ValueError("metric_applicability must map metric ids to explicit booleans")
+    return value
+
+
+def task_route(scene, task):
+    """Return the frozen route, rejecting mutable task-to-route remapping."""
+    if not scene.get("routes"):
+        return scene
+    frozen = next((item for item in scene["tasks"] if item["id"] == task.get("id")), None)
+    if (frozen is None or task.get("route") != frozen["route"] or task.get("task_class") != frozen["task_class"]
+            or task.get("unit_ids") != frozen.get("unit_ids")):
+        raise ValueError("task id, route and task_class must match the frozen task mapping")
+    return scene["routes"][frozen["route"]]
+
+
+def task_unit_ids(scene, task):
+    """Installed Units this frozen task may use, for context and shared admission."""
+    route = task_route(scene, task)
+    frozen = next((item for item in scene.get("tasks", []) if item["id"] == task.get("id")), None)
+    if "tasks" in scene and (frozen is None or task.get("unit_ids") != frozen.get("unit_ids")):
+        raise ValueError("task Unit subset must match the frozen task mapping")
+    selected = task.get("unit_ids", route.get("unit_ids", []))
+    if (not isinstance(selected, list) or len(set(selected)) != len(selected)
+            or set(selected) - set(route.get("unit_ids", []))):
+        raise ValueError("task Unit subset is outside its frozen route")
+    return list(selected)
+
+
+def scene_task_criteria(scene, task, fallback, scope="criteria"):
+    if scope not in {"criteria", "evaluation_criteria"}:
+        raise ValueError("unknown route criterion scope")
+    return copy.deepcopy(task_route(scene, task).get(scope, fallback))
+
+
+def route_metric_applicability(scene, task, terminal=None):
+    """Combine frozen task declarations with actual terminal applicability.
+
+    A task/terminal may narrow a route requirement but cannot re-enable an
+    explicitly inapplicable route metric. Missing metrics remain UNKNOWN in the
+    evaluator; they are never silently marked inapplicable here.
+    """
+    route = task_route(scene, task)
+    result = copy.deepcopy(_applicability(route.get("metric_applicability", {})))
+    for declaration in (task.get("metric_applicability", {}), (terminal or {}).get("metric_applicability", {})):
+        for key, flag in _applicability(declaration).items():
+            if result.get(key) is False and flag:
+                raise ValueError("task/terminal cannot enable a route-inapplicable metric: " + key)
+            result[key] = flag
+    return result
+
+
+def route_metric_report(scene, records, criteria=None, evaluation_criteria=None):
+    """Count every arrived record, including failures and absent feedback, per route.
+
+    Defined metrics are seeded before counting. Missing feedback is UNKNOWN unless
+    the frozen declaration explicitly makes that metric inapplicable. No quality
+    values or denominators are combined across routes. Outcomes count final
+    completions/failures and tasks unfinished at the horizon or final close;
+    late_completed is the intersection of completed and horizon-unfinished.
+    """
+    tasks = {task["id"]: task for task in scene["tasks"]}
+    result = {}
+    for record in records:
+        if record.get("status") == "NOT_ARRIVED":
+            continue
+        task = tasks[record["task_id"]]
+        task_route(scene, task)
+        key = task.get("route", scene["id"])
+        bucket = result.setdefault(key, dict(route=key, tasks=0, metrics={}, _records=[],
+            outcomes=dict(completed=0, failed=0, unfinished=0, late_completed=0)))
+        bucket["tasks"] += 1
+        status = record.get("status")
+        bucket["outcomes"]["completed"] += int(status == "DONE")
+        bucket["outcomes"]["failed"] += int(status == "FAILED")
+        bucket["outcomes"]["unfinished"] += int(status == "UNFINISHED" or record.get("deadline_status") == "UNFINISHED")
+        bucket["outcomes"]["late_completed"] += int(status == "DONE" and record.get("deadline_status") == "UNFINISHED")
+        bucket["_records"].append((task, record))
+        for scope, field in (("criteria", "feedback"), ("evaluation_criteria", "independent_feedback")):
+            spec = scene_task_criteria(scene, task, criteria if scope == "criteria" else evaluation_criteria, scope)
+            definitions = {item["id"]: item for item in (spec or {}).get("dimensions", [])}
+            observed = {item["id"]: item for item in (record.get(field) or {}).get("metrics", [])}
+            for mid in dict.fromkeys([*definitions, *observed]):
+                identity = scope + ":" + mid
+                bucket["metrics"].setdefault(identity, dict(id=mid, scope=scope,
+                    definition=copy.deepcopy(definitions.get(mid, observed.get(mid))),
+                    total=0, applicable=0, known=0, unknown=0, not_applicable=0, values=[]))
+    for bucket in result.values():
+        for task, record in bucket.pop("_records"):
+            applicability = route_metric_applicability(scene, task)
+            for row in bucket["metrics"].values():
+                field = "feedback" if row["scope"] == "criteria" else "independent_feedback"
+                metric = next((m for m in (record.get(field) or {}).get("metrics", []) if m["id"] == row["id"]), None)
+                if metric is None:
+                    applicable = applicability.get(row["id"], row["definition"].get("applicable", True))
+                    metric = dict(status="UNKNOWN" if applicable else "NOT_APPLICABLE")
+                status = metric["status"]
+                if status not in {"KNOWN", "UNKNOWN", "NOT_APPLICABLE"}:
+                    raise ValueError("unknown metric status")
+                row["total"] += 1
+                row[status.lower()] += 1
+                row["applicable"] += int(status != "NOT_APPLICABLE")
+                if status == "KNOWN":
+                    row["values"].append(metric["value"])
+    return list(result.values())
 
 
 def _vector(value, size, label):
@@ -347,39 +542,107 @@ class SceneContext:
             call["duration_ms"] = (time.perf_counter() - started) * 1000
 
 
+class RouteCatalog:
+    """Task-facing view of a shared installed catalog, never a capability builder."""
+    def __init__(self, catalog, unit_ids):
+        self._catalog, self._ids = catalog, frozenset(unit_ids)
+        self.facts = catalog.facts
+
+    def _check(self, unit_ids):
+        if set(unit_ids) - self._ids:
+            raise ValueError("Unit is outside the task's frozen route")
+
+    def public(self):
+        return [unit for unit in self._catalog.public() if unit["id"] in self._ids]
+
+    def business_units(self):
+        return [unit for unit in self._catalog.business_units() if unit["id"] in self._ids]
+
+    def tools(self):
+        return [dict(type="function", function=dict(name=unit["tool_name"], description=unit["description"],
+                    parameters=unit["parameters"])) for unit in self.business_units()]
+
+    def name_to_id(self, name):
+        found = [unit["id"] for unit in self.business_units() if unit["tool_name"] == name]
+        if len(found) != 1:
+            raise ValueError("route has no unique native tool with this name")
+        return found[0]
+
+    def unit(self, unit_id):
+        self._check([unit_id])
+        return self._catalog.unit(unit_id)
+
+    def dispatch_status(self, unit_id):
+        self._check([unit_id])
+        return self._catalog.dispatch_status(unit_id)
+
+    def runtime_state(self, unit_ids):
+        self._check(unit_ids)
+        return self._catalog.runtime_state(unit_ids)
+
+    def validate_arguments(self, unit_id, arguments, native_arguments=(), deferred_arguments=()):
+        self._check([unit_id])
+        return self._catalog.validate_arguments(unit_id, arguments, native_arguments, deferred_arguments)
+
+    def invoke(self, unit_id, arguments, native_arguments=()):
+        self._check([unit_id])
+        return self._catalog.invoke(unit_id, arguments, native_arguments)
+
+
 class SceneSession:
     def __init__(self, spec, platform, run_id, profiles=None, catalog=None):
         self.spec, self.platform = spec, platform
         self.catalog = catalog if catalog is not None else FrozenCatalog(platform.catalog, spec.get("unit_ids", []))
+        self.context = SceneContext(platform, run_id, profiles, self.catalog)
+        self.environment, self.route, self.task = None, spec, None
+        self.task_units = list(spec.get("unit_ids", []))
+        self.last = None
+        self._verify(spec)
+        # Mixed factories need their route-restricted context and start at reset.
+        if not spec.get("routes"):
+            self._load(spec)
+
+    @staticmethod
+    def _verify(spec):
         for item in spec["adapter"]["files"]:
             if digest_file(item["path"]) != item["sha256"]:
                 raise ValueError("场景适配源码已改变，请新建运行")
-        for item in spec.get("resource_files", []):
+        for item in spec.get("resource_files", []) + ([spec["tasks_file"]] if spec.get("tasks_file") else []):
             if digest_file(item["path"]) != item["sha256"]:
                 raise ValueError("场景模型／数据资源已改变，请新建运行")
+
+    def _load(self, spec):
+        self._verify(spec)
         adapter = spec["adapter"]
         name = "seampact_scene_" + digest_file(adapter["path"])
         module_spec = importlib.util.spec_from_file_location(name, adapter["path"])
         module = importlib.util.module_from_spec(module_spec)
         sys.modules[name] = module
         module_spec.loader.exec_module(module)
-        self.context = SceneContext(platform, run_id, profiles, self.catalog)
         self.context.model_roles = spec.get("model_roles", ["chat"])
         self.context.native_usage = copy.deepcopy(spec.get("native_usage", {}))
         self.environment = getattr(module, adapter["symbol"])(copy.deepcopy(adapter.get("config", {})), self.context)
-        self.last = None
 
     def _event(self, event):
         started = time.perf_counter()
         if not isinstance(event, dict) or event.get("kind") not in {"decision", "terminal"}:
             raise ValueError("场景必须返回 decision 或真正的 terminal 事件；等待由原环境处理")
+        if self.spec.get("routes"):
+            event.update(route=self.task["route"], task_class=self.task["task_class"], task_id=self.task["id"])
         if event["kind"] == "terminal":
             if type(event.get("terminated")) is not bool or type(event.get("truncated")) is not bool:
                 raise ValueError("终止事件需要明确 terminated/truncated")
             if not (event["terminated"] or event["truncated"]):
                 raise ValueError("非结束快照不能用作 terminal")
+            event["metric_applicability"] = route_metric_applicability(self.spec, self.task or {}, event)
             self.last = event
             return event
+        pool = set(self.task_units)
+        if set(event.get("required_units", [])) - pool:
+            raise ValueError("required_units contains Units outside the task route")
+        # Reject foreign candidates before representation looks up their cards.
+        if any(set(candidate.get("units", [])) - pool for candidate in event.get("candidates", [])):
+            raise ValueError("候选包含当前任务路由以外的 Unit")
         if self.spec.get("representation"):
             represent(event, self.spec["representation"], self.catalog.runtime_state)
         _vector(event.get("observation"), len(self.spec["observation_schema"]), "观测")
@@ -392,7 +655,6 @@ class SceneSession:
         if any(not isinstance(i, str) for i in ids) or len(set(ids)) != len(ids):
             raise ValueError("本次候选需要不重复 id")
         required = set(event.get("required_units", []))
-        pool = set(self.spec.get("unit_ids", []))
         for candidate in candidates:
             _vector(candidate.get("features"), len(self.spec["candidate_schema"]), "候选特征")
             units = set(candidate.get("units", []))
@@ -418,10 +680,25 @@ class SceneSession:
         return event
 
     def reset(self, task, seed):
+        self.last = None
+        self.context.allowed.clear()
         self.context.calls.clear()
         self.context.model_calls.clear()
         self.context.wire_reasoning.clear()
         self.context.upstream_costs = copy.deepcopy(task.get("upstream_costs", {}))
+        if self.spec.get("routes"):
+            route = task_route(self.spec, task)
+            self.close()
+            self.environment = None
+            self.task, self.route = copy.deepcopy(task), route
+            self.task_units = task_unit_ids(self.spec, task)
+            self.context.catalog = RouteCatalog(self.catalog, self.task_units)
+            self._verify(self.spec)
+            self._load(route)
+        else:
+            self.task = copy.deepcopy(task)
+            self.task_units = task_unit_ids(self.spec, task)
+            self.context.catalog = RouteCatalog(self.catalog, self.task_units)
         return self._event(self.environment.reset(copy.deepcopy(task), seed))
 
     def step(self, index):

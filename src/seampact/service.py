@@ -17,8 +17,7 @@ from .inspection import Inspector
 from .intake import RepositoryIntake, inside_platform_checkout, managed_checkout, remove_checkout
 from .providers import Profiles
 from .resources import ResourceRegistry
-from .dependencies import Dependencies, check_requirements, reference as resource_reference
-from .verification import check_candidate
+from .dependencies import Dependencies, reference as resource_reference
 from .revisions import build_review_context, candidate_diff, intervention, declared_result
 from .runtime import Coordinator, OwnerRuntime
 from .scheduler import TwoLayerScheduler
@@ -407,6 +406,8 @@ class Platform:
             if source.get("analysis_id") != job["id"]:
                 job["status"] = "CANCELLED"
                 return []
+            if not job["submitted"].get("report"):
+                job["submitted"]["report"] = self.analysis._check_candidate(inspector, job["submitted"]["candidate"])
             self.dependencies.record(inspector, job["submitted"]["candidate"])
             units = self.catalog.install(inspector, job["submitted"]["candidate"], job["id"])
             source.update(status="ANALYZED", analysis_id=job["id"], installation_id=job["id"], error=None,
@@ -810,9 +811,7 @@ class Platform:
             if (not isinstance(candidate.get("runtime_groups"), list)
                     or (candidate.get("entries") and not candidate["runtime_groups"])):
                 raise ValueError("完整候选需要 runtime_groups 数组，存在入口时必须列出完整运行组")
-            report = check_candidate(inspector, candidate)
-            report["dependencies"] = check_requirements(inspector, candidate)
-            report["entry_bindings"] = self.catalog.inspect_candidate(inspector, candidate)
+            report = self.analysis._check_candidate(inspector, candidate)
         except Exception as error:
             revision.update(status="FAILED", error=str(error), checked_digest=None, updated_at=now())
             self._revision_action(revision, "CHECK_FAILED", attribution,
@@ -1087,7 +1086,8 @@ class Platform:
                           reason=bindings.get(entry.get("id"), {}).get("reason"))
                      for entry in content.get("entries", [])],
             dependency_count=len(content.get("dependencies", [])), missing=content.get("missing", []),
-            issues=report.get("issues", []), execution=report.get("execution", "NOT_RUN"))
+            issues=report.get("issues", []), execution=report.get("execution", "NOT_RUN"),
+            classification=report.get("classification"), entry_readiness=report.get("entry_readiness", []))
 
     def analysis_snapshot(self, analysis_id):
         """Export observation metadata without source messages or machine configuration."""
@@ -1166,7 +1166,7 @@ class Platform:
         messages = job.get("messages") or []
         replies = {message.get("tool_call_id"): message for message in messages
                    if isinstance(message, dict) and message.get("role") == "tool"}
-        tool_names = {"list_source", "read_file", "inspect_symbols", "inspect_construction", "list_structure",
+        tool_names = {"list_source", "read_file", "inspect_symbols", "inspect_construction", "inspect_harness", "list_structure",
                       "inspect_imports", "entry_candidates", "list_resources", "add_source", "check_candidate",
                       "submit_candidate", "check_preprocessing", "submit_preprocessing"}
         tools = []
