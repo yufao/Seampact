@@ -323,7 +323,7 @@ def build_review_context(old_inspector, new_inspector, store=None, home=None):
             if path in changed:
                 facts.append(cached)
             if cached.get("imports") or cached.get("entry_candidates") or cached.get("registration_candidates"):
-                references.append(dict(path=path, fact_id=key, changed=path in changed,
+                references.append(dict(path=path, sha256=record["sha256"], fact_id=key, changed=path in changed,
                     kinds=[name for name in ("imports", "entry_candidates", "registration_candidates") if cached.get(name)]))
     finally:
         if owned:
@@ -332,5 +332,6 @@ def build_review_context(old_inspector, new_inspector, store=None, home=None):
         changed_symbols=[dict(path=fact["path"], change="CHANGED_FILE_RECHECK", **symbol)
                          for fact in facts for symbol in fact.get("symbols", [])],
         coverage="FILE_LOCAL_FACTS_ONLY; dynamic dependencies/registration UNKNOWN; unchanged files may be affected",
+        mappings="REQUIRE_CURRENT_CHECK", resource_selections="REQUIRE_CURRENT_CHECK",
         access="Full frozen source remains queryable through source_tools; add_source changes source_version and requires a fresh review.",
         permissions="NOT_REUSED; complete candidate requires current mechanical checks")

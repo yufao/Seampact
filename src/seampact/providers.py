@@ -267,7 +267,8 @@ class Profiles:
         # Credentials have a separate identity/version; neither keys nor their hashes
         # are part of the execution configuration's model/resource identity.
         fields = {name: connection.get(name) for name in ("protocol", "base_url", "model", "parameters",
-                  "service_capabilities", "service_version", "declared_max_output_tokens")}
+                  "service_capabilities", "service_version", "declared_max_output_tokens",
+                  "declared_context_window", "context_management")}
         return hashlib.sha256(json.dumps(fields, ensure_ascii=False, sort_keys=True,
             separators=(",", ":"), allow_nan=False).encode("utf-8")).hexdigest()
 
@@ -421,6 +422,12 @@ class Profiles:
             ceiling = body.get("max_output_tokens", previous.get("declared_max_output_tokens"))
             if ceiling is not None and (type(ceiling) is not int or ceiling < 1):
                 raise ValueError("provider output capability must be a positive integer or null")
+            window = body.get('context_window', previous.get('declared_context_window'))
+            if window is not None and (type(window) is not int or window < 1):
+                raise ValueError('context window must be a positive integer or null')
+            manage = body.get('context_management', previous.get('context_management', True))
+            if type(manage) is not bool:
+                raise ValueError('context management must be true or false')
             version = body.get("service_version", previous.get("service_version"))
             if version is not None and not isinstance(version, str):
                 raise ValueError("service version must be a string or null")
@@ -428,6 +435,7 @@ class Profiles:
                 model=model.strip(), provider=provider_name(base), service_capabilities=sorted(set(declared)),
                 parameters=self._parameters(body.get("parameters", previous.get("parameters", {}))),
                 service_version=version, declared_max_output_tokens=ceiling,
+                declared_context_window=window, context_management=manage,
                 created_at=previous.get("created_at", now()), updated_at=now())
             if protocol == "openai-compatible" and connection_id in self.roles.values():
                 completion_parameters(replacement)
@@ -531,7 +539,7 @@ class Profiles:
         if not model:
             raise ValueError("provide a model ID")
         update = dict(id=connection_id, base_url=base, model=model)
-        for name in ("name", "parameters", "auth", "service_version", "max_output_tokens"):
+        for name in ("name", "parameters", "auth", "service_version", "max_output_tokens", "context_window", "context_management"):
             if name in body:
                 update[name] = body[name]
         if "service_version" not in body and (base != previous.get("base_url") or model != previous.get("model")):
@@ -564,7 +572,8 @@ class Profiles:
             # Profile snapshots may enter analysis and run artifacts. Only the
             # declared nonsecret configuration contract is copied into them.
             fields = ("id", "name", "protocol", "base_url", "model", "provider", "service_capabilities",
-                      "parameters", "service_version", "declared_max_output_tokens", "docs", "revision",
+                      "parameters", "service_version", "declared_max_output_tokens", "declared_context_window",
+                      "context_management", "docs", "revision",
                       "created_at", "updated_at", "config_digest")
             connection = {name: copy.deepcopy(stored[name]) for name in fields if name in stored}
             connection["parameters"] = self._parameters(connection.get("parameters", {}))
@@ -584,9 +593,62 @@ class Profiles:
 
 
 class ProviderError(RuntimeError):
-    def __init__(self, message, *, kind=None):
+    def __init__(self, message, *, kind=None, diagnostic=None):
         super().__init__(message)
         self.kind = kind
+        self.diagnostic = diagnostic
+
+
+def _http_diagnostic(error):
+    """Classify a bounded error body without retaining provider-supplied text."""
+    status = error.code
+    category = ("authentication" if status in (401, 403) else
+                "rate_limit" if status == 429 else
+                "request_too_large" if status == 413 else
+                "server" if 500 <= status <= 599 else
+                "invalid_request" if status == 400 else "unknown")
+    fields = {}
+    try:
+        raw = error.read(16385)
+        if len(raw) <= 16384:
+            payload = json.loads(raw)
+            if isinstance(payload, dict):
+                fields = payload.get("error", payload)
+                if not isinstance(fields, dict):
+                    fields = {}
+    except (OSError, ValueError, TypeError, RecursionError, http.client.IncompleteRead):
+        pass
+    # Only inspect these three fields; neither the original text nor arbitrary
+    # provider data is carried into the exception or its diagnostic.
+    text = " ".join(value.lower() for name in ("code", "type", "message")
+                    if isinstance((value := fields.get(name)), str))
+    if status not in (401, 403, 413, 429) and not 500 <= status <= 599:
+        if (re.search(r"context[_ -]?(length|window)|maximum context|context.{0,30}(too long|exceed|limit)", text)):
+            category = "context_length"
+        elif re.search(r"(request|payload|body|content)[_ -]?(too[_ -]?(large|big)|size[_ -]?limit)|"
+                       r"(request|payload|body).{0,30}(too large|too big|size limit|size.{0,20}exceed)", text):
+            category = "request_too_large"
+        elif re.search(r"(max_tokens|max_completion_tokens|max_output_tokens|output[_ -]?(tokens|limit)).{0,80}"
+                       r"(exceed|too (large|high|many)|maximum|limit|invalid|range|less than|greater than)|"
+                       r"(output[_ -]?limit|invalid[_ -]?max[_ -]?tokens)", text):
+            category = "output_limit"
+    diagnostic = {"http_status": status, "category": category}
+    # Recognized numeric fields only, and only plausible positive token counts.
+    for name in ("max_context_tokens", "max_output_tokens", "requested_tokens"):
+        value = fields.get(name)
+        if type(value) is int and 0 < value <= 100000000:
+            diagnostic[name] = value
+    reasons = {
+        "context_length": "输入超出上下文长度限制",
+        "request_too_large": "请求内容超过大小限制",
+        "output_limit": "输出 token 参数超出限制",
+        "invalid_request": "请求参数或内容无效",
+        "authentication": "认证或访问权限失败",
+        "rate_limit": "请求频率或额度受限",
+        "server": "供应商服务发生错误",
+        "unknown": "供应商拒绝请求，原因未知",
+    }
+    return diagnostic, reasons[category]
 
 
 class Transport:
@@ -605,7 +667,7 @@ class Transport:
             with urllib.request.build_opener(NoRedirect).open(request, timeout=600) as response:
                 return json.load(response)
         except urllib.error.HTTPError as error:
-            raise ProviderError(f"provider HTTP {error.code}") from None
+            diagnostic, reason = _http_diagnostic(error)
         except (http.client.IncompleteRead, http.client.RemoteDisconnected) as error:
             raise ProviderError(
                 f"provider response/{type(error).__name__}：模型响应接收中断，本次响应未完整取得",
@@ -630,6 +692,10 @@ class Transport:
         except (OSError, ValueError) as error:
             raise ProviderError(f"provider transport/{type(error).__name__}",
                                 kind="transport" if isinstance(error, OSError) else "invalid_response") from None
+        # Raise outside the handler so the original HTTPError and body are not
+        # retained in the new exception's implicit context.
+        raise ProviderError(f"provider HTTP {diagnostic['http_status']}：{reason}",
+                            kind=diagnostic["category"], diagnostic=diagnostic)
 
 
 def request_parameters(profile, reserved):

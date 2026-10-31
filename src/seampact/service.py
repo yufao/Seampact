@@ -11,7 +11,7 @@ import time
 from pathlib import Path, PurePosixPath, PureWindowsPath
 
 from . import __version__
-from .analysis import AnalysisJobs, content_digest
+from .analysis import AnalysisJobs, content_digest, preparation_input
 from .chat import ChatJobs
 from .inspection import Inspector
 from .intake import RepositoryIntake, inside_platform_checkout, managed_checkout, remove_checkout
@@ -244,8 +244,13 @@ class Platform:
         return record
 
     def _environment_guard(self, source):
-        if source.get("status") in {"DETACHED", "ANALYZING"} or (source.get("target_runtime") or {}).get("status") == "PREPARING":
-            raise ValueError("请先结束当前分析或环境准备，再调整运行环境")
+        if source.get("status") == "DETACHED":
+            raise ValueError("来源已摘除，请先重新接入")
+        if (source.get("target_runtime") or {}).get("status") == "PREPARING":
+            raise ValueError("目标解释器正在准备，请等待完成")
+        # Source status records the start, while the analysis job owns its
+        # eventual outcome. Failed/interrupted jobs must not leave a stale
+        # ANALYZING marker blocking a fresh request. Callers hold source_lock.
         if self._source_analysis_running(source["id"]):
             raise ValueError("该来源仍有模型分析或修订正在进行，请等待完成")
         if self.catalog.source_running(source["id"]):
@@ -521,8 +526,17 @@ class Platform:
         self._refresh_revision_scope(revision, inspector)
         return inspector
 
-    def _refresh_revision_scope(self, revision, inspector):
-        if inspector.request["source_version"] == revision["source_version"]:
+    @staticmethod
+    def _revision_material_basis(inspector, implementation):
+        """Identify readable materials; this does not preserve a check permission."""
+        return dict(source_version=inspector.request["source_version"],
+            input_digest=content_digest(preparation_input(inspector)), implementation=copy.deepcopy(implementation))
+
+    def _refresh_revision_scope(self, revision, inspector, implementation=None, checked=False):
+        implementation = (self.analysis.freeze_implementation(inspector)
+                          if implementation is None else implementation)
+        basis = self._revision_material_basis(inspector, implementation)
+        if basis == (revision.get("materials") or {}).get("basis"):
             return
         # add_source persists its expanded request even when the model later fails.
         # Manual checks and a new attempt must use that same scope and materials.
@@ -530,8 +544,13 @@ class Platform:
         prior = self.store.get("request", base["request_id"])
         context = build_review_context(Inspector(revision["proposed_source"]["root"],
             self.home / "snapshots", prior), inspector, self.store)
+        context["basis"] = basis
         revision.update(source_version=inspector.request["source_version"],
-            source_diff=context["source_diff"], materials=context, reuse=context["reuse"], updated_at=now())
+            source_diff=context["source_diff"], materials=context, reuse=context["reuse"],
+            implementation=copy.deepcopy(implementation), updated_at=now())
+        if not checked:
+            revision.update(status="DRAFT", report=None, checked_digest=None)
+            revision.pop("check_identity", None)
         revision.update(result=declared_result(), result_basis=None)
         self.store.save("analysis_revision", revision["id"], revision)
 
@@ -603,6 +622,7 @@ class Platform:
                 build_review_context(old_inspector, old_inspector, self.store)
                 context = build_review_context(old_inspector, inspector, self.store)
                 implementation = self.analysis.freeze_implementation(inspector)
+                context["basis"] = self._revision_material_basis(inspector, implementation)
                 candidate = copy.deepcopy(base["submitted"]["candidate"])
                 revision = dict(schema="analysis-revision/2", id=rid, harness_id=source["id"],
                     base_analysis_id=base["id"], base_candidate_digest=content_digest(candidate),
@@ -801,6 +821,7 @@ class Platform:
         import sys
         target = inspector.request.get("target_runtime") or {}
         return dict(request_id=inspector.request["id"], source_version=inspector.request["source_version"],
+            input_digest=content_digest(preparation_input(inspector)),
             candidate_digest=revision["candidate_digest"], implementation=copy.deepcopy(revision["implementation"]),
             rules_digest=content_digest(inspector.request.get("rules")),
             entry_profile_digest=content_digest(inspector.request.get("entry_profile")),
@@ -854,8 +875,22 @@ class Platform:
             revision = self._editable_revision(body.get("revision_id"))
             if self._source_analysis_running(revision["harness_id"]):
                 raise ValueError("该来源还有模型分析正在进行")
-            prior_report = revision.get("report") or (
-                (self.store.get("analysis", revision["base_analysis_id"]) or {}).get("submitted") or {}).get("report")
+            prior_report = revision.get("report")
+            if prior_report is not None:
+                prior_report_basis = copy.deepcopy(revision.get("check_identity") or {})
+                prior_report_basis["analysis_id"] = revision.get("analysis_id")
+            else:
+                base = self.store.get("analysis", revision["base_analysis_id"]) or {}
+                prior_report = (base.get("submitted") or {}).get("report")
+                request = self.store.get("request", base.get("request_id"))
+                prior_report_basis = dict(analysis_id=base.get("id"), request_id=base.get("request_id"),
+                    implementation=copy.deepcopy(base.get("implementation")),
+                    candidate_digest=content_digest((base.get("submitted") or {}).get("candidate")))
+                if request:
+                    prior = Inspector(revision["proposed_source"]["root"], self.home / "snapshots", request)
+                    prior_report_basis.update(source_version=request.get("source_version"),
+                        input_digest=content_digest(preparation_input(prior)))
+            prior_report_basis["scope"] = "HISTORICAL_CHECK_ONLY; current complete candidate requires recheck"
             self._save_revision(revision, body, "REFINE_REQUEST")
             try:
                 inspector = self._revision_inspector(revision)
@@ -869,12 +904,14 @@ class Platform:
                 raise
             materials = revision["materials"]
             facts = {key: materials.get(key) for key in
-                ("changed_symbols", "related_candidates", "reuse", "coverage", "permissions")}
+                ("basis", "changed_symbols", "related_candidates", "reuse", "coverage", "permissions",
+                 "mappings", "resource_selections")}
             facts["changed_files"] = materials.get("facts", [])
             repair = dict(revision_id=revision["id"], base_analysis_id=revision["base_analysis_id"],
                 base_candidate_digest=revision["base_candidate_digest"], candidate=revision["candidate"],
                 mode=revision["mode"], guidance=revision["guidance"], reason=revision["reason"],
-                source_diff=revision["source_diff"], facts=facts, prior_report=prior_report)
+                source_diff=revision["source_diff"], facts=facts, prior_report=prior_report,
+                prior_report_basis=prior_report_basis)
             aid = uuid.uuid4().hex
             prior_analysis_id = revision.get("analysis_id")
             revision.update(status="ANALYZING", analysis_id=aid, error=None, updated_at=now())
@@ -909,7 +946,7 @@ class Platform:
             processed_analysis_id=job["id"], usage=job.get("usage", []), updated_at=now(), error=None)
         if content_digest(before) != revision["candidate_digest"]:
             revision.update(result=declared_result(), result_basis=None)
-        self._refresh_revision_scope(revision, inspector)
+        self._refresh_revision_scope(revision, inspector, implementation=job["implementation"], checked=True)
         revision["implementation"] = copy.deepcopy(job["implementation"])
         revision["check_identity"] = self._revision_check_identity(revision, inspector)
         self._revision_action(revision, "MODEL_REFINEMENT",

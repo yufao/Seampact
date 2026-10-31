@@ -1,6 +1,6 @@
 [project]
 name = "seampact-core"
-version = "0.14.8"
+version = "0.14.9"
 description = "Heterogeneous Harness intake, native Units and two-layer RL chat prototype"
 requires-python = ">=3.11"
 dependencies = []

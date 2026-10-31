@@ -141,6 +141,7 @@ class RevisionFeedbackChecks(unittest.TestCase):
         candidate = dict(revision["candidate"], label="model candidate")
         job = dict(id="model-1", revision_id="r", implementation={"verification.py": "hash"},
             submitted=dict(candidate=candidate, report={"status": "CHECKED"}))
+        self.platform._refresh_revision_scope = lambda *args, **kwargs: None
         self.platform._complete_revision(inspector, job)
         saved = self.store.get("analysis_revision", "r")
         event = saved["provenance"][-1]

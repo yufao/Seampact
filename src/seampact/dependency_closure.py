@@ -18,11 +18,54 @@ from .inspection import units
 from .execution_context import process_context
 
 
-@dataclass(frozen=True)
+@dataclass(eq=False)
 class _Function:
     path: str
     name: str
     node: object
+    closure: object = None
+    method_kind: str = ""
+    defaults: object = None
+    owner: object = None
+
+
+@dataclass(eq=False)
+class _Class:
+    path: str
+    name: str
+    node: object
+    attributes: dict
+    bases: list
+    fields: dict
+    dataclass_init: bool = False
+    problem: str = ""
+
+
+@dataclass(frozen=True)
+class _Unsupported:
+    reason: str
+    path: str
+    node: object
+
+
+@dataclass(frozen=True)
+class _BoundMethod:
+    function: _Function
+    receiver: object
+
+
+@dataclass(frozen=True)
+class _Super:
+    cls: _Class
+    receiver: object
+
+
+@dataclass(frozen=True)
+class _Field:
+    default: object = None
+    factory: object = None
+    init: bool = True
+    kw_only: bool = False
 
 
 @dataclass(frozen=True)
@@ -41,6 +84,7 @@ class _Instance:
     """Opaque external result, with only explicit original attribute writes."""
     origin: str
     attributes: dict
+    local_class: object = None
 
 
 @dataclass(frozen=True)
@@ -60,11 +104,20 @@ def _branch_environment(env):
     # becoming evidence in its sibling. Frozen callable ASTs are shared.
     memo = {}
     def clone(value):
-        if not isinstance(value, (dict, list, _Instance)):
+        if isinstance(value, _Function) and value.closure is None:
+            return value
+        if not isinstance(value, (dict, list, _Instance, _Function, _BoundMethod)):
             return value
         if id(value) in memo:
             return memo[id(value)]
-        result = _Instance(value.origin, {}) if isinstance(value, _Instance) else {} if isinstance(value, dict) else []
+        if isinstance(value, _Function):
+            result = _Function(value.path, value.name, value.node, None, value.method_kind, value.defaults, value.owner)
+            memo[id(value)] = result
+            result.closure = clone(value.closure) if value.closure is not None else None
+            return result
+        if isinstance(value, _BoundMethod):
+            return _BoundMethod(clone(value.function), clone(value.receiver))
+        result = _Instance(value.origin, {}, value.local_class) if isinstance(value, _Instance) else {} if isinstance(value, dict) else []
         memo[id(value)] = result
         if isinstance(value, _Instance):
             result.attributes.update((k, clone(v)) for k, v in value.attributes.items())
@@ -80,6 +133,7 @@ class _Closure:
     def __init__(self, inspector, candidate):
         self.inspector, self.candidate = inspector, candidate
         self.modules, self.loading = {}, set()
+        self.unavailable_modules = set()
         self.steps, self.active = 0, set()
         self.calls, self.unknown, self.processes = [], [], []
         self.visited = set()
@@ -89,7 +143,12 @@ class _Closure:
         return ast.parse(dict(units(path, self.inspector.data(path)))["file"])
 
     def unknown_target(self, path, node, target, reason):
-        row = dict(target=target, reason=reason, evidence=[_cite(path, node)])
+        code = ("dependency_closure_limit" if reason.startswith("finite_") else
+                "dependency_closure_unresolved" if reason in {"frozen_source_unavailable", "local_call_source_unavailable",
+                                                               "subprocess_source_unavailable", "local_base_source_unavailable"} else
+                "dependency_closure_unsupported")
+        row = dict(target=target, reason=reason, issue_code=code,
+                   scope="source" if code == "dependency_closure_unresolved" else "rule", evidence=[_cite(path, node)])
         if row not in self.unknown:
             self.unknown.append(row)
 
@@ -135,8 +194,15 @@ class _Closure:
         self.import_roots.setdefault(path, self.roots(path))
         try:
             tree = self.tree(path)
-        except (ValueError, SyntaxError, KeyError, OSError):
-            self.unknown.append(dict(target=path, reason="frozen_source_unavailable", evidence=[]))
+        except SyntaxError as error:
+            location = ast.Pass(lineno=error.lineno or 1, end_lineno=error.end_lineno or error.lineno or 1)
+            self.unknown_target(path, location, path, "source_syntax_rule_unsupported")
+            self.unavailable_modules.add(path)
+            return env
+        except (ValueError, KeyError, OSError):
+            self.unavailable_modules.add(path)
+            self.unknown.append(dict(target=path, reason="frozen_source_unavailable",
+                                     issue_code="dependency_closure_unresolved", scope="source", evidence=[]))
             return env
         # Module setup imports/definitions/constants, never unused bodies.
         for node in tree.body:
@@ -157,12 +223,162 @@ class _Closure:
                 # rule. Invalidate affected values rather than use stale constants.
                 for child in ast.walk(node):
                     if isinstance(child, ast.Name) and isinstance(child.ctx, (ast.Store, ast.Del)):
-                        env[child.id] = None
+                        env[child.id] = _Unsupported("module_binding_control_flow_unsupported", path, child)
                     if isinstance(child, ast.Call) and isinstance(child.func, ast.Attribute):
                         receiver = child.func.value
                         if isinstance(receiver, ast.Name) and isinstance(env.get(receiver.id), (dict, list)):
                             env[receiver.id] = None
         return env
+
+    def class_attribute(self, cls, name):
+        if cls.problem:
+            return _Unsupported(cls.problem, cls.path, cls.node)
+        if name in cls.attributes:
+            return cls.attributes[name]
+        if cls.bases:
+            base = cls.bases[0]
+            if isinstance(base, _Class):
+                return self.class_attribute(base, name)
+            if isinstance(base, _External) and not base.local:
+                # Opaque third-party base: do not read or enumerate its methods.
+                return _External(base.name + "." + name)
+            return _Unsupported("dynamic_inheritance_unsupported", cls.path, cls.node)
+        return None
+
+    def class_definition(self, node, env, path, scope):
+        cls = _Class(path, node.name, node, {}, [], {})
+        # Resolve only explicit bases; never inspect unrelated external classes.
+        cls.bases = [_External("builtins.object") if isinstance(base, ast.Name) and base.id == "object" and "object" not in env else
+                     self.value(base, env, path, scope, setup=True) for base in node.bases]
+        if len(cls.bases) > 1 or node.keywords or any(not isinstance(b, (_Class, _External)) for b in cls.bases):
+            cls.problem = "dynamic_inheritance_unsupported"
+        if any(isinstance(b, _External) and b.local for b in cls.bases):
+            cls.problem = "local_base_source_unavailable"
+        if any(isinstance(b, _Class) and b.problem for b in cls.bases):
+            cls.problem = "inherited_class_protocol_unsupported"
+        dataclass_options = None
+        for decorator in node.decorator_list:
+            target = decorator.func if isinstance(decorator, ast.Call) else decorator
+            resolved = self.value(target, env, path, scope, setup=True)
+            if isinstance(resolved, _External) and resolved.name == "dataclasses.dataclass":
+                options = {k.arg: k.value.value for k in decorator.keywords if isinstance(k.value, ast.Constant)} if isinstance(decorator, ast.Call) else {}
+                if isinstance(decorator, ast.Call) and (decorator.args or len(options) != len(decorator.keywords)):
+                    cls.problem = "dataclass_options_unsupported"
+                elif any(k not in {"init", "repr", "eq", "order", "unsafe_hash", "frozen", "match_args", "kw_only", "slots", "weakref_slot"} or not isinstance(v, bool) for k, v in options.items()):
+                    cls.problem = "dataclass_options_unsupported"
+                dataclass_options = options
+            else:
+                cls.problem = "decorated_class_target_unsupported"
+        if dataclass_options is not None and cls.bases and isinstance(cls.bases[0], _Class):
+            cls.fields.update(cls.bases[0].fields)
+        class_env = env.copy()
+        for child in node.body:
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                kind = "unsupported" if child.decorator_list else "instance"
+                if len(child.decorator_list) == 1:
+                    decorator = child.decorator_list[0]
+                    if isinstance(decorator, ast.Name) and decorator.id in {"staticmethod", "classmethod"} and decorator.id not in env:
+                        kind = decorator.id
+                function = _Function(path, node.name + "." + child.name, child,
+                                     env if scope != "<module>" else None, kind)
+                function.owner = cls
+                function.defaults = self.function_defaults(child, class_env, path, scope)
+                cls.attributes[child.name] = class_env[child.name] = function
+                if child.name in {"__new__", "__getattr__", "__getattribute__", "__setattr__"}:
+                    cls.problem = "custom_class_protocol_unsupported"
+            elif isinstance(child, (ast.Assign, ast.AnnAssign)):
+                value = None
+                field = None
+                if isinstance(child, ast.AnnAssign) and dataclass_options is not None:
+                    field = _Field(kw_only=dataclass_options.get("kw_only", False))
+                    call = child.value
+                    callee = self.value(call.func, class_env, path, scope, setup=True) if isinstance(call, ast.Call) else None
+                    if isinstance(callee, _External) and callee.name == "dataclasses.field":
+                        options = {k.arg: self.value(k.value, class_env, path, scope, setup=True) for k in call.keywords}
+                        if call.args or any(k not in {"default", "default_factory", "init", "kw_only", "repr", "compare", "hash", "metadata"} for k in options):
+                            cls.problem = "dataclass_field_unsupported"
+                        field = _Field(options.get("default"), options.get("default_factory"), options.get("init", True), options.get("kw_only", field.kw_only))
+                        value = field.default
+                    else:
+                        value = self.value(child.value, class_env, path, scope, setup=True)
+                        field = _Field(value, kw_only=field.kw_only)
+                    if isinstance(child.target, ast.Name):
+                        # ClassVar/InitVar need different generated constructor semantics.
+                        annotation = ast.unparse(child.annotation)
+                        if "ClassVar" in annotation or "InitVar" in annotation:
+                            cls.problem = "dataclass_annotation_unsupported"
+                        cls.fields[child.target.id] = field
+                else:
+                    value = self.value(child.value, class_env, path, scope, setup=True)
+                for target in child.targets if isinstance(child, ast.Assign) else [child.target]:
+                    self.bind(target, value, class_env)
+                    if isinstance(target, ast.Name):
+                        cls.attributes[target.id] = value
+            elif not isinstance(child, ast.Pass) and not (isinstance(child, ast.Expr) and isinstance(child.value, ast.Constant)):
+                cls.problem = "class_body_rule_unsupported"
+        cls.dataclass_init = dataclass_options is not None and dataclass_options.get("init", True) and "__init__" not in cls.attributes
+        return cls
+
+    def construct(self, cls, args, kwargs, path, scope, node):
+        if cls.problem:
+            self.unknown_target(path, node, cls.name, cls.problem)
+            self.unknown_target(cls.path, cls.node, cls.name, cls.problem)
+            return _Unsupported(cls.problem, cls.path, cls.node)
+        edge = dict(source_path=path, source_symbol=scope, target_path=cls.path,
+                    target_symbol=cls.name, evidence=[_cite(path, node)])
+        if edge not in self.calls:
+            self.calls.append(edge)
+        self.visited.add((cls.path, cls.name))
+        instance = _Instance(cls.name + "()", {}, cls)
+        if cls.dataclass_init:
+            position = 0
+            for name, field in cls.fields.items():
+                value = field.default
+                if field.init and name in kwargs:
+                    value = kwargs[name]
+                elif field.init and not field.kw_only and position < len(args):
+                    value = args[position]
+                    position += 1
+                elif field.factory is not None:
+                    value = self.call_value(field.factory, [], {}, path, scope, node)
+                instance.attributes[name] = value
+            post = self.class_attribute(cls, "__post_init__")
+            if isinstance(post, _Function):
+                self.invoke(post, [instance], {}, path, scope, node)
+        else:
+            init = self.class_attribute(cls, "__init__")
+            if isinstance(init, _Function):
+                self.invoke(init, [instance] + args, kwargs, path, scope, node)
+            elif isinstance(init, _Unsupported):
+                self.unknown_target(path, node, cls.name, init.reason)
+        return instance
+
+    def call_value(self, function, args, kwargs, path, scope, node):
+        if isinstance(function, _BoundMethod):
+            return self.invoke(function.function, [function.receiver] + args, kwargs, path, scope, node)
+        if isinstance(function, _Function):
+            return self.invoke(function, args, kwargs, path, scope, node)
+        if isinstance(function, _Class):
+            return self.construct(function, args, kwargs, path, scope, node)
+        if isinstance(function, _Instance) and function.local_class is not None:
+            method = self.class_attribute(function.local_class, "__call__")
+            if isinstance(method, _Function):
+                return self.invoke(method, [function] + args, kwargs, path, scope, node)
+            self.unknown_target(path, node, function.origin, "instance_call_protocol_unsupported")
+        if isinstance(function, _Unsupported):
+            self.unknown_target(path, node, ast.unparse(node.func) if isinstance(node, ast.Call) else scope, function.reason)
+            self.unknown_target(function.path, function.node, scope, function.reason)
+        elif isinstance(function, _External) and function.local:
+            self.unknown_target(path, node, function.name, "local_call_source_unavailable")
+        elif function is None:
+            self.unknown_target(path, node, scope, "dynamic_call_target_unresolved")
+        return None
+
+    def function_defaults(self, node, env, path, scope):
+        parameters = node.args.posonlyargs + node.args.args
+        defaults = dict(zip([p.arg for p in parameters[-len(node.args.defaults):]], node.args.defaults)) if node.args.defaults else {}
+        defaults.update((p.arg, value) for p, value in zip(node.args.kwonlyargs, node.args.kw_defaults) if value is not None)
+        return {name: self.value(value, env, path, scope, setup=True) for name, value in defaults.items()}
 
     def bind(self, target, value, env):
         if isinstance(target, ast.Name):
@@ -183,11 +399,11 @@ class _Closure:
                     return env.get(node.id)
                 if isinstance(node, ast.Attribute):
                     parent = receiver(node.value)
-                    if isinstance(parent, _Instance):
+                    if isinstance(parent, (_Instance, _Class)):
                         return parent.attributes.get(node.attr)
                 return None
             parent = receiver(target.value)
-            if isinstance(parent, _Instance):
+            if isinstance(parent, (_Instance, _Class)):
                 parent.attributes[target.attr] = value
                 return
             root = target.value
@@ -211,13 +427,41 @@ class _Closure:
         if isinstance(node, ast.Attribute):
             parent = self.value(node.value, env, path, scope, setup)
             if isinstance(parent, _Module):
-                return self.module(parent.path).get(node.attr)
+                module = self.module(parent.path)
+                if parent.path in self.unavailable_modules:
+                    return _External(parent.path + "." + node.attr, True)
+                return module.get(node.attr, _Unsupported("source_export_rule_unsupported", path, node))
             if isinstance(parent, _External):
                 if parent.name == "sys" and node.attr == "executable":
                     return "python"
                 return _External(parent.name + "." + node.attr, parent.local)
+            if isinstance(parent, _Unsupported):
+                return parent
+            if isinstance(parent, _Super):
+                base = parent.cls.bases[0] if parent.cls.bases else None
+                if isinstance(base, _Class):
+                    member = self.class_attribute(base, node.attr)
+                    return _BoundMethod(member, parent.receiver) if isinstance(member, _Function) else member
+                if isinstance(base, _External):
+                    return _External(base.name + "." + node.attr, base.local)
+                return _Unsupported("super_dispatch_unsupported", path, node)
             if isinstance(parent, _Instance):
-                return parent.attributes.get(node.attr, _External(parent.origin + '.' + node.attr))
+                if node.attr in parent.attributes:
+                    return parent.attributes[node.attr]
+                if parent.local_class is None:
+                    return _External(parent.origin + '.' + node.attr)
+                member = self.class_attribute(parent.local_class, node.attr)
+                if isinstance(member, _Function):
+                    if member.method_kind == "unsupported":
+                        self.unknown_target(path, node, member.name, "decorated_method_target_unsupported")
+                        return _Unsupported("decorated_method_target_unsupported", member.path, member.node)
+                    return member if member.method_kind == "staticmethod" else _BoundMethod(
+                        member, parent.local_class if member.method_kind == "classmethod" else parent)
+                return member if member is not None else _Unsupported("local_attribute_target_unsupported", path, node)
+            if isinstance(parent, _Class):
+                member = self.class_attribute(parent, node.attr)
+                return (_BoundMethod(member, parent) if isinstance(member, _Function) and member.method_kind == "classmethod" else
+                        member if member is not None else _Unsupported("local_attribute_target_unsupported", path, node))
             if isinstance(parent, _Path):
                 if node.attr == "parent":
                     return _Path(posixpath.dirname(parent.value) or ".")
@@ -278,6 +522,12 @@ class _Closure:
             args = [self.value(a, env, path, scope, setup) for a in node.args]
             kwargs = {k.arg: self.value(k.value, env, path, scope, setup) for k in node.keywords}
             name = function.name if isinstance(function, _External) else ast.unparse(node.func)
+            if function is None and name == "super" and "super" not in env:
+                cls = args[0] if len(args) == 2 else env.get("<method_class>")
+                receiver = args[1] if len(args) == 2 else env.get("<method_self>")
+                if isinstance(cls, _Class) and receiver is not None:
+                    return _Super(cls, receiver)
+                return _Unsupported("super_dispatch_unsupported", path, node)
             if args and ((isinstance(function, _External) and name == "pathlib.Path") or
                          (function is None and name == "str" and "str" not in env)):
                 if name == "str":
@@ -297,15 +547,19 @@ class _Closure:
                     # update/delete/escape to a method.
                     receiver.clear()
                 # Standard executor callback registration is a real call edge.
-                if node.func.attr in {"submit", "map"} and args and isinstance(args[0], _Function) and not setup:
-                    self.invoke(args[0], args[1:], {}, path, scope, node)
+                if node.func.attr in {"submit", "map"} and args and isinstance(args[0], (_Function, _BoundMethod)) and not setup:
+                    self.call_value(args[0], args[1:], {}, path, scope, node)
             if setup:
                 for value in args + list(kwargs.values()):
                     if isinstance(value, (dict, list)):
                         value.clear()
+                if isinstance(function, _Class):
+                    # A setup-created local object must not masquerade as missing
+                    # source; analysing arbitrary module initialization is outside this rule.
+                    return _Unsupported("module_constructor_unsupported", path, node)
                 return _Instance(name + '()', {}) if isinstance(function, _External) and not function.local else None
-            if isinstance(function, _Function):
-                return self.invoke(function, args, kwargs, path, scope, node)
+            if isinstance(function, (_Function, _BoundMethod, _Class, _Unsupported)) or isinstance(function, _Instance) and function.local_class is not None:
+                return self.call_value(function, args, kwargs, path, scope, node)
             if name in {"subprocess.run", "subprocess.Popen", "subprocess.call", "subprocess.check_call", "subprocess.check_output"}:
                 self.process(path, scope, node, args[0] if args else kwargs.get("args"), kwargs)
             elif isinstance(function, _External) and function.local:
@@ -314,7 +568,7 @@ class _Closure:
             elif function is None and isinstance(node.func, ast.Name) and (node.func.id not in _BUILTINS or node.func.id in env):
                 self.unknown_target(path, node, node.func.id, "dynamic_call_target_unresolved")
             elif function is None and isinstance(node.func, ast.Attribute) and isinstance(
-                    self.value(node.func.value, env, path, scope, setup), _Instance):
+                    self.value(node.func.value, env, path, scope, setup), (_Instance, _Class)):
                 self.unknown_target(path, node, ast.unparse(node.func), "dynamic_call_target_unresolved")
             if name not in {"subprocess.run", "subprocess.Popen", "subprocess.call", "subprocess.check_call", "subprocess.check_output"}:
                 for value in args + list(kwargs.values()):
@@ -337,16 +591,21 @@ class _Closure:
     def truth(self, node, env, path, scope):
         if isinstance(node, ast.Compare) and len(node.ops) == 1 and isinstance(node.ops[0], (ast.Eq, ast.NotEq)):
             a, b = self.value(node.left, env, path, scope), self.value(node.comparators[0], env, path, scope)
-            if a is not None and b is not None:
+            # Abstract source values are not the original runtime objects.
+            # Their dataclass equality cannot prove a branch false (or true).
+            if isinstance(a, (str, int, float, bool)) and isinstance(b, (str, int, float, bool)):
                 return (a == b) if isinstance(node.ops[0], ast.Eq) else a != b
         value = self.value(node, env, path, scope)
         return bool(value) if isinstance(value, (bool, int, str)) else None
 
     def statement(self, node, env, path, scope, setup=False):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            env[node.name] = _Function(path, node.name, node)
+            function = _Function(path, node.name if scope in {"<module>", "__main__"} else scope + ".<locals>." + node.name,
+                                 node, env if scope not in {"<module>", "__main__"} else None)
+            function.defaults = self.function_defaults(node, env, path, scope)
+            env[node.name] = function
         elif isinstance(node, ast.ClassDef):
-            env[node.name] = None
+            env[node.name] = self.class_definition(node, env, path, scope)
         elif isinstance(node, (ast.Import, ast.ImportFrom)):
             for alias in node.names:
                 module = node.module or "" if isinstance(node, ast.ImportFrom) else alias.name
@@ -354,7 +613,8 @@ class _Closure:
                 bound = alias.asname or (alias.name if isinstance(node, ast.ImportFrom) else alias.name.split(".")[0])
                 if target:
                     value = self.module(target).get(alias.name) if isinstance(node, ast.ImportFrom) else _Module(target)
-                    env[bound] = value if value is not None else _External(module + "." + alias.name, True)
+                    env[bound] = (value if value is not None else _External(module + "." + alias.name, True)
+                                  if target in self.unavailable_modules else _Unsupported("source_export_rule_unsupported", path, node))
                 else:
                     name = module + "." + alias.name if isinstance(node, ast.ImportFrom) else module
                     env[bound] = _External(name, self.local_module(module, path, getattr(node, "level", 0)))
@@ -418,6 +678,8 @@ class _Closure:
 
     def block(self, statements, env, path, scope):
         for node in statements:
+            if self.steps > 16000:
+                return False, None
             result = self.statement(node, env, path, scope)
             if result[0]:
                 return result
@@ -428,7 +690,7 @@ class _Closure:
                     target_symbol=target.name, evidence=[_cite(path, node)])
         if edge not in self.calls:
             self.calls.append(edge)
-        if target.node.decorator_list:
+        if target.node.decorator_list and target.method_kind not in {"staticmethod", "classmethod"}:
             module = self.module(target.path)
             decorators = [self.value(d, module, target.path, target.name, setup=True) for d in target.node.decorator_list]
             if any(not isinstance(d, _External) or d.name != "contextlib.contextmanager" for d in decorators):
@@ -437,20 +699,58 @@ class _Closure:
         key = (target.path, target.name)
         self.visited.add(key)
         if key in self.active:
+            self.unknown_target(path, node, target.name, "finite_recursive_call")
             return None
         if len(self.active) >= 16:
             self.unknown_target(path, node, target.name, "finite_call_depth")
             return None
         self.active.add(key)
         local = self.module(target.path).copy()
+        if target.closure is not None:
+            local.update(target.closure)
+        # Python resolves a function's own locals lexically, including names
+        # assigned after a call. Do not fall through to a stale global/capture.
+        assigned, declarations = set(), {}
+        def bindings(statements):
+            for child in statements:
+                if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                    assigned.add(child.name)
+                    continue
+                if isinstance(child, (ast.Global, ast.Nonlocal)):
+                    declarations.update((name, child) for name in child.names)
+                elif isinstance(child, ast.Name) and isinstance(child.ctx, (ast.Store, ast.Del)):
+                    assigned.add(child.id)
+                elif isinstance(child, (ast.Import, ast.ImportFrom)):
+                    assigned.update(a.asname or (a.name if isinstance(child, ast.ImportFrom) else a.name.split('.')[0]) for a in child.names)
+                bindings(list(ast.iter_child_nodes(child)))
+        bindings(target.node.body)
+        for name in assigned - declarations.keys():
+            local[name] = None
+        for name in assigned & declarations.keys():
+            declaration = declarations[name]
+            reason = "lexical_binding_mutation_unsupported"
+            self.unknown_target(target.path, declaration, name, reason)
+            marker = _Unsupported(reason, target.path, declaration)
+            local[name] = marker
+            # Do not let a later closure call recover a pre-mutation binding.
+            frame = target.closure if isinstance(declaration, ast.Nonlocal) else self.module(target.path)
+            if frame is not None:
+                frame[name] = marker
+        if target.owner is not None:
+            local["<method_class>"] = target.owner
+            local["<method_self>"] = args[0] if args else None
         parameters = target.node.args.posonlyargs + target.node.args.args
-        defaults = dict(zip([p.arg for p in parameters[-len(target.node.args.defaults):]],
-                            target.node.args.defaults)) if target.node.args.defaults else {}
+        defaults = target.defaults or {}
         for index, parameter in enumerate(parameters):
             local[parameter.arg] = (args[index] if index < len(args) else kwargs[parameter.arg] if parameter.arg in kwargs
-                                    else self.value(defaults.get(parameter.arg), local, target.path, target.name))
+                                    else defaults.get(parameter.arg))
         for parameter in target.node.args.kwonlyargs:
-            local[parameter.arg] = kwargs.get(parameter.arg)
+            local[parameter.arg] = kwargs.get(parameter.arg, defaults.get(parameter.arg))
+        if target.node.args.vararg:
+            local[target.node.args.vararg.arg] = args[len(parameters):]
+        if target.node.args.kwarg:
+            names = {p.arg for p in parameters + target.node.args.kwonlyargs}
+            local[target.node.args.kwarg.arg] = {k: v for k, v in kwargs.items() if k not in names}
         try:
             return self.block(target.node.body, local, target.path, target.name)[1]
         finally:
@@ -506,13 +806,16 @@ class _Closure:
         try:
             env = self.module(path).copy()
             env["__name__"] = "__main__"
+            if path in self.unavailable_modules:
+                return
             self.block(self.tree(path).body, env, path, "__main__")
         finally:
             self.cwd = previous
 
     def entry(self, entry):
         self.calls, self.unknown, self.processes, self.visited = [], [], [], set()
-        self.modules, self.import_roots, self.steps = {}, {}, 0
+        self.modules, self.import_roots, self.steps, self.active = {}, {}, 0, set()
+        self.unavailable_modules = set()
         self.cwd, self.script_contexts = '.', set()
         path, symbol = entry.get("path"), entry.get("symbol", "__main__")
         def not_covered(reason):
@@ -548,11 +851,21 @@ class _Closure:
                 field_paths=[f"dependencies[{index}].entry_ids"], evidence=evidence,
                 reason="Original host reaches an entry with this discovered dependency; host membership and mapping are missing.",
                 repair_action="Include this host in the affected dependency and prove its original parameter/environment transfer."))
-        if self.unknown:
-            issues.append(dict(issue_code="dependency_closure_unresolved", entry_id=entry["id"],
-                field_paths=["entries"], evidence=[e for u in self.unknown for e in u["evidence"]],
-                reason="Called local code or original subprocess target is not closed over frozen source.",
-                repair_action="Provide missing frozen source or retain an unresolved host dependency scope; do not infer resource closure."))
+        descriptions = {
+            "dependency_closure_unresolved": ("Called local code or original subprocess target lacks frozen source.",
+                "Provide the specifically missing frozen source or retain an unresolved host scope."),
+            "dependency_closure_unsupported": ("Available source uses a call or binding outside the finite dependency rules.",
+                "Resolve the cited unsupported rule or retain unknown scope; rereading available source cannot establish closure."),
+            "dependency_closure_limit": ("Dependency investigation reached its finite analysis bound.",
+                "Retain unknown scope and inspect the cited bound; do not request repeated source reads or infer closure.")}
+        for code, (reason, repair) in descriptions.items():
+            targets = [u for u in self.unknown if u["issue_code"] == code]
+            if targets:
+                issues.append(dict(issue_code=code, scope="source" if code == "dependency_closure_unresolved" else "rule",
+                    repair_scope="evidence" if code == "dependency_closure_unresolved" else "rule",
+                    model_repairable=code == "dependency_closure_unresolved",
+                    entry_id=entry["id"], field_paths=["entries"], evidence=[e for u in targets for e in u["evidence"]],
+                    reason=reason, repair_action=repair))
         return dict(entry_id=entry["id"], status="MISSING" if issues else "CHECKED", scope_covered=True,
                     reachable_entries=reachable, dependency_ids=dependencies, missing_dependency_ids=missing,
                     call_edges=self.calls, process_edges=self.processes, evidence=evidence,

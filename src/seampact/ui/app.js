@@ -13,6 +13,7 @@ let refreshing = false;
 let connected = false;
 let activeChatId = null;
 let chatLegacy = false;
+let chatContextTask = null;
 let chatRestoring = false;
 let chatLoadVersion = 0;
 let historySearchVersion = 0;
@@ -519,7 +520,7 @@ function setChatAddress(identity, push = false) {
 function resetChat(push = true) {
   if (pendingTask || chatRestoring) return;
   chatLoadVersion += 1;
-  activeChatId = null; chatLegacy = false; messages.length = 0;
+  activeChatId = null; chatLegacy = false; chatContextTask = null; renderChatContext(); messages.length = 0;
   $('conversation').replaceChildren();
   const welcome = node('div', undefined, 'welcome');
   welcome.append(node('h2', '有什么想一起完成的？'), node('p', '发送消息开始新对话；历史会话仍保留。'));
@@ -591,6 +592,7 @@ async function loadConversation(identity, push = false) {
     $('chat-title').textContent = chat.legacy ? '旧对话记录' : first ? responseText(first.content).slice(0, 32) : '对话';
     $('chat-input').value = ''; $('scene-task-selector').value = '';
     const task = chat.task;
+    chatContextTask = task; renderChatContext();
     if (task.status === 'RUNNING') {
       const output = appendMessage('assistant', '正在运行…', false); output.item.classList.add('message-pending');
       pendingTask = {id: task.id, output, sceneTaskId: null};
@@ -664,7 +666,7 @@ async function sendMessage(event) {
   const sceneRunId = researchState().active_checkpoint?.run_id;
   if (!content || pendingTask || chatRestoring || (chatLegacy && !sceneTaskId) || !connected ||
       (sceneTaskId ? !sceneRunId : !isReady(state?.models?.chat))) return;
-  if (!sceneTaskId) messages.push({role: 'user', content});
+  if (!sceneTaskId) { messages.push({role: 'user', content}); chatContextTask = null; renderChatContext(); }
   const user = appendMessage('user', content);
   if (sceneTaskId) user.meta.textContent = '运行附言 · 已保存任务 ' + sceneTaskId + ' · 不改写原任务';
   $('chat-input').value = '';
@@ -700,6 +702,7 @@ function synchronizeTask() {
   if (!pendingTask?.id) return;
   const task = (state.tasks || []).find(item => item.id === pendingTask.id);
   if (!task) return;
+  if (!pendingTask.sceneTaskId) { chatContextTask = task; renderChatContext(); }
   const status = String(task.status || '').toUpperCase();
   const {output} = pendingTask;
   const text = responseText(task.response);
@@ -832,6 +835,45 @@ function planDetails(task) {
   return detail;
 }
 
+function contextDescription(task) {
+  const info = task?.context_status;
+  if (!info || info.schema !== 'context-window/1') return null;
+  const number = value => finiteNumber(value) ? value.toLocaleString('zh-CN') : '未知';
+  const parts = ['窗口 ' + number(info.context_window), '当前输入估算 ' + number(info.estimated_input_tokens),
+    '输出预留 ' + number(info.requested_output_tokens), '上次实际输入 ' + number(info.last_actual_input_tokens)];
+  if (finiteNumber(info.estimated_ratio) && finiteNumber(info.context_window) && info.multimodal_tokens === 'not_present') {
+    parts.push('估算占输入预算 ' + (info.estimated_ratio * 100).toFixed(1) + '%');
+  }
+  const events = Array.isArray(task.context_events) ? task.context_events.filter(item => item.operation === 'context_compaction') : [];
+  parts.push('整理 ' + events.length + ' 次');
+  return parts.join(' · ');
+}
+
+function contextDetails(task) {
+  const description = contextDescription(task);
+  if (!description) return null;
+  const detail = node('details', undefined, 'context-details');
+  detail.append(node('summary', '上下文用量与整理'), node('p', description, 'card-meta'));
+  const info = task.context_status;
+  detail.append(node('p', '可用输入预算 ' + (finiteNumber(info.available_input_tokens) ? info.available_input_tokens.toLocaleString('zh-CN') : '未知') +
+    ' · 窗口来源：' + ({declared: '手动填写', provider_metadata: '服务信息', unknown: '未知'}[info.window_basis] || '未知') +
+    '。输入量为估算，实际用量以服务返回为准。' + (info.multimodal_tokens === 'UNKNOWN' ? '含图像时无法估算完整占用。' : ''), 'card-note'));
+  const events = Array.isArray(task.context_events) ? task.context_events.filter(item => item.operation === 'context_compaction') : [];
+  const usages = events.map(event => event.usage).filter(usage => usage && typeof usage === 'object');
+  if (usages.length) {
+    const total = names => {
+      const values = usages.map(usage => names.map(name => usage[name]).find(finiteNumber)).filter(finiteNumber);
+      return values.length ? values.reduce((sum, value) => sum + value, 0).toLocaleString('zh-CN') + (values.length < events.length ? '（部分记录）' : '') : '未知';
+    };
+    detail.append(node('p', '整理用量：输入 ' + total(['prompt_tokens', 'input_tokens']) + ' · 输出 ' + total(['completion_tokens', 'output_tokens']), 'card-meta'));
+  }
+  return detail;
+}
+
+function renderChatContext() {
+  $('chat-context-status').textContent = contextDescription(chatContextTask) || '上下文用量：暂无记录';
+}
+
 function renderTasks() {
   const tasks = visibleTasks();
   const root = $('task-list');
@@ -848,6 +890,7 @@ function renderTasks() {
     if (typeof task.model_calls === 'number') card.append(node('p', '模型调用：' + task.model_calls + ' 次', 'card-meta'));
     if (latency(task.latency_ms)) card.append(node('p', '任务时延：' + latency(task.latency_ms), 'card-meta'));
     if (task.error) card.append(node('p', textValue(task.error), 'card-note message-error'));
+    const context = contextDetails(task); if (context) card.append(context);
     const plan = planDetails(task);
     if (plan) card.append(plan);
     const detail = callDetails(task.calls);
@@ -2133,6 +2176,8 @@ function entryIssueSummary(issue) {
   const specific = {
     host_dependency_missing: ['上层入口漏了下游所需资源', '需要分析器补齐该入口的服务或权重需求，并核对原参数或子进程传递。'],
     dependency_closure_unresolved: ['下游调用还没有查完整', '需要补查实际调用的同版源码和子进程目标，不能把未知当作不需要资源。'],
+    dependency_closure_unsupported: ['平台暂时不能核对这段原调用', '需要补充通用调用检查；原文件可能已经齐全，不必反复补读或选择资源。'],
+    dependency_closure_limit: ['这段调用超过了当前检查范围', '平台需要改进调用调查，已知结果保留；不能当作缺源码让分析器重复尝试。'],
     subprocess_environment_overridden: ['子进程会改写这项资源配置', '需要核对原覆盖顺序，保留原行为；不能直接把上层连接当作下游实际使用的连接。'],
     subprocess_child_source_unavailable: ['还缺实际子进程的源码', '需要分析器补读原脚本，再核对服务参数怎样传入。'],
     subprocess_flow_unsupported: ['这段子进程资源传递尚未核对', '请查看原调用和环境传递的具体缺口，不能靠重复选择资源放行。'],
@@ -2428,7 +2473,7 @@ function renderAnalyses() {
       if (files !== null) card.append(node('p', files + ' 份可读文件' + (typeof harness.inventory_count === 'number' ? ' · 仓库共 ' + harness.inventory_count + ' 项文件' : ''), 'card-meta'));
     }
     if (job?.rounds !== undefined) card.append(node('p', '分析模型响应 ' + job.rounds + ' 轮', 'card-meta'));
-    if (job) card.append(analysisProgress(job));
+    if (job) { card.append(analysisProgress(job)); const context = contextDetails(job); if (context) card.append(context); }
     const outcome = job?.outcome || job?.submitted?.report?.outcome;
     const outcomeText = {NEEDS_CANDIDATE_REPAIR: '分析已结束，候选或源码证据还需修正。',
       AWAITING_EXTERNAL_CONDITIONS: '分析已结束，仍有平台支持、资源或运行条件待补齐。',
@@ -2464,7 +2509,8 @@ function renderAnalyses() {
         if (job.started_at) card.append(node('p', '开始：' + job.started_at, 'card-meta'));
         if (job.refinement_of) card.append(node('p', '沿用分析上下文：' + job.refinement_of, 'card-meta'));
         if (job.resumed_from) card.append(node('p', '继续分析：' + job.resumed_from +
-          ' · 已保留此前 ' + job.prior_rounds + ' 轮，本记录只统计新增用量。', 'card-meta'));
+          (job.resume_mode === 'checked_candidate' ? ' · 原记录保留此前 ' + job.prior_rounds + ' 轮，本次从候选开启新会话。' :
+            ' · 已保留此前 ' + job.prior_rounds + ' 轮，本记录只统计新增用量。'), 'card-meta'));
         detailValue(card, '实际模型用量', job.usage);
         if (job.model_binding) detailValue(card, '本记录冻结的模型与请求参数', job.model_binding);
       }
@@ -2472,6 +2518,13 @@ function renderAnalyses() {
     if (harness.status === 'DETACHED') card.append(node('p', '来源已退出当前能力池。源码和分析历史保留，可重新接入。', 'card-note'));
     const error = job?.error || harness.error;
     if (error) card.append(node('p', textValue(error), 'card-note message-error'));
+    if (job?.failure_phase === 'model_request' && ['context_length', 'request_too_large'].includes(job.error_kind)) {
+      card.append(node('p', job.resumable ?
+        '请求内容过长。最近检查的候选与完整历史已保存，可从该候选开启新的分析会话继续；不会自动重试。' :
+        '请求内容过长。请检查输出额度并重新分析；已有历史保留，本次没有可恢复的完整候选。', 'card-note'));
+    }
+    if (job?.last_request_size) detailValue(card, '最近一次模型请求规模', job.last_request_size);
+    if (job?.failure_diagnostic) detailValue(card, '模型接口错误类别', job.failure_diagnostic);
     if (job?.unreported_usage || job?.resumable) card.append(node('p', '中断请求未返回用量，未将其记作零费用。', 'card-note'));
     const boundaries = job?.submitted?.candidate?.boundaries || job?.boundaries || [];
     if (boundaries.length) {
@@ -2500,7 +2553,8 @@ function renderAnalyses() {
     if (cancel) actions.append(cancel);
     if (job?.status === 'COMPLETED' && job.submitted?.candidate) actions.append(analysisExportButton(job, true));
     if (job?.resumable) {
-      const resume = node('button', '继续这次分析', 'secondary-button');
+      const recoverCandidate = ['context_length', 'request_too_large'].includes(job.error_kind);
+      const resume = node('button', recoverCandidate ? (job.last_check ? '从已保存候选继续' : '整理上下文后继续') : '继续这次分析', 'secondary-button');
       resume.disabled = harness.status === 'DETACHED' || harness.status === 'ANALYZING' || analysisSubmitting.has(harness.id);
       if (harness.status === 'DETACHED') resume.title = '先重新接入来源，再继续保存的分析；使用当前分析模型配置。';
       resume.onclick = async () => {
@@ -2508,7 +2562,9 @@ function renderAnalyses() {
         analysisSubmitting.add(harness.id); resume.disabled = true;
         try {
           await api('/api/analysis/resume', {analysis_id: job.id});
-          showNotice('已保留此前的完整上下文，使用当前分析模型继续；本次用量单独记录。');
+          showNotice(recoverCandidate ? (job.last_check ? '已用最近候选开启新的分析会话；原历史保留，本次用量单独记录。' :
+            '已从完整工具回复处继续，将先整理上下文；原历史保留，整理用量单独记录。') :
+            '已保留此前的完整上下文，使用当前分析模型继续；本次用量单独记录。');
         } catch (error) { showNotice(error.message); }
         finally {
           analysisSubmitting.delete(harness.id);
@@ -3132,6 +3188,8 @@ function editConnection(connection) {
   const form = $('connection-form');
   form.elements.id.value = resourceId(connection) || '';
   for (const field of ['name', 'base_url', 'model', 'service_version']) form.elements[field].value = connection[field] || '';
+  form.elements.context_window.value = connection.declared_context_window ?? '';
+  form.elements.context_management.checked = connection.context_management !== false;
   form.elements.protocol.value = connection.protocol || 'openai-compatible';
   form.elements.parameters.value = textValue(connection.parameters || {});
   form.elements.auth_mode.value = connection.auth?.mode || 'none';
@@ -3448,6 +3506,8 @@ function hydrateModels() {
       form.elements.base_url.value = profile?.base_url || '';
       form.elements.model.value = profile?.model || '';
       form.elements.max_output_tokens.value = profile?.declared_max_output_tokens ?? '';
+      form.elements.context_window.value = profile?.declared_context_window ?? '';
+      form.elements.context_management.checked = profile?.context_management !== false;
       form.elements.service_version.value = profile?.service_version || '';
       form.dataset.hydrated = 'true';
     }
@@ -3513,6 +3573,8 @@ async function saveModel(event) {
   const status = form.querySelector('.form-status');
   const body = {role: form.dataset.role, base_url: form.elements.base_url.value.trim(), model: form.elements.model.value.trim()};
   body.max_output_tokens = form.elements.max_output_tokens.value ? Number(form.elements.max_output_tokens.value) : null;
+  body.context_window = form.elements.context_window.value ? Number(form.elements.context_window.value) : null;
+  body.context_management = form.elements.context_management.checked;
   body.service_version = form.elements.service_version.value.trim() || null;
   button.disabled = true;
   status.textContent = '正在保存…';
@@ -3569,6 +3631,8 @@ async function saveConnection(event) {
     const body = {name: form.elements.name.value.trim(), protocol: form.elements.protocol.value,
       base_url: form.elements.base_url.value.trim(), model: form.elements.model.value.trim(),
       service_version: form.elements.service_version.value.trim() || null, parameters,
+      context_window: form.elements.context_window.value ? Number(form.elements.context_window.value) : null,
+      context_management: form.elements.context_management.checked,
       capabilities: [...form.querySelectorAll('[name="capability"]:checked')].map(input => input.value),
       auth: {mode: form.elements.auth_mode.value}};
     if (form.elements.id.value) body.id = form.elements.id.value;

@@ -46,6 +46,7 @@
           <textarea id="chat-input" rows="1" placeholder="发送消息…" aria-describedby="composer-hint" required></textarea>
           <div class="composer-footer"><span id="composer-hint" class="composer-hint">Enter 发送 · Shift + Enter 换行</span><button id="send-message" class="primary-button" type="submit" disabled><span class="send-label">发送</span><span aria-hidden="true">↑</span></button></div>
         </form>
+        <p id="chat-context-status" class="chat-footnote" aria-live="polite">上下文用量：暂无记录</p>
         <p id="chat-readiness" class="chat-footnote">正在连接平台。</p>
       </div>
     </main>
@@ -93,6 +94,7 @@
             <label>模型 ID<input name="model" type="text" placeholder="填写部署或提供方的模型 ID" required></label>
             <label>API Key<input name="api_key" type="password" autocomplete="new-password" placeholder="本地可留空；同一接口留空保持已有密钥"></label>
             <label>最大输出 token（可选）<input name="max_output_tokens" type="number" min="1" step="1" placeholder="按模型能力填写"></label>
+            <label>上下文窗口 token（可选）<input name="context_window" type="number" min="1" step="1" placeholder="未知可留空"></label><label class="context-switch"><input name="context_management" type="checkbox" checked> 自动整理上下文（对话与分析）</label>
             <label>服务／模型版本（可选）<input name="service_version" type="text" placeholder="填可核对版本；未知可留空"></label>
             <div class="form-actions"><button class="secondary-button save-role-credential" type="button">单独保存凭据</button><button class="primary-button" type="submit">保存对话配置</button><span class="form-status" role="status"></span></div>
           </form>
@@ -103,6 +105,7 @@
             <label>模型 ID<input name="model" type="text" placeholder="填写分析模型 ID" required></label>
             <label>API Key<input name="api_key" type="password" autocomplete="new-password" placeholder="无鉴权可留空；已有密钥留空保持"></label>
             <label>最大输出 token（可选）<input name="max_output_tokens" type="number" min="1" step="1" placeholder="按模型能力填写"></label>
+            <label>上下文窗口 token（可选）<input name="context_window" type="number" min="1" step="1" placeholder="未知可留空"></label><label class="context-switch"><input name="context_management" type="checkbox" checked> 自动整理上下文（对话与分析）</label>
             <label>服务／模型版本（可选）<input name="service_version" type="text" placeholder="填可核对版本；未知可留空"></label>
             <div class="form-actions"><button class="secondary-button save-role-credential" type="button">单独保存凭据</button><button class="primary-button" type="submit">保存分析配置</button><span class="form-status" role="status"></span></div>
           </form>
@@ -113,6 +116,7 @@
             <label>模型 ID<input name="model" type="text" placeholder="填写教师模型 ID" required></label>
             <label>API Key<input name="api_key" type="password" autocomplete="new-password" placeholder="本地可留空；同一接口留空保持已有密钥"></label>
             <label>最大输出 token（可选）<input name="max_output_tokens" type="number" min="1" step="1" placeholder="按模型能力填写"></label>
+            <label>上下文窗口 token（可选）<input name="context_window" type="number" min="1" step="1" placeholder="未知可留空"></label><label class="context-switch"><input name="context_management" type="checkbox" checked> 自动整理上下文（对话与分析）</label>
             <label>服务／模型版本（可选）<input name="service_version" type="text" placeholder="填可核对版本；未知可留空"></label>
             <div class="form-actions"><button class="secondary-button save-role-credential" type="button">单独保存凭据</button><button class="primary-button" type="submit">保存教师配置</button><span class="form-status" role="status"></span></div>
           </form>
@@ -133,6 +137,7 @@
           <p class="form-note">这里登记已启动的服务；如果只有权重文件，请先去<a href="/configuration?section=weights">登记权重路径</a>。无需为本地模型另选一种协议。</p>
           <label>服务地址<input name="base_url" type="url" required placeholder="http://服务器地址:8000/v1"></label>
           <div class="optional-grid"><label>模型 ID（原服务需要时填写）<input name="model"></label><label>可核对服务／模型版本<input name="service_version" placeholder="未知可留空"></label></div>
+          <div class="optional-grid"><label>上下文窗口 token（可选）<input name="context_window" type="number" min="1" step="1" placeholder="未知可留空"></label><label class="context-switch"><input name="context_management" type="checkbox" checked> 自动整理上下文（对话与分析）</label></div>
           <fieldset class="capability-options"><legend>服务声明能力（实际操作另行核对）</legend><label><input type="checkbox" name="capability" value="text"> 文本</label><label><input type="checkbox" name="capability" value="image"> 图像</label><label><input type="checkbox" name="capability" value="embedding"> Embedding</label><label><input type="checkbox" name="capability" value="retrieval"> 检索</label></fieldset>
           <label>非敏感参数（JSON 对象）<textarea name="parameters" rows="3" spellcheck="false">{}</textarea></label>
           <p class="form-note">按提供方官方文档填写生成参数，例如 {"reasoning_effort":"max","thinking":{"type":"enabled"}}。文本、图像能力调用及平台对话／分析／教师请求会携带这些参数；保留 model、messages、tools 等平台请求字段，不在这里填写。向量接口只使用其支持的参数；Harness 原库按已核对的映射读取参数。</p>

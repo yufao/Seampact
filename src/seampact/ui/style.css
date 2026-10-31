@@ -475,3 +475,7 @@ body:not(.inspect-page) .research-heading h3 { font-size: 13px; }
   .research-config .form-actions { flex-wrap: wrap; }
   .resource-states { grid-template-columns: minmax(0, 1fr); }
 }
+
+.configuration .context-switch { display: flex; align-items: center; gap: 7px; }
+.context-details { margin: 8px 0; }
+.context-details summary { cursor: pointer; color: var(--muted); font-size: 12px; }

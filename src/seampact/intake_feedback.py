@@ -128,7 +128,9 @@ def entry_readiness(inspector, candidate, report):
             code = detail.get("issue_code", "candidate_incomplete")
             issue("candidate_incomplete", "接入候选还不完整", detail.get("reason"),
                   detail.get("repair_action", "按原定义补齐候选后完整重检。"), "revision",
-                  issue_code=code, repair_scope=detail.get("repair_scope", "evidence" if code in {"execution_context_unproven", "dependency_closure_unresolved"} else "candidate"),
+                  issue_code=code, repair_scope=detail.get("repair_scope", "rule" if code in {
+                      "dependency_closure_unsupported", "dependency_closure_limit"} else "evidence" if code in {
+                      "execution_context_unproven", "dependency_closure_unresolved"} else "candidate"),
                   field_paths=[p if p.startswith(("dependencies[", "entries[")) or p == "entries" else entry_path + "." + p
                                for p in detail.get("field_paths", [])],
                   source_evidence=detail.get("evidence", []))

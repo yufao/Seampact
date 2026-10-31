@@ -54,6 +54,15 @@ def fingerprint(value):
         allow_nan=False).encode()).hexdigest()
 
 
+def _execution_basis(inspector):
+    # Same input fields as analysis.preparation_input, without importing the
+    # model job layer into the independently packaged target source checker.
+    fields = ("source_version", "entry", "configuration", "user_resources", "rules", "entry_profile", "observation",
+              "dependency_bindings", "resource_catalog", "runtime_environment", "target_runtime")
+    return dict(source_version=inspector.request.get("source_version"),
+        input_digest=fingerprint({key: inspector.request.get(key) for key in fields}))
+
+
 def reference(value):
     if not isinstance(value, dict) or "$dependency" not in value:
         return None
@@ -933,6 +942,8 @@ class DependencyBindings:
         self.registry, self.inspector = registry, inspector
         self.entries = {e.get("id"): e for e in candidate.get("entries", []) if isinstance(e, dict)}
         self.rows = {row["id"]: row for row in check_requirements(inspector, candidate)}
+        for row in self.rows.values():
+            row["execution_basis"] = _execution_basis(inspector)
         self.selected, self.keys = {}, {}
         # None raises; a list collects facts that a separately declared host re-checks.
         self.environment_gaps = None
@@ -1100,12 +1111,19 @@ class Dependencies:
         for row in rows:
             identity = source + ":" + row["id"]
             item = dict(row, origin_id=row["id"], id=identity, source_id=source,
-                        active=True, checked_at=now(), execution="NOT_RUN")
+                        active=True, checked_at=now(), execution="NOT_RUN", execution_basis=_execution_basis(inspector))
             previous = self.store.get("resource_dependency", identity)
-            if previous and previous.get("definition_digest") == item["definition_digest"]:
+            if (previous and previous.get("definition_digest") == item["definition_digest"]
+                    and previous.get("execution_basis") == item["execution_basis"]):
                 item["execution"] = previous.get("execution", "NOT_RUN")
                 if "last_execution" in previous:
                     item["last_execution"] = copy.deepcopy(previous["last_execution"])
+            else:
+                selection = self.store.get("dependency_binding", identity)
+                if selection:
+                    selection.update(execution="NOT_RUN")
+                    selection.pop("last_execution", None)
+                    self.store.save("dependency_binding", identity, selection)
             self.store.save("resource_dependency", identity, item)
         return rows
 
@@ -1126,6 +1144,7 @@ class Dependencies:
                 continue
             connection, resource = selection.get("connection", {}), selection.get("resource", {})
             evidence.append(dict(dependency_id=identity, definition_digest=row.get("definition_digest"),
+                execution_basis=copy.deepcopy(row.get("execution_basis")),
                 binding_digest=selection.get("revision_digest"), connection_id=connection.get("id"),
                 connection_digest=connection.get("config_digest"), resource_id=resource.get("id"),
                 resource_digest=resource.get("config_digest")))
@@ -1133,6 +1152,7 @@ class Dependencies:
         for identity, row in requirements.items():
             if identity not in represented and entry_id in row.get("entry_ids", []):
                 evidence.append(dict(dependency_id=identity, definition_digest=row.get("definition_digest"),
+                                     execution_basis=copy.deepcopy(row.get("execution_basis")),
                                      binding_digest=None, connection_id=None, connection_digest=None,
                                      resource_id=None, resource_digest=None))
         outcome = dict(at=now(), source_id=source_id, entry_id=entry_id,
@@ -1144,12 +1164,19 @@ class Dependencies:
             if row.get("source_id") != source_id or entry_id not in row.get("entry_ids", []):
                 continue
             frozen = requirements.get(row.get("origin_id"))
-            if frozen is None or frozen.get("definition_digest") != row.get("definition_digest"):
+            if (frozen is None or frozen.get("definition_digest") != row.get("definition_digest")
+                    or not frozen.get("execution_basis")
+                    or frozen["execution_basis"] != row.get("execution_basis")):
                 continue
-            row.update(execution=outcome["target_execution"], last_execution=copy.deepcopy(outcome))
-            self.store.save("resource_dependency", row["id"], row)
             selected = self.store.get("dependency_binding", row["id"])
             frozen_selection = selections.get(row.get("origin_id"))
+            if selected or frozen_selection:
+                if (not selected or not frozen_selection
+                        or selected.get("definition_digest") != frozen_selection.get("definition_digest")
+                        or selected.get("revision_digest") != frozen_selection.get("revision_digest")):
+                    continue
+            row.update(execution=outcome["target_execution"], last_execution=copy.deepcopy(outcome))
+            self.store.save("resource_dependency", row["id"], row)
             if (selected and frozen_selection and selected.get("definition_digest") == frozen.get("definition_digest")
                     and selected.get("revision_digest") == frozen_selection.get("revision_digest")):
                 selected.update(execution=outcome["target_execution"], last_execution=copy.deepcopy(outcome))

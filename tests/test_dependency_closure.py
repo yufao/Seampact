@@ -238,6 +238,154 @@ class DependencyClosureChecks(unittest.TestCase):
         self.assertEqual(rows['host']['dependency_ids'], [])
         self.assertEqual(rows['host']['unresolved_targets'][0]['reason'], 'dynamic_call_target_unresolved')
 
+    def test_imported_class_constructor_bound_method_and_attribute_callback(self):
+        rows = self.inspect({'main.py': 'from tasks import Worker\ndef host():\n    worker = Worker(child)\n    worker.run()\ndef child():\n    pass\n',
+                             'tasks.py': 'from external import Base\nclass Worker(Base):\n    def __init__(self, callback):\n        self.callback = callback\n    def run(self):\n        self.callback()\n    def unused(self):\n        missing()\n'},
+                            [self.function('host'), self.function('child')])
+        self.assertEqual(rows['host']['dependency_ids'], ['service'])
+        self.assertEqual([u for u in rows['host']['unresolved_targets']], [])
+        self.assertEqual({e['target_symbol'] for e in rows['host']['call_edges']}, {'Worker', 'Worker.__init__', 'Worker.run', 'host', 'child'})
+        method = next(e for e in rows['host']['call_edges'] if e['target_symbol'] == 'Worker.run')
+        self.assertEqual(method['evidence'][0]['start'], 4)
+
+    def test_local_inheritance_super_static_and_class_methods(self):
+        source = ('def child():\n    pass\nclass Base:\n    def __init__(self):\n        child()\n'
+                  '    def run(self):\n        child()\nclass Worker(Base):\n'
+                  '    def __init__(self):\n        super().__init__()\n'
+                  '    @staticmethod\n    def static():\n        child()\n'
+                  '    @classmethod\n    def create(cls):\n        return cls()\n'
+                  'def host():\n    worker = Worker.create()\n    worker.run()\n    Worker.static()\n')
+        rows = self.inspect({'main.py': source}, [self.function('host'), self.function('child')])
+        self.assertEqual(rows['host']['dependency_ids'], ['service'])
+        self.assertEqual(rows['host']['unresolved_targets'], [])
+        symbols = {e['target_symbol'] for e in rows['host']['call_edges']}
+        self.assertTrue({'Worker.create', 'Worker.__init__', 'Base.__init__', 'Base.run', 'Worker.static'} <= symbols)
+
+    def test_class_and_instance_rebinding_do_not_reach_old_method(self):
+        prefix = 'def child():\n    pass\nclass Worker:\n    def run(self):\n        child()\n'
+        for body in ('Worker = unknown\n    Worker()', 'worker = Worker()\n    worker.run = unknown\n    worker.run()',
+                     'Worker.run = unknown\n    Worker().run()'):
+            with self.subTest(body=body):
+                rows = self.inspect({'main.py': prefix + 'def host():\n    ' + body + '\n'},
+                                    [self.function('host'), self.function('child')])
+                self.assertEqual(rows['host']['dependency_ids'], [])
+                self.assertIn('dependency_closure_unsupported', {i['issue_code'] for i in rows['host']['issues']})
+
+    def test_dynamic_class_protocols_and_decorators_are_rule_gaps(self):
+        for definition in ('class Worker(dynamic):\n    pass',
+                           '@unknown\nclass Worker:\n    pass',
+                           'class Worker:\n    def __new__(cls):\n        return child()',
+                           'class Worker:\n    @unknown\n    @staticmethod\n    def run():\n        child()'):
+            with self.subTest(definition=definition):
+                call = 'Worker().run()' if 'def run' in definition else 'Worker()'
+                rows = self.inspect({'main.py': 'def child():\n    pass\n' + definition + '\ndef host():\n    ' + call + '\n'},
+                                    [self.function('host'), self.function('child')])
+                self.assertEqual(rows['host']['dependency_ids'], [])
+                self.assertTrue(rows['host']['unresolved_targets'])
+                self.assertTrue(all(i['issue_code'] == 'dependency_closure_unsupported' for i in rows['host']['issues']))
+                self.assertTrue(all(i['repair_scope'] == 'rule' and i['model_repairable'] is False for i in rows['host']['issues']))
+
+    def test_dataclass_fields_post_init_and_factory_follow_actual_calls(self):
+        source = ('from dataclasses import dataclass, field\ndef child():\n    pass\n'
+                  'def factory():\n    child()\n    return child\n'
+                  '@dataclass(frozen=True)\nclass Job:\n    callback: object\n'
+                  '    generated: object = field(default_factory=factory)\n'
+                  '    def __post_init__(self):\n        self.callback()\n'
+                  '    def run(self):\n        self.generated()\n'
+                  'def host():\n    job = Job(child)\n    job.run()\n')
+        rows = self.inspect({'main.py': source}, [self.function('host'), self.function('child')])
+        self.assertEqual(rows['host']['dependency_ids'], ['service'])
+        self.assertEqual(rows['host']['unresolved_targets'], [])
+        symbols = {e['target_symbol'] for e in rows['host']['call_edges']}
+        self.assertTrue({'Job', 'Job.__post_init__', 'factory', 'Job.run'} <= symbols)
+        # Overridden factory is not a call edge; unconstructed dataclasses do not run factories.
+        source = source.replace('job = Job(child)', 'job = Job(child, generated=print)')
+        rows = self.inspect({'main.py': source}, [self.function('host'), self.function('child')])
+        self.assertNotIn('factory', {e['target_symbol'] for e in rows['host']['call_edges']})
+
+    def test_executor_nested_callback_keeps_lexical_binding_and_late_rebinding(self):
+        source = ('from concurrent.futures import ThreadPoolExecutor\ndef child():\n    pass\n'
+                  'def other():\n    pass\ndef host():\n    callback = other\n'
+                  '    def process_row():\n        callback()\n'
+                  '    def run_and_release():\n        process_row()\n'
+                  '    callback = child\n    with ThreadPoolExecutor() as executor:\n'
+                  '        executor.submit(run_and_release)\n')
+        rows = self.inspect({'main.py': source}, [self.function('host'), self.function('child'), self.function('other')])
+        self.assertEqual(rows['host']['dependency_ids'], ['service'])
+        self.assertEqual(rows['host']['unresolved_targets'], [])
+        symbols = {e['target_symbol'] for e in rows['host']['call_edges']}
+        self.assertTrue({'host.<locals>.process_row', 'host.<locals>.run_and_release', 'child'} <= symbols)
+        self.assertNotIn('other', symbols)
+
+    def test_returned_closure_default_and_local_shadowing_use_python_bindings(self):
+        prefix = 'def child():\n    pass\ndef other():\n    pass\n'
+        source = prefix + ('def make():\n    callback = child\n    def nested(captured=callback):\n        captured()\n'
+                           '    callback = other\n    return nested\ndef host():\n    make()()\n')
+        rows = self.inspect({'main.py': source}, [self.function('host'), self.function('child'), self.function('other')])
+        self.assertEqual(rows['host']['dependency_ids'], ['service'])
+        self.assertNotIn('other', {e['target_symbol'] for e in rows['host']['call_edges']})
+        source = prefix + 'def host():\n    child()\n    child = other\n'
+        rows = self.inspect({'main.py': source}, [self.function('host'), self.function('child')])
+        self.assertEqual(rows['host']['dependency_ids'], [])
+        self.assertEqual(rows['host']['unresolved_targets'][0]['reason'], 'dynamic_call_target_unresolved')
+
+    def test_called_nonlocal_rebinding_is_unsupported_and_invalidates_old_capture(self):
+        source = ('def child():\n    pass\ndef host():\n    callback = child\n'
+                  '    def mutate(value):\n        nonlocal callback\n        callback = value\n'
+                  '    def run():\n        callback()\n    mutate(unknown)\n    run()\n')
+        rows = self.inspect({'main.py': source}, [self.function('host'), self.function('child')])
+        self.assertEqual(rows['host']['dependency_ids'], [])
+        self.assertTrue(any(u['reason'] == 'lexical_binding_mutation_unsupported' and u['evidence'][0]['start'] == 6 for u in rows['host']['unresolved_targets']))
+        self.assertTrue(all(i['issue_code'] == 'dependency_closure_unsupported' for i in rows['host']['issues']))
+
+    def test_uncalled_classes_and_closures_do_not_run_bodies_or_factories(self):
+        source = ('from dataclasses import dataclass, field\ndef child():\n    pass\n'
+                  '@dataclass\nclass Job:\n    x: object = field(default_factory=child)\n'
+                  '    def run(self):\n        child()\ndef host():\n'
+                  '    callback = child\n    def unused():\n        nonlocal callback\n        callback = unknown\n        child()\n'
+                  '    class Local:\n        def __init__(self):\n            child()\n    return 1\n')
+        rows = self.inspect({'main.py': source}, [self.function('host'), self.function('child')])
+        self.assertEqual(rows['host']['dependency_ids'], [])
+        self.assertEqual(rows['host']['issues'], [])
+
+    def test_recursive_and_step_limits_are_not_missing_source(self):
+        for source in ('def host():\n    host()\n', 'def host():\n' + '    value = 1\n' * 16010):
+            with self.subTest(size=len(source)):
+                rows = self.inspect({'main.py': source}, [self.function('host')], [])
+                self.assertEqual(rows['host']['status'], 'MISSING')
+                self.assertEqual({i['issue_code'] for i in rows['host']['issues']}, {'dependency_closure_limit'})
+                self.assertTrue(rows['host']['issues'][0]['evidence'])
+                self.assertEqual(rows['host']['issues'][0]['repair_scope'], 'rule')
+
+    def test_available_unmodelled_export_is_rule_gap_but_absent_source_stays_source_gap(self):
+        rows = self.inspect({'main.py': 'from pkg.module import Runner\ndef host():\n    Runner()\n',
+                             'pkg/module.py': 'if dynamic:\n    Runner = unknown\n'}, [self.function('host')], [])
+        self.assertEqual({i['issue_code'] for i in rows['host']['issues']}, {'dependency_closure_unsupported'})
+        rows = self.inspect({'main.py': 'from pkg.missing import Runner\ndef host():\n    Runner()\n',
+                             'pkg/exists.py': ''}, [self.function('host')], [])
+        self.assertEqual({i['issue_code'] for i in rows['host']['issues']}, {'dependency_closure_unresolved'})
+
+    def test_opaque_external_comparisons_do_not_prune_original_calls(self):
+        prefix = ('from argparse import ArgumentParser\nfrom external import Config\n'
+                  'args = ArgumentParser().parse_args()\nconfig = Config()\n'
+                  'def child():\n    pass\n')
+        for expression in ('args.command == "evaluate"', 'config.MODEL.NAME == "detconfcmx"',
+                           'args.command != "evaluate"', 'config.MODEL.NAME != "detconfcmx"'):
+            with self.subTest(expression=expression):
+                rows = self.inspect({'main.py': prefix + 'def host():\n    if ' + expression + ':\n        child()\n'},
+                                    [self.function('host'), self.function('child')])
+                self.assertEqual(rows['host']['dependency_ids'], ['service'])
+
+    def test_known_scalar_comparisons_select_only_the_original_branch(self):
+        prefix = 'def child():\n    pass\ndef other():\n    pass\n'
+        for expression, expected in (('"evaluate" == "evaluate"', 'child'), ('1 != 2', 'child'),
+                                     ('1.5 == 2.0', 'other'), ('True != True', 'other')):
+            with self.subTest(expression=expression):
+                source = prefix + 'def host():\n    if ' + expression + ':\n        child()\n    else:\n        other()\n'
+                rows = self.inspect({'main.py': source}, [self.function('host'), self.function('child'), self.function('other')],
+                                    [dict(id='service', entry_ids=['child']), dict(id='other-service', entry_ids=['other'])])
+                self.assertEqual(rows['host']['dependency_ids'], ['service' if expected == 'child' else 'other-service'])
+
 
 if __name__ == '__main__':
     unittest.main()

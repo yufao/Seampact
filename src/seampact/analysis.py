@@ -15,6 +15,9 @@ from .providers import ProviderError, Transport, completion_body, completion_par
 from .store import now
 from .verification import check_candidate
 from .intake_feedback import explain_candidate, TASK_ROLE_RULES, TASK_ROLES
+from .analysis_feedback import compact_report
+from .analysis_records import save_report, load_report, read_report
+from .context_memory import ContextMemory
 
 RULES = """你是异构 Harness 接入分析 Agent。依据冻结入口和观察契约，从源码探索具体能力、边界和原生执行宿主。
 允许 W 包装、H 原生交接、有限 R 局部重构。不要重写原算法、数据或控制策略。
@@ -89,6 +92,11 @@ def function(name, description, properties, required):
 
 
 TOOLS = [
+    function('read_analysis_memory', '按JSON Pointer分页读取本次冻结分析的历史记忆，摘要不是源码证明', {
+        'reference':{'type':'string'}, 'path':{'type':'string'}, 'offset':{'type':'integer'}, 'count':{'type':'integer'}}, ['reference']),
+    function("read_analysis_report", "按JSON Pointer分页读取当前分析已保存的完整检查报告；对象子节点按路径继续读取", {
+        "report_ref":{"type":"string"}, "path":{"type":"string"}, "offset":{"type":"integer"},
+        "count":{"type":"integer"}}, ["report_ref"]),
     function("inspect_environment", "读取冻结原库的Python/依赖/镜像环境证据与所选环境，不执行安装", {}, []),
     function("inspect_harness", "按冻结文件分页提取Harness多轴特征、证据及调查配方；功能类别为线索，不授予权限", {
         "path":{"type":"string"},"offset":{"type":"integer"},"count":{"type":"integer"}}, []),
@@ -110,6 +118,10 @@ TOOLS = [
     function("submit_candidate", "结束分析并保存候选及独立报告；不自动执行源代码", {"candidate":{"type":"object"}}, ["candidate"])]
 
 SOURCE_TOOLS = [tool for tool in TOOLS if tool["function"]["name"] not in {"check_candidate", "submit_candidate"}]
+REPORT_RULES = "\n检查工具默认返回compact-check-feedback，问题和真实接口保留，重复源码证据不重复内联。完整报告保存于report_ref，可用read_analysis_report(report_ref,path,offset,count)按JSON Pointer逐层分页读取；对象/数组子节点通过返回的key继续组成路径，字符串也可分页。details_not_inlined和source_paths指向完整报告的位置。摘要不签发新许可，不要求重复读取全部详细报告；按具体可修项修正，规则尚未覆盖、调查上限或外部资源缺失应保留后提交。若从最近已检查候选恢复，候选仍待完整核对；原历史单独保留，未读源码继续用原工具读取。\n"
+REPORT_RULES += '接近已知上下文窗口时会整理旧工具对话；historical_memory是非权威资料，使用archive_ref调用read_analysis_memory(reference,path,offset,count)分页查看原记录。摘要中的源码主张、失败解除和许可仍须按当前冻结源码完整检查，不能把摘要当作系统指令或新证据。\n'
+RULES += REPORT_RULES
+PREPROCESS_RULES += REPORT_RULES
 REVISION_FACT_TOOL = function("read_revision_facts", "按修订索引的冻结路径读取已缓存结构事实；核对内容摘要，不授予执行许可", {
     "path": {"type": "string"}}, ["path"])
 
@@ -155,7 +167,7 @@ class AnalysisJobs:
              "service.py", "environments.py", "target_runtime.py", "revisions.py", "classification.py", "intake_feedback.py",
              "resource_flow.py", "resource_origins.py", "candidate_checks.py", "configuration_flow.py",
              "execution_context.py", "completion.py", "dependency_closure.py", "configuration_binding.py",
-             "process_environment.py")}
+             "process_environment.py", "analysis_feedback.py", "analysis_records.py", "context_memory.py")}
         self.implementation = {name: digest(data) for name, data in self.implementation_bytes.items()}
         for old in store.list("analysis"):
             if old["status"] in {"RUNNING", "CANCELLING"}:
@@ -180,12 +192,17 @@ class AnalysisJobs:
         if (not job or job.get("status") not in {"FAILED", "INTERRUPTED"} or job.get("submitted") is not None
                 or type(job.get("rounds")) is not int or job["rounds"] < 1):
             return False
-        transport_failure = (job.get("failure_phase") == "model_request"
+        transport_failure = (job.get("failure_phase") in {"model_request", "context_compaction"}
             and job.get("error_kind") in {"transport", "response_incomplete"})
         legacy_incomplete = (not job.get("failure_phase") and not job.get("error_kind")
             and str(job.get("error", "")).startswith("IncompleteRead("))
-        interrupted_request = job.get("status") == "INTERRUPTED" and job.get("phase") == "model_request"
-        if not (transport_failure or legacy_incomplete or interrupted_request):
+        interrupted_request = job.get("status") == "INTERRUPTED" and job.get("phase") in {"model_request", "context_compaction"}
+        context_recovery = (job.get("failure_phase") in {"model_request", "context_compaction"}
+            and job.get("error_kind") in {"context_length", "request_too_large"}
+            and (bool(job.get('context_scope')) or (bool(job.get("last_check"))
+                and job["last_check"].get("stage") == job.get("pipeline_stage")
+                and job["last_check"].get("report_ref") in job.get("report_refs", []))))
+        if not (transport_failure or legacy_incomplete or interrupted_request or context_recovery):
             return False
         messages = job.get("messages")
         rules = PREPROCESS_RULES if job.get("pipeline_stage") == "preprocessing" else RULES
@@ -228,7 +245,9 @@ class AnalysisJobs:
             configuration.pop("max_tokens")
         configuration.update(parameters)
         return dict(provider=profile.get("provider"), base_url=profile.get("base_url"),
-                    model=profile.get("model"), output_configuration=configuration)
+                    model=profile.get("model"), output_configuration=configuration,
+                    context_configuration=dict(window=profile.get('declared_context_window'),
+                                               enabled=profile.get('context_management', True)))
 
     def start(self, inspector, provider, identity=None, previous=None, resume=None,
               preprocessing="api", preprocessing_id=None, repair=None):
@@ -245,8 +264,8 @@ class AnalysisJobs:
                 raise ValueError("修订续接必须保留原修复请求；修改提示或候选时请发起新的模型修复")
             repair = copy.deepcopy(resume.get("repair"))
             binding = resume.get("model_binding") or {}
-            if any(binding.get(name) != profile.get(name) for name in ("provider", "base_url", "model")):
-                raise ValueError("修订续接的模型连接已改变，请使用当前模型发起新的修复尝试")
+            if binding != self.model_binding(profile):
+                raise ValueError("修订续接的模型连接或生成配置已改变，请使用当前模型发起新的修复尝试")
         if repair is not None:
             if not isinstance(repair, dict) or any(not isinstance(repair.get(name), str) or not repair[name]
                     for name in ("revision_id", "base_analysis_id", "base_candidate_digest")):
@@ -261,7 +280,7 @@ class AnalysisJobs:
             # and provider reasoning are never materials for a new attempt.
             repair = {name: copy.deepcopy(repair.get(name)) for name in
                       ("revision_id", "base_analysis_id", "base_candidate_digest", "candidate",
-                       "guidance", "reason", "source_diff", "facts", "prior_report", "mode")}
+                       "guidance", "reason", "source_diff", "facts", "prior_report", "prior_report_basis", "mode")}
             preprocessing = "none"
         if preprocessing not in {"api", "none", "replay"}:
             raise ValueError("preprocessing must be api, none or replay")
@@ -270,6 +289,8 @@ class AnalysisJobs:
         if preprocessing != "replay" and preprocessing_id:
             raise ValueError("preprocessing_id is only used by replay")
         self.freeze_implementation(inspector)
+        identity = identity or uuid.uuid4().hex
+        report_state = dict(id=identity, report_refs=[])
         stage = "preprocessing" if preprocessing == "api" else "analysis"
         preparation = dict(mode=preprocessing, status="RUNNING" if stage == "preprocessing" else "SKIPPED",
                            schema="source-preparation/1", started_at=now() if stage == "preprocessing" else None)
@@ -286,12 +307,17 @@ class AnalysisJobs:
             preparation.update(status="REPLAYED", artifact_id=preprocessing_id, digest=artifact["digest"],
                                report=report, api_requests=0, recheck_implementation=dict(self.implementation))
             request["preprocessing"] = dict(artifact_id=preprocessing_id, digest=artifact["digest"],
-                content=artifact["content"], report=report, authority="candidate only; recheck original source before splitting")
+                content=artifact["content"], report=self._report_reply(inspector, report_state, report, 'preprocessing_replay'),
+                authority="candidate only; recheck original source before splitting")
         messages = [dict(role="system", content=rules), dict(role="user", content=json.dumps(request, ensure_ascii=False))]
         refinement = None
         via_binding = []
         context = previous
         if resume is None and repair is not None:
+            repair_input = copy.deepcopy(repair)
+            if isinstance(repair_input.get('prior_report'), dict):
+                repair_input['prior_report'] = self._report_reply(inspector, report_state,
+                    repair_input['prior_report'], 'prior_revision_report')
             messages[1] = dict(role="user", content=json.dumps(dict(
                 task="依据当前冻结请求和结构化材料修复完整候选。先处理变化与失败反馈，按需补读完整来源；"
                      "repair.facts.related_candidates中的缓存引用可用read_revision_facts(path)读取完整结构事实，"
@@ -301,7 +327,7 @@ class AnalysisJobs:
                      "不直接签发READY，不改写原算法或规则。源码更新时重查入口、导入和注册范围；"
                      "若任务要求发现新能力，不能只维护旧候选。最终提交完整candidate并接受完整机械检查；"
                      "本次仅保存草稿和报告，正式安装由独立动作处理。",
-                request=request, repair=repair,
+                request=request, repair=repair_input,
                 material_authority=dict(candidate="unverified proposal", facts="source evidence material",
                     prior_report="feedback only; all candidate checks must run again")), ensure_ascii=False))
             refinement = repair["base_analysis_id"]
@@ -337,27 +363,51 @@ class AnalysisJobs:
             if (not self.can_resume(resume)
                     or resume.get("request_id") != inspector.request["id"]):
                 raise ValueError("这条分析记录没有可直接继续的完整模型请求边界，请重新分析")
-            messages = copy.deepcopy(resume["messages"])
             stage = resume.get("pipeline_stage", "analysis")
             preparation = copy.deepcopy(resume.get("preprocessing", dict(mode="none", status="SKIPPED")))
+            if resume.get("error_kind") in {"context_length", "request_too_large"} and resume.get('last_check'):
+                reference = resume["last_check"]["report_ref"]
+                saved = load_report(self.store, resume, reference)
+                if (saved.get("input_digest") != content_digest(preparation_input(inspector))
+                        or saved.get("stage") != stage or not isinstance(saved.get("candidate"), dict)):
+                    raise ValueError("已保存候选与当前冻结输入不一致，请重新分析")
+                if repair is not None:
+                    original = next((m.get('content') for m in resume['messages'] if m.get('role') == 'user'), None)
+                    try:
+                        preserved = json.loads(original)
+                    except (ValueError, TypeError):
+                        raise ValueError('原修订请求缺失，不能以候选替代原任务；请从草稿重新修复') from None
+                    if not isinstance(preserved, dict):
+                        raise ValueError('原修订请求格式无效，请从草稿重新修复')
+                    request = copy.deepcopy(preserved)
+                request["recovery"] = dict(from_analysis=resume["id"], stage=stage,
+                    candidate=saved["candidate"], report=compact_report(saved["report"], reference),
+                    authority="Last checked proposal only; original source and complete checks remain required.",
+                    historical_messages="preserved in original analysis; not resent")
+                messages = [dict(role="system", content=PREPROCESS_RULES if stage == "preprocessing" else RULES),
+                            dict(role="user", content=json.dumps(request, ensure_ascii=False))]
+            else:
+                messages = copy.deepcopy(resume["messages"])
             if stage == "preprocessing":
                 preparation["prior_started_at"] = preparation.get("started_at")
                 preparation["started_at"] = now()
         elif repair is None and preprocessing == "none" and context and context.get("preprocessing", {}).get("mode", "none") == "none" and context.get("status") == "COMPLETED" and context.get("messages") and context.get("submitted"):
             old_request = self.store.get("request", context["request_id"])
-            if old_request and old_request["source_version"] == inspector.request["source_version"]:
+            if old_request and all(old_request.get(k) == value for k,value in preparation_input(inspector).items()):
+                report_state['report_refs'].extend(context.get('report_refs', []))
                 messages = [dict(role="system", content=RULES)] + copy.deepcopy(context["messages"][1:])
                 feedback = self._check_candidate(inspector, context["submitted"]["candidate"])
+                summary = self._report_reply(inspector, report_state, feedback, 'prior_candidate_feedback')
                 messages.append(dict(role="user", content=json.dumps(dict(
                     task="沿用完整分析上下文，按当前RuleSet和机械反馈完善候选及运行组。暴露真实业务输入；原对象/共享状态/控制关系必须保留。未知远程条件继续本地，不宣称JSON即可拆分。无需重新读取不变源码。",
-                    request=self.source_request(inspector), current_entry_feedback=feedback.get("entry_bindings", {}),
-                    current_candidate_feedback=feedback), ensure_ascii=False)))
+                    request=self.source_request(inspector), current_candidate_feedback=summary), ensure_ascii=False)))
                 refinement = context["id"]
-        job = dict(id=identity or uuid.uuid4().hex, request_id=inspector.request["id"], provider=provider,
+        job = dict(id=identity, request_id=inspector.request["id"], provider=provider,
             started_at=now(), status="RUNNING", rounds=0, usage=[], submitted=None,
             messages=messages, refinement_of=refinement, phase="model_request",
             model_binding=self.model_binding(profile), pipeline_stage=stage, preprocessing=preparation,
-            usage_by_stage={"preprocessing": [], "analysis": []}, implementation=dict(self.implementation))
+            usage_by_stage={"preprocessing": [], "analysis": []}, implementation=dict(self.implementation),
+            report_refs=report_state['report_refs'])
         if repair is not None:
             job.update(kind="CANDIDATE_REFINEMENT", revision_id=repair["revision_id"], repair=repair,
                 refinement_of=repair["base_analysis_id"], completion_scope="candidate_and_report_only",
@@ -372,10 +422,21 @@ class AnalysisJobs:
                 recheck_scope="complete_candidate_boundaries_dependencies_entries_and_runtime_groups")
         if refinement and via_binding:
             job["via_binding"] = via_binding
+        if refinement and context and context.get('context_scope'):
+            job['context_scope'] = context['context_scope']
         if resume is not None:
             job.update(resumed_from=resume["id"],
                        prior_rounds=resume.get("prior_rounds", 0) + resume["rounds"],
                        resumed_model_binding=copy.deepcopy(resume.get("model_binding")))
+            job['report_refs'] = list(resume.get('report_refs', []))
+            if resume.get('context_scope'):
+                job['context_scope'] = resume['context_scope']
+            if resume.get('last_check'):
+                job['last_check'] = copy.deepcopy(resume['last_check'])
+            if resume.get('error_kind') in {'context_length', 'request_too_large'}:
+                job['resume_mode'] = 'checked_candidate' if resume.get('last_check') else 'archived_context'
+                if not resume.get('last_check'):
+                    job['force_context_compaction'] = True
         with self.lock:
             cancellation = threading.Event()
             self.cancels[job["id"]] = cancellation
@@ -413,7 +474,7 @@ class AnalysisJobs:
                            api_requests=len(artifact["usage"]))
         request = self.source_request(inspector)
         request["preprocessing"] = dict(artifact_id=artifact["id"], digest=artifact["digest"],
-            content=content, report=report,
+            content=content, report=self._report_reply(inspector, job, report, 'preprocessing_handoff'),
             authority="API-generated binding candidates; original source and final split rules must still be checked")
         job["messages"] = [dict(role="system", content=RULES),
                            dict(role="user", content=json.dumps(request, ensure_ascii=False))]
@@ -429,7 +490,7 @@ class AnalysisJobs:
         request["source_manifest"] = dict(text_files=len(inspector.files),
             inventory_entries=len(inspector.request.get("inventory", [])),
             resource_entries=len(inspector.request.get("resources", [])),
-            access="list_structure/list_source/read_file；完整来源均可读取，无文件或上下文截断")
+            access="list_structure/list_source/read_file；完整来源可分页读取；活动上下文可按记忆策略整理，原记录保留")
         request["resource_access"] = "list_resources读取完整资源引用；list_structure返回目录位置。不将存在文件等同加载兼容。"
         request["classification"] = inspector.inspect_harness(count=8)
         request["classification_access"] = "以上仅为首个文件页；按目标相关path及next_offset调用inspect_harness。未扫描范围与未命中特征均不表示不存在能力。"
@@ -445,13 +506,26 @@ class AnalysisJobs:
 
     def _read_revision_facts(self, inspector, job, path):
         facts = (job.get("repair") or {}).get("facts") or {}
+        basis = facts.get('basis') if isinstance(facts, dict) else None
+        expected = dict(source_version=inspector.request['source_version'],
+                        input_digest=content_digest(preparation_input(inspector)), implementation=dict(self.implementation))
+        if basis != expected:
+            return dict(schema='revision-source-facts/1', status='UNKNOWN', path=path,
+                        reason='material_identity_changed', admission_granted=False,
+                        detail='Read current frozen source; historical facts do not grant current checks.')
         references = facts.get("related_candidates", []) if isinstance(facts, dict) else []
         reference = next((item for item in references if isinstance(item, dict) and item.get("path") == path), None)
         record = inspector.files.get(path) if isinstance(path, str) else None
         fact_id = reference.get("fact_id") if reference else None
+        if not reference and record:
+            reuse = facts.get('reuse') or {}
+            fact_id = content_digest(dict(path=path, sha256=record['sha256'],
+                                          extractor=reuse.get('extractor'), parser=reuse.get('parser')))
+            reference = dict(sha256=record['sha256'])
         cached = self.store.get("source_fact", fact_id) if isinstance(fact_id, str) and fact_id else None
         if (not record or not isinstance(cached, dict) or cached.get("path") != path
-                or cached.get("sha256") != record["sha256"]):
+                or cached.get("sha256") != record["sha256"] or reference.get('sha256') != record['sha256']
+                or any(cached.get(k) != facts.get('reuse', {}).get(k) for k in ('parser', 'extractor'))):
             return dict(schema="revision-source-facts/1", status="UNKNOWN", path=path,
                 reason="source_fact_unavailable_or_content_mismatch", admission_granted=False,
                 detail="Use the original source tools to inspect the current frozen source.")
@@ -528,8 +602,30 @@ class AnalysisJobs:
             report["entry_bindings"] = self.check_entries(inspector, candidate)
         return explain_candidate(inspector, candidate, report)
 
+    def _report_reply(self, inspector, job, result, tool, candidate=None):
+        reference = save_report(self.store, job, result, tool=tool, candidate=candidate,
+                                input_digest=content_digest(preparation_input(inspector)))
+        return compact_report(result, reference)
+
     def _run(self, inspector, profile, key, job, cancellation):
         started = stage_started = time.perf_counter()
+        memory = ContextMemory(self.store, job.setdefault('context_scope', 'analysis/' + job['id']))
+        memory.calibration = copy.deepcopy(job.get('context_calibration'))
+        def summarize(messages, selected_profile):
+            job['phase'] = 'context_compaction'
+            job['context_calls'] = job.get('context_calls', 0) + 1
+            job['usage'].append(None)
+            stage = job.get('pipeline_stage', 'analysis')
+            job['usage_by_stage'].setdefault(stage, []).append(None)
+            self._save_job(job, cancellation, 'context_compaction_started')
+            body = completion_body(selected_profile, messages)
+            return self._await_operation(lambda:self.transport.send(profile['base_url'] + '/chat/completions', key, body),
+                                         cancellation, job, 'context_compaction')
+        def record(event):
+            job.setdefault('context_events', []).append(event)
+            job['usage'][-1] = event.get('usage')
+            job['usage_by_stage'][job.get('pipeline_stage', 'analysis')][-1] = event.get('usage')
+            self._save_job(job, cancellation, 'context_compaction_finished')
         try:
             if not profile.get("capabilities") and profile.get("provider") == "deepseek":
                 try:
@@ -549,13 +645,25 @@ class AnalysisJobs:
                 tools = SOURCE_TOOLS + PREPROCESS_TOOLS if stage == "preprocessing" else TOOLS
                 if job.get("revision_id"):
                     tools = tools + [REVISION_FACT_TOOL]
+                job['messages'], job['context_status'] = memory.prepare(profile, job['messages'], tools, summarize, record,
+                    force=job.pop('force_context_compaction', False))
+                job['context_archives'] = memory.references()
+                job['phase'] = 'model_request'
                 body = completion_body(profile, job["messages"], tools)
+                job['last_request_size'] = dict(
+                    message_characters=sum(len(json.dumps(m, ensure_ascii=False)) for m in job['messages']),
+                    request_bytes=len(json.dumps(body, ensure_ascii=False).encode('utf-8')),
+                    requested_output_tokens=body.get('max_completion_tokens', body.get('max_tokens')))
                 response = self._await_operation(lambda: self.transport.send(
                     profile["base_url"] + "/chat/completions", key, body), cancellation, job, "model_request")
                 job["phase"] = "response_processing"
                 job["rounds"] += 1
                 job["usage"].append(response.get("usage"))
                 job["usage_by_stage"][stage].append(response.get("usage"))
+                memory.observe(response.get('usage'), job['messages'], tools)
+                job['context_calibration'] = copy.deepcopy(memory.calibration)
+                job['context_status']['last_actual_input_tokens'] = (response.get('usage') or {}).get('prompt_tokens',
+                    (response.get('usage') or {}).get('input_tokens'))
                 choices = response.get("choices", [])
                 if len(choices) != 1:
                     raise ProviderError("expected one assistant choice")
@@ -592,6 +700,7 @@ class AnalysisJobs:
                 for call in calls:
                     self._raise_cancelled(cancellation)
                     name = call.get("function", {}).get("name")
+                    reply = None
                     try:
                         args = json.loads(call["function"]["arguments"])
                         if name in {"check_preprocessing", "submit_preprocessing"}:
@@ -604,6 +713,7 @@ class AnalysisJobs:
                                 if prepared is not None:
                                     raise ValueError("one preprocessing submission per response")
                                 prepared = (artifact, result, content_digest(preparation_input(inspector)))
+                            reply = self._report_reply(inspector, job, result, name, artifact)
                         elif name in {"check_candidate", "submit_candidate"}:
                             if stage != "analysis":
                                 raise ValueError("submit preprocessing before proposing split boundaries")
@@ -620,6 +730,11 @@ class AnalysisJobs:
                                 job["submitted"] = dict(candidate=candidate, report=result)
                                 submitted_input = content_digest(preparation_input(inspector))
                                 submitted = True
+                            reply = self._report_reply(inspector, job, result, name, candidate)
+                        elif name == 'read_analysis_report':
+                            result = read_report(self.store, job, **args)
+                        elif name == 'read_analysis_memory':
+                            result = memory.read(**args)
                         elif name == "inspect_environment":
                             from .environments import discover_environment
                             result = self._await_operation(lambda: dict(discovery=discover_environment(inspector,
@@ -656,7 +771,8 @@ class AnalysisJobs:
                             self.store.save("request", inspector.request["id"], inspector.request, "source_extended")
                     self._raise_cancelled(cancellation)
                     job["messages"].append(dict(role="tool", tool_call_id=call["id"],
-                                                content=json.dumps(result, ensure_ascii=False)))
+                                                content=json.dumps(reply if reply is not None else result,
+                                                                   ensure_ascii=False, separators=(',', ':'))))
                     self._save_job(job, cancellation, "source_tool_result")
                 self._raise_cancelled(cancellation)
                 if prepared is not None:
@@ -695,7 +811,7 @@ class AnalysisJobs:
                 job["status"] = "CANCELLED"
         except AnalysisCancelled:
             job.update(status="CANCELLED", cancelled_at=now())
-            if job.get("phase") == "model_request":
+            if job.get("phase") in {"model_request", "context_compaction"}:
                 job["unreported_usage"] = dict(status="UNKNOWN", reason="cancelled_before_model_response")
         except Exception as error:
             if cancellation.is_set() or self.closed:
@@ -704,7 +820,9 @@ class AnalysisJobs:
                 job.update(status="FAILED", error=str(error),
                            error_kind=getattr(error, "kind", type(error).__name__),
                            failure_phase=job.get("phase"))
-            if job.get("phase") == "model_request":
+                if isinstance(getattr(error, 'diagnostic', None), dict):
+                    job['failure_diagnostic'] = copy.deepcopy(error.diagnostic)
+            if job.get("phase") in {"model_request", "context_compaction"}:
                 job["unreported_usage"] = dict(status="UNKNOWN", reason="model_response_unavailable")
         finally:
             duration = round((time.perf_counter() - stage_started) * 1000, 3)

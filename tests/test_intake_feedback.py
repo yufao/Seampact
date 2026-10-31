@@ -234,6 +234,18 @@ class IntakeFeedbackChecks(unittest.TestCase):
         self.assertEqual(rows[0]["issues"][0]["issue_code"], "initialization_unverified")
         self.assertFalse(rows[0]["issues"][0]["model_repairable"])
 
+    def test_call_rule_gap_is_external_while_missing_source_is_model_repairable(self):
+        for source, code, scope, group in [
+                ('def target():\n    unknown_callback()\n', 'dependency_closure_unsupported', 'rule', 'external_conditions'),
+                ('from .missing import run\ndef target():\n    run()\n', 'dependency_closure_unresolved', 'evidence', 'model_repairs')]:
+            with self.subTest(code=code):
+                inspector = self.freeze(source)
+                report = self.jobs._check_candidate(inspector, self.candidate())
+                issues = [i for i in report['feedback'][group] if i['issue_code'] == code]
+                self.assertEqual(len(issues), 1)
+                self.assertEqual(issues[0]['repair_scope'], scope)
+                self.assertEqual(issues[0]['model_repairable'], group == 'model_repairs')
+
     def test_typed_post_constructor_initialization_gap_points_to_original_prefix(self):
         inspector = SimpleNamespace(request={})
         candidate = self.candidate()
