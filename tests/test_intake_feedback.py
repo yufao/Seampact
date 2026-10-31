@@ -206,12 +206,12 @@ class IntakeFeedbackChecks(unittest.TestCase):
                             for issue in feedback["model_repairs"]))
 
     def test_real_dependency_checker_codes_reach_model_feedback_with_full_paths(self):
-        inspector = self.freeze("def target(url):\n    return Client(base_url=url)\n")
+        inspector = self.freeze("from openai import OpenAI\ndef target(url):\n    return OpenAI(base_url=url)\n")
         candidate = self.candidate()
         candidate["entries"][0]["fixed_arguments"] = dict(url={"$dependency": dict(id="api", field="base_url")})
         candidate["dependencies"] = [dict(id="api", kind="service", required=True, configurable=True,
             entry_ids=["target"], read_time="call", owner_scope="request",
-            evidence=[dict(path="source.py", start=1, end=2)], mappings=[])]
+            evidence=[dict(path="source.py", start=1, end=3)], mappings=[])]
         report = self.jobs._check_candidate(inspector, candidate)
         issue = report["feedback"]["model_repairs"][0]
         self.assertEqual(issue["issue_code"], "candidate_incomplete")

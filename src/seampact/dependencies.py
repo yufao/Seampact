@@ -13,16 +13,20 @@ from .intake import inside_platform_checkout
 from .store import now
 from .resource_flow import parameter_flow
 from .configuration_flow import environment_flow, configuration_facts
+from .configuration_binding import configuration_override_flow
+from .process_environment import process_environment_flow
 from .resource_origins import resource_origin_facts
 
 DEPENDENCY_RULES = """
 资源配置由用户保存，依赖需求和原参数映射必须由你从原源码提出。预处理工件和最终候选必须提供dependencies数组，逐项枚举已发现的原必需及可选外部服务、权重和配套模型资源；已有用户字面配置、原签名默认值、固定路径或尚未提供资源，均不是省略需求的理由。只在已检查的目标及原初始化范围确实没有发现此类需求时填[]，并在missing说明仍未覆盖的范围；[]本身不证明资源发现完整。
 资源发现与可执行映射分别提交。已发现需求即使没有当前有限规则支持的映射，也必须保留其源码证据、受影响entry_ids、原读取时点和owner，保留未核对/空mappings及具体missing，由检查器返回MISSING；不得为使入口READY而删除需求、改用用户字面配置绕过，或用无关辅助入口代替原目标。不要编造参数、引用或加载依据来消除MISSING。
 可配置依赖按受影响入口逐项核对，每个entry_ids中的入口都需自己的原参数映射和证据；一个入口通过不能替另一个入口放行。检查反馈的entry_checks给出逐入口状态与原因，selection_allowed只表示至少有入口可选择资源，不表示所有入口就绪，也不表示原服务已启动。
+宿主/编排入口通过函数或子进程间接使用已发现的服务/权重时，同样属于受影响入口；不能仅因为客户端构造在下游就省略宿主的需求。未核对跨进程配置传递时保留该入口的需求和映射缺口，不将无映射宿主写成资源闭合。
 mapping可提供自己的evidence:[{path,unit:"file",start,end}]；提供时独立核对该证据，不能用空值或不完整范围回退到依赖总证据。省略mapping.evidence时使用依赖的evidence。每份映射证据须覆盖完整参数定义及完整调用表达式（包含多行调用的结束行），跨文件时分别引用各文件。
 沿原目标的构造、初始化及请求路径检查依赖，区分基座、adapter、processor/checkpoint等实际资源及其原配置关系，不把其中一项代替整组。required按原owner实际的无条件加载或分支条件填写；拆分不能省略原初始化必需工作。最终候选应保留预处理发现且仍影响所选入口的需求；因入口范围改变而不再适用的需求须在missing说明源码依据，不能静默丢弃。资源未发现完整、映射未覆盖及资源尚未配置要分别说明。
 dependency格式：{id:"ASCII需求标识",kind:"service或weight",description:"实际用途",configurable:true或false,required:true或false,entry_ids:["依赖它的候选entry.id"],read_time:"constructor或call或process_start",owner_scope:"原对象/模块/请求作用域说明",evidence:[{path,unit:"file",start,end}],mappings:[{entry_id,location:"constructor.arguments或entry.fixed_arguments或initializers.原方法或binding_program.arguments或environment",parameter:"原真实参数/变量",field:"base_url或model或credential或path或parameters.非敏感参数"}]}。
 service与本地weight不得互换。原本地from_pretrained/torch.load等必须保留原模型对象路径；不能因为有API连接而改成HTTP或手写包装。service的base_url与model等只填真实原配置入口；credential只能映射到源码可核对的原认证调用参数，秘密从不进入分析上下文。原代码只在导入读环境时，当前同进程宿主不能临时改os.environ；保留MISSING。environment仅支持原CLI process_start且有原os.getenv/os.environ.get依据，值经子进程env传递不进命令行。
+environment映射的read_time描述平台注入边界，应为process_start；即使原子进程后来在构造器或请求方法消费该变量，也不能把这个注入时点填成constructor/call。原实际消费位置继续写在owner_scope和源码证据中。CLI候选的错误read_time和缺失/不匹配资源引用属于候选可修项；修正后仍须完整核对配置传递，不自动通过。
 每个mapping的evidence必须同时覆盖原参数定义和该参数进入原调用的位置；base_url/model/parameters.xxx须有同名原调用keyword，base_url也可进入原requests/httpx等HTTP调用的URL位置参数；credential须有原认证keyword（api_key/token/password/access_token/auth_token）。权重path须进入原from_pretrained/torch.load/safetensors加载调用；原构造参数还允许同一作用域顺序中的单赋值局部变量或receiver直接属性，以及已核对pathlib.Path导入的透明包装、参数唯一一次同名Path(parameter)规范化、已为Path的值与字面相对子路径的/连接、一层固定等长tuple/list字面解包。构造函数内已核对且未遮蔽的joblib.load也可作原加载依据。evidence须覆盖参数、每次赋值及加载调用。除此以外的重赋、删除、动态下标、分支赋值、嵌套作用域、跨方法或自定义转换不属于该有限规则；不推断任意对象属性或动态配置数据流，覆盖不了则保留具体MISSING。CLI environment须覆盖原环境读取，服务或加载调用也须有上述字段依据。依赖引用必须实际出现在所映射的entry字段，不能仅列mappings。
 参数值可引用用户所选资源：{"$dependency":{"id":"需求id","field":"base_url/model/credential/path/parameters.xxx"}}，只能放在该需求mappings已列的原参数位置。引用不是原函数参数类型；运行边界由引擎解析为原值。资源未选择仍提交真实需求与MISSING，不自选连接、模型或假权重。
 原函数通过配置字典读服务字段时，可在entry.fixed_arguments映射增加parameter_path:["原固定键", "原子键"]，parameter仍为原显式函数参数；引用放在该参数字典的同一键路径。仅支持1至8层字符串字面键、同一原函数或未遮蔽的词法闭包读取、单赋值局部别名；evidence须覆盖原参数、每个别名赋值和原字段调用。base_url允许保留原字符串字面后缀拼接，平台不自动增删后缀，所选连接必须符合原代码期望的基址。配置字典其余值仍须来自用户明确配置或现有值来源规则，不能自行编造整份配置。原字典的重赋、变更、动态键、字典前缀外传、类/lambda作用域或跨函数传参仍不支持；动态代码、命名空间/栈帧反射、动态调用目标、资源别名变更或外传不属于有限静态规则，须保留MISSING。该核对仅证明可见原语法中的参数来源，不证明任意外部Python调用不会反射改写。CLI/YAML文件参数不能冒充原函数字典参数。无需认证时，个别原SDK要求的非密钥占位符须由用户配置明确提供，不能把真实凭据写成候选字面值。
@@ -30,7 +34,7 @@ service与本地weight不得互换。原本地from_pretrained/torch.load等必�
 resource_catalog只提供非敏感连接、权重状态及已有选择；配置存在不等于服务能力、权重完整或原目标已运行。用户选择不改变入口与边界，W/H/R及生命周期规则继续适用。
 新增有限参数传递规则：可核对冻结 Python 中唯一且未遮蔽的函数/构造器调用，连接实参—形参、单赋值别名和同一接收者的单写属性，最多追踪8层；对象后续方法须从当前原入口实际调用到达，不能引用未调用方法冒充使用。每步参数、赋值和完整调用都要有evidence，检查反馈给出缺失的源码范围。解析真实导入后支持LiteLLM的api_base对应base_url，以及原OpenAI客户端中实际model字段/字面键请求字典；不改原SDK字段。动态目标、覆盖、多来源分支值、别名逃逸或循环来源不能确定时保留parameter_flow_unsupported；这只核对资源使用关系，不授予跳过、并行或生命周期许可。
 资源反馈resource_origins区分模型/附加checkpoint、Hub或本地目录、cache及下载目的地。from_pretrained的Hub标识不能当作仓库下固定路径，cache_dir不能当作模型文件；原分支选模型的配置参数不能直接替换成路径。有现成原路径参数时绑定已检查的本地文件/目录；只能经Hub/复杂配置消费的来源保留resource_locator_unsupported，不下载或改原算法。原构造后加载权重、设备和模式设置须沿原initializers或已支持的完整B-CALL保留；缺口不能靠删除依赖或随机初始化消除。
-CLI environment可沿唯一真实导入/调用追踪原模块单赋值常量、无自定义方法的普通dataclass字段及原对象单写属性；仅真实SDK字段或urllib.request.Request进入urlopen的URL、JSON model字段、Bearer Authorization可作消费者证据。各导入、环境读取、字段、赋值和完整调用均须覆盖。配置工厂或客户端名称本身不证明消费；未调用方法、动态读取、环境覆盖、遮蔽及缺失源文件保留具体MISSING。configuration_flow中的SOURCE_SIGNAL只记录配置来源、合并/条件覆盖次序和原字段加载事实，selected_value:UNRESOLVED不表示YAML/YACS值已求解，不可据此放行或将Hub标识当本地路径。
+CLI environment可沿唯一真实导入/调用追踪原模块单赋值常量、无自定义方法的普通dataclass字段及原对象单写属性；仅真实SDK字段或urllib.request.Request进入urlopen的URL、JSON model字段、Bearer Authorization可作消费者证据。各导入、环境读取、字段、赋值和完整调用均须覆盖。配置工厂或客户端名称本身不证明消费；未调用方法、动态读取、环境覆盖、遮蔽及缺失源文件保留具体MISSING。configuration_flow中的SOURCE_SIGNAL只记录配置来源、合并/条件覆盖次序和原字段加载事实，selected_value:UNRESOLVED不表示YAML/YACS值已求解，不可据此放行或将Hub标识当本地路径。原CLI权重可在entry.fixed_arguments声明whole-placeholder资源引用，mapping另填configuration_key:"原点分字段"及cli_override:{parameter:"原argparse.REMAINDER参数"}；command最后须为该字面字段和{资源参数占位符}，read_time须为process_start。检查器须核对真实YACS导入、原字符串键声明、原工作目录的冻结YAML、最后merge_from_list及该字段到torch.load，无后续覆盖或动态剩余选项。此前YAML值不在平台执行，原CLI保持原加载/合并/推理。
 """
 
 
@@ -657,13 +661,38 @@ def _mapping_shape(entries, row, mapping):
 
 def _check_mapping(inspector, entries, identity, row, mapping, evidence):
     entry, location, parameter, field, keys = _mapping_shape(entries, row, mapping)
-    ref = reference(_destination(entry, location, parameter, keys))
+    try:
+        ref = reference(_destination(entry, location, parameter, keys))
+    except ValueError as error:
+        raise MappingGap(str(error), "candidate_incomplete",
+            "在该入口的声明目标位置补齐真实资源引用，或修正映射位置；不要删除必需资源来消除缺口。",
+            ["mappings.location", "mappings.parameter", "mappings.parameter_path"]) from error
     if ref != {"id": identity, "field": field}:
-        raise ValueError("dependency reference does not occupy its declared original destination")
+        raise MappingGap("dependency reference does not occupy its declared original destination", "candidate_incomplete",
+            "核对原目标位置的资源引用 id/field 与这条映射一致，再完整重检。", ["mappings"])
+    if "configuration_key" in mapping or "cli_override" in mapping:
+        if row.get("read_time") != "process_start":
+            raise MappingGap("CLI configuration injection must declare read_time=process_start", "candidate_incomplete",
+                "将原 CLI 配置注入时点声明为 process_start，再核对原剩余选项和覆盖顺序。", ["read_time"])
+        flow = configuration_override_flow(inspector, entry, mapping, evidence)
+        if not flow["proved"]:
+            raise MappingGap(flow.get("reason") or "configuration override lacks complete original source evidence",
+                flow["issue_code"], "补齐原参数解析、YACS 对象、配置合并顺序、字段及加载调用证据；动态或后续覆盖保留缺口。",
+                ["mappings.evidence"] if flow["missing"] else ["mappings"], flow["missing"] or flow["facts"])
+        return flow
     if location == "environment":
-        if entry.get("kind") != "cli" or row.get("read_time") != "process_start":
-            raise ValueError("environment injection requires an original CLI process-start binding; in-process environment is never changed")
+        if entry.get("kind") != "cli":
+            raise MappingGap("environment injection requires an original CLI process-start binding; in-process environment is never changed",
+                "parameter_flow_unsupported", "同进程函数不支持临时环境注入；调查原 CLI 或原显式参数，保留未支持范围。", ["mappings.location"])
+        if row.get("read_time") != "process_start":
+            raise MappingGap("CLI environment injection must declare read_time=process_start", "candidate_incomplete",
+                "将原 CLI 环境注入时点声明为 process_start；构造器/请求中的实际消费位置保留源码证据，再核对配置传递。",
+                ["read_time"])
         flow = environment_flow(inspector, entry, parameter, field, evidence)
+        if not flow["proved"]:
+            forwarded = process_environment_flow(inspector, entry, parameter, field, evidence)
+            if forwarded.get("proved") or forwarded.get("facts"):
+                flow = forwarded
         if not flow["proved"]:
             raise MappingGap("environment configuration must reach an original field/loader/authentication consumer",
                 flow["issue_code"], "补读环境来源、配置字段、原调用链及消费者；动态覆盖或子进程转交仍须保留缺口。",

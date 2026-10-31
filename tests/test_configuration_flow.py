@@ -10,10 +10,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
 
 from seampact.dependencies import check_requirements
 from seampact.inspection import Inspector
+from seampact.intake_feedback import explain_candidate
 
 
 class ConfigurationFlowChecks(unittest.TestCase):
-    def check_flow(self, files, *, field='base_url', evidence=None, kind='cli', read_time='process_start'):
+    def check_flow(self, files, *, field='base_url', evidence=None, kind='cli', read_time='process_start', destination='valid'):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         root = Path(temporary.name)
@@ -30,10 +31,47 @@ class ConfigurationFlowChecks(unittest.TestCase):
             evidence=evidence if evidence is not None else [dict(path=p, start=1, end=len(s.splitlines())) for p, s in files.items()],
             mappings=[dict(entry_id='target', location='environment', parameter='RESOURCE', field=field)])
         candidate = dict(entries=[entry], dependencies=[dependency])
+        if destination == 'missing':
+            entry['environment'] = {}
+        elif destination == 'wrong':
+            entry['environment']['RESOURCE'] = {'$dependency': dict(id='other', field=field)}
         original = copy.deepcopy(candidate)
         checked = check_requirements(inspector, candidate)[0]
         self.assertEqual(candidate, original)
+        self.feedback = explain_candidate(inspector, candidate, dict(dependencies=[checked],
+            entry_bindings=dict(entries=[dict(id='target', status='MISSING', reason=checked.get('reason'))])))['feedback']
         return checked
+
+    def test_cli_injection_time_is_repairable_without_relaxing_flow_checks(self):
+        source = {'main.py': "import os\nimport requests\nrequests.post(os.getenv('RESOURCE'))\n"}
+        for read_time in ('constructor', 'call'):
+            with self.subTest(read_time=read_time):
+                row = self.check_flow(source, read_time=read_time)
+                issue = row['entry_checks']['target']['issues'][0]
+                self.assertEqual(issue['issue_code'], 'candidate_incomplete')
+                self.assertEqual(issue['field_paths'], ['read_time'])
+                repair = next(i for i in self.feedback['model_repairs'] if i.get('dependency_id') == 'resource')
+                self.assertEqual(repair['field_paths'], ['dependencies[0].read_time'])
+                self.assertTrue(repair['model_repairable'])
+        self.assertEqual(self.check_flow(source)['status'], 'MAPPING_CHECKED')
+        unsupported = {'main.py': "import os\nvalue = os.getenv('RESOURCE')\nunknown(value)\n"}
+        self.assertEqual(self.check_flow(unsupported)['status'], 'MISSING')
+
+    def test_missing_or_wrong_reference_is_candidate_error(self):
+        source = {'main.py': "import os\nimport requests\nrequests.post(os.getenv('RESOURCE'))\n"}
+        for destination in ('missing', 'wrong'):
+            with self.subTest(destination=destination):
+                row = self.check_flow(source, destination=destination)
+                self.assertEqual(row['status'], 'MISSING')
+                self.assertEqual(row['entry_checks']['target']['issues'][0]['issue_code'], 'candidate_incomplete')
+                self.assertTrue(any(i.get('dependency_id') == 'resource' and i['model_repairable']
+                                    for i in self.feedback['model_repairs']))
+
+    def test_in_process_environment_remains_a_rule_gap(self):
+        row = self.check_flow({'main.py': "import os\nimport requests\nrequests.post(os.getenv('RESOURCE'))\n"}, kind='function')
+        self.assertEqual(row['entry_checks']['target']['issues'][0]['issue_code'], 'parameter_flow_unsupported')
+        self.assertTrue(any(i.get('dependency_id') == 'resource' and not i['model_repairable']
+                            for i in self.feedback['external_conditions']))
 
     def test_module_constant_import_and_original_factory(self):
         files = {'main.py': "from cfg import endpoint\nfrom helper import query\nif __name__ == '__main__':\n    query(endpoint)\n",

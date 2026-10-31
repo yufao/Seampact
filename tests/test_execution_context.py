@@ -101,6 +101,7 @@ class ExecutionContextTests(unittest.TestCase):
         resources.check_entry.side_effect = AssertionError("must not resolve resources")
         binding = NativeBindings(inspector, dict(entries=[], boundaries=[]), None, resource_binding=resources)
         for change, code, field in [(dict(command=[]), "cli_command_invalid", "command"),
+                                    (dict(command=["app/run.py"]), "cli_interpreter_missing", "command.0"),
                                     (dict(symbol="main"), "cli_symbol_invalid", "symbol"),
                                     (dict(command=["python", "app/run.py", "--input={image}"]), "cli_placeholder_invalid", "command")]:
             entry = self.entry()

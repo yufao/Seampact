@@ -2131,6 +2131,11 @@ function taskRoleLabel(claim) {
 
 function entryIssueSummary(issue) {
   const specific = {
+    host_dependency_missing: ['上层入口漏了下游所需资源', '需要分析器补齐该入口的服务或权重需求，并核对原参数或子进程传递。'],
+    dependency_closure_unresolved: ['下游调用还没有查完整', '需要补查实际调用的同版源码和子进程目标，不能把未知当作不需要资源。'],
+    subprocess_environment_overridden: ['子进程会改写这项资源配置', '需要核对原覆盖顺序，保留原行为；不能直接把上层连接当作下游实际使用的连接。'],
+    subprocess_child_source_unavailable: ['还缺实际子进程的源码', '需要分析器补读原脚本，再核对服务参数怎样传入。'],
+    subprocess_flow_unsupported: ['这段子进程资源传递尚未核对', '请查看原调用和环境传递的具体缺口，不能靠重复选择资源放行。'],
     configuration_incomplete: ['原配置缺少必填内容', '需要分析器补查原配置的必读项，再使用原默认值或你的配置；不要猜测参数。'],
     dependency_destination_mismatch: ['资源接到了错误的位置', '需要分析器修正资源引用和参数映射；重新登记资源不能解决。'],
     execution_context_unsupported: ['原运行目录或导入环境还没核对好', '需要保留原脚本的工作目录和导入方式，再检查接入。'],
@@ -2186,6 +2191,7 @@ function entryReadinessDetails(readiness, job) {
   detailValue(root, '入口参数', readiness.parameters);
   detailValue(root, '入口操作与绑定条件', readiness.operations);
   if (readiness.execution_context) detailValue(root, '原运行目录与导入依据', readiness.execution_context);
+  if (readiness.dependency_closure) detailValue(root, '下游调用与所需资源', readiness.dependency_closure);
   return root;
 }
 

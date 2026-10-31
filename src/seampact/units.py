@@ -381,6 +381,7 @@ class NativeBindings:
         self.execution_contexts = {}
         self.import_contexts = {}
         self.completion_contracts = {}
+        self.dependency_closure = None
         self.callsite_gates, self.entry_owner_ids = {}, {}
         self.active_owner = contextvars.ContextVar("seampact_native_binding_owner", default=None)
         self.loop, self.thread = None, None
@@ -1116,6 +1117,11 @@ class NativeBindings:
                 raise ContextIssue("completion_contract_unproven", "completion", str(error)) from error
         from .candidate_checks import candidate_issues
         issues = candidate_issues(self.inspector, entry, self.candidate.get("dependencies", []))
+        from .dependency_closure import dependency_closure
+        if self.dependency_closure is None:
+            self.dependency_closure = dependency_closure(self.inspector, self.candidate)
+        closure = self.dependency_closure["entries"].get(entry["id"], {})
+        issues += closure.get("issues", [])
         if issues:
             error = MissingBinding(issues[0]["reason"])
             error.code = issues[0]["issue_code"]
@@ -1328,6 +1334,8 @@ class NativeBindings:
         if len(indices) != 1 or indices[0] not in {0, 1}:
             fail("cli_command_invalid", "command", "CLI command must invoke this exact original script")
         index = indices[0]
+        if index == 0 and entry["path"].endswith(".py") and not self.inspector.data(entry["path"]).startswith(b"#!"):
+            fail("cli_interpreter_missing", "command.0", "original Python script without a shebang needs an explicit Python interpreter")
         if index == 1 and Path(command[0]).name.lower() not in {"python", "python3", "python.exe", "bash", "sh", "pwsh", "powershell", "powershell.exe"}:
             fail("cli_interpreter_invalid", "command.0", "original CLI interpreter is not identified")
         placeholders = [match.group(1) for argument in command[index + 1:]
@@ -1909,6 +1917,7 @@ class UnitCatalog:
                           execution_context=binding.execution_contexts.get(entry.get("id")),
                           import_context=list(binding.import_contexts.get(entry.get("path"), {}).values()),
                           completion_contract=binding.completion_contracts.get(entry.get("id")),
+                          dependency_closure=(binding.dependency_closure or {}).get("entries", {}).get(entry.get("id")),
                           operations={"export_entry": {"status": "SOURCE_BOUND", "formal_proof": False,
                                        "scope": "user-confirmed prototype native binding; semantic export obligations remain conditional"}})
             if gaps:
@@ -1922,6 +1931,8 @@ class UnitCatalog:
             for attribute in ("code", "field_paths", "structured_issues", "candidate_issues"):
                 if hasattr(error, attribute):
                     result[attribute] = getattr(error, attribute)
+            if binding is not None:
+                result["dependency_closure"] = (binding.dependency_closure or {}).get("entries", {}).get(entry.get("id"))
             if getattr(error, "initialization_gaps", None):
                 result["code"] = "initialization_incomplete"
                 result["initialization_gaps"] = error.initialization_gaps

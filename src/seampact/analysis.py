@@ -154,7 +154,8 @@ class AnalysisJobs:
              "lowering.py", "callsite.py", "deployment.py", "dependencies.py", "resources.py", "providers.py",
              "service.py", "environments.py", "target_runtime.py", "revisions.py", "classification.py", "intake_feedback.py",
              "resource_flow.py", "resource_origins.py", "candidate_checks.py", "configuration_flow.py",
-             "execution_context.py", "completion.py")}
+             "execution_context.py", "completion.py", "dependency_closure.py", "configuration_binding.py",
+             "process_environment.py")}
         self.implementation = {name: digest(data) for name, data in self.implementation_bytes.items()}
         for old in store.list("analysis"):
             if old["status"] in {"RUNNING", "CANCELLING"}:

@@ -15,6 +15,8 @@ check工具的feedback将具体field_paths、issue_code、repair_action分为mod
 submit结束本次分析，outcome单独表示仍需修正、等待外部条件或静态核对且未运行；COMPLETED不表示原能力已跑通。不得为修复资源条件自行调用真实服务、下载或购买资源。
 按目标入口调查控制C、状态效果S、资源生命周期R；它们汇总原检查事实而非新的许可。先处理candidate_issues中的命令、引用位置和必读配置键缺项，再处理资源。配置只提取键和原默认依据，不把含凭据配置全文送给模型或猜测max_workers/generation。CLI保留原cwd/导入/argv与结果文件；退出0、输出已存在或续跑跳过均不等于本次目标完成。独立报告原并发、重试、汇合、处理数量与未知结果契约，不能删这些工作来接入。
 CLI可提供cwd:{path:"仓库相对目录",evidence:[{path,unit,start,end}]}，须有冻结README中原脚本命令及目录，或Dockerfile中COPY/ADD、WORKDIR及ENTRYPOINT对应；不能填任意服务器绝对路径。省略默认仓库根。命令symbol用__main__/script/<script>/脚本文件名，不把函数main当CLI整体；command是原脚本argv，业务值用独立完整{task_parameter}占位符，不能将凭据放进命令行。子进程环境仅支持原CLI进程启动时的已核对依赖引用，内部subprocess转交未核对时保留缺口。
+检查报告dependency_closure沿实际原函数/脚本调用核对宿主所需的下游资源。host_dependency_missing须在原需求entry_ids补宿主并提出它自己的真实映射；只补名称没有映射仍不能通过。dependency_closure_unresolved按unresolved_targets补读同版源/原命令；不能因动态或缺源而宣称不需要资源。保留原stage选择、并发、评分与续跑；未调用定义、无关阶段不强行挂到宿主。CLI可核对有限原Python子进程的环境继承，所有argv/env/cwd及消费链均须有证据；原覆盖、动态目标或缺源时保留具体缺口，不临时修改平台环境。
+Python脚本没有原shebang时command须显式以python/python3开始，不能只写脚本路径。保留原活动配置/默认设备与并发；不能为了静态检查环境缺GPU而擅自固定CPU模式，目标运行设备未知时记录配置缺口或原任务参数。
 仅对原Python CLI的单文件输入和精确输出，可提出completion:{schema:"native-completion/1",input_parameter:"实际命令占位符",output_parameter:"实际命令占位符",format:"json或npz",required_keys:["原结果必要键"],evidence:[{path,unit,start,end}]}。证据覆盖原参数声明、输出路径赋值、保存调用和必要键定义，不能编造文件命名。运行时拒绝目录/glob及未明确后缀，区分新产物、旧文件未变、缺失/无效；数值效果仍未知。未声明契约的CLI返回UNKNOWN完成状态，不能声称已检查结果；复杂多项映射不假装单文件支持。
 """
 
@@ -126,8 +128,9 @@ def entry_readiness(inspector, candidate, report):
             code = detail.get("issue_code", "candidate_incomplete")
             issue("candidate_incomplete", "接入候选还不完整", detail.get("reason"),
                   detail.get("repair_action", "按原定义补齐候选后完整重检。"), "revision",
-                  issue_code=code, repair_scope=detail.get("repair_scope", "evidence" if code == "execution_context_unproven" else "candidate"),
-                  field_paths=[entry_path + "." + p for p in detail.get("field_paths", [])],
+                  issue_code=code, repair_scope=detail.get("repair_scope", "evidence" if code in {"execution_context_unproven", "dependency_closure_unresolved"} else "candidate"),
+                  field_paths=[p if p.startswith(("dependencies[", "entries[")) or p == "entries" else entry_path + "." + p
+                               for p in detail.get("field_paths", [])],
                   source_evidence=detail.get("evidence", []))
         claim = task_role_claim(inspector, entry)
         if claim["status"] == "MISSING":
@@ -149,6 +152,8 @@ def entry_readiness(inspector, candidate, report):
                     scope = {"candidate_incomplete": "candidate", "evidence_incomplete": "evidence",
                              "parameter_flow_unsupported": "rule", "resource_locator_unsupported": "rule",
                              "configuration_flow_unsupported": "rule", "configuration_source_unavailable": "evidence"}.get(code, "candidate")
+                    scope = {"subprocess_child_source_unavailable": "evidence", "subprocess_environment_overridden": "rule",
+                             "subprocess_flow_unsupported": "rule"}.get(code, scope)
                     dep_path = "dependencies[" + str(dep_index) + "]"
                     paths = [dep_path if path == "dependencies" else path
                              if path.startswith(("dependencies[", "entries", "dependency_bindings"))
@@ -219,6 +224,7 @@ def entry_readiness(inspector, candidate, report):
                 boundaries={name: copy.deepcopy(boundaries[name].get("operations", {}))
                             for name in entry.get("boundary_ids", []) if name in boundaries}),
             task_role=claim, issues=issues, execution_context=checked.get("execution_context"),
+            dependency_closure=checked.get("dependency_closure"),
             scope="仅本次静态检查；实际初始化与调用另由运行记录保存",
             next_step=("按真实参数启动并调用目标入口，检查原结果；部署后在目标 worker 再核验。"
                        if checked.get("status") == "READY" and not issues else
@@ -300,6 +306,7 @@ def execution_contracts(inspector, candidate, report):
             resources=dict(dependency_ids=[d.get("id") for d in report.get("dependencies", [])
                 if entry.get("id") in d.get("entry_ids", [])], required_dictionary_keys=required_keys,
                 execution_context=row.get("execution_context"), initialization="NOT_RUN"),
+            downstream_dependencies=row.get("dependency_closure"),
             unresolved=[dict(issue_code=i.get("issue_code"), field_paths=i.get("field_paths"),
                              repair_scope=i.get("repair_scope")) for i in row.get("issues", [])]))
     return result
