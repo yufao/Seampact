@@ -90,6 +90,48 @@ class DependencyBindingChecks(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "affected original entries"):
             bindings.check_entry("first")
 
+    def test_mapping_uses_its_own_validated_evidence_across_source_files(self):
+        inspector, candidate = self.candidate("def first(url):\n    return Client(base_url=url)\n")
+        files = {"original.py": inspector.data("original.py"), "context.py": b"purpose = 'service'\n"}
+        inspector.data = lambda path: files[path]
+        row = candidate["dependencies"][0]
+        own_evidence = copy.deepcopy(row["evidence"])
+        row["evidence"] = [dict(path="context.py", start=1, end=1)]
+        self.assertEqual(check_requirements(inspector, candidate)[0]["status"], "MISSING")
+        row["mappings"][0]["evidence"] = own_evidence
+        self.assertEqual(check_requirements(inspector, candidate)[0]["status"], "MAPPING_CHECKED")
+
+    def test_mapping_evidence_does_not_fall_back_when_empty_or_invalid(self):
+        inspector, candidate = self.candidate("def first(url):\n    return Client(base_url=url)\n")
+        for evidence in ([], None, "original.py", [None], [dict(path="original.py", start=1, end=99)]):
+            with self.subTest(evidence=evidence):
+                candidate["dependencies"][0]["mappings"][0]["evidence"] = evidence
+                row = check_requirements(inspector, candidate)[0]
+                self.assertEqual(row["status"], "MISSING")
+                self.assertFalse(row["selection_allowed"])
+
+    def test_mapping_evidence_must_cover_its_parameter_and_complete_call(self):
+        inspector, candidate = self.candidate("def first(url):\n    return Client(\n        base_url=url\n    )\n")
+        mapping = candidate["dependencies"][0]["mappings"][0]
+        for start, end in ((1, 1), (1, 3), (2, 4)):
+            with self.subTest(start=start, end=end):
+                mapping["evidence"] = [dict(path="original.py", start=start, end=end)]
+                self.assertEqual(check_requirements(inspector, candidate)[0]["status"], "MISSING")
+        mapping["evidence"] = [dict(path="original.py", start=1, end=4)]
+        self.assertEqual(check_requirements(inspector, candidate)[0]["status"], "MAPPING_CHECKED")
+
+    def test_mapping_evidence_for_one_entry_does_not_admit_another(self):
+        inspector, candidate = self.candidate(
+            "def first(url):\n    return Client(base_url=url)\ndef second(url):\n    return Client(base_url=url)\n",
+            entries=["first", "second"])
+        row = candidate["dependencies"][0]
+        row["mappings"].append(dict(row["mappings"][0], entry_id="second"))
+        for mapping in row["mappings"]:
+            mapping["evidence"] = [dict(path="original.py", start=1, end=2)]
+        checked = check_requirements(inspector, candidate)[0]
+        self.assertEqual(checked["entry_checks"]["first"]["status"], "MAPPING_CHECKED")
+        self.assertEqual(checked["entry_checks"]["second"]["status"], "MISSING")
+
     def test_invalid_falsey_required_flag_cannot_skip_an_unresolved_dependency(self):
         inspector, candidate = self.candidate("def first(url):\n    return Client(base_url=url)\n")
         for invalid in (None, [], 0, ""):
@@ -101,6 +143,10 @@ class DependencyBindingChecks(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "boolean required"):
                     bindings.check_entry("first")
         candidate["dependencies"][0].update(required=False, mappings=[])
+        _, bindings = self.bound(inspector, candidate)
+        with self.assertRaisesRegex(ValueError, "no original parameter mapping"):
+            bindings.check_entry("first")
+        candidate["entries"][0]["fixed_arguments"] = {}
         _, bindings = self.bound(inspector, candidate)
         bindings.check_entry("first")
 

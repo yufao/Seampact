@@ -1819,6 +1819,7 @@ async function revisionAction(id, operation) {
       const candidate = JSON.parse(draft.candidate);
       if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate)) throw new Error('候选必须是 JSON 对象。');
       Object.assign(body, {candidate, guidance: draft.guidance, reason: draft.reason});
+      if (Array.isArray(draft.selectedEntryIds)) body.selected_entry_ids = draft.selectedEntryIds;
     }
     const result = await api('/api/analysis/revisions/' + operation, body);
     draft.dirty = false;
@@ -1834,6 +1835,45 @@ async function revisionAction(id, operation) {
   finally {
     revisionBusy.delete(id); renderedSections.delete('analyses'); await refresh();
   }
+}
+
+function renderRevisionEntrySelection(root, draft, locked, changed) {
+  root.replaceChildren();
+  root.append(node('h4', '选择本次接入的入口'));
+  root.append(node('p', '取消勾选可移除不需要的入口，包括未接通的入口。先保存并检查，再安装才会改变能力池；原源码和内部必需调用不会被删除。', 'card-note'));
+  let candidate;
+  try { candidate = JSON.parse(draft.candidate); }
+  catch { root.append(node('p', '候选内容暂时无法读取，请先修正高级编辑中的 JSON。', 'card-note')); return; }
+  const candidates = candidate?.entries;
+  if (!Array.isArray(candidates) || candidates.some(item => !item || typeof item.id !== 'string') ||
+      new Set(candidates.map(item => item.id)).size !== candidates.length) {
+    root.append(node('p', '入口列表不完整或编号重复，请先修正候选。', 'card-note')); return;
+  }
+  const selected = new Set(Array.isArray(draft.selectedEntryIds) ? draft.selectedEntryIds : candidates.map(item => item.id));
+  const summary = node('p', undefined, 'card-note'); root.append(summary);
+  const update = () => {
+    const ids = candidates.filter(item => selected.has(item.id)).map(item => item.id);
+    draft.selectedEntryIds = ids;
+    summary.textContent = ids.length ? '保留 ' + ids.length + ' / ' + candidates.length + ' 个入口。' :
+      '当前不保留任何入口。安装后，该来源的现有入口将全部移出能力池。';
+  };
+  const boxes = [];
+  for (const entry of candidates) {
+    const label = node('label', undefined, 'revision-field');
+    const input = node('input'); input.type = 'checkbox'; input.checked = selected.has(entry.id); input.disabled = locked;
+    input.setAttribute('aria-label', '保留入口 ' + (entry.description || entry.id));
+    input.onchange = () => { if (input.checked) selected.add(entry.id); else selected.delete(entry.id); update(); changed(); };
+    label.append(input, node('span', entry.description || entry.capability?.goal || entry.id));
+    if (entry.task_role) label.append(node('small', '用途判断：' + taskRoleLabel(entry.task_role) + '（待核对）'));
+    root.append(label, node('p', (entry.path || '') + (entry.symbol ? ' · ' + entry.symbol : ''), 'card-meta'));
+    boxes.push(input);
+  }
+  const all = node('button', '全选当前候选', 'secondary-button'); all.type = 'button'; all.disabled = locked;
+  all.onclick = () => { for (const entry of candidates) selected.add(entry.id); for (const input of boxes) input.checked = true; update(); changed(); };
+  root.append(all, node('p', '移除时请填写下方修改理由。若让模型重新生成候选，请重新确认入口列表。', 'card-note'));
+  const previous = draft.selectedEntryIds;
+  update();
+  if (!Array.isArray(previous)) delete draft.selectedEntryIds;
 }
 
 function renderRevisionWorkspace(card, harness, job) {
@@ -1915,9 +1955,11 @@ function renderRevisionWorkspace(card, harness, job) {
     if (revision.status === 'INSTALLED') workspace.append(node('p', '候选已安装，候选内容只读；下方仍可补记介入、个例结果与共性改进。', 'card-note'));
     else if (stale) workspace.append(node('p', (revision.stale_reason || '父分析或来源条件已改变，请从当前分析创建新修订。') + ' 候选内容只读，下方仍可补记处理记录。', 'card-note'));
     if (draft.dirty) detailValue(workspace, '服务器已保存的完整候选（本地未保存编辑另行保留）', revision.candidate);
+    const entrySelection = node('section', undefined, 'revision-entry-selection');
+    renderRevisionEntrySelection(entrySelection, draft, locked, changed); workspace.append(entrySelection);
     const advanced = node('details'); advanced.append(node('summary', '高级：编辑完整候选 JSON'));
     const editor = revisionInput(advanced, '完整候选 JSON（人工编辑）', draft.candidate, id + ':candidate', value => {
-      draft.candidate = value; changed();
+      draft.candidate = value; renderRevisionEntrySelection(entrySelection, draft, locked, changed); changed();
     }, true);
     editor.classList.add('revision-candidate'); editor.spellcheck = false;
     workspace.append(advanced);
@@ -2050,6 +2092,7 @@ function analysisClassification(classification) {
     const item = node('details');
     item.append(node('summary', [profile.path, profile.unit, profile.symbol, profile.kind].filter(Boolean).join(' · ') || '未指定源码范围'));
     detailValue(item, '条目范围', profile.scope);
+    if (profile.task_role) detailValue(item, '用途判断（分析声明）', profile.task_role);
     for (const [field, label] of [['forms', '形态'], ['families', '功能类型'], ['traits', '特征']]) {
       const tags = Array.isArray(profile[field]) ? profile[field] : [];
       if (!tags.length) item.append(node('p', label + '：未知／未提供', 'card-note'));
@@ -2081,28 +2124,58 @@ function analysisClassification(classification) {
   return root;
 }
 
+function taskRoleLabel(claim) {
+  return {target_defense: '目标防护', evidence: '检索或补证', host: '任务或对话宿主', support: '必要支撑',
+    display: '界面展示', mock: '测试替身', offline: '离线训练或评价', unknown: '尚未确定'}[claim?.role] || '尚未确定';
+}
+
+function entryIssueSummary(issue) {
+  const specific = {
+    candidate_incomplete: ['分析结果缺少必要信息', '需要分析器补齐原参数、入口或资源描述，再完整检查。'],
+    evidence_incomplete: ['源码依据还不完整', '需要分析器补读原定义、赋值和完整调用，检查记录中列出了缺少的位置。'],
+    parameter_flow_unsupported: ['平台暂不支持这段参数传递', '需要补充平台的通用检查规则；重复添加资源不能解决。'],
+    resource_locator_unsupported: ['模型来源还没核对清楚', '需要核对原模型标识、配置分支和缓存；不能把缓存目录当作模型文件。'],
+    initialization_incomplete: ['没有保留完整的初始化步骤', '需要按原代码保留权重加载、设备和模式设置；支持不了时继续记录缺口。']
+  };
+  if (specific[issue.issue_code]) {
+    const [title, action] = specific[issue.issue_code]; return {title, action};
+  }
+  const summaries = {
+    parameter_mapping: ['这项功能还没接好', '需要分析器继续修正接线；如果修正后仍是同一问题，需要改进平台。现在不用重复添加资源。'],
+    resource_binding: ['还没有选好所需资源', '请选择对应的服务或模型文件，再重新检查。'],
+    source_anchor: ['分析结果与原代码位置对不上', '需要分析器重新查找原函数，再检查接入结果。'],
+    unsupported_rule: ['平台暂不支持这段代码的接入方式', '需要改进平台；添加服务或模型文件不能解决这个问题。'],
+    runtime_environment: ['运行条件还没准备好', '请检查运行环境、依赖包和文件是否齐全，再重新检查。'],
+    binding_unresolved: ['这项功能还没接好', '需要继续检查接入方式；具体原因保留在下方原始记录中。']
+  };
+  const [title, action] = summaries[issue.category] || ['接入检查尚未通过', '请查看原始记录，确认还需要补齐什么。'];
+  return {title, action};
+}
+
 function entryReadinessDetails(readiness, job) {
   const root = node('div', undefined, 'entry-readiness');
-  const statuses = {STATIC_READY: '静态条件已满足', NEEDS_REPAIR: '仍需补齐条件'};
-  root.append(node('p', '入口准备：' + (statuses[readiness.status] || readiness.status || '未知') +
-    ' · 本次检查的初始化：' + (readiness.initialization === 'NOT_RUN' ? '未运行' : readiness.initialization || '未记录') +
-    ' · 本次检查的目标调用：' + (readiness.execution === 'NOT_RUN' ? '未运行' : readiness.execution || '未记录'), 'card-note'));
-  root.append(node('p', '这是本次静态检查的结果；已有真实初始化和调用状态请查看运行记录。', 'card-note'));
-  detailValue(root, '检查范围', readiness.scope);
-  if (readiness.reason) root.append(node('p', '原检查原因：' + issueText(readiness.reason), 'card-note'));
-  if (readiness.next_step) root.append(node('p', '下一步：' + readiness.next_step, 'card-note'));
+  root.append(node('p', readiness.status === 'STATIC_READY' ? '接入检查已通过，还需要实际运行验证。' :
+    '接入检查尚未通过，请先处理下方问题。', 'card-note'));
+  root.append(node('p', '本次检查没有运行原功能；已有结果请查看运行记录。', 'card-note'));
+  if (readiness.task_role?.status && readiness.task_role.status !== 'NOT_DECLARED') {
+    root.append(node('p', '用途判断：' + taskRoleLabel(readiness.task_role) + '（待核对）', 'card-note'));
+  }
   for (const issue of Array.isArray(readiness.issues) ? readiness.issues : []) {
-    root.append(node('p', [issue.category, issue.title, issue.reason].filter(Boolean).join(' · '), 'card-note'));
-    if (issue.action) root.append(node('p', '处理建议：' + issue.action, 'card-note'));
+    const summary = entryIssueSummary(issue);
+    root.append(node('p', summary.title, 'card-note'));
+    root.append(node('p', '下一步：' + summary.action, 'card-note'));
     if (inspectPage) {
       const section = {resources: 'harnesses', services: 'services', weights: 'weights', environment: 'harnesses'}[issue.target];
       if (section || issue.target === 'revision') {
-        const link = node('a', section ? '打开对应配置' : '查看本次修订入口', 'detail-link');
+        const link = node('a', section ? '打开对应配置' : '查看分析与修正', 'detail-link');
         link.href = section ? '/configuration?section=' + section : '#analysis-revision-' + job.id;
         root.append(link);
       }
     }
   }
+  detailValue(root, '查看原始检查记录', {status: readiness.status, reason: readiness.reason,
+    initialization: readiness.initialization, execution: readiness.execution, scope: readiness.scope,
+    next_step: readiness.next_step, issues: readiness.issues, task_role: readiness.task_role});
   detailValue(root, '入口参数', readiness.parameters);
   detailValue(root, '入口操作与绑定条件', readiness.operations);
   return root;
@@ -2342,6 +2415,11 @@ function renderAnalyses() {
     }
     if (job?.rounds !== undefined) card.append(node('p', '分析模型响应 ' + job.rounds + ' 轮', 'card-meta'));
     if (job) card.append(analysisProgress(job));
+    const outcome = job?.outcome || job?.submitted?.report?.outcome;
+    const outcomeText = {NEEDS_CANDIDATE_REPAIR: '分析已结束，候选或源码证据还需修正。',
+      AWAITING_EXTERNAL_CONDITIONS: '分析已结束，仍有平台支持、资源或运行条件待补齐。',
+      STATIC_CHECKED_NOT_RUN: '静态检查已通过，尚未实际运行目标。'}[outcome];
+    if (outcomeText) card.append(node('p', outcomeText, 'card-note'));
     const classification = analysisClassification(job?.submitted?.report?.classification);
     if (classification) card.append(classification);
     const resultSummary = job && analysisResultSummary(job);
@@ -3222,13 +3300,38 @@ function renderWeights() {
   }
 }
 
+function dependencyPresentation(dependency, binding, harness) {
+  const mappingReady = dependency.configurable === false ? dependency.status === 'MAPPING_CHECKED' :
+    (dependency.selection_allowed ?? dependency.status === 'MAPPING_CHECKED');
+  const bindingAllowed = mappingReady && !['DETACHED', 'ANALYZING'].includes(harness.status);
+  const partial = mappingReady && dependency.status !== 'MAPPING_CHECKED';
+  const noun = dependency.kind === 'service' ? '服务连接' : '模型文件';
+  let title, action;
+  if (harness.status === 'DETACHED') {
+    title = '来源已停用'; action = '重新接入后，再配置所需资源。';
+  } else if (harness.status === 'ANALYZING') {
+    title = '正在分析'; action = '请等分析结束后再配置资源。';
+  } else if (!mappingReady) {
+    title = '待平台处理'; action = '平台还没确认原代码如何使用这项资源。需要继续修正接线；现在不用重复添加服务或模型文件。';
+  } else if (dependency.configurable === false) {
+    title = '需要检查文件'; action = '请把文件放到原代码要求的位置，再检查文件是否齐全。';
+  } else if (!binding) {
+    title = '待选择' + noun; action = '接线检查已通过，请在下方选择对应的' + noun + '。';
+  } else if (binding.reason || !['BOUND', 'MAPPING_CHECKED', 'READY', 'CONFIGURED', 'SAVED', 'SELECTED', 'VERIFIED'].includes(String(binding.status).toUpperCase())) {
+    title = '需要检查所选资源'; action = '资源已选过，但还没有确认可用。请检查配置或文件，再保存并重新检查。';
+  } else {
+    title = '资源已选择'; action = '接下来实际运行一次，确认这项功能能正常工作。';
+  }
+  return {mappingReady, bindingAllowed, partial, noun, title, action};
+}
+
 function harnessDependencies(card, harness) {
   const dependencies = entries(resourceState().dependencies).filter(item => (item.source_id || item.harness_id) === harness.id);
   const detail = node('details', undefined, 'dependency-details');
   detail.open = dependencies.some(dependency => dependency.status !== 'MAPPING_CHECKED');
-  detail.append(node('summary', '依赖配置 · ' + dependencies.length + ' 项分析器需求'));
+  detail.append(node('summary', '所需资源 · ' + dependencies.length + ' 项'));
   if (!dependencies.length) {
-    detail.append(node('p', '尚未形成依赖需求。先由分析器读取原库；已登记的服务或权重不会自动制造入口或参数映射。', 'card-note'));
+    detail.append(node('p', '分析器还没有列出所需资源，请先完成来源分析。', 'card-note'));
     card.append(detail); return;
   }
   const bindings = entries(resourceState().bindings);
@@ -3236,51 +3339,27 @@ function harnessDependencies(card, harness) {
     const id = dependency.id || dependency.dependency_id;
     const binding = bindings.find(item => item.dependency_id === id);
     const row = node('article', undefined, 'dependency-card'); row.dataset.itemId = id;
-    row.append(node('h4', dependency.description || dependency.name || id), node('p',
-      (dependency.kind === 'service' ? '原 API 服务' : '原加载器的权重') + ' · 需求 ' + id, 'card-meta'));
+    const heading = String(dependency.name || dependency.description || (dependency.kind === 'service' ? '服务连接' : '模型文件')).split(/[。\n]/)[0];
+    row.append(node('h4', heading.length > 90 ? heading.slice(0, 90) + '…' : heading));
+    const {mappingReady, bindingAllowed, partial, noun, title, action} = dependencyPresentation(dependency, binding, harness);
     const statuses = node('div', undefined, 'resource-states');
-    const bindingReason = binding?.reason || dependency.reason;
-    resourceStatus(statuses, '依赖绑定', readableResourceStatus(binding?.status || dependency.status || 'NOT_CONFIGURED'), bindingReason ? issueText(bindingReason) : undefined);
-    resourceStatus(statuses, '原目标执行', readableResourceStatus(resourceExecution(dependency)));
+    resourceStatus(statuses, '配置', title);
+    const execution = resourceExecution(dependency);
+    resourceStatus(statuses, '实际运行', execution === 'NOT_RUN' ? '尚未运行' : readableResourceStatus(execution));
     row.append(statuses);
-    const entryChecks = Object.entries(dependency.entry_checks || {});
-    const mappingReady = dependency.configurable === false ? dependency.status === 'MAPPING_CHECKED' :
-      (dependency.selection_allowed ?? dependency.status === 'MAPPING_CHECKED');
-    const bindingAllowed = mappingReady && !['DETACHED', 'ANALYZING'].includes(harness.status);
-    const partial = mappingReady && dependency.status !== 'MAPPING_CHECKED';
-    row.append(node('p', partial ? '部分入口的原参数映射已核对，可为这些入口选择资源；其余入口仍需修订。' :
-      mappingReady ? '原源码映射已核对；接下来准备并选择资源。' :
-      '原参数映射尚未通过核对。此项缺口需要修订或补充通用规则，登记资源本身不能解决。', 'card-note'));
-    if (dependency.reason) row.append(node('p', '待解决：' + issueText(dependency.reason), 'card-note'));
-    if (dependency.entry_ids?.length) row.append(node('p', '影响入口：' + dependency.entry_ids.join('、'), 'card-meta'));
-    if (entryChecks.length) {
-      const coverage = node('div', undefined, 'dependency-entry-checks');
-      for (const [entryId, check] of entryChecks) {
-        const item = node('p', entryId + '：' + (check.status === 'MAPPING_CHECKED' ? '原参数映射已核对' : '映射待修订') +
-          (check.reason ? ' · ' + issueText(check.reason) : ''), 'card-note');
-        coverage.append(item);
-      }
-      row.append(coverage);
-    }
-    if (dependency.kind === 'weight') row.append(node('p', '权重文件检查、原加载器加载与服务启动分别记录；登记路径不会自动部署模型服务。', 'card-note'));
+    row.append(node('p', '下一步：' + action, 'card-note'));
+    if (partial) row.append(node('p', '目前只接好部分功能，可先为这些功能配置资源。其余问题见原始记录。', 'card-note'));
     if (!mappingReady || partial) {
-      const repair = node('a', '前往来源分析与修订台', 'detail-link');
+      const repair = node('a', '查看分析与修正', 'detail-link');
       repair.href = '/inspect?' + new URLSearchParams({view: 'analyses', harness: harness.id}); row.append(repair);
     }
-    detailValue(row, '原源码依据、读取时点与 owner', {anchor: dependency.anchor || dependency.evidence,
-      original_configuration: dependency.configuration || dependency.config_field,
-      read_time: dependency.read_time || dependency.read_at,
-      owner_scope: dependency.owner_scope || dependency.owner, lifetime: dependency.lifetime, required: dependency.required});
     if (dependency.configurable === false) {
       const placement = dependency.placement || {};
-      row.append(node('p', '源库要求的位置 · 原路径不可覆盖', 'card-note'));
+      row.append(node('p', '文件需要放在指定位置', 'card-note'));
       if (typeof placement === 'string') row.append(node('p', placement, 'resource-path'));
       else {
         row.append(node('p', '实际放置位置：' + (placement.absolute_path || placement.resolved_path || placement.path || '位置未确定'), 'resource-path'));
-        if (placement.expression || placement.relative_path || placement.value || placement.base || placement.original_cwd) row.append(node('p',
-          '原表达式：' + (placement.expression || placement.relative_path || placement.value || '—') +
-          ' · 原工作目录：' + (placement.original_cwd || placement.base || '未确定'), 'card-note'));
-        if (placement.execution_environment) row.append(node('p', '执行环境：' + placement.execution_environment, 'card-note'));
+        detailValue(row, '查看路径来源', placement);
       }
       const required = dependency.required_files || placement.required_files;
       const missing = dependency.missing_files || placement.missing_files || placement.missing;
@@ -3293,47 +3372,49 @@ function harnessDependencies(card, harness) {
       check.onclick = () => resourceAction(check, '/api/harnesses/check-dependency', {harness_id: harness.id, dependency_id: id},
         '已核对源库要求的位置及文件。本次未覆盖路径或加载模型。');
       row.append(check);
-    } else {
+    } else if (bindingAllowed) {
       const form = node('form', undefined, 'dependency-binding');
       const select = node('select'); select.required = true; select.setAttribute('aria-label', '为 ' + (dependency.description || id) + ' 选择资源');
       const none = node('option', '选择已登记的' + (dependency.kind === 'service' ? '连接' : '权重')); none.value = ''; select.append(none);
       const records = entries(dependency.kind === 'service' ? resourceState().connections : resourceState().weights);
-      const noun = dependency.kind === 'service' ? '服务连接' : '权重';
-      const selectionReason = !mappingReady ? issueText(dependency.selection_reason || '需先修复原参数映射') : !bindingAllowed ?
-        '来源正在分析或已摘除' : !records.length ? '尚未登记' + noun : '';
-      if (selectionReason) none.textContent = '暂不能选择：' + selectionReason;
-      row.append(node('p', '已登记' + noun + '：' + records.length + ' 项' +
-        (selectionReason ? '。当前不可选择：' + selectionReason + '。' : '。可在下方选择。'), 'card-note dependency-selection-note'));
+      if (!records.length) none.textContent = '请先添加' + noun;
       const register = node('a', dependency.kind === 'service' ? '登记／管理服务连接' : '登记／管理权重', 'detail-link');
       register.href = '/configuration?section=' + (dependency.kind === 'service' ? 'services' : 'weights'); row.append(register);
       for (const resource of records) {
         const option = node('option', resource.name || resourceId(resource)); option.value = resourceId(resource); select.append(option);
       }
       select.value = binding?.connection_id || binding?.resource_id || '';
-      const button = node('button', '保存选择并重新接入', 'secondary-button'); button.type = 'submit';
+      const button = node('button', '保存并检查', 'secondary-button'); button.type = 'submit';
       select.disabled = !bindingAllowed || !records.length;
       button.disabled = !bindingAllowed || !records.length;
       if (!records.length) row.append(node('p', '尚无已登记资源；先使用上方配置入口登记。', 'card-note'));
       const status = node('span', '', 'form-status'); status.setAttribute('role', 'status');
       form.append(select, button, status);
       form.onsubmit = async event => {
-        event.preventDefault(); button.disabled = true; status.textContent = '正在核对映射…';
+        event.preventDefault(); button.disabled = true; status.textContent = '正在检查接入配置…';
         try {
           const body = {harness_id: harness.id, dependency_id: id};
           body[dependency.kind === 'service' ? 'connection_id' : 'resource_id'] = select.value;
           await api('/api/harnesses/bind-dependency', body);
-          showNotice('资源选择已保存，并重新核对接入条件；请在最新分析结论和能力池查看结果。实际调用尚未执行。');
+          showNotice('选择已保存，接入条件已重新检查。尚未实际运行，请查看最新结果。');
           await refresh();
         } catch (error) { status.textContent = error.message; }
         finally { button.disabled = !bindingAllowed || !records.length; }
       };
       row.append(form);
     }
-    detailValue(row, '分析器提出的原字段映射', dependency.mappings || dependency.mapping);
+    detailValue(row, '查看原始检查记录', {id, description: dependency.description,
+      status: dependency.status, reason: dependency.reason, selection_reason: dependency.selection_reason,
+      entry_checks: dependency.entry_checks, entry_ids: dependency.entry_ids,
+      resource_origins: dependency.resource_origins,
+      binding, mappings: dependency.mappings || dependency.mapping, evidence: dependency.anchor || dependency.evidence,
+      original_configuration: dependency.configuration || dependency.config_field,
+      read_time: dependency.read_time || dependency.read_at,
+      owner_scope: dependency.owner_scope || dependency.owner, lifetime: dependency.lifetime, required: dependency.required});
     if (dependency.last_execution) detailValue(row, '最近原生调用及冻结配置依据', dependency.last_execution);
     detail.append(row);
   }
-  detail.append(node('p', '绑定只使用规则核对的原字段；同一资源不合并原 owner。新配置用于新运行，在途运行保留冻结配置。', 'card-note'));
+  detail.append(node('p', '保存配置不会启动模型；正在执行的任务继续使用原配置。', 'card-note'));
   card.append(detail);
 }
 

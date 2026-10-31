@@ -13,6 +13,52 @@ from . import inspection
 EXTRACTOR_VERSION = "source-fact/1"
 
 
+def select_candidate_entries(candidate, selected_ids):
+    """Select exported entries only; leave original code and boundaries intact."""
+    import copy
+    if not isinstance(selected_ids, list) or any(not isinstance(value, str) for value in selected_ids):
+        raise ValueError("保留入口需要字符串 ID 列表")
+    entries = candidate.get("entries")
+    if not isinstance(entries, list) or any(not isinstance(entry, dict) or not isinstance(entry.get("id"), str)
+                                           for entry in entries):
+        raise ValueError("候选入口格式不完整，请先修正候选")
+    available = [entry["id"] for entry in entries]
+    if len(set(available)) != len(available) or len(set(selected_ids)) != len(selected_ids):
+        raise ValueError("入口 ID 不能重复")
+    if set(selected_ids) - set(available):
+        raise ValueError("选择中包含当前候选不存在的入口，请刷新后重新选择")
+    selected = set(selected_ids)
+    result = copy.deepcopy(candidate)
+    result["entries"] = [entry for entry in result["entries"] if entry["id"] in selected]
+    if isinstance(result.get("runtime_groups"), list):
+        groups = []
+        for group in result["runtime_groups"]:
+            if not isinstance(group, dict) or not isinstance(group.get("entries"), list):
+                raise ValueError("运行组格式不完整，请先修正候选")
+            group["entries"] = [identity for identity in group["entries"] if identity in selected]
+            if group["entries"]:
+                groups.append(group)
+        result["runtime_groups"] = groups
+    if isinstance(result.get("dependencies"), list):
+        dependencies = []
+        for dependency in result["dependencies"]:
+            if not isinstance(dependency, dict):
+                raise ValueError("依赖格式不完整，请先修正候选")
+            scope = dependency.get("entry_ids")
+            if isinstance(scope, list) and scope:
+                dependency["entry_ids"] = [identity for identity in scope if identity in selected]
+                if not dependency["entry_ids"]:
+                    continue
+            if isinstance(dependency.get("mappings"), list):
+                dependency["mappings"] = [mapping for mapping in dependency["mappings"]
+                    if not isinstance(mapping, dict) or mapping.get("entry_id") in selected]
+            if selected:
+                dependencies.append(dependency)
+        result["dependencies"] = dependencies
+    return result, dict(retained_ids=[identity for identity in available if identity in selected],
+                        excluded_ids=[identity for identity in available if identity not in selected])
+
+
 def _object(value, fields, label):
     if not isinstance(value, dict) or set(value) - set(fields):
         raise ValueError(label + "需要对象且只能包含约定字段")

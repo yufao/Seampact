@@ -11,7 +11,7 @@ from types import SimpleNamespace
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from seampact.analysis import content_digest
-from seampact.revisions import candidate_diff, declared_result, intervention
+from seampact.revisions import candidate_diff, declared_result, intervention, select_candidate_entries
 from seampact.service import Platform
 from seampact.store import Store
 
@@ -39,6 +39,55 @@ class RevisionFeedbackChecks(unittest.TestCase):
 
     def save(self, revision):
         self.store.save("analysis_revision", revision["id"], revision)
+
+    def selection_candidate(self):
+        return dict(entries=[dict(id="real", boundary_ids=["shared"]), dict(id="demo", boundary_ids=["shared"])],
+            boundaries=[dict(id="shared", path="source.py", symbol="Controller.check")],
+            runtime_groups=[dict(id="owner", entries=["real", "demo"])],
+            dependencies=[dict(id="both", required=True, entry_ids=["real", "demo"], mappings=[
+                dict(entry_id="real", parameter="model"), dict(entry_id="demo", parameter="model")]),
+                dict(id="demo_only", entry_ids=["demo"], mappings=[dict(entry_id="demo")])])
+
+    def test_entry_selection_retains_shared_boundaries_and_required_dependencies(self):
+        original = self.selection_candidate()
+        candidate, selection = select_candidate_entries(original, ["real"])
+        self.assertEqual(candidate["entries"], original["entries"][:1])
+        self.assertEqual(candidate["boundaries"], original["boundaries"])
+        self.assertEqual(candidate["runtime_groups"][0]["entries"], ["real"])
+        self.assertEqual([d["id"] for d in candidate["dependencies"]], ["both"])
+        self.assertTrue(candidate["dependencies"][0]["required"])
+        self.assertEqual(candidate["dependencies"][0]["entry_ids"], ["real"])
+        self.assertEqual(candidate["dependencies"][0]["mappings"], [dict(entry_id="real", parameter="model")])
+        self.assertEqual(selection["excluded_ids"], ["demo"])
+        self.assertEqual(len(original["entries"]), 2)
+
+    def test_entry_selection_allows_empty_and_rejects_invalid_choices(self):
+        candidate, selection = select_candidate_entries(self.selection_candidate(), [])
+        self.assertEqual(candidate["entries"], [])
+        self.assertEqual(candidate["runtime_groups"], [])
+        self.assertEqual(candidate["dependencies"], [])
+        self.assertEqual(selection["excluded_ids"], ["real", "demo"])
+        for invalid in (["absent"], ["real", "real"], [None], "real"):
+            with self.subTest(choice=invalid), self.assertRaises(ValueError):
+                select_candidate_entries(self.selection_candidate(), invalid)
+
+    def test_entry_removal_requires_reason_and_invalidates_prior_check(self):
+        revision = self.revision()
+        revision["candidate"] = self.selection_candidate()
+        original = copy.deepcopy(revision["candidate"])
+        with self.assertRaisesRegex(ValueError, "移除入口的理由"):
+            self.platform._save_revision(revision, dict(selected_entry_ids=["real"]))
+        self.assertEqual(revision["candidate"], original)
+        self.platform._save_revision(revision, dict(selected_entry_ids=["real"], reason="测试替身不参与本次接入",
+            intervention=dict(actor=dict(kind="user", name=""))))
+        self.assertEqual(revision["candidate"]["entries"], original["entries"][:1])
+        self.assertEqual(revision["status"], "DRAFT")
+        self.assertIsNone(revision["report"])
+        self.assertIsNone(revision["checked_digest"])
+        event = revision["provenance"][-1]
+        self.assertEqual(event["entry_selection"]["excluded_ids"], ["demo"])
+        self.assertEqual(event["before_candidate_snapshot"], original)
+        self.assertEqual(event["intervention"]["actor"]["kind"], "user")
 
     def test_incremental_action_diff_does_not_infer_actor(self):
         revision = self.revision()

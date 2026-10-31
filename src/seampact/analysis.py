@@ -14,13 +14,14 @@ from .dependencies import check_requirements, DEPENDENCY_RULES
 from .providers import ProviderError, Transport, completion_body, completion_parameters
 from .store import now
 from .verification import check_candidate
-from .intake_feedback import explain_candidate
+from .intake_feedback import explain_candidate, TASK_ROLE_RULES, TASK_ROLES
 
 RULES = """你是异构 Harness 接入分析 Agent。依据冻结入口和观察契约，从源码探索具体能力、边界和原生执行宿主。
 允许 W 包装、H 原生交接、有限 R 局部重构。不要重写原算法、数据或控制策略。
 输入是接入者配置的整个仓库/目录，不是预登记示例。接入目标entry仅限定要接入的Harness，不预填边界。先用list_structure查看根结构，再按相关path查entry_candidates/inspect_imports/inspect_construction；完整目录随时可读取，不必一次把无关库全部放入上下文。
 入口发现、构造绑定候选及有限拆分由本平台分析链完成，不要求接入者先手写来源包装或切分答案。自动预处理工件只提供待核对候选，不授予Unit或执行许可；生成适配工件与原源码分别记录，不能把前者伪称原库入口。
 区分目标在线能力、初始化、离线训练/评测及辅助函数。目标绑定不受现有规则支持或资源不足时保留真实入口与MISSING原因，不用辅助函数的READY代替目标完成，不建议用外部逐库手写入口绕过。
+整仓可读不等于全部入口都应接入。先按当前接入目标追踪真实输入、输出和控制关系，在entry.description说明其实际角色：防护功能、必要支撑、任务/对话宿主、界面展示、示例/测试替身(MOCK)、离线训练评测、混合或未知，并说明是否适合当前目标。只把与当前目标相关的真实可调用入口列入entries；已识别但不选用的入口在analysis中列出用途、排除理由和源码依据。普通模型生成、API可调用、静态READY都不证明是防护；MOCK或预置结果不能冒充真实效果。不能只按文件名或目录名排除：demo/前端也可能包含真实检查或唯一原请求路径，须追踪实际调用和活动配置。原流程内部必需初始化、检查和清理继续保留；不因不单独导出而跳过。任务相关性未明时说明未知，不以分类标签强行删代码或改变原算法。
 入口、初始化、请求、关闭、数据/模型/配置/CLI、同步/异步、回调、异常、取消、资源驻留都要分析。
 一个完整 Harness 可提出多个能力或不同粒度候选；原 controller 继续决定激活/分支。
 Coordinator 只决定已使能发生的启动。controller_schedule、composition_export、parallel、remote 必须分别核验。
@@ -76,6 +77,7 @@ check_candidate.entry_bindings.runtime_groups返回引擎按源码核对的分�
 
 
 RULES += DEPENDENCY_RULES
+RULES += TASK_ROLE_RULES
 RULES += "\n运行环境由inspect_environment返回原库声明、推荐、冲突与用户选择。entry_profile保留平台本地基线，runtime_environment为明确选择的独立目标解释器，具体语法与构造仍须通过引擎核对。先核对环境事实；不自行升级依赖、执行安装命令或以镜像存在证明原能力可用。需要不同Python/依赖时说明来源依据和缺口，交由运行环境配置，不改变原算法或拆分规则。\n"
 RULES += "\n同一响应可以提出多个互不依赖的源码读取工具请求，减少逐项等待模型的往返。已有预处理工件中的源锚点、构造候选和反馈应先消费；按需补读与拆分有关的证据，无需重复读取未改变且已有完整证据的文件。最终候选仍须接受完整机械核验。\n"
 RULES += "\n先消费 classification 中的多轴源码线索及 recipes，按目标相关路径调用 inspect_harness 并按 next_offset 续查。它区分原生形态、Harness 功能结构与状态资源特征；HYPOTHESIS 不是已证明的功能类别。按配方追查构造、模型与索引加载、工具注册、反馈循环和效果；未命中或混合类别仍可继续探索，不能因分类丢弃目标。check_candidate 返回目标范围分类及 entry_readiness，将明确缺口用于下一次补读或修订；说明较细候选为何被拒绝或没有新控制机会。分类不签发 W/H/R、并行、独立导出或远程许可。最终交付应说明目标入口、真实输入与资源、已核对操作和下一步；静态检查不执行原代码，运行状态保留 NOT_RUN。\n"
@@ -150,7 +152,8 @@ class AnalysisJobs:
         self.implementation_bytes = {name: Path(__file__).with_name(name).read_bytes() for name in
             ("analysis.py", "preprocessing.py", "inspection.py", "units.py", "verification.py",
              "lowering.py", "callsite.py", "deployment.py", "dependencies.py", "resources.py", "providers.py",
-             "service.py", "environments.py", "target_runtime.py", "revisions.py", "classification.py", "intake_feedback.py")}
+             "service.py", "environments.py", "target_runtime.py", "revisions.py", "classification.py", "intake_feedback.py",
+             "resource_flow.py", "resource_origins.py")}
         self.implementation = {name: digest(data) for name, data in self.implementation_bytes.items()}
         for old in store.list("analysis"):
             if old["status"] in {"RUNNING", "CANCELLING"}:
@@ -342,10 +345,11 @@ class AnalysisJobs:
             old_request = self.store.get("request", context["request_id"])
             if old_request and old_request["source_version"] == inspector.request["source_version"]:
                 messages = [dict(role="system", content=RULES)] + copy.deepcopy(context["messages"][1:])
-                feedback = self.check_entries(inspector, context["submitted"]["candidate"]) if self.check_entries else {}
+                feedback = self._check_candidate(inspector, context["submitted"]["candidate"])
                 messages.append(dict(role="user", content=json.dumps(dict(
                     task="沿用完整分析上下文，按当前RuleSet和机械反馈完善候选及运行组。暴露真实业务输入；原对象/共享状态/控制关系必须保留。未知远程条件继续本地，不宣称JSON即可拆分。无需重新读取不变源码。",
-                    request=self.source_request(inspector), current_entry_feedback=feedback), ensure_ascii=False)))
+                    request=self.source_request(inspector), current_entry_feedback=feedback.get("entry_bindings", {}),
+                    current_candidate_feedback=feedback), ensure_ascii=False)))
                 refinement = context["id"]
         job = dict(id=identity or uuid.uuid4().hex, request_id=inspector.request["id"], provider=provider,
             started_at=now(), status="RUNNING", rounds=0, usage=[], submitted=None,
@@ -427,6 +431,11 @@ class AnalysisJobs:
         request["resource_access"] = "list_resources读取完整资源引用；list_structure返回目录位置。不将存在文件等同加载兼容。"
         request["classification"] = inspector.inspect_harness(count=8)
         request["classification_access"] = "以上仅为首个文件页；按目标相关path及next_offset调用inspect_harness。未扫描范围与未命中特征均不表示不存在能力。"
+        request["intake_contract"] = dict(task_role=dict(optional=True, roles=sorted(TASK_ROLES),
+            fields=["role", "purpose", "evidence"], semantic_claims="NOT_INDEPENDENTLY_PROVED"),
+            feedback=dict(schema="intake-feedback/1", source="check_preprocessing/check_candidate",
+                fields=["issue_code", "repair_action", "field_paths", "repair_scope", "model_repairable"],
+                partitions=["model_repairs", "external_conditions"], initialization="NOT_RUN", execution="NOT_RUN"))
         return request
 
     def _read_revision_facts(self, inspector, job, path):
@@ -662,6 +671,8 @@ class AnalysisJobs:
                         job["final_check_reused_submission"] = False
                     job["final_check_duration_ms"] = round((time.perf_counter() - checked_at) * 1000, 3)
                     job["submitted"]["report"] = report
+                    job["outcome"] = report["outcome"]
+                    job["execution"] = "NOT_RUN"
                     self._raise_cancelled(cancellation)
                     job["status"] = "COMPLETED"
                     job["phase"] = "candidate_refinement_complete" if job.get("revision_id") else "installation"

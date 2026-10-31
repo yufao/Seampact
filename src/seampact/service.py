@@ -18,7 +18,7 @@ from .intake import RepositoryIntake, inside_platform_checkout, managed_checkout
 from .providers import Profiles
 from .resources import ResourceRegistry
 from .dependencies import Dependencies, reference as resource_reference
-from .revisions import build_review_context, candidate_diff, intervention, declared_result
+from .revisions import build_review_context, candidate_diff, intervention, declared_result, select_candidate_entries
 from .runtime import Coordinator, OwnerRuntime
 from .scheduler import TwoLayerScheduler
 from .store import Store, now
@@ -408,6 +408,7 @@ class Platform:
                 return []
             if not job["submitted"].get("report"):
                 job["submitted"]["report"] = self.analysis._check_candidate(inspector, job["submitted"]["candidate"])
+            job["outcome"] = job["submitted"]["report"].get("outcome")
             self.dependencies.record(inspector, job["submitted"]["candidate"])
             units = self.catalog.install(inspector, job["submitted"]["candidate"], job["id"])
             source.update(status="ANALYZED", analysis_id=job["id"], installation_id=job["id"], error=None,
@@ -761,10 +762,17 @@ class Platform:
         attribution = intervention(body.get("intervention"), revision.get("intervention"))
         before = copy.deepcopy(revision["candidate"])
         updates = {}
+        selection = None
         if "candidate" in body:
             if not isinstance(body["candidate"], dict):
                 raise ValueError("候选需要 JSON 对象")
             updates["candidate"] = json.loads(json.dumps(body["candidate"], allow_nan=False, ensure_ascii=False))
+        if "selected_entry_ids" in body:
+            updates["candidate"], selection = select_candidate_entries(
+                updates.get("candidate", revision["candidate"]), body["selected_entry_ids"])
+            reason = body.get("reason", revision.get("reason", ""))
+            if selection["excluded_ids"] and (not isinstance(reason, str) or not reason.strip()):
+                raise ValueError("请填写移除入口的理由")
         for field in ("guidance", "reason"):
             if field in body:
                 if not isinstance(body[field], str) or len(body[field]) > 16000:
@@ -780,7 +788,7 @@ class Platform:
             revision.update(result=declared_result(), result_basis=None)
         revision.pop("check_identity", None)
         self._revision_action(revision, action, attribution, before,
-            guidance=revision["guidance"], reason=revision["reason"])
+            guidance=revision["guidance"], reason=revision["reason"], entry_selection=selection)
         self.store.save("analysis_revision", revision["id"], revision)
 
     def save_revision(self, body):
@@ -1079,7 +1087,7 @@ class Platform:
         content, report = record.get("content") or {}, record.get("report") or {}
         bindings = {row.get("id"): row for row in report.get("entry_bindings", {}).get("entries", [])}
         return dict(id=identity, goal=content.get("goal"), status=report.get("status"),
-            targets=[{key: target.get(key) for key in ("path", "symbol", "kind", "purpose", "execution_role")}
+            targets=[{key: target.get(key) for key in ("path", "symbol", "kind", "purpose", "execution_role", "task_role")}
                      for target in content.get("targets", [])],
             entries=[dict({key: entry.get(key) for key in ("id", "path", "symbol", "description")},
                           status=bindings.get(entry.get("id"), {}).get("status", "NOT_CHECKED"),
@@ -1087,7 +1095,8 @@ class Platform:
                      for entry in content.get("entries", [])],
             dependency_count=len(content.get("dependencies", [])), missing=content.get("missing", []),
             issues=report.get("issues", []), execution=report.get("execution", "NOT_RUN"),
-            classification=report.get("classification"), entry_readiness=report.get("entry_readiness", []))
+            classification=report.get("classification"), entry_readiness=report.get("entry_readiness", []),
+            outcome=report.get("outcome"), feedback=report.get("feedback"))
 
     def analysis_snapshot(self, analysis_id):
         """Export observation metadata without source messages or machine configuration."""
@@ -1152,7 +1161,7 @@ class Platform:
                         visit(child)
 
             visit(report)
-            summary = dict(status=status(report.get("status")), status_counts=counts)
+            summary = dict(status=status(report.get("status")), status_counts=counts, outcome=status(report.get("outcome")))
             for key in ("admitted", "has_bindable_entries", "admission_granted", "split_permission", "export_permission"):
                 if type(report.get(key)) is bool:
                     summary[key] = report[key]
@@ -1242,6 +1251,7 @@ class Platform:
             revision = None
         return dict(schema="seampact-analysis-progress/1", analysis_id=job["id"], exported_at=now(),
             status=status(job.get("status")), complete=job.get("status") == "COMPLETED", partial=job.get("status") != "COMPLETED",
+            outcome=status(job.get("outcome") or (submitted.get("report") or {}).get("outcome")),
             terminal=terminal, importable=False, resumable_artifact=False,
             scope="Observation snapshot only; not an importable candidate or a resumable checkpoint.",
             excluded=["messages", "source text", "credential values and references", "service addresses",

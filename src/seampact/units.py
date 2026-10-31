@@ -32,6 +32,7 @@ from .dependencies import DependencyBindings, has_reference as has_resource_refe
 from .inspection import Inspector, digest, native_ast, python_runtime_issue, units
 from .lowering import lower_loop
 from .runtime import ProtocolError
+from .resource_origins import initialization_gaps
 from .store import now
 from .verification import check_candidate, source_unit
 
@@ -1086,6 +1087,14 @@ class NativeBindings:
         path, cell, symbol, kind = entry["path"], entry.get("unit", "file"), entry["symbol"], entry["kind"]
         if path not in self.inspector.files:
             raise MissingBinding("native entry file is outside the frozen source scope")
+        initialization = initialization_gaps(self.inspector, entry)
+        if initialization:
+            first = initialization[0]
+            operation = first["operations"][0]
+            error = MissingBinding("initialization_incomplete: " + first["reason"] + " (" +
+                operation["path"] + ":" + str(operation["start"]) + ")")
+            error.initialization_gaps = initialization
+            raise error
         if self.resource_binding is not None:
             self.resource_binding.check_entry(entry["id"])
         environment = entry.get("environment", {})
@@ -1852,6 +1861,9 @@ class UnitCatalog:
         except (ValueError, KeyError, TypeError, SyntaxError, OSError) as error:
             reason = binding.redact(error) if binding is not None else str(error)
             result["reason"] = reason
+            if getattr(error, "initialization_gaps", None):
+                result["code"] = "initialization_incomplete"
+                result["initialization_gaps"] = error.initialization_gaps
             if entry.get("binding_program"):
                 result["construction"] = {"rule": "B-CALL-straight-prefix/1", "status": "UNKNOWN", "reason": reason}
             if binding is not None:
