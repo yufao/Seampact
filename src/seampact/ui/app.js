@@ -2131,6 +2131,13 @@ function taskRoleLabel(claim) {
 
 function entryIssueSummary(issue) {
   const specific = {
+    configuration_incomplete: ['原配置缺少必填内容', '需要分析器补查原配置的必读项，再使用原默认值或你的配置；不要猜测参数。'],
+    dependency_destination_mismatch: ['资源接到了错误的位置', '需要分析器修正资源引用和参数映射；重新登记资源不能解决。'],
+    execution_context_unsupported: ['原运行目录或导入环境还没核对好', '需要保留原脚本的工作目录和导入方式，再检查接入。'],
+    execution_context_unproven: ['原运行目录还缺源码依据', '需要分析器核对原启动命令所在目录；不要填写服务器上的任意路径。'],
+    configuration_flow_unsupported: ['平台还不能核对这段配置传递', '需要补充通用配置检查；保留原合并顺序和配置覆盖，不能跳过加载。'],
+    configuration_source_unavailable: ['配置调用链还缺原文件', '需要分析器补读实际调用的同版源码；不能用另一版本文件或同名第三方包代替。'],
+    completion_contract_unproven: ['任务结果的判定方式还没核对好', '需要核对原输入、输出文件和必需内容；进程退出成功不代表结果齐全。'],
     candidate_incomplete: ['分析结果缺少必要信息', '需要分析器补齐原参数、入口或资源描述，再完整检查。'],
     evidence_incomplete: ['源码依据还不完整', '需要分析器补读原定义、赋值和完整调用，检查记录中列出了缺少的位置。'],
     parameter_flow_unsupported: ['平台暂不支持这段参数传递', '需要补充平台的通用检查规则；重复添加资源不能解决。'],
@@ -2178,6 +2185,7 @@ function entryReadinessDetails(readiness, job) {
     next_step: readiness.next_step, issues: readiness.issues, task_role: readiness.task_role});
   detailValue(root, '入口参数', readiness.parameters);
   detailValue(root, '入口操作与绑定条件', readiness.operations);
+  if (readiness.execution_context) detailValue(root, '原运行目录与导入依据', readiness.execution_context);
   return root;
 }
 
@@ -2422,6 +2430,9 @@ function renderAnalyses() {
     if (outcomeText) card.append(node('p', outcomeText, 'card-note'));
     const classification = analysisClassification(job?.submitted?.report?.classification);
     if (classification) card.append(classification);
+    if (job?.submitted?.report?.execution_contracts) {
+      detailValue(card, '执行约束与剩余条件', job.submitted.report.execution_contracts);
+    }
     const resultSummary = job && analysisResultSummary(job);
     if (resultSummary) card.append(resultSummary);
     if (!resultSummary && Array.isArray(job?.submitted?.report?.entry_readiness)) {

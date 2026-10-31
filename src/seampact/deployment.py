@@ -442,6 +442,10 @@ def check_group_host(rows, members, scalar):
         check, entry = row["check"], row["entry"]
         member = dict(status="HOST_CHECKED", reason=None, prepare=prepare_rule(entry),
                       ports=dict(codec="JSON_SCALARS" if scalar else PORT_CODEC["id"]))
+        if check.get("execution_context"):
+            member["execution_context"] = check["execution_context"]
+        if check.get("import_context"):
+            member["import_context"] = check["import_context"]
         schema = check.get("input_schema") or {}
         native_inputs = sorted(name for name, port in schema.get("properties", {}).items()
                                if "x-native-type" in port and name in schema.get("required", []))

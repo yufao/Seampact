@@ -213,6 +213,7 @@ class NativePlanOwner:
 
     def execute(self, catalog, project_result):
         records, success = [], True
+        execution_status = "STOPPED_AT_NON_SUCCESS_EXIT"
         needed = {edge["source_step"] for edge in self.plan["data_edges"]}
         try:
             for step in self.plan["steps"]:
@@ -225,6 +226,12 @@ class NativePlanOwner:
                     records.append(dict(step=step["id"], unit=step["unit_id"], result=project_result(value)))
                     if isinstance(value, subprocess.CompletedProcess) and value.returncode != 0:
                         success = False
+                        execution_status = "STOPPED_AT_NON_SUCCESS_EXIT"
+                        break
+                    completion = getattr(value, "seampact_completion", None)
+                    if isinstance(completion, dict) and completion.get("contract_declared") and completion.get("task_status") != "COMPLETE":
+                        success = False
+                        execution_status = "STOPPED_AT_INCOMPLETE_RESULT"
                         break
                     self.completed.add(step["id"])
                     if step["id"] in needed:
@@ -234,7 +241,7 @@ class NativePlanOwner:
                     records.append(dict(step=step["id"], unit=step["unit_id"], error=str(error)))
                     break
             return dict(plan=self.plan["id"], results=records, completed=success,
-                execution_status="RETURNED" if success else "STOPPED_AT_NON_SUCCESS_EXIT",
+                execution_status="RETURNED" if success else execution_status,
                 semantic_status="UNRESOLVED", data_edges=self.plan["data_edges"],
                 control_edges=self.plan["control_edges"]), success
         finally:

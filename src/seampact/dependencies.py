@@ -12,6 +12,7 @@ from .inspection import units
 from .intake import inside_platform_checkout
 from .store import now
 from .resource_flow import parameter_flow
+from .configuration_flow import environment_flow, configuration_facts
 from .resource_origins import resource_origin_facts
 
 DEPENDENCY_RULES = """
@@ -29,6 +30,7 @@ service与本地weight不得互换。原本地from_pretrained/torch.load等必�
 resource_catalog只提供非敏感连接、权重状态及已有选择；配置存在不等于服务能力、权重完整或原目标已运行。用户选择不改变入口与边界，W/H/R及生命周期规则继续适用。
 新增有限参数传递规则：可核对冻结 Python 中唯一且未遮蔽的函数/构造器调用，连接实参—形参、单赋值别名和同一接收者的单写属性，最多追踪8层；对象后续方法须从当前原入口实际调用到达，不能引用未调用方法冒充使用。每步参数、赋值和完整调用都要有evidence，检查反馈给出缺失的源码范围。解析真实导入后支持LiteLLM的api_base对应base_url，以及原OpenAI客户端中实际model字段/字面键请求字典；不改原SDK字段。动态目标、覆盖、多来源分支值、别名逃逸或循环来源不能确定时保留parameter_flow_unsupported；这只核对资源使用关系，不授予跳过、并行或生命周期许可。
 资源反馈resource_origins区分模型/附加checkpoint、Hub或本地目录、cache及下载目的地。from_pretrained的Hub标识不能当作仓库下固定路径，cache_dir不能当作模型文件；原分支选模型的配置参数不能直接替换成路径。有现成原路径参数时绑定已检查的本地文件/目录；只能经Hub/复杂配置消费的来源保留resource_locator_unsupported，不下载或改原算法。原构造后加载权重、设备和模式设置须沿原initializers或已支持的完整B-CALL保留；缺口不能靠删除依赖或随机初始化消除。
+CLI environment可沿唯一真实导入/调用追踪原模块单赋值常量、无自定义方法的普通dataclass字段及原对象单写属性；仅真实SDK字段或urllib.request.Request进入urlopen的URL、JSON model字段、Bearer Authorization可作消费者证据。各导入、环境读取、字段、赋值和完整调用均须覆盖。配置工厂或客户端名称本身不证明消费；未调用方法、动态读取、环境覆盖、遮蔽及缺失源文件保留具体MISSING。configuration_flow中的SOURCE_SIGNAL只记录配置来源、合并/条件覆盖次序和原字段加载事实，selected_value:UNRESOLVED不表示YAML/YACS值已求解，不可据此放行或将Hub标识当本地路径。
 """
 
 
@@ -661,35 +663,12 @@ def _check_mapping(inspector, entries, identity, row, mapping, evidence):
     if location == "environment":
         if entry.get("kind") != "cli" or row.get("read_time") != "process_start":
             raise ValueError("environment injection requires an original CLI process-start binding; in-process environment is never changed")
-        tree = ast.parse(_source(inspector, entry["path"], entry.get("unit", "file")))
-        reads = [n for n in ast.walk(tree) if isinstance(n, ast.Call) and ast.unparse(n.func)
-            in {"os.getenv", "os.environ.get"} and n.args and isinstance(n.args[0], ast.Constant)
-            and n.args[0].value == parameter]
-        if not reads:
-            raise ValueError("original environment read is not anchored")
-        checked_read = False
-        for read in reads:
-            if not _covered(evidence, entry["path"], entry.get("unit", "file"), read):
-                continue
-            scopes = [n for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
-                      and n.lineno <= read.lineno <= n.end_lineno]
-            scope = min(scopes, key=lambda n: n.end_lineno - n.lineno) if scopes else tree
-            aliases = set()
-            for statement in ast.walk(scope):
-                if isinstance(statement, (ast.Assign, ast.AnnAssign)) and statement.value is read:
-                    targets = statement.targets if isinstance(statement, ast.Assign) else [statement.target]
-                    if _covered(evidence, entry["path"], entry.get("unit", "file"), statement):
-                        aliases.update(target.id for target in targets if isinstance(target, ast.Name))
-            writes = {name: sum(isinstance(n, ast.Name) and n.id == name and isinstance(n.ctx, (ast.Store, ast.Del))
-                               for n in ast.walk(scope)) for name in aliases}
-            aliases = {name for name in aliases if writes[name] == 1}
-            matches = lambda value: value is read or isinstance(value, ast.Name) and value.id in aliases
-            if any(_field_call(call, field, matches) and
-                   _covered(evidence, entry["path"], entry.get("unit", "file"), call) for call in _calls(scope)):
-                checked_read = True
-                break
-        if not checked_read:
-            raise ValueError("environment evidence must cover its read and original field/loader/authentication call")
+        flow = environment_flow(inspector, entry, parameter, field, evidence)
+        if not flow["proved"]:
+            raise MappingGap("environment configuration must reach an original field/loader/authentication consumer",
+                flow["issue_code"], "补读环境来源、配置字段、原调用链及消费者；动态覆盖或子进程转交仍须保留缺口。",
+                ["mappings.evidence"] if flow["missing"] else ["mappings"], flow["missing"] or flow["facts"])
+        return flow
     else:
         if location not in {"constructor.arguments", "entry.fixed_arguments", "binding_program.arguments"} and not location.startswith("initializers."):
             raise ValueError("unsupported original dependency parameter location")
@@ -791,6 +770,8 @@ def check_requirements(inspector, candidate):
                     failure_code, failure_action = "evidence_incomplete", "提供有效的逐映射源码证据；空或越界证据不能回退。"
                     _evidence_sources(inspector, mapping["evidence"])
             failure_code, failure_action = "candidate_incomplete", "补齐候选中缺失或格式错误的原字段，再完整重检。"
+            configuration_evidence = evidence + [item for mapping in mappings for item in mapping.get("evidence", [])]
+            row["configuration_flow"] = configuration_facts(inspector, configuration_evidence)
             if row["kind"] == "weight":
                 origin_evidence = evidence + [item for mapping in mappings for item in mapping.get("evidence", [])]
                 row["resource_origins"] = resource_origin_facts(inspector, origin_evidence)
@@ -862,9 +843,13 @@ def check_requirements(inspector, candidate):
                 count = sum(mapping["entry_id"] == entry_id for mapping in mappings)
                 issues = errors.get(entry_id, [])
                 if row["configurable"] and not count:
-                    issues = [dict(reason="configurable dependency has no original parameter mapping for this affected entry",
-                        issue_code="candidate_incomplete", field_paths=["mappings"],
-                        repair_action="为这个入口保留原资源需求，提出真实原参数映射；无法绑定时记录支持缺口。")]
+                    merged_configuration = any(f["kind"] == "configuration_merge" for f in row["configuration_flow"])
+                    issues = [dict(reason=("original configuration merge/override to loader is unresolved" if merged_configuration else
+                        "configurable dependency has no original parameter mapping for this affected entry"),
+                        issue_code="configuration_flow_unsupported" if merged_configuration else "candidate_incomplete", field_paths=["mappings"],
+                        evidence=row["configuration_flow"] if merged_configuration else [],
+                        repair_action="核对原配置来源、合并次序、条件覆盖和字段加载；保留原入口与未知，不把 YAML 字段冒充函数参数。" if merged_configuration else
+                        "为这个入口保留原资源需求，提出真实原参数映射；无法绑定时记录支持缺口。")]
                 row["entry_checks"][entry_id] = dict(status="MISSING" if issues else "MAPPING_CHECKED",
                     reason="; ".join(dict.fromkeys(i["reason"] for i in issues)) if issues else None,
                     mapping_count=count, issues=issues, mapping_proofs=proofs.get(entry_id, []),

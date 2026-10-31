@@ -10,7 +10,7 @@ import json
 
 from .inspection import native_ast, units
 from .dependencies import check_requirements, DEPENDENCY_RULES
-from .intake_feedback import target_classification, entry_readiness, candidate_feedback, task_role_claim, TASK_ROLE_RULES
+from .intake_feedback import target_classification, entry_readiness, candidate_feedback, task_role_claim, TASK_ROLE_RULES, execution_contracts
 
 
 RULES = """你是 SeamPact 分析器中的自动源码预处理 Agent。本次任务属于分析器内部，下一次独立的拆分分析会实际消费你的结构化工件。
@@ -211,4 +211,5 @@ def check_preprocessing(inspector, artifact, check_entries=None):
     report["entry_readiness"] = entry_readiness(inspector, candidate, report)
     report["feedback"] = candidate_feedback(candidate, report)
     report["outcome"] = report["feedback"]["outcome"]
+    report["execution_contracts"] = execution_contracts(inspector, candidate, report)
     return report

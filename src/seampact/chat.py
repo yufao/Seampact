@@ -18,8 +18,11 @@ def public_result(value, active=None):
     if type(value) is subprocess.CompletedProcess:
         def output(text):
             return text.decode("utf-8", errors="replace") if type(text) is bytes else text
-        return dict(result_type="subprocess.CompletedProcess", returncode=value.returncode,
-                    stdout=output(value.stdout), stderr=output(value.stderr))
+        result = dict(result_type="subprocess.CompletedProcess", returncode=value.returncode,
+                      stdout=output(value.stdout), stderr=output(value.stderr))
+        if hasattr(value, "seampact_completion"):
+            result["completion"] = public_result(value.seampact_completion)
+        return result
     kind = type(value)
     if kind in {dict, list, tuple}:
         if id(value) in active:

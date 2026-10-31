@@ -1096,7 +1096,8 @@ class Platform:
             dependency_count=len(content.get("dependencies", [])), missing=content.get("missing", []),
             issues=report.get("issues", []), execution=report.get("execution", "NOT_RUN"),
             classification=report.get("classification"), entry_readiness=report.get("entry_readiness", []),
-            outcome=report.get("outcome"), feedback=report.get("feedback"))
+            outcome=report.get("outcome"), feedback=report.get("feedback"),
+            execution_contracts=report.get("execution_contracts", []))
 
     def analysis_snapshot(self, analysis_id):
         """Export observation metadata without source messages or machine configuration."""

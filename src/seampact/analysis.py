@@ -153,7 +153,8 @@ class AnalysisJobs:
             ("analysis.py", "preprocessing.py", "inspection.py", "units.py", "verification.py",
              "lowering.py", "callsite.py", "deployment.py", "dependencies.py", "resources.py", "providers.py",
              "service.py", "environments.py", "target_runtime.py", "revisions.py", "classification.py", "intake_feedback.py",
-             "resource_flow.py", "resource_origins.py")}
+             "resource_flow.py", "resource_origins.py", "candidate_checks.py", "configuration_flow.py",
+             "execution_context.py", "completion.py")}
         self.implementation = {name: digest(data) for name, data in self.implementation_bytes.items()}
         for old in store.list("analysis"):
             if old["status"] in {"RUNNING", "CANCELLING"}:
@@ -436,6 +437,9 @@ class AnalysisJobs:
             feedback=dict(schema="intake-feedback/1", source="check_preprocessing/check_candidate",
                 fields=["issue_code", "repair_action", "field_paths", "repair_scope", "model_repairable"],
                 partitions=["model_repairs", "external_conditions"], initialization="NOT_RUN", execution="NOT_RUN"))
+        request["intake_contract"]["execution_contracts"] = dict(
+            axes=["control", "state", "resources"], authority="existing source checks only; grants no new operation",
+            access="check tools report required config keys, original process context and remaining obligations")
         return request
 
     def _read_revision_facts(self, inspector, job, path):

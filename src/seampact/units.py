@@ -33,6 +33,8 @@ from .inspection import Inspector, digest, native_ast, python_runtime_issue, uni
 from .lowering import lower_loop
 from .runtime import ProtocolError
 from .resource_origins import initialization_gaps
+from .execution_context import ContextIssue, explicit_import_roots, process_context
+from .completion import after_completion, before_completion, check_completion
 from .store import now
 from .verification import check_candidate, source_unit
 
@@ -376,6 +378,9 @@ class NativeBindings:
         self.programs, self.program_helpers = {}, {}
         self.effective_bindings = {}
         self.fixed_value_bindings = {}
+        self.execution_contexts = {}
+        self.import_contexts = {}
+        self.completion_contracts = {}
         self.callsite_gates, self.entry_owner_ids = {}, {}
         self.active_owner = contextvars.ContextVar("seampact_native_binding_owner", default=None)
         self.loop, self.thread = None, None
@@ -445,6 +450,21 @@ class NativeBindings:
             package = module if current.endswith("/__init__.py") else module.rpartition(".")[0]
             for imported in facts["imports"]:
                 name = imported.get("module") or ""
+                roots = explicit_import_roots(self.inspector, current, imported.get("line")) if current.endswith(".py") else []
+                for root in roots:
+                    self.import_contexts.setdefault(path, {})[(current, root["start"])] = dict(source=current, **root)
+                if not imported.get("level"):
+                    for root in reversed(roots):
+                        if imported.get("line", 0) <= root["end"]:
+                            continue
+                        relative = (Path(root["path"]) / Path(*name.split("."))).as_posix()
+                        options = [(relative + ".py", False), (relative + "/__init__.py", True)]
+                        found = [record for record in options if record[0] in self.inspector.files]
+                        if found:
+                            if name in self.module_paths and self.module_paths[name] != found[0]:
+                                raise MissingBinding("explicit native import path is ambiguous: " + name)
+                            self.module_paths[name] = found[0]
+                            break
                 if imported.get("level"):
                     try:
                         name = importlib.util.resolve_name("." * imported["level"] + name, package)
@@ -1087,6 +1107,21 @@ class NativeBindings:
         path, cell, symbol, kind = entry["path"], entry.get("unit", "file"), entry["symbol"], entry["kind"]
         if path not in self.inspector.files:
             raise MissingBinding("native entry file is outside the frozen source scope")
+        if kind == "cli":
+            self._cli_shape(entry)
+            self.execution_contexts[entry["id"]] = process_context(self.inspector, entry)
+            try:
+                self.completion_contracts[entry["id"]] = check_completion(self.inspector, entry)
+            except ValueError as error:
+                raise ContextIssue("completion_contract_unproven", "completion", str(error)) from error
+        from .candidate_checks import candidate_issues
+        issues = candidate_issues(self.inspector, entry, self.candidate.get("dependencies", []))
+        if issues:
+            error = MissingBinding(issues[0]["reason"])
+            error.code = issues[0]["issue_code"]
+            error.field_paths = issues[0]["field_paths"]
+            error.candidate_issues = issues
+            raise error
         initialization = initialization_gaps(self.inspector, entry)
         if initialization:
             first = initialization[0]
@@ -1278,26 +1313,41 @@ class NativeBindings:
                     raise MissingBinding("nested native gates require the unsupported parent/child resource rule: "
                                          + whole["id"] + " -> " + child["id"])
 
-    def _cli_interface(self, entry):
+    def _cli_shape(self, entry):
+        """Check candidate command structure before resolving any resources."""
+        def fail(code, field, reason):
+            raise ContextIssue(code, field, reason)
         command = entry.get("command")
         if not isinstance(command, list) or not command or any(not isinstance(argument, str) for argument in command):
-            raise MissingBinding("CLI requires its original script command as an argv list")
+            fail("cli_command_invalid", "command", "CLI requires its original script command as an argv list")
         source_path = (self.inspector.root / entry["path"]).resolve()
         if entry["symbol"] not in {"__main__", "script", "<script>", source_path.name}:
-            raise MissingBinding("CLI symbol must identify the original script as a whole")
+            fail("cli_symbol_invalid", "symbol", "CLI symbol must identify the original script as a whole")
         indices = [index for index, argument in enumerate(command[:2])
                    if (self.inspector.root / argument).resolve() == source_path]
         if len(indices) != 1 or indices[0] not in {0, 1}:
-            raise MissingBinding("CLI command must invoke this exact original script")
+            fail("cli_command_invalid", "command", "CLI command must invoke this exact original script")
         index = indices[0]
         if index == 1 and Path(command[0]).name.lower() not in {"python", "python3", "python.exe", "bash", "sh", "pwsh", "powershell", "powershell.exe"}:
-            raise MissingBinding("original CLI interpreter is not identified")
+            fail("cli_interpreter_invalid", "command.0", "original CLI interpreter is not identified")
+        placeholders = [match.group(1) for argument in command[index + 1:]
+                        for match in re.finditer(r"^\{([A-Za-z_][A-Za-z0-9_]*)\}$", argument)]
+        if any(("{" in argument or "}" in argument) and not re.fullmatch(r"\{[A-Za-z_][A-Za-z0-9_]*\}", argument)
+               for argument in command[index + 1:]):
+            fail("cli_placeholder_invalid", "command", "CLI task placeholders must occupy complete argv elements")
+        declared = entry.get("fixed_arguments", {})
+        if not isinstance(declared, dict) or set(declared) - set(placeholders):
+            fail("cli_placeholder_invalid", "fixed_arguments", "CLI fixed arguments must name actual command placeholders")
+        return index, placeholders
+
+    def _cli_interface(self, entry):
+        index, placeholders = self._cli_shape(entry)
+        command = entry["command"]
+        source_path = (self.inspector.root / entry["path"]).resolve()
         if index == 1 and Path(command[0]).name.lower() not in {"python", "python3", "python.exe"} and not shutil.which(command[0]):
             raise MissingBinding("native CLI interpreter is unavailable")
         if index == 0 and not os.access(source_path, os.X_OK):
             raise MissingBinding("original CLI interpreter must be supplied")
-        placeholders = [match.group(1) for argument in command[index + 1:]
-                        for match in re.finditer(r"^\{([A-Za-z_][A-Za-z0-9_]*)\}$", argument)]
         declared = entry.get("fixed_arguments", {})
         if not isinstance(declared, dict):
             raise MissingBinding("CLI fixed arguments must be a parameter mapping")
@@ -1547,7 +1597,12 @@ class NativeBindings:
                         command[position] = arguments[match.group(1)]
                 environment = os.environ.copy()
                 environment.update(self._resource_values(entry, "environment", entry.get("environment", {}), runtime=True))
-                return subprocess.run(command, cwd=self.inspector.root, capture_output=True, check=False, env=environment)
+                context = process_context(self.inspector, entry)
+                cwd = self.inspector.root / context["cwd"]
+                observation = before_completion(self.completion_contracts.get(entry["id"]), arguments, cwd)
+                result = subprocess.run(command, cwd=cwd, capture_output=True, check=False, env=environment)
+                after_completion(observation, result)
+                return result
             owner_id = "native-cli-" + uuid.uuid4().hex
             gate = uuid.uuid4().hex + ":" + identity
             self._register(gate, owner_id, unit)
@@ -1851,6 +1906,9 @@ class UnitCatalog:
                           construction=construction["facts"] if construction else None,
                           fixed_value_bindings=binding.fixed_value_bindings.get(entry.get("id"), []),
                           effective_binding=binding.effective_bindings.get(entry.get("id"), "cli"),
+                          execution_context=binding.execution_contexts.get(entry.get("id")),
+                          import_context=list(binding.import_contexts.get(entry.get("path"), {}).values()),
+                          completion_contract=binding.completion_contracts.get(entry.get("id")),
                           operations={"export_entry": {"status": "SOURCE_BOUND", "formal_proof": False,
                                        "scope": "user-confirmed prototype native binding; semantic export obligations remain conditional"}})
             if gaps:
@@ -1861,6 +1919,9 @@ class UnitCatalog:
         except (ValueError, KeyError, TypeError, SyntaxError, OSError) as error:
             reason = binding.redact(error) if binding is not None else str(error)
             result["reason"] = reason
+            for attribute in ("code", "field_paths", "structured_issues", "candidate_issues"):
+                if hasattr(error, attribute):
+                    result[attribute] = getattr(error, attribute)
             if getattr(error, "initialization_gaps", None):
                 result["code"] = "initialization_incomplete"
                 result["initialization_gaps"] = error.initialization_gaps
@@ -2176,7 +2237,11 @@ class UnitCatalog:
         except Exception:
             record_outcome(False)
             raise
-        outcome = record_outcome(True)
+        completion = getattr(result, "seampact_completion", None)
+        success = (not isinstance(result, subprocess.CompletedProcess) or result.returncode == 0)
+        if completion and completion.get("contract_declared"):
+            success = success and completion.get("task_status") == "COMPLETE"
+        outcome = record_outcome(success)
         with self.lock:
             binding_duration = unit.get("last_binding_duration_ms")
             initialization_before = unit.get("last_initialization_before")
@@ -2187,5 +2252,7 @@ class UnitCatalog:
             unit["last_initialization_before"] = initialization_before
             if outcome is not None:
                 unit["last_execution"] = outcome
+            if completion is not None:
+                unit["last_completion"] = completion
             self.store.save("unit", unit_id, unit, "unit_returned")
         return result

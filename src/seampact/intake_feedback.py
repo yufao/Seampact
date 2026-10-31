@@ -3,6 +3,7 @@
 import copy
 
 from .classification import classify_target
+from .candidate_checks import candidate_issues, dictionary_requirements
 
 
 TASK_ROLES = {"target_defense", "evidence", "host", "support", "display", "mock", "offline", "unknown"}
@@ -12,6 +13,9 @@ entry和target可提供task_role:{role:"target_defense/evidence/host/support/dis
 task_role始终是分析声明；检查器只核验冻结证据范围及原定义锚点，不证明用途或防护效果，不改变入口准入。
 check工具的feedback将具体field_paths、issue_code、repair_action分为model_repairs和external_conditions。按字段修正候选/补证；规则缺口、资源未选、运行环境或初始化未运行应如实保留，不要求全部READY。
 submit结束本次分析，outcome单独表示仍需修正、等待外部条件或静态核对且未运行；COMPLETED不表示原能力已跑通。不得为修复资源条件自行调用真实服务、下载或购买资源。
+按目标入口调查控制C、状态效果S、资源生命周期R；它们汇总原检查事实而非新的许可。先处理candidate_issues中的命令、引用位置和必读配置键缺项，再处理资源。配置只提取键和原默认依据，不把含凭据配置全文送给模型或猜测max_workers/generation。CLI保留原cwd/导入/argv与结果文件；退出0、输出已存在或续跑跳过均不等于本次目标完成。独立报告原并发、重试、汇合、处理数量与未知结果契约，不能删这些工作来接入。
+CLI可提供cwd:{path:"仓库相对目录",evidence:[{path,unit,start,end}]}，须有冻结README中原脚本命令及目录，或Dockerfile中COPY/ADD、WORKDIR及ENTRYPOINT对应；不能填任意服务器绝对路径。省略默认仓库根。命令symbol用__main__/script/<script>/脚本文件名，不把函数main当CLI整体；command是原脚本argv，业务值用独立完整{task_parameter}占位符，不能将凭据放进命令行。子进程环境仅支持原CLI进程启动时的已核对依赖引用，内部subprocess转交未核对时保留缺口。
+仅对原Python CLI的单文件输入和精确输出，可提出completion:{schema:"native-completion/1",input_parameter:"实际命令占位符",output_parameter:"实际命令占位符",format:"json或npz",required_keys:["原结果必要键"],evidence:[{path,unit,start,end}]}。证据覆盖原参数声明、输出路径赋值、保存调用和必要键定义，不能编造文件命名。运行时拒绝目录/glob及未明确后缀，区分新产物、旧文件未变、缺失/无效；数值效果仍未知。未声明契约的CLI返回UNKNOWN完成状态，不能声称已检查结果；复杂多项映射不假装单文件支持。
 """
 
 
@@ -110,6 +114,21 @@ def entry_readiness(inspector, candidate, report):
                       "从冻结源码补齐该入口字段后完整重检。", "revision",
                       issue_code="candidate_incomplete", repair_scope="candidate",
                       field_paths=[entry_path + "." + field])
+        independent = candidate_issues(inspector, entry, candidate.get("dependencies", []))
+        independent += checked.get("candidate_issues", [])
+        independent += checked.get("structured_issues", [])
+        seen_issues = set()
+        for detail in independent:
+            signature = (detail.get("issue_code"), detail.get("reason"))
+            if signature in seen_issues:
+                continue
+            seen_issues.add(signature)
+            code = detail.get("issue_code", "candidate_incomplete")
+            issue("candidate_incomplete", "接入候选还不完整", detail.get("reason"),
+                  detail.get("repair_action", "按原定义补齐候选后完整重检。"), "revision",
+                  issue_code=code, repair_scope=detail.get("repair_scope", "evidence" if code == "execution_context_unproven" else "candidate"),
+                  field_paths=[entry_path + "." + p for p in detail.get("field_paths", [])],
+                  source_evidence=detail.get("evidence", []))
         claim = task_role_claim(inspector, entry)
         if claim["status"] == "MISSING":
             issue("evidence_incomplete", "入口用途声明的证据尚未核对", claim["reason"],
@@ -128,7 +147,8 @@ def entry_readiness(inspector, candidate, report):
                 for detail in details:
                     code = detail.get("issue_code") or "parameter_mapping"
                     scope = {"candidate_incomplete": "candidate", "evidence_incomplete": "evidence",
-                             "parameter_flow_unsupported": "rule", "resource_locator_unsupported": "rule"}.get(code, "candidate")
+                             "parameter_flow_unsupported": "rule", "resource_locator_unsupported": "rule",
+                             "configuration_flow_unsupported": "rule", "configuration_source_unavailable": "evidence"}.get(code, "candidate")
                     dep_path = "dependencies[" + str(dep_index) + "]"
                     paths = [dep_path if path == "dependencies" else path
                              if path.startswith(("dependencies[", "entries", "dependency_bindings"))
@@ -186,7 +206,7 @@ def entry_readiness(inspector, candidate, report):
             issue("binding_unresolved", "入口绑定仍需核对",
                   checked.get("reason") or report.get("entry_bindings", {}).get("reason") or "尚未取得入口绑定检查结果。",
                   checked.get("repair_action") or "按原始原因补查签名、对象构造或规则条件后重检；无法确定原因时保留待核对，不猜成缺资源。",
-                  "revision", issue_code=checked.get("issue_code") or "initialization_unverified",
+                  "revision", issue_code=checked.get("issue_code") or checked.get("code") or "initialization_unverified",
                   field_paths=checked.get("field_paths") or [entry_path])
         # Retain the complete checker reason even when an earlier prerequisite
         # has already yielded an actionable issue; never claim it is exhaustive.
@@ -198,7 +218,7 @@ def entry_readiness(inspector, candidate, report):
             operations=dict(entry=copy.deepcopy(checked.get("operations", {})),
                 boundaries={name: copy.deepcopy(boundaries[name].get("operations", {}))
                             for name in entry.get("boundary_ids", []) if name in boundaries}),
-            task_role=claim, issues=issues,
+            task_role=claim, issues=issues, execution_context=checked.get("execution_context"),
             scope="仅本次静态检查；实际初始化与调用另由运行记录保存",
             next_step=("按真实参数启动并调用目标入口，检查原结果；部署后在目标 worker 再核验。"
                        if checked.get("status") == "READY" and not issues else
@@ -253,4 +273,33 @@ def explain_candidate(inspector, candidate, report):
     report["entry_readiness"] = entry_readiness(inspector, candidate, report)
     report["feedback"] = candidate_feedback(candidate, report)
     report["outcome"] = report["feedback"]["outcome"]
+    report["execution_contracts"] = execution_contracts(inspector, candidate, report)
     return report
+
+
+def execution_contracts(inspector, candidate, report):
+    """Project existing checks onto C/S/R; the projection grants no operation."""
+    readiness = {row["entry_id"]: row for row in report.get("entry_readiness", [])}
+    result = []
+    for entry in candidate.get("entries", []):
+        if not isinstance(entry, dict):
+            continue
+        row = readiness.get(entry.get("id"), {})
+        try:
+            required_keys = dictionary_requirements(inspector, entry)
+        except (OSError, ValueError, KeyError, TypeError, SyntaxError):
+            required_keys = []
+        result.append(dict(entry_id=entry.get("id"), schema="execution-contract/1",
+            task_role=row.get("task_role"), authority="PROJECTION_OF_EXISTING_CHECKS", admission_granted=False,
+            control=dict(input_schema=row.get("parameters"), boundary_ids=entry.get("boundary_ids", []),
+                         operations=row.get("operations", {}), completion="NOT_RUN",
+                         result_contract="DECLARED_NOT_RUN" if entry.get("completion") else "NOT_DECLARED"),
+            state=dict(owner=(entry.get("constructor") or {}).get("symbol"),
+                       binding_program=bool(entry.get("binding_program")),
+                       effects="UNKNOWN_UNLESS_CHECKED_BY_EXISTING_OPERATIONS", parallel_permission="SEE_OPERATIONS"),
+            resources=dict(dependency_ids=[d.get("id") for d in report.get("dependencies", [])
+                if entry.get("id") in d.get("entry_ids", [])], required_dictionary_keys=required_keys,
+                execution_context=row.get("execution_context"), initialization="NOT_RUN"),
+            unresolved=[dict(issue_code=i.get("issue_code"), field_paths=i.get("field_paths"),
+                             repair_scope=i.get("repair_scope")) for i in row.get("issues", [])]))
+    return result
