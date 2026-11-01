@@ -21,6 +21,8 @@ class Bound:
 
 
 class Catalog:
+    router = None
+
     def tools(self):
         return [{"type": "function", "function": {"name": "unit", "parameters": {"type": "object"}}}]
 

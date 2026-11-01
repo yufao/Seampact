@@ -186,10 +186,13 @@ class ChatJobs:
             if (latest.get("models") or {}).get("chat") == bound.public().get("chat"):
                 prior_calibration = latest.get("context_calibration")
         identity = uuid.uuid4().hex
+        catalog.bind_run(identity, dict(start_timeout_s=(catalog.router.backend()["start_timeout_s"]
+                                                       if catalog.router else 900)))
         task = dict(id=identity, status="RUNNING", started_at=now(), response=None,
             error=None, calls=[], model_calls=0, usage=[], latency_ms=None, phase="conversation",
             conversation_id=conversation_id, messages=copy.deepcopy(messages),
-            context_calibration=copy.deepcopy(prior_calibration), models=bound.public(), role_resources=bound.resources(), harness_resources=catalog.snapshot_resources())
+            context_calibration=copy.deepcopy(prior_calibration), models=bound.public(), role_resources=bound.resources(),
+            harness_resources=catalog.snapshot_resources(), placements=copy.deepcopy(catalog.placement))
         self.store.save("task", identity, task)
         threading.Thread(target=self._run, args=(task, messages, bound, catalog, prior_wire, prior_context), daemon=True).start()
         return dict(task_id=identity, conversation_id=conversation_id)
@@ -372,6 +375,8 @@ class ChatJobs:
                 self.scheduler.feedback(token, False, duration)
             task.update(status="FAILED", error=str(error))
         finally:
+            if catalog.router:
+                catalog.router.release_task(task["id"])
             task.update(latency_ms=(time.perf_counter() - started) * 1000, finished_at=now())
             task["calls"] = [call for call in self.runtime.snapshot()["calls"].values()
                 if call.get("task_id") == task["id"]]

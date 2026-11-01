@@ -1673,6 +1673,7 @@ class Deployments:
         """Functional mode: a fixed controller prepares an instance, then the call is dispatched."""
         waited = None
         with self.lock:
+            self._guard(placement["group_id"], placement["run_id"])
             record = self._route(placement["group_id"], unit["id"], _task_context.get())
         if record is None:
             started = time.perf_counter()
