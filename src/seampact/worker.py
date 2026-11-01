@@ -11,6 +11,7 @@ import hashlib
 import json
 import os
 import re
+import subprocess
 import sys
 import threading
 import time
@@ -257,7 +258,11 @@ class Worker:
             else:
                 encoded = encode_port(result)
             schema = unit.get("result_schema") or {}
-            if schema and not _matches(result, schema):
+            cli_result = (self.profile == GROUP_PROFILE["id"] and
+                self.catalog.entry_specs[unit_id].get("kind") == "cli" and
+                schema == {"x-native-type": {"module": "subprocess", "symbol": "CompletedProcess"}} and
+                type(result) is subprocess.CompletedProcess)
+            if schema and not (_matches(result, schema) or cli_result):
                 raise ValueError("原实际返回不符合核对的结果类型；后继不使能")
             return dict(result=encoded, **self.identity(), timing=timing)
         except Exception as error:
