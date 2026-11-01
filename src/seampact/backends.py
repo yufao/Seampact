@@ -21,8 +21,8 @@ KINDS = {"none", "docker", "kubernetes"}
 IMAGE_ACCESS = {"local", "kind", "registry", "preloaded"}
 NAME = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?")
 ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
-IMAGE_IDENTITY_FORMAT = ('{"Id":{{json .Id}},"Config":{"Labels":{'
-    + ",".join('"' + label + '":{{if .Config.Labels}}{{json (index .Config.Labels "' + label +
+IMAGE_IDENTITY_FORMAT = ('{{$labels := index .Config "Labels"}}{"Id":{{json .Id}},"Config":{"Labels":{'
+    + ",".join('"' + label + '":{{if $labels}}{{json (index $labels "' + label +
                '")}}{{else}}null{{end}}' for label in (RECIPE_LABEL, BASE_LABEL)) + "}}}")
 
 

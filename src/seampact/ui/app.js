@@ -2176,8 +2176,8 @@ function entryIssueSummary(issue) {
   const specific = {
     host_dependency_missing: ['上层入口漏了下游所需资源', '需要分析器补齐该入口的服务或权重需求，并核对原参数或子进程传递。'],
     dependency_closure_unresolved: ['下游调用还没有查完整', '需要补查实际调用的同版源码和子进程目标，不能把未知当作不需要资源。'],
-    dependency_closure_unsupported: ['平台暂时不能核对这段原调用', '需要补充通用调用检查；原文件可能已经齐全，不必反复补读或选择资源。'],
-    dependency_closure_limit: ['这段调用超过了当前检查范围', '平台需要改进调用调查，已知结果保留；不能当作缺源码让分析器重复尝试。'],
+    dependency_closure_unsupported: ['部分原调用暂不支持检查', '需要完善平台的调用分析。'],
+    dependency_closure_limit: ['调用分析达到当前上限', '需要完善平台的调用分析，保留已取得的结果。'],
     subprocess_environment_overridden: ['子进程会改写这项资源配置', '需要核对原覆盖顺序，保留原行为；不能直接把上层连接当作下游实际使用的连接。'],
     subprocess_child_source_unavailable: ['还缺实际子进程的源码', '需要分析器补读原脚本，再核对服务参数怎样传入。'],
     subprocess_flow_unsupported: ['这段子进程资源传递尚未核对', '请查看原调用和环境传递的具体缺口，不能靠重复选择资源放行。'],
@@ -2185,7 +2185,7 @@ function entryIssueSummary(issue) {
     dependency_destination_mismatch: ['资源接到了错误的位置', '需要分析器修正资源引用和参数映射；重新登记资源不能解决。'],
     execution_context_unsupported: ['原运行目录或导入环境还没核对好', '需要保留原脚本的工作目录和导入方式，再检查接入。'],
     execution_context_unproven: ['原运行目录还缺源码依据', '需要分析器核对原启动命令所在目录；不要填写服务器上的任意路径。'],
-    configuration_flow_unsupported: ['平台还不能核对这段配置传递', '需要补充通用配置检查；保留原合并顺序和配置覆盖，不能跳过加载。'],
+    configuration_flow_unsupported: ['配置传递暂不支持检查', '需要完善平台的配置检查。'],
     configuration_source_unavailable: ['配置调用链还缺原文件', '需要分析器补读实际调用的同版源码；不能用另一版本文件或同名第三方包代替。'],
     completion_contract_unproven: ['任务结果的判定方式还没核对好', '需要核对原输入、输出文件和必需内容；进程退出成功不代表结果齐全。'],
     candidate_incomplete: ['分析结果缺少必要信息', '需要分析器补齐原参数、入口或资源描述，再完整检查。'],
@@ -2209,7 +2209,54 @@ function entryIssueSummary(issue) {
   return {title, action};
 }
 
-function entryReadinessDetails(readiness, job) {
+function groupEntryIssues(issues) {
+  const groups = new Map();
+  for (const issue of issues) {
+    const summary = entryIssueSummary(issue);
+    const key = JSON.stringify([issue.issue_code || issue.category || issue.reason, summary.title,
+      summary.action, issue.repair_scope, issue.target]);
+    if (!groups.has(key)) groups.set(key, {...summary, issues: [], entries: new Set()});
+    const group = groups.get(key);
+    group.issues.push(issue);
+    if (issue.entry_id) group.entries.add(issue.entry_id);
+  }
+  return [...groups.values()];
+}
+
+function entryIssuesOverview(issues, job) {
+  if (!issues.length) return null;
+  const groups = groupEntryIssues(issues);
+  const root = node('section', undefined, 'entry-issues-overview');
+  root.append(node('h4', '需处理的 ' + groups.length + ' 类问题（共 ' + issues.length + ' 项）'));
+  const links = new Map();
+  for (const group of groups) {
+    const item = node('div', undefined, 'entry-issue-group');
+    const heading = node('p', undefined, 'entry-issue-heading');
+    heading.append(node('strong', group.title), node('span', group.issues.length + ' 项' +
+      (group.entries.size ? ' · 涉及 ' + group.entries.size + ' 个入口' : ''), 'card-meta'));
+    item.append(heading, node('p', group.action, 'card-note'));
+    detailValue(item, '受影响位置与原始记录', group.issues);
+    root.append(item);
+    if (!inspectPage) continue;
+    for (const issue of group.issues) {
+      const section = {resources: 'harnesses', services: 'services', weights: 'weights', environment: 'harnesses'}[issue.target];
+      if (section || issue.target === 'revision') {
+        const href = section ? '/configuration?section=' + section : '#analysis-revision-' + job.id;
+        links.set(href, section ? {services: '配置服务', weights: '配置权重', harnesses: '配置接入与环境'}[section] : '查看分析与修正');
+      }
+    }
+  }
+  if (links.size) {
+    const actions = node('div', undefined, 'entry-issue-actions');
+    for (const [href, label] of links) {
+      const link = node('a', label, 'detail-link'); link.href = href; actions.append(link);
+    }
+    root.append(actions);
+  }
+  return root;
+}
+
+function entryReadinessDetails(readiness, job, {showIssues = true} = {}) {
   const root = node('div', undefined, 'entry-readiness');
   root.append(node('p', readiness.status === 'STATIC_READY' ? '接入检查已通过，还需要实际运行验证。' :
     '接入检查尚未通过，请先处理下方问题。', 'card-note'));
@@ -2217,18 +2264,9 @@ function entryReadinessDetails(readiness, job) {
   if (readiness.task_role?.status && readiness.task_role.status !== 'NOT_DECLARED') {
     root.append(node('p', '用途判断：' + taskRoleLabel(readiness.task_role) + '（待核对）', 'card-note'));
   }
-  for (const issue of Array.isArray(readiness.issues) ? readiness.issues : []) {
-    const summary = entryIssueSummary(issue);
-    root.append(node('p', summary.title, 'card-note'));
-    root.append(node('p', '下一步：' + summary.action, 'card-note'));
-    if (inspectPage) {
-      const section = {resources: 'harnesses', services: 'services', weights: 'weights', environment: 'harnesses'}[issue.target];
-      if (section || issue.target === 'revision') {
-        const link = node('a', section ? '打开对应配置' : '查看分析与修正', 'detail-link');
-        link.href = section ? '/configuration?section=' + section : '#analysis-revision-' + job.id;
-        root.append(link);
-      }
-    }
+  if (showIssues) {
+    const overview = entryIssuesOverview(Array.isArray(readiness.issues) ? readiness.issues : [], job);
+    if (overview) root.append(overview);
   }
   detailValue(root, '查看原始检查记录', {status: readiness.status, reason: readiness.reason,
     initialization: readiness.initialization, execution: readiness.execution, scope: readiness.scope,
@@ -2373,9 +2411,15 @@ function analysisResultSummary(job) {
       '分析任务已结束。' : '分析仍在进行。'), 'card-note'));
   root.append(node('p', '静态可绑定表示源码与绑定条件已核对；实际初始化、执行结果和任务效果另见任务记录。', 'card-note'));
   const entries = new Map((candidate.entries || []).map(entry => [entry.id, entry]));
+  const readinessByEntry = new Map((Array.isArray(report.entry_readiness) ? report.entry_readiness : [])
+    .map(item => [item.entry_id, item]));
+  const issues = bindings.entries.flatMap(result => (readinessByEntry.get(result.id)?.issues || [])
+    .map(issue => ({...issue, entry_id: result.id})));
+  const overview = entryIssuesOverview(issues, job);
+  if (overview) root.append(overview);
   const reasons = {'required source resource mapping is unresolved': '必需资源与原参数的映射未解决',
     'no bindable native entry was discovered': '尚未找到可绑定的原生入口'};
-  const table = node('table', undefined, 'research-metrics analysis-usage');
+  const table = node('table', undefined, 'research-metrics analysis-entry-table');
   const header = node('tr');
   for (const title of ['入口与用途（分析器描述）', '静态绑定', '当前条件']) header.append(node('th', title));
   const thead = node('thead'); thead.append(header); table.append(thead);
@@ -2384,14 +2428,32 @@ function analysisResultSummary(job) {
     const entry = entries.get(result.id) || {};
     const cell = node('td');
     const title = entry.capability?.goal || entry.description || result.id;
-    cell.append(node('p', String(title).split(/[。\n]/)[0]), node('code', (result.path || entry.path || '') +
+    cell.append(node('p', String(title).split(/[。\n]/)[0], 'analysis-entry-purpose'), node('code', (result.path || entry.path || '') +
       ((result.symbol || entry.symbol) ? ' · ' + (result.symbol || entry.symbol) : '')));
     const row = node('tr');
-    const conditions = node('td', result.reason ? reasons[result.reason] || result.reason : bindings.initialization === 'NOT_RUN' ? '本报告未执行初始化' : '查看具体检查结果');
-    const readiness = (Array.isArray(report.entry_readiness) ? report.entry_readiness : []).find(item => item.entry_id === result.id);
-    if (readiness) conditions.append(entryReadinessDetails(readiness, job));
-    row.append(cell, node('td', {READY: '静态可绑定', MISSING: '缺少条件'}[result.status] || statusLabel(result.status)), conditions);
+    const readiness = readinessByEntry.get(result.id);
+    const entryIssues = readiness?.issues || [];
+    let condition = result.status === 'READY' ? '待实际运行验证' : '查看检查明细';
+    if (entryIssues.length) {
+      const scopes = new Set(entryIssues.map(issue => issue.repair_scope));
+      condition = [...(scopes.has('rule') ? ['需要平台支持'] : []),
+        ...(scopes.has('candidate') || scopes.has('evidence') ? ['需要补齐分析结果'] : []),
+        ...(scopes.has('resource') ? ['需要选择资源'] : []),
+        ...(scopes.has('environment') ? ['需要准备运行环境'] : [])].join('；') || '仍有待处理问题';
+    } else if (!readiness && result.reason && result.status !== 'READY') condition = reasons[result.reason] || '查看检查明细';
+    const conditions = node('td'); conditions.append(node('p', condition));
+    if (entryIssues.length) conditions.append(node('p', groupEntryIssues(entryIssues).length + ' 类问题 · ' +
+      entryIssues.length + ' 项，见上方汇总', 'card-meta'));
+    row.append(cell, node('td', {READY: '静态可绑定', MISSING: '缺少条件'}[result.status] || statusLabel(result.status), 'entry-binding-status'), conditions);
     body.append(row);
+    const detailRow = node('tr', undefined, 'analysis-entry-detail-row');
+    const detailCell = node('td'); detailCell.colSpan = 3;
+    const detail = node('details', undefined, 'analysis-entry-detail');
+    detail.append(node('summary', '检查明细 · ' + (result.path || entry.path || result.id)));
+    detailValue(detail, '入口用途（分析器描述）', title);
+    if (readiness) detail.append(entryReadinessDetails(readiness, job, {showIssues: false}));
+    else detailValue(detail, '原始绑定检查记录', result);
+    detailCell.append(detail); detailRow.append(detailCell); body.append(detailRow);
   }
   table.append(body); root.append(table);
   const modes = {W: '整体包装', H: '原生交接', R: '有限局部重构'};

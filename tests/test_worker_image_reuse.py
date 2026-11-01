@@ -26,13 +26,20 @@ class FakeDocker:
         self.commands = []
         self.dependency_builds = 0
         self.invalid_built_labels = False
+        self.strict_missing_labels = False
 
     def run(self, argv, timeout, stdin=None):
         self.commands.append(list(argv))
         status, output = 0, ""
         if argv[:3] == ["docker", "image", "inspect"]:
             if argv[-1] in self.images:
-                output = json.dumps(self.images[argv[-1]])
+                info = self.images[argv[-1]]
+                if self.strict_missing_labels and 'Labels' not in info['Config'] and '.Config.Labels' in argv[4]:
+                    status, output = 1, 'template parsing error: map has no entry for key "Labels"'
+                else:
+                    labels = info.get('Config', {}).get('Labels') or {}
+                    output = json.dumps(dict(Id=info['Id'], Config=dict(Labels={
+                        key: labels.get(key) for key in (RECIPE_LABEL, BASE_LABEL)})))
             else:
                 status, output = 1, "No such image"
         elif argv[:2] == ["docker", "pull"]:
@@ -181,6 +188,21 @@ class WorkerImageReuseTests(unittest.TestCase):
         self.assertEqual(result["status"], "BUILT")
         self.assertEqual(result["base_resolution"], "pull-then-inspect")
         self.assertEqual(sum(argv[:2] == ["docker", "pull"] for argv in docker.commands), 1)
+
+    def test_unlabelled_base_is_valid_and_optional_labels_stay_private(self):
+        docker = FakeDocker()
+        docker.strict_missing_labels = True
+        docker.images['python:3.11-slim'] = dict(Id=BASE, Config={})
+        result = self.build(docker, self.export())
+        self.assertEqual(result['status'], 'BUILT')
+        self.assertEqual(result['resolved_base_id'], BASE)
+        self.assertFalse(any(argv[:2] == ['docker', 'pull'] for argv in docker.commands))
+        docker.images['unrelated:labelled'] = dict(Id=BASE, Config=dict(Labels={
+            RECIPE_LABEL: 'recipe', BASE_LABEL: BASE, 'private.operator.note': 'unrelated value'}))
+        with patch.object(backends, 'run', side_effect=docker.run):
+            _, info = backends._inspect_image('unrelated:labelled', 5)
+        self.assertEqual(info['Config']['Labels'], {RECIPE_LABEL: 'recipe', BASE_LABEL: BASE})
+        self.assertNotIn('private.operator.note', backends.IMAGE_IDENTITY_FORMAT)
 
     def test_unavailable_backend_reports_full_manual_build_without_reuse_claim(self):
         folder, environment, plan = self.export()

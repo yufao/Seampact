@@ -64,6 +64,26 @@ ol.resource-guide { padding-left: 32px; }
 .preprocessing-summary h4, .analysis-next-steps h4, .analysis-result-summary h4 { margin: 0 0 8px; font-size: 13px; font-weight: 650; color: #31483c; }
 .analysis-next-steps ol { padding-left: 20px; }
 .preprocessing-summary table td, .analysis-result-summary table td { overflow-wrap: anywhere; }
+.entry-issues-overview { margin: 14px 0; }
+.entry-issue-group { padding: 10px 0; border-bottom: 1px solid var(--line); }
+.entry-issue-heading { display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px 16px; margin: 0; }
+.entry-issue-group > .card-note { margin: 5px 0; }
+.entry-issue-actions { display: flex; flex-wrap: wrap; gap: 8px 18px; margin-top: 10px; }
+.analysis-entry-table { table-layout: fixed; }
+.analysis-entry-table th:first-child { width: 48%; }
+.analysis-entry-table th:nth-child(2) { width: 100px; }
+.analysis-entry-table .entry-binding-status { white-space: nowrap; }
+.analysis-entry-table td > p { margin: 0 0 5px; }
+.analysis-entry-purpose { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 3; overflow: hidden; }
+.analysis-entry-table .analysis-entry-detail-row > td { padding-top: 0; }
+.analysis-entry-detail { margin: 0 0 8px; }
+.analysis-entry-detail > summary { cursor: pointer; color: var(--accent); }
+.analysis-entry-detail > .entry-readiness { margin-top: 10px; }
+@media (max-width: 640px) {
+  .analysis-entry-table th:first-child { width: 40%; }
+  .analysis-entry-table th:nth-child(2) { width: 72px; }
+  .analysis-entry-table .entry-binding-status { white-space: normal; }
+}
 .header-actions .status-pill { white-space: normal; overflow-wrap: anywhere; }
 .icon-button { display: inline-flex; align-items: center; justify-content: center; min-width: 34px; height: 34px; padding: 0 10px; border: 1px solid transparent; border-radius: 7px; background: transparent; color: #68756c; font-size: 13px; white-space: nowrap; }
 .icon-button:hover { color: var(--accent); background: #f0f4f1; }
