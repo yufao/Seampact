@@ -17,6 +17,7 @@ import math
 import re
 import shlex
 import shutil
+import subprocess
 import sys
 import threading
 import time
@@ -41,15 +42,16 @@ REMOTE_PROFILE = dict(id="python-native-scalar-worker/2", confirmed=True, python
     session_recovery=False, codec="JSON_SCALARS", parallel=False,
     source="用户确认：按原对象/共享状态/控制依赖分组，远程条件独立核对，未覆盖继续本地")
 GROUP_PROFILE = dict(id="python-native-group-worker/2", process_per_instance=1, python_versions=["3.10", "3.11", "3.12", "3.13"],
-    preserve_original_lifetimes=True, session_recovery=False, codec="group-port/1", parallel=False,
+    preserve_original_lifetimes=True, session_recovery=False, codec="group-port/2", parallel=False,
     environment="RECHECKED_IN_HOST",
     source="部署前建设方案 P2：整组冻结原源码与核对后的绑定在同一工作进程；原 owner、构造、controller 与内部许可留在组内")
 CONTRACT = "runtime-group-contract/1"
 IDENTITY_PROTOCOL = "process-identity/1"
-PORT_CODEC = dict(id="group-port/1", transport="inline JSON body of one call", visibility="caller of that call",
+PORT_CODEC = dict(id="group-port/2", transport="inline JSON body of one call", visibility="caller of that call",
     validity="that call only", identity="sha256 over byte/array payloads",
     types=["None", "bool", "int", "finite float", "str", "bytes", "list", "tuple", "dict with str keys",
-           "numpy.ndarray / numpy scalar without object dtype (npy, allow_pickle=False)"],
+           "numpy.ndarray / numpy scalar without object dtype (npy, allow_pickle=False)",
+           "original CLI subprocess.CompletedProcess: args, returncode, stdout, stderr, optional seampact_completion"],
     rejected="any other type is reported by name; no str()/JSON conversion and no pickle")
 LIVE = {"UNDEPLOYED", "STARTING", "READY", "DRAINING", "UNKNOWN"}
 
@@ -60,6 +62,14 @@ class RemoteGap(ValueError):
 
 class PortGap(ValueError):
     pass
+
+
+def _process_fields(args, returncode, stdout, stderr):
+    argv = type(args) in (str, bytes) or (type(args) in (list, tuple) and
+        all(type(item) in (str, bytes) for item in args))
+    if (not argv or type(returncode) is not int or
+            any(item is not None and type(item) not in (str, bytes) for item in (stdout, stderr))):
+        raise PortGap("CLI process result has unsupported field types")
 
 
 def json_request(url, body=None, timeout=None):
@@ -85,28 +95,39 @@ def encode_port(value):
             return item
         if kind is float:
             if not math.isfinite(item):
-                raise PortGap("group-port/1 carries finite floats only")
+                raise PortGap("group-port/2 carries finite floats only")
             return item
         if kind is bytes:
             return {"$bytes": base64.b64encode(item).decode("ascii")}
+        if kind is subprocess.CompletedProcess:
+            fields = {"args", "returncode", "stdout", "stderr"}
+            if set(vars(item)) - fields - {"seampact_completion"}:
+                raise PortGap("CLI process result has undeclared attributes")
+            _process_fields(item.args, item.returncode, item.stdout, item.stderr)
+            payload = {name: walk(getattr(item, name)) for name in fields}
+            if hasattr(item, "seampact_completion"):
+                if type(item.seampact_completion) is not dict:
+                    raise PortGap("CLI completion observation must be a dictionary")
+                payload["completion"] = walk(item.seampact_completion)
+            return {"$process_result": payload}
         if kind is list:
             return [walk(member) for member in item]
         if kind is tuple:
             return {"$tuple": [walk(member) for member in item]}
         if kind is dict:
             if any(type(key) is not str or key.startswith("$") for key in item):
-                raise PortGap("group-port/1 dictionaries need str keys without a leading $")
+                raise PortGap("group-port/2 dictionaries need str keys without a leading $")
             return {key: walk(member) for key, member in item.items()}
         if numpy is not None and (kind is numpy.ndarray or (isinstance(item, numpy.generic) and kind.__module__ == "numpy")):
             array = numpy.asarray(item)
             if array.dtype.hasobject:
-                raise PortGap("group-port/1 does not carry object arrays")
+                raise PortGap("group-port/2 does not carry object arrays")
             buffer = io.BytesIO()
             numpy.save(buffer, array, allow_pickle=False)
             data = buffer.getvalue()
             return {"$ndarray": dict(dtype=array.dtype.str, shape=list(array.shape), scalar=kind is not numpy.ndarray,
                                      sha256=hashlib.sha256(data).hexdigest(), npy=base64.b64encode(data).decode("ascii"))}
-        raise PortGap("group-port/1 has no encoding for " + kind.__module__ + "." + kind.__qualname__)
+        raise PortGap("group-port/2 has no encoding for " + kind.__module__ + "." + kind.__qualname__)
     return walk(value)
 
 
@@ -118,12 +139,25 @@ def decode_port(value):
     if not any(key.startswith("$") for key in value):
         return {key: decode_port(member) for key, member in value.items()}
     if len(value) != 1:
-        raise PortGap("unknown group-port/1 marker")
+        raise PortGap("unknown group-port/2 marker")
     key, payload = next(iter(value.items()))
     if key == "$bytes":
         return base64.b64decode(payload, validate=True)
     if key == "$tuple":
         return tuple(decode_port(member) for member in payload)
+    if key == "$process_result":
+        fields = {"args", "returncode", "stdout", "stderr"}
+        if type(payload) is not dict or not fields <= set(payload) or set(payload) - fields - {"completion"}:
+            raise PortGap("CLI process result has missing or unknown fields")
+        decoded = {name: decode_port(payload[name]) for name in fields}
+        _process_fields(**decoded)
+        process = subprocess.CompletedProcess(**decoded)
+        if "completion" in payload:
+            observation = decode_port(payload["completion"])
+            if type(observation) is not dict:
+                raise PortGap("CLI completion observation must be a dictionary")
+            process.seampact_completion = observation
+        return process
     if key == "$ndarray":
         try:
             import numpy
@@ -136,7 +170,7 @@ def decode_port(value):
         if array.dtype.str != payload["dtype"] or list(array.shape) != payload["shape"]:
             raise PortGap("array payload dtype/shape differs from its declaration")
         return array[()] if payload.get("scalar") else array
-    raise PortGap("unknown group-port/1 marker: " + key)
+    raise PortGap("unknown group-port/2 marker: " + key)
 
 
 def worker_spec(binding, group, unit):
@@ -454,7 +488,8 @@ def check_group_host(rows, members, scalar):
             member.update(status="MISSING", reason="native entry binding is missing: " + str(check.get("reason")))
         elif native_inputs:
             member.update(status="MISSING", reason="组外端口没有原对象输入的编码，该成员保留本地组合：" + ", ".join(native_inputs))
-        elif "x-native-type" in result_schema:
+        elif "x-native-type" in result_schema and not (not scalar and entry.get("kind") == "cli" and
+                result_schema["x-native-type"] == {"module": "subprocess", "symbol": "CompletedProcess"}):
             member.update(status="MISSING", reason="原返回对象 " + str(result_schema["x-native-type"]) +
                           " 没有组外编码；不做 str()/JSON 转换或 pickle，该成员保留本地执行")
         else:

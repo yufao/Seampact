@@ -70,10 +70,10 @@ flowchart LR
 
 | 宿主规格 | 适用 | 组外端口 |
 |---|---|---|
-| `python311-scalar-worker/1` | 规则 `scalar-independent-entry/1` 核对的原同步顶层函数：原源码和包初始化、有限值运算、不可变字符串／整数／布尔输入与返回 | 原内建标量 |
-| `python311-native-group-worker/1` | 其余组（包括保守原上下文组）：整组成员在一个进程，保留原构造次数、owner、原 controller、初始化与关闭 | `group-port/1` |
+| `python-native-scalar-worker/2` | 规则 `scalar-independent-entry/1` 核对的原同步顶层函数：原源码和包初始化、有限值运算、不可变字符串／整数／布尔输入与返回 | 原内建标量 |
+| `python-native-group-worker/2` | 其余组（包括保守原上下文组）：整组成员在一个进程，保留原构造次数、owner、原 controller、初始化与关闭 | `group-port/2` |
 
-`group-port/1` 只编码精确的 JSON 标量、list、dict（字符串键）、bytes、tuple，以及非 object dtype 的 numpy 数组（npy 格式、`allow_pickle=False`，带 sha256）。不做 `str()`、JSON 转换或 pickle。成员若有必需的原对象输入，或结果端口是原对象类型，该成员在宿主中记为 MISSING，继续本地组合执行；例如 MADL 返回的原结果对象不跨进程。
+本地最新 `group-port/2` 编码精确的 JSON 标量、list、dict（字符串键）、bytes、tuple，以及非 object dtype 的 numpy 数组（npy 格式、`allow_pickle=False`，带 sha256）。新增原 CLI 的 `subprocess.CompletedProcess` 固定字段编码：argv、退出码、stdout、stderr 及可选完成检查记录，解码恢复同一类型；已核对 CLI 可使用这一结果端口。任意函数的原对象返回、对象输入、子类或附加未声明状态继续拒绝，不做 `str()`、通用对象转换或 pickle。例如 MADL 的原结果对象仍不跨进程。该增补尚未部署，更新后的平台须重新核对并生成 worker，旧工件不获得新增能力。实际运行范围见[当前实现](当前实现.md)。
 
 ### 环境条件由宿主核对
 
