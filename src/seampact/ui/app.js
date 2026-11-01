@@ -3169,6 +3169,28 @@ function renderResearchComparison() {
 
 function resourceState() { return state?.resources || {}; }
 function resourceId(record) { return record?.id || record?.connection_id || record?.resource_id; }
+const resourceKindNames = {cloud: '云端服务', borrowed: '借用服务', managed: '平台管理服务'};
+function managedServiceOptions(value) {
+  const form = $('connection-form'), select = form.elements.managed_service_id;
+  const previous = value === undefined ? select.value : value;
+  select.replaceChildren();
+  const prompt = node('option', '选择已登记的服务规格'); prompt.value = ''; select.append(prompt);
+  for (const service of entries(resourceState().managed_services)) {
+    const id = service.managed_service_id || service.id;
+    const option = node('option', service.service_spec?.model ? id + ' · ' + service.service_spec.model : id);
+    option.value = id; select.append(option);
+  }
+  if (previous && ![...select.options].some(option => option.value === previous)) {
+    const missing = node('option', previous + ' · 规格不可用'); missing.value = previous; select.append(missing);
+  }
+  select.value = previous || '';
+}
+function connectionResourceChanged() {
+  const form = $('connection-form');
+  const managed = form.elements.resource_kind.value === 'managed';
+  $('connection-managed-service-label').hidden = !managed;
+  form.elements.managed_service_id.required = managed;
+}
 function connectionOptions(select, value) {
   const connections = entries(resourceState().connections);
   const signature = JSON.stringify(connections.map(item => [resourceId(item), item.name, item.model]));
@@ -3253,6 +3275,8 @@ function editConnection(connection) {
   form.elements.context_window.value = connection.declared_context_window ?? '';
   form.elements.context_management.checked = connection.context_management !== false;
   form.elements.protocol.value = connection.protocol || 'openai-compatible';
+  form.elements.resource_kind.value = connection.resource_kind || 'borrowed';
+  managedServiceOptions(connection.managed_service_id); connectionResourceChanged();
   form.elements.parameters.value = textValue(connection.parameters || {});
   form.elements.auth_mode.value = connection.auth?.mode || 'none';
   form.elements.auth_env.value = connection.auth?.env || '';
@@ -3349,6 +3373,15 @@ function renderConnections() {
     card.append(node('p', [connection.protocol, connection.model || '无固定模型 ID',
       '版本 ' + (connection.service_version || 'UNKNOWN')].filter(Boolean).join(' · '), 'card-meta'));
     const checks = connection.check || connection.checks || {};
+    const service = entries(resourceState().managed_services).find(item => (item.managed_service_id || item.id) === connection.managed_service_id);
+    card.append(node('p', '资源归属：' + (resourceKindNames[connection.resource_kind || 'borrowed'] || '未知') +
+      (connection.managed_service_id ? ' · ' + (service?.name || connection.managed_service_id) : ''), 'card-meta'));
+    if (connection.resource_kind === 'managed') {
+      const instances = service?.instances || [];
+      const status = !service ? '规格不可用' : instances.length ? instances.map(item =>
+        [item.state || 'UNKNOWN', item.model_state].filter(Boolean).join(' / ')).join('、') : '未运行';
+      card.append(node('p', '服务状态：' + status, 'card-meta'));
+    }
     const operations = connectionOperationChecks(connection);
     const statuses = node('div', undefined, 'resource-states');
     resourceStatus(statuses, '凭据', credentialSummary(connection));
@@ -3697,6 +3730,8 @@ async function saveConnection(event) {
       context_management: form.elements.context_management.checked,
       capabilities: [...form.querySelectorAll('[name="capability"]:checked')].map(input => input.value),
       auth: {mode: form.elements.auth_mode.value}};
+    body.resource_kind = form.elements.resource_kind.value;
+    if (body.resource_kind === 'managed') body.managed_service_id = form.elements.managed_service_id.value;
     if (form.elements.id.value) body.id = form.elements.id.value;
     if (body.auth.mode === 'environment') body.auth.env = form.elements.auth_env.value.trim();
     if (body.auth.mode === 'saved') {
@@ -3825,7 +3860,8 @@ async function refresh() {
     hydrateSceneTasks();
     updateInspectPage();
     renderSection('profile', state.entry_profile, renderProfile, ['entry-profile-summary', 'config-entry-profile']);
-    renderSection('connections', resourceState().connections, renderConnections, ['connection-list']);
+    managedServiceOptions();
+    renderSection('connections', [resourceState().connections, resourceState().managed_services], renderConnections, ['connection-list']);
     renderSection('weights', resourceState().weights, renderWeights, ['weight-list']);
     synchronizeTask();
     renderSection('scheduler', state.scheduler, renderScheduler, ['scheduler-summary']);
@@ -3887,6 +3923,47 @@ $('analysis-model-form').onsubmit = saveModel;
 $('teacher-model-form').onsubmit = saveModel;
 for (const button of document.querySelectorAll('.select-role-connection')) button.onclick = selectRoleConnection;
 for (const button of document.querySelectorAll('.save-role-credential')) button.onclick = saveRoleCredential;
+{
+  const form = $('connection-form');
+  const kindLabel = node('label', '资源归属');
+  const kind = node('select'); kind.name = 'resource_kind';
+  for (const [value, name] of Object.entries(resourceKindNames)) {
+    const option = node('option', name); option.value = value; kind.append(option);
+  }
+  kind.value = 'borrowed'; kindLabel.append(kind);
+  const serviceLabel = node('label', '受管服务规格'); serviceLabel.id = 'connection-managed-service-label';
+  const service = node('select'); service.name = 'managed_service_id'; serviceLabel.append(service);
+  serviceLabel.append(node('small', '用于符合条件的 Harness 服务依赖；普通对话与分析模型角色请选择云端或借用连接。'));
+  form.insertBefore(kindLabel, form.querySelector('.form-actions'));
+  form.insertBefore(serviceLabel, form.querySelector('.form-actions'));
+  kind.onchange = connectionResourceChanged;
+  managedServiceOptions(); connectionResourceChanged();
+  const details = node('details');
+  details.append(node('summary', '登记受管服务规格（JSON）'));
+  details.append(node('p', '填写服务规格并保存；只检查本地镜像身份，不启动模型。连接端点和模型须与规格一致。凭据值请留在环境变量中。', 'form-note'));
+  details.append(node('p', '规格字段和填写约束见 0.15.1 更新说明；镜像须预先存在。相同 id 保存会更新规格。', 'form-note'));
+  const editor = node('form', undefined, 'resource-form');
+  const label = node('label', '服务规格 JSON');
+  const input = node('textarea'); input.rows = 12;
+  input.placeholder = '填写 id、model、model_identity、weight_identity、image、argv、endpoint、docker、contract、resource_envelope';
+  label.append(input); editor.append(label);
+  const actions = node('div', undefined, 'form-actions');
+  const save = node('button', '保存服务规格', 'primary-button'); save.type = 'submit';
+  const status = node('span', '', 'form-status'); status.setAttribute('role', 'status');
+  actions.append(save, status); editor.append(actions); details.append(editor);
+  form.insertAdjacentElement('afterend', details);
+  editor.onsubmit = async event => {
+    event.preventDefault(); save.disabled = true;
+    try {
+      const spec = JSON.parse(input.value);
+      if (!spec || typeof spec !== 'object' || Array.isArray(spec)) throw new Error('服务规格需要 JSON 对象');
+      const result = await api('/api/managed-services', spec);
+      status.textContent = '服务规格已保存；未启动服务';
+      await refresh(); managedServiceOptions(result.id); form.elements.resource_kind.value = 'managed'; connectionResourceChanged();
+    } catch (error) { status.textContent = error.message; }
+    finally { save.disabled = false; }
+  };
+}
 $('connection-form').onsubmit = saveConnection;
 $('connection-invoke-form').onsubmit = invokeConnection;
 $('connection-invoke-form').elements.connection_id.onchange = () => {
@@ -3904,6 +3981,7 @@ $('connection-form').elements.base_url.onchange = () => {
 };
 $('connection-new').onclick = () => {
   const form = $('connection-form'); form.reset(); form.elements.id.value = ''; delete form.dataset.savedUrl;
+  form.elements.resource_kind.value = 'borrowed'; managedServiceOptions(''); connectionResourceChanged();
   $('connection-form-title').textContent = '新增命名连接'; $('connection-form-status').textContent = '';
   $('connection-auth-note').textContent = '凭据值使用下方独立表单保存。更换地址后需重新明确认证方式。'; connectionAuthChanged();
 };

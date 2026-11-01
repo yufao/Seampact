@@ -19,7 +19,7 @@ import uuid
 from dataclasses import asdict
 
 from .capabilities import VERSION_2, freeze_joint, joint_candidate, joint_observation
-from .costs import episode_costs, summarize_usage
+from .costs import episode_costs, summarize_usage, envelope_integral
 from .evaluation import evaluate
 from .runtime import ProtocolError
 from .scenarios import (SceneSession, task_unit_ids, scene_task_criteria,
@@ -29,7 +29,7 @@ from .resource_observation import ObservationConfig, WindowObserver
 
 MODE = "joint/1"
 DISPATCH = ("fifo/1", "shortest_estimated/1", "edf/1", "learned_ready/1")
-RESOURCE = ("fixed/1", "queue_threshold/1", "learned/1")
+RESOURCE = ("fixed/1", "queue_threshold/1", "dependency_cost/1", "shared_lru/1", "learned/1")
 FIELDS = {"functional_policy", "dispatch_policy", "resource_policy", "retention", "queue_threshold", "age_guard_ms",
           "max_consecutive_resource_ops", "review_interval_ms", "capacity", "workload", "costs", "scales",
           "initial_state", "start_timeout_s", "dispatch_scope", "boundary_slots", "warm_groups", "observation"}
@@ -55,7 +55,7 @@ def _count(value, label, default=None):
 
 
 def configure(config, *, scene, tasks, task_ids, algorithm, criteria, contracts, groups, deployments,
-              learning, references, mode, placements=None):
+              learning, references, mode, placements=None, service_dependencies=None, shared_services=None):
     """Validate and freeze one joint/1 run; every compared policy shares these values."""
     value = copy.deepcopy(config.get("joint") or {})
     if not isinstance(value, dict) or set(value) - FIELDS:
@@ -100,6 +100,8 @@ def configure(config, *, scene, tasks, task_ids, algorithm, criteria, contracts,
             _positive(retention.get("idle_ms"), "retention.idle_ms")
         elif set(retention) != {"mode"}:
             raise ValueError("fixed_resident 不接收其他字段")
+        if resource in {"dependency_cost/1", "shared_lru/1"} and retention["mode"] != "idle_retire/1":
+            raise ValueError(resource + " 须显式冻结 retention={mode: idle_retire/1, idle_ms: 调参阈值}")
     threshold = value.get("queue_threshold")
     if resource == "queue_threshold/1":
         threshold = _count(threshold, "queue_threshold")
@@ -115,24 +117,37 @@ def configure(config, *, scene, tasks, task_ids, algorithm, criteria, contracts,
     capacity["call_slots"] = _count(capacity.get("call_slots"), "capacity.call_slots", 1)
     capacity["replica_cap"] = _count(capacity.get("replica_cap"), "capacity.replica_cap", 2)
     resources, demands = capacity.setdefault("resources", {}), capacity.setdefault("demands", {})
+    services = [g for g in groups if g.startswith("service:")]
+    if services and not resources:
+        raise ValueError("受管服务调度须显式声明完整容量与资源包络需求")
     if not isinstance(resources, dict) or not isinstance(demands, dict):
         raise ValueError("capacity.resources 与 capacity.demands 须为对象")
     for name, quota in resources.items():
         _positive(quota, "资源配额 " + str(name))
     if set(demands) - set(groups):
-        raise ValueError("驻留需求只能声明本次远程运行组")
+        raise ValueError("驻留需求只能声明本次 worker 与模型服务分配单元")
     for group_id in groups if resources else []:
         row = demands.get(group_id)
         # Unknown residency demands are not filled with zero.
         if not isinstance(row, dict) or set(row) != set(resources) or any(not _number(v) or v < 0 for v in row.values()):
             raise ValueError("声明资源配额后，每个远程运行组须给出每项资源的实例驻留需求：" + group_id)
+    for group_id in services:
+        spec = deployments.platform.managed_services.get(group_id)
+        envelope = spec["resource_envelope"]
+        required = {"host_memory_mb": envelope["host_memory_mb"]}
+        required.update({"gpu:" + device + ":memory_mb": values["memory_mb"]
+                         for device, values in envelope["devices"].items()})
+        if set(required) - set(resources):
+            raise ValueError("受管服务容量须覆盖冻结包络 host_memory_mb 及 gpu:<device>:memory_mb：" + group_id)
+        if any(demands[group_id][name] < amount for name, amount in required.items()):
+            raise ValueError("服务驻留需求不得小于冻结资源包络（含加载与并发上界）：" + group_id)
     reclaimable = [g for g in groups if deployments._idle_rebuild_allowed(
         deployments.platform.store.get("runtime_group", g))]
     placement = placements or {u: dict(kind="LOCAL") for u in scene.get("unit_ids", [])}
     if groups and placements is None:
         raise ValueError("联合驻留准入需要实际冻结的 Unit 放置映射")
     working_sets = freeze_working_sets(scene, [t for t in tasks if t["id"] in task_ids], placement,
-        resources, demands, reclaimable, (retention or {}).get("mode"))
+        resources, demands, reclaimable, (retention or {}).get("mode"), service_dependencies, shared_services)
     scalable = [g for g in groups if contracts[g]["replicas"].get("replicable") is True
                 and contracts[g]["operations"].get("add_replica") == "SUPPORTED"]
     if resource != "fixed/1" and capacity["replica_cap"] >= 2 and scalable and capacity["call_slots"] < 2:
@@ -172,9 +187,17 @@ def configure(config, *, scene, tasks, task_ids, algorithm, criteria, contracts,
             raise ValueError("edf/1 仅在每个任务确有 deadline_ms 时使用")
 
     costs = value.get("costs")
-    if not isinstance(costs, dict) or set(costs) != {"task_seconds", "instance_seconds"} or any(
-            not _number(v) or v < 0 for v in costs.values()):
+    second_costs = isinstance(costs, dict) and costs.get("schema") == "joint-costs/2"
+    expected = {"schema", "task_seconds", "instance_seconds", "resource_seconds"} if second_costs else {"task_seconds", "instance_seconds"}
+    if not isinstance(costs, dict) or set(costs) != expected or any(
+            not _number(costs[k]) or costs[k] < 0 for k in ("task_seconds", "instance_seconds")):
         raise ValueError("joint.costs 须显式给出 task_seconds 与 instance_seconds 的非负权重")
+    if services and not second_costs:
+        raise ValueError("模型服务须显式采用 joint-costs/2 与完整 resource_seconds 权重；旧策略不能沿用")
+    if second_costs and (not isinstance(costs["resource_seconds"], dict)
+            or set(costs["resource_seconds"]) != set(resources)
+            or any(not _number(v) or v < 0 for v in costs["resource_seconds"].values())):
+        raise ValueError("joint-costs/2.resource_seconds 须显式给出每项冻结资源的非负积分权重")
     if costs["task_seconds"] > 0:
         specs = [criteria, *[r["criteria"] for r in scene.get("routes", {}).values() if r.get("criteria")]]
         doubled = sorted({d["id"] for spec in specs for d in spec["dimensions"] if d["provider"] == "program"
@@ -201,7 +224,7 @@ def configure(config, *, scene, tasks, task_ids, algorithm, criteria, contracts,
         age_guard_ms=_positive(value.get("age_guard_ms"), "age_guard_ms"),
         max_consecutive_resource_ops=_count(value.get("max_consecutive_resource_ops"), "max_consecutive_resource_ops"),
         review_interval_ms=review, capacity=capacity, workload=workload, costs=dict(costs),
-        representation=freeze_joint(value.get("scales")), initial_state=initial, start_timeout_s=timeout,
+        representation=freeze_joint(value.get("scales"), resources), initial_state=initial, start_timeout_s=timeout,
         working_sets=working_sets, warm_groups=warm_groups, dispatch_scope=dispatch_scope,
         boundary_slots=_count(value.get("boundary_slots"), "boundary_slots", capacity["call_slots"]),
         observation=dict(asdict(observation), cgroup_paths=[str(p) for p in observation.cgroup_paths]) if observation else None,
@@ -294,6 +317,7 @@ class Window:
         self.scales = self.config["representation"]["scales"]
         self.cards = manifest["scene"]["representation"]["cards"]
         self.groups = catalog.remote_groups()
+        self.service_groups = {g for g in self.groups if g.startswith("service:")}
         self.members = {g: [u for u, p in catalog.placement.items() if p.get("group_id") == g] for g in self.groups}
         self.events = queue.Queue()
         self.estimates = estimates
@@ -307,7 +331,7 @@ class Window:
         # op id -> (group, held instance ids at submission): a start not yet registered still holds budget.
         self.reserved, self.op_walls, self.withheld, self.idle_seen = {}, {}, {}, set()
         self.unknown_outcomes = []
-        self.unattributed = dict(quality=0.0, task_time=0.0, instance_time=0.0, unfinished=0.0)
+        self.unattributed = dict(quality=0.0, task_time=0.0, instance_time=0.0, resource_time=0.0, unfinished=0.0)
         self.ledger = dict(task_seconds=0.0, instance_seconds=0.0, release_tail_seconds=0.0, root_seconds=0.0,
                            unknown_root_seconds=0.0, parallel_seconds=0.0, max_active_roots=0,
                            max_unknown_roots=0, max_held_instances=0, hosts_used=[])
@@ -321,15 +345,72 @@ class Window:
                                    self.config["capacity"]["demands"])
         self.observation = None
         self.boundaries_seen = set()
+        self.resource_charged = {name: 0.0 for name in self.config["capacity"]["resources"]}
+
+    def _candidate(self, action, scales, **facts):
+        return joint_candidate(action, scales, resource_schema=self.config["representation"].get("resources", []), **facts)
+
+    def _charge_resources(self, integral):
+        if self.config["costs"].get("schema") != "joint-costs/2" or integral["status"] != "KNOWN":
+            return
+        current = integral["resource_seconds"]
+        charge = sum(self.config["costs"]["resource_seconds"][name] *
+                     (value - self.resource_charged.get(name, 0.0)) for name, value in current.items())
+        self._credit("resource_time", -charge)
+        self.resource_charged = dict(current)
+
+    def _services(self, task):
+        return set(self.config["working_sets"]["tasks"][task.task["id"]]) & self.service_groups
+
+    def _services_ready(self, task, views):
+        return all(any(i["state"] == "READY" and i["accepting"] and not i["pending_stop"]
+                       for i in views[g]["instances"]) for g in self._services(task))
+
+    def _load_history(self, group):
+        expected = self.groups[group].get("contract_digest")
+        with self.deployments.lock:
+            samples = [(i["ready_wall"] - i["start_wall"]) * 1000
+                for i in self.deployments.instances.values() if i["group_id"] == group
+                and i.get("ready_wall") and i.get("start_wall")
+                and (not expected or i.get("spec_digest", i.get("contract_digest")) == expected)]
+        return dict(load_ms=sum(samples) / len(samples) if samples else None,
+                    load_samples=len(samples), load_uncertainty=1 / math.sqrt(len(samples)) if samples else 1.0)
+
+    def _release_order(self):
+        dependencies = self.config["working_sets"].get("dependencies", {})
+        visited, ordered = set(), []
+        def visit(group):
+            if group in visited:
+                return
+            visited.add(group)
+            for dependency in dependencies.get(group, []):
+                visit(dependency)
+            if group in self.groups:
+                ordered.append(group)
+        for group in sorted(self.service_groups):
+            visit(group)
+        return sorted(set(self.groups) - self.service_groups) + list(reversed(ordered))
+
+    def _release_task(self, task, unknown=False):
+        task.lease_unknown = getattr(task, "lease_unknown", False) or unknown
+        unknown = task.lease_unknown
+        if self._services(task):
+            self.platform.managed_services.release_lease(task.context, unknown=unknown)
+        if not unknown:
+            self.deployments.release_task(task.context)
+            self.working.release(task.context)
 
     # Window lifecycle.
 
     def run(self):
         observer = WindowObserver(self.config.get("observation"), run_id=self.wid,
-            arm=self.manifest["algorithm"], runtime_dir=self.jobs.directory / "runtime" / self.rid)
+            arm=self.manifest["algorithm"], runtime_dir=self.jobs.directory / "runtime" / self.rid,
+            allocation_sampler=(lambda: self.platform.managed_services.sample_resources(self.service_groups))
+                               if self.service_groups else None)
         self.observer = observer
         try:
             observer.start()
+            self.accounting_start = time.time()
             observer.mark_phase("preparation")
             self._setup()
             observer.mark_phase("workload")
@@ -358,11 +439,14 @@ class Window:
             for group_id in self.config["warm_groups"]:
                 placement = self.groups[group_id]
                 started = time.perf_counter()
-                record = deployments.ensure_ready(placement, self.members[group_id][0])
+                record = deployments.ensure_ready(placement, None if group_id in self.service_groups else self.members[group_id][0])
                 required = self.members[group_id]
                 setup = dict(instance_id=record["id"], start_to_ready_ms=(time.perf_counter() - started) * 1000,
                              process_ready=record["state"] == "READY", required_units=required)
                 self.setup[group_id] = setup
+                if group_id in self.service_groups:
+                    setup.update(status="PREPARED", initialization_ready=record["state"] == "READY")
+                    continue
                 if set(required) - set(record["units"]) or set(required) - set(self._preparable(group_id)):
                     setup["status"] = "FAILED"
                     raise ValueError("暖态准备要求全部所需成员可用且契约允许提前初始化：" + group_id)
@@ -511,8 +595,7 @@ class Window:
                 task.event, task.status, task.event_at = scene_event, "DECISION", at
         elif kind == "task_abandoned":
             event[1].status = "UNFINISHED"
-            self.working.release(event[1].context)
-            self.deployments.release_task(event[1].context)
+            self._release_task(event[1])
         elif kind == "task_error":
             _, task, error, at = event
             task.error = dict(type=type(error).__name__, message=str(error))
@@ -521,8 +604,7 @@ class Window:
             else:
                 task.status = "FAILED"
                 self._fail(dict(type=type(error).__name__, message=str(error), task_id=task.task["id"]))
-            self.deployments.release_task(task.context)
-            self.working.release(task.context)
+            self._release_task(task, unknown=type(error).__name__ in {"TimeoutError", "ConnectionError"})
         elif kind == "root":
             self.resource_due = True
         elif kind == "instance":
@@ -549,6 +631,8 @@ class Window:
         elif kind == "evaluated":
             _, task, feedback, independent, index, error = event
             task.evaluating, task.feedback, task.independent = False, feedback, independent
+            self._release_task(task, unknown=bool(error and error.get("type") in {"TimeoutError", "ConnectionError"}))
+            self.resource_due = True
             # Quality after the horizon is recorded, not credited: unfinished_reward already settled that task.
             late = task.deadline_status == "UNFINISHED"
             if error is not None:
@@ -572,36 +656,35 @@ class Window:
         task.status, task.done, task.terminal = "DONE", at, event
         if event.get("truncated") and task.deadline_status != "UNFINISHED":
             self.truncated.append(task.task["id"])
-        self.deployments.release_task(task.context)
-        self.working.release(task.context)
-        self.resource_due = True
+        # Shared service and capacity leases include both teacher and independent evaluation.
         task.evaluating = True
         index = len(self.trajectory) - 1 if self.trajectory else None
         threading.Thread(target=self._evaluate, args=(task, index), daemon=True, name="seampact-joint-eval").start()
 
     def _evaluate(self, task, index):
         from .training import task_criteria
-        try:
-            event, calls = task.terminal, task.session.context.calls
-            program = dict(event.get("program_metrics", {}), latency_ms=(task.done - task.arrived) * 1000,
-                           module_calls=len(calls), module_duration_ms=sum(c["duration_ms"] for c in calls),
-                           root_wait_ms=sum((c.get("root") or {}).get("wait_ms") or 0 for c in calls))
-            task.program = program
-            applicability = route_metric_applicability(self.manifest["scene"], task.task, event)
-            called = {c["unit_id"] for c in calls}
-            criterion = task_criteria(scene_task_criteria(self.manifest["scene"], task.task,
-                self.manifest["criteria"]), applicability, called)
-            final = task_criteria(scene_task_criteria(self.manifest["scene"], task.task,
-                self.manifest["evaluation_criteria"], "evaluation_criteria"), applicability, called)
-            evidence = event.get("evidence", {})
-            feedback = evaluate(task.session.context.profiles, criterion, evidence, program)
-            final_program = dict(program)
-            final_program.update(event.get("evaluation_metrics", {}))
-            final_program.update({key: program[key] for key in ("latency_ms", "module_calls", "module_duration_ms")})
-            independent = evaluate(task.session.context.profiles, final, evidence, final_program) if final else None
-            self.events.put(("evaluated", task, feedback, independent, index, None))
-        except Exception as error:
-            self.events.put(("evaluated", task, None, None, index, dict(type=type(error).__name__, message=str(error))))
+        with self.runtime.context(task.context):
+            try:
+                event, calls = task.terminal, task.session.context.calls
+                program = dict(event.get("program_metrics", {}), latency_ms=(task.done - task.arrived) * 1000,
+                               module_calls=len(calls), module_duration_ms=sum(c["duration_ms"] for c in calls),
+                               root_wait_ms=sum((c.get("root") or {}).get("wait_ms") or 0 for c in calls))
+                task.program = program
+                applicability = route_metric_applicability(self.manifest["scene"], task.task, event)
+                called = {c["unit_id"] for c in calls}
+                criterion = task_criteria(scene_task_criteria(self.manifest["scene"], task.task,
+                    self.manifest["criteria"]), applicability, called)
+                final = task_criteria(scene_task_criteria(self.manifest["scene"], task.task,
+                    self.manifest["evaluation_criteria"], "evaluation_criteria"), applicability, called)
+                evidence = event.get("evidence", {})
+                feedback = evaluate(task.session.context.profiles, criterion, evidence, program)
+                final_program = dict(program)
+                final_program.update(event.get("evaluation_metrics", {}))
+                final_program.update({key: program[key] for key in ("latency_ms", "module_calls", "module_duration_ms")})
+                independent = evaluate(task.session.context.profiles, final, evidence, final_program) if final else None
+                self.events.put(("evaluated", task, feedback, independent, index, None))
+            except Exception as error:
+                self.events.put(("evaluated", task, None, None, index, dict(type=type(error).__name__, message=str(error))))
 
     def _fail(self, error):
         if self.execution_error is None:
@@ -620,7 +703,7 @@ class Window:
         for task in self.tasks:
             if task.status == "PENDING":
                 task.status = "NOT_ARRIVED"
-            elif task.status == "WAITING_CAPACITY":
+            elif task.status in {"WAITING_CAPACITY", "WAITING_RESOURCES"}:
                 task.status = "UNFINISHED"
             elif task.status == "DECISION":
                 task.inbox.put(None)
@@ -658,7 +741,15 @@ class Window:
                     self.execution_error = self.execution_error or task.error
                     # A task that can still execute retains its owner lease.
                     continue
-            deployments.release_task(task.context)
+            if not task.evaluating:
+                self._release_task(task)
+        # Teachers use the same frozen service dependency leases as the task.
+        self.observer.mark_phase("evaluation_tail")
+        while any(task.evaluating for task in self.tasks):
+            try:
+                self._handle(self.events.get(timeout=1.0))
+            except queue.Empty:
+                pass
         end = self.done_at or time.time()
         if self.start is not None:
             self._track_ops(time.time())
@@ -667,7 +758,7 @@ class Window:
                 # The window ends before this start resolved; release stops it, which is not a start failure.
                 self._settle(op, "CANCELLED", "窗口收尾时撤回未就绪的启动")
         released_at = time.time()
-        for group_id in self.groups:
+        for group_id in self._release_order():
             try:
                 self.release[group_id] = deployments.release_run(group_id, self.rid)
             except Exception as error:
@@ -696,6 +787,20 @@ class Window:
             self._credit("instance_time", -self.config["costs"]["instance_seconds"] * tail)
             self.clock = self.end_at
             self.residency = deployments.residency(set(self.groups), self.start, self.end_at)
+        complete = deployments.residency(set(self.groups), getattr(self, "accounting_start", self.start) or self.end_at,
+                                         self.end_at)
+        self.envelope = envelope_integral(complete, self.config["capacity"]["demands"],
+                                         self.config["capacity"]["resources"])
+        if self.config["costs"].get("schema") == "joint-costs/2":
+            # Include warm-state loading and asynchronous lifecycle changes from
+            # the physical ledger rather than the event-loop sample count.
+            correction = complete["resident_ms"] / 1000 - self.ledger["instance_seconds"]
+            self.ledger["instance_seconds"] += correction
+            self._credit("instance_time", -self.config["costs"]["instance_seconds"] * correction)
+            if self.envelope["status"] != "KNOWN":
+                self.unknown_outcomes.append("resource_envelope_unknown")
+            else:
+                self._charge_resources(self.envelope)
         self.window_end = end
         self.observer.mark_phase("evaluation_tail")
         while any(task.evaluating for task in self.tasks):
@@ -764,6 +869,10 @@ class Window:
         weights = self.config["costs"]
         self._credit("task_time", -weights["task_seconds"] * tasks * charged)
         self._credit("instance_time", -weights["instance_seconds"] * held * span)
+        if weights.get("schema") == "joint-costs/2":
+            lifetime = self.deployments.residency(set(self.groups), self.accounting_start, now)
+            self._charge_resources(envelope_integral(lifetime, self.config["capacity"]["demands"],
+                                                     self.config["capacity"]["resources"]))
         self.clock = now
 
     def _credit(self, component, value, index=-1):
@@ -782,13 +891,14 @@ class Window:
         if retention.get("mode") != "idle_retire/1":
             return {}
         result = {}
-        for view in getattr(self, "views", {}).values():
+        for group, view in getattr(self, "views", {}).items():
             if not view["reclaim"]:
                 continue
             for item in view["instances"]:
                 if (item["state"] == "READY" and not item["in_flight"] and item.get("last_activity_wall")
                         and item["id"] not in self.stopping):
-                    result[(item["id"], item["last_activity_wall"])] = item["last_activity_wall"] + retention["idle_ms"] / 1000
+                    loading = (self._load_history(group)["load_ms"] or 0) if self.config["resource_policy"] == "dependency_cost/1" else 0
+                    result[(item["id"], item["last_activity_wall"])] = item["last_activity_wall"] + (retention["idle_ms"] + loading) / 1000
         return result
 
     def _start_deadlines(self):
@@ -836,9 +946,7 @@ class Window:
             window_elapsed_ms=(now - self.start) * 1000)
 
     def _resource_use(self, views):
-        demands, occupancy = self.config["capacity"]["demands"], self._occupancy(views)
-        return {name: sum(occupancy[g] * demands[g][name] for g in views)
-                for name in self.config["capacity"]["resources"]}
+        return self.working.used(self._occupancy(views))
 
     def _budget_after(self, group_id, views):
         resources = self.config["capacity"]["resources"]
@@ -851,10 +959,18 @@ class Window:
         # No future task or task label is exposed to the learned policy here.
         for task in sorted((t for t in self.tasks if t.status == "WAITING_CAPACITY"),
                            key=lambda t: (t.arrived, t.index)):
-            if not self.working.admit(task.context, task.task["id"]):
+            views, _ = self._state()
+            if not self.working.admit(task.context, task.task["id"], self._occupancy(views)):
                 break
-            task.status = "STARTING"
+            task.status = "WAITING_RESOURCES"
             task.admitted_at = time.time()
+            for group in self._services(task):
+                self.platform.managed_services.acquire(group, task.context, run_id=self.rid)
+        views, _ = self._state()
+        for task in self.tasks:
+            if task.status != "WAITING_RESOURCES" or not self._services_ready(task, views):
+                continue
+            task.status = "STARTING"
             task.thread = threading.Thread(target=self._task_body, args=(task,), daemon=True,
                                            name="seampact-joint-task")
             task.thread.start()
@@ -866,7 +982,12 @@ class Window:
             return
         views, roots = self._state()
         used = self.working.used(self._occupancy(views))
-        pressure = any(used[n] > quota for n, quota in self.config["capacity"]["resources"].items())
+        waiting = [t for t in self.tasks if t.status == "WAITING_CAPACITY"]
+        proposed = set(self.config["working_sets"]["tasks"][waiting[0].task["id"]]) if waiting else set()
+        pressure = any(used[n] > quota or sum(max(self._occupancy(views).get(g, 0),
+            int(g in self.working.groups() | proposed)) * self.config["capacity"]["demands"][g][n]
+            for g in set(views) | proposed) > quota
+            for n, quota in self.config["capacity"]["resources"].items())
         if not pressure:
             return
         options = [o for o in self._resource_options(views, roots, time.time()) if o["action"] == "scale_in"]
@@ -881,6 +1002,8 @@ class Window:
             return
 
     def _preparable(self, group_id):
+        if group_id in self.service_groups:
+            return []
         cache = self.__dict__.setdefault("preparable", {})
         if group_id not in cache:
             # The run lock and contract digest keep these rules fixed for the run.
@@ -915,7 +1038,7 @@ class Window:
             self.trajectory[-1]["transition"].update(next_state=observation, next_candidates=candidates,
                 next_legal=legal, elapsed_ms=max(0.0, at_ms - self.trajectory[-1]["at_ms"]))
         self.trajectory.append(dict(transition=row, kind=kind, at_ms=at_ms,
-            components=dict(quality=0.0, task_time=0.0, instance_time=0.0, unfinished=0.0),
+            components=dict(quality=0.0, task_time=0.0, instance_time=0.0, resource_time=0.0, unfinished=0.0),
             explored=bool((decision.get("diagnostics") or {}).get("explored")),
             diagnostics=copy.deepcopy(decision.get("diagnostics"))))
         return decision["index"], "learned", represented, policy
@@ -967,7 +1090,7 @@ class Window:
                             remote=root["target"]["kind"] == "REMOTE", warm_target=True, aged=bool(aged), boundary=True)
             def build():
                 return (joint_observation("dispatch", self.scales, self._workload(views, roots, now)),
-                        [joint_candidate("dispatch", self.scales,
+                        [self._candidate("dispatch", self.scales,
                             cards=[self.cards.get((c.get("unit") or {}).get("id"),
                                                   self.cards[by_root[c["root_id"]]["unit_id"]])],
                             dispatch=facts(c)) for c in pool])
@@ -998,7 +1121,7 @@ class Window:
             views, roots = self._state()
             observation = joint_observation("business", self.scales, self._workload(views, roots, time.time()),
                                             event["observation"])
-            return observation, [joint_candidate(c["action_type"], self.scales, business=c["features"])
+            return observation, [self._candidate(c["action_type"], self.scales, business=c["features"])
                                  for c in event["candidates"]]
         def reference():
             target = (event.get("references") or {}).get(policy)
@@ -1019,6 +1142,16 @@ class Window:
 
     def _on_demand(self):
         views, roots = self._state()
+        # Prepare the complete service closure before original reset/SDK calls can run.
+        for group_id in sorted(self.working.groups() & self.service_groups):
+            view = views[group_id]
+            if view["instances"] or group_id in self.pending_groups:
+                continue
+            budget = self._budget_after(group_id, views)
+            if budget is not None and budget < 0:
+                continue
+            self._execute(dict(action="prepare", mode="start", group_id=group_id), "on_demand", views)
+            views, roots = self._state()
         for r in sorted((r for r in roots if r["state"] == "ENABLED"), key=lambda r: r["enabled_at"]):
             if r["target"]["kind"] != "REMOTE":
                 continue
@@ -1050,6 +1183,8 @@ class Window:
         result = []
         for r in sorted((r for r in roots if r["state"] == "ENABLED"), key=lambda r: r["enabled_at"]):
             target = r["target"]
+            if not self._services_ready(self.by_context[r["task_id"]], views):
+                continue
             if target["kind"] == "LOCAL":
                 host = None if "local" in busy else "local"
             else:
@@ -1100,7 +1235,7 @@ class Window:
             else:
                 def build():
                     observation = joint_observation("dispatch", self.scales, self._workload(views, roots, now))
-                    return observation, [joint_candidate("dispatch", self.scales, cards=[self.cards[r["unit_id"]]],
+                    return observation, [self._candidate("dispatch", self.scales, cards=[self.cards[r["unit_id"]]],
                                                          dispatch=self._dispatch_facts(r, host, views, now))
                                          for r, host in pool]
                 index, choice, represented, policy_ms = self._choose("dispatch", [True] * len(pool), build,
@@ -1133,9 +1268,13 @@ class Window:
             warm = (item.get("initialization") or {}).get(root["unit_id"]) == "BOUND"
         else:
             warm = bool(self.catalog.runtime_state([root["unit_id"]]).get("warm"))
+        services = self._services(task)
         return dict(wait_ms=(now - root["enabled_at"]) * 1000, estimate_ms=self._estimate(root["unit_id"]),
                     task_age_ms=(now - task.arrived) * 1000, task_roots=task.roots_done, remote=remote,
-                    warm_target=warm, aged=False)
+                    warm_target=warm, aged=False, dependencies_ready=self._services_ready(task, views),
+                    shared_users=sum(bool(services & set(v)) for v in self.working.claims.values()),
+                    dependency_waiters=sum(bool(services & self._services(t)) and t.status == "WAITING_RESOURCES"
+                                           for t in self.tasks), leases=len(services))
 
     def _resource_options(self, views, roots, now):
         options = []
@@ -1159,6 +1298,16 @@ class Window:
                 waiting_roots=len(queued), cold=not instances, replicable=view["replicable"], budget_after=budget,
                 warm=any(all((item.get("initialization") or {}).get(u) == "BOUND" for u in preparable)
                          for item in ready) if preparable else False)
+            claimed = self.working.groups()
+            users = sum(group_id in v for v in self.working.claims.values())
+            facts.update(service_target=group_id in self.service_groups, shared_users=users,
+                leases=users, dependency_waiters=sum(group_id in self._services(t) and
+                    t.status == "WAITING_RESOURCES" for t in self.tasks),
+                dependencies_ready=bool(ready),
+                **self._load_history(group_id),
+                marginal_resources={name: (0 if group_id in claimed or held else
+                    self.config["capacity"]["demands"][group_id][name]) / quota
+                    for name, quota in self.config["capacity"]["resources"].items()})
             cards = [self.cards[u] for u in self.members[group_id]]
             fits = budget is None or budget >= 0
             if not held:
@@ -1182,7 +1331,8 @@ class Window:
                               self.deployments.bound(r["task_id"], group_id)) in (None, item["id"])]
                     if (item["accepting"] and not item["pending_stop"] and not item["in_flight"]
                             and item["id"] not in busy and item["id"] not in self.stopping
-                            and not view["leases"].get(item["id"]) and not usable):
+                            and not view["leases"].get(item["id"]) and not usable
+                            and not (group_id in claimed and held <= 1)):
                         idle = now - (item.get("last_activity_wall") or item.get("ready_wall") or now)
                         options.append(dict(action="scale_in", group_id=group_id, instance_id=item["id"],
                             facts=dict(facts, idle_ms=idle * 1000,
@@ -1191,11 +1341,44 @@ class Window:
                             cards=cards))
         # A known failure is not repeated on the same group state; the policy learns from the attempt itself.
         signatures = {g: self._signature(view) for g, view in views.items()}
+        for option in options:
+            group = option["group_id"]
+            facts = dict(option["facts"])
+            current = max(occupancy[group], int(group in self.working.groups()))
+            delta = -1 if option["action"] == "scale_in" else int(option.get("mode") == "start" or
+                                                                          option["action"] == "scale_out")
+            future = max(occupancy[group] + delta, int(group in self.working.groups()))
+            facts["marginal_resources"] = {name: (future - current) *
+                self.config["capacity"]["demands"][group][name] / quota
+                for name, quota in self.config["capacity"]["resources"].items()}
+            option["facts"] = facts
         return [o for o in options if self.withheld.get((o["action"], o.get("mode"), o["group_id"], o.get("instance_id")))
                 != signatures[o["group_id"]]]
 
     def _resource_rule(self, options):
         policy, retention = self.config["resource_policy"], self.config.get("retention") or {}
+        if policy in {"dependency_cost/1", "shared_lru/1"}:
+            # All candidates already passed contract, full-closure budget and
+            # task/evaluation lease guards. No future arrivals are consulted.
+            needed = [i for i, o in enumerate(options) if o["action"] == "prepare" and
+                      o["facts"]["waiting_roots"] + o["facts"].get("dependency_waiters", 0) > 0]
+            if needed:
+                return max(needed, key=lambda i: (options[i]["facts"]["waiting_roots"] +
+                    options[i]["facts"].get("dependency_waiters", 0),
+                    options[i]["facts"].get("load_ms") or 0, options[i]["group_id"]))
+            retired = [i for i, o in enumerate(options) if o["action"] == "scale_in" and
+                o["facts"]["idle_ms"] >= retention["idle_ms"] +
+                ((o["facts"].get("load_ms") or 0) if policy == "dependency_cost/1" else 0)]
+            if retired:
+                if policy == "shared_lru/1":
+                    return max(retired, key=lambda i: (options[i]["facts"]["idle_ms"], options[i]["instance_id"]))
+                # Prefer useful reclaimed capacity with low observed reload cost;
+                # unknown loading cost has no predicted value and ties use age.
+                return max(retired, key=lambda i: (
+                    sum(max(0, -v) for v in options[i]["facts"]["marginal_resources"].values()) /
+                    (1 + (options[i]["facts"].get("load_ms") or retention["idle_ms"])),
+                    options[i]["facts"]["idle_ms"], options[i]["instance_id"]))
+            return len(options) - 1
         if policy == "queue_threshold/1":
             for index, option in enumerate(options):
                 if option["action"] == "scale_out" and option["facts"]["waiting_roots"] >= self.config["queue_threshold"]:
@@ -1217,7 +1400,7 @@ class Window:
             options.append(dict(action="yield_until_next_event"))
             def build():
                 observation = joint_observation("resource", self.scales, self._workload(views, roots, now))
-                return observation, [joint_candidate(o["action"], self.scales, cards=o.get("cards"),
+                return observation, [self._candidate(o["action"], self.scales, cards=o.get("cards"),
                                                      resource=o.get("facts")) for o in options]
             index, choice, represented, policy_ms = self._choose("resource", [True] * len(options), build,
                                                                  lambda: self._resource_rule(options))
@@ -1347,6 +1530,13 @@ class Window:
             if fact.get("held"):
                 self._cleanup(op)
         if op["origin"] == "on_demand":
+            if op["group_id"] in self.service_groups:
+                for task in self.tasks:
+                    if task.status == "WAITING_RESOURCES" and op["group_id"] in self._services(task):
+                        task.status = "FAILED"
+                        task.error = dict(type="ServiceStartFailed", message=reason)
+                        self._release_task(task)
+                        self._fail(task.error)
             # As in functional mode, a call whose instance cannot start fails; nothing else can host it.
             for r in self.runtime.call("root_view", self.wid):
                 if r["state"] == "ENABLED" and r["target"].get("group_id") == op["group_id"]:
@@ -1462,7 +1652,8 @@ class Window:
             setup=self.setup, release=dict(groups=self.release, release_ms=getattr(self, "release_ms", None),
                                            left=getattr(self, "release_left", {})),
             parallelism=ledger, residency=self.residency,
-            costs=dict(schema="joint-cost-ledger/1",
+            costs=dict(schema="joint-cost-ledger/2" if self.config["costs"].get("schema") else "joint-cost-ledger/1",
+                resource_envelope=self.envelope,
                 online=dict(wall_ms=span * 1000 if span else 0.0,
                     representation_ms=sum(d.get("representation_ms", 0) for d in self.records),
                     policy_ms=sum(d.get("policy_ms", 0) for d in self.records),
@@ -1546,6 +1737,13 @@ def run_windows(jobs, rid, run, folder, manifest, catalog, bound, learner):
         costs["task_seconds"] += item["parallelism"]["task_seconds"]
         costs["instance_seconds"] += item["parallelism"]["instance_seconds"]
         costs["release_tail_seconds"] = costs.get("release_tail_seconds", 0.0) + item["parallelism"]["release_tail_seconds"]
+        envelope = item["costs"].get("resource_envelope") or {}
+        if envelope.get("status") == "KNOWN":
+            resource_totals = costs.setdefault("resource_envelope_seconds", {})
+            for name, value in envelope["resource_seconds"].items():
+                resource_totals[name] = resource_totals.get(name, 0.0) + value
+        else:
+            costs["resource_envelope_status"] = "UNKNOWN"
         for scope in records:
             records[scope].extend(item["costs"][scope]["records"])
             costs[scope + "_usage"] = summarize_usage(records[scope])

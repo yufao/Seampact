@@ -50,7 +50,7 @@ SCALES_2 = set(NUMBERS) | {"latency_ms", "coverage_chars", "plan_units", *RUNTIM
 # joint/1: one shared scorer over business, dispatch and resource events. A
 # business event keeps its capability-features/2 vectors; workload facts are only
 # what has arrived or is observable now, never future arrivals.
-JOINT_VERSION = "joint-features/2"
+JOINT_VERSION = "joint-features/3"
 JOINT_DECISIONS = ("business", "dispatch", "resource")
 JOINT_ACTIONS = ("invoke", "continue", "finish", "dispatch", "prepare", "scale_out", "scale_in",
                  "yield_until_next_event")
@@ -69,6 +69,8 @@ RESOURCE_NUMBERS = (("held", "instances"), ("ready", "instances"), ("starting", 
                     ("draining", "instances"), ("cap_remaining", "instances"), ("waiting_roots", "calls"),
                     ("idle_ms", "wait_ms"), ("budget_after", None))
 RESOURCE_FLAGS = ("cold", "warm", "replicable", "budget_after:missing")
+DEPENDENCY_FEATURES = ("service_target", "shared_users", "dependency_waiters", "dependencies_ready",
+                       "leases", "load_ms", "load_ms:missing", "load_samples", "load_uncertainty")
 UNIT_CATEGORIES = [f"unit:{key}:{v}" for key, values in CATEGORIES.items() for v in (*values, "unknown")]
 JOINT_OBSERVATION_SCHEMA = ([f"decision:{v}" for v in JOINT_DECISIONS] +
     ["business:" + name for name in OBSERVATION_SCHEMA_2] + ["business:not_applicable"] +
@@ -79,7 +81,7 @@ JOINT_CANDIDATE_SCHEMA = ([f"action:{v}" for v in JOINT_ACTIONS] +
     ["dispatch:" + name for name, _ in DISPATCH_NUMBERS] + ["dispatch:" + name for name in DISPATCH_FLAGS] +
     ["dispatch:not_applicable"] +
     ["resource:" + name for name, _ in RESOURCE_NUMBERS] + ["resource:" + name for name in RESOURCE_FLAGS] +
-    ["resource:not_applicable"])
+    ["resource:not_applicable"] + ["dependency:" + name for name in DEPENDENCY_FEATURES])
 
 
 def content_digest(value):
@@ -254,13 +256,15 @@ def _represent_2(event, config, runtime_state):
     event["representation_digest"] = config["digest"]
 
 
-def freeze_joint(scales):
+def freeze_joint(scales, resources=None):
     if not isinstance(scales, dict) or set(scales) != JOINT_SCALES:
         raise ValueError("joint representation scales must declare exactly: " + ", ".join(sorted(JOINT_SCALES)))
     if any(type(v) not in (int, float) or not math.isfinite(v) or v <= 0 for v in scales.values()):
         raise ValueError("joint representation scales must be positive and finite")
-    value = dict(version=JOINT_VERSION, base=VERSION_2, scales=dict(sorted(scales.items())),
-                 observation_schema=list(JOINT_OBSERVATION_SCHEMA), candidate_schema=list(JOINT_CANDIDATE_SCHEMA))
+    names = sorted(resources or {})
+    value = dict(version=JOINT_VERSION, base=VERSION_2, scales=dict(sorted(scales.items())), resources=names,
+                 observation_schema=list(JOINT_OBSERVATION_SCHEMA),
+                 candidate_schema=list(JOINT_CANDIDATE_SCHEMA) + ["marginal:" + name for name in names])
     value["digest"] = content_digest(value)
     return value
 
@@ -296,7 +300,7 @@ def joint_observation(kind, scales, workload, business=None):
     return _joint_vector(JOINT_OBSERVATION_SCHEMA, values)
 
 
-def joint_candidate(action, scales, business=None, cards=None, dispatch=None, resource=None):
+def joint_candidate(action, scales, business=None, cards=None, dispatch=None, resource=None, resource_schema=None):
     if action not in JOINT_ACTIONS:
         raise ValueError("unknown joint action label")
     values = {"action:" + action: 1}
@@ -342,4 +346,19 @@ def joint_candidate(action, scales, business=None, cards=None, dispatch=None, re
         values["resource:budget_after:missing"] = int(resource.get("budget_after") is None)
         for name in ("cold", "warm", "replicable"):
             values["resource:" + name] = int(bool(resource.get(name)))
-    return _joint_vector(JOINT_CANDIDATE_SCHEMA, values)
+    facts = resource or dispatch or {}
+    for name in DEPENDENCY_FEATURES:
+        value = facts.get(name)
+        if name == "load_ms:missing":
+            value = int(facts.get("load_ms") is None)
+        if value is not None:
+            scale = scales["service_ms"] if name == "load_ms" else scales["tasks"] if name in {
+                "shared_users", "dependency_waiters", "leases"} else 1
+            values["dependency:" + name] = value / scale
+    for name in resource_schema or []:
+        value = (facts.get("marginal_resources") or {}).get(name)
+        # An absent business resource action has no additional allocation.
+        if value is None and resource is not None:
+            raise ValueError("candidate marginal resource demand is unavailable: " + name)
+        values["marginal:" + name] = value or 0.0
+    return _joint_vector(JOINT_CANDIDATE_SCHEMA + ["marginal:" + name for name in resource_schema or []], values)

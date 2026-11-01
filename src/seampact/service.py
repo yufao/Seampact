@@ -24,6 +24,7 @@ from .scheduler import TwoLayerScheduler
 from .store import Store, now
 from .units import UnitCatalog
 from .deployment import Deployments, REMOTE_PROFILE, GROUP_PROFILE
+from .managed_services import ManagedServices
 from .training import TrainingJobs
 from .environments import discover_environment, normalize_environment
 from .target_runtime import attach_target, checker_identity, environment_selection, prepare_checker
@@ -58,6 +59,8 @@ class Platform:
         self.catalog = UnitCatalog(self.home, self.store, self.runtime)
         self.catalog.resource_registry = self.dependencies
         self.deployments = Deployments(self)
+        self.managed_services = ManagedServices(self)
+        self.profiles.managed_services = self.managed_services
         self.analysis = AnalysisJobs(self.store, self.profiles, on_complete=self._connect_units,
                                      check_entries=self.catalog.inspect_candidate)
         self.chat = ChatJobs(self.store, self.profiles, self.catalog, self.runtime, self.scheduler)
@@ -128,6 +131,7 @@ class Platform:
         requirements, selections = self.dependencies.public()
         return dict(version=__version__, models=self.profiles.public_roles(), harnesses=harnesses,
             resources=dict(connections=self.public_connections(), weights=self.resources.public_weights(),
+                           managed_services=self.managed_services.public(),
                            dependencies=requirements, bindings=selections),
             analyses=jobs, analysis_revisions=self.revision_summaries(),
             units=self.catalog.public(), tasks=tasks, rules=RULESET, entry_profile=NATIVE_PROFILE,
@@ -146,6 +150,7 @@ class Platform:
         weights = [record for record in self.resources.public_weights()
                    if not inside_platform_checkout(self.intake.home, record.get("path"))]
         return dict(connections=self.profiles.public_connections(), weights=weights,
+                    managed_services=self.managed_services.public(),
                     execution_environment="platform_process", platform_home=str(self.home))
 
     def add_harness(self, body):

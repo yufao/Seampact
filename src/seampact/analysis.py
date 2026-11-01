@@ -252,6 +252,8 @@ class AnalysisJobs:
     def start(self, inspector, provider, identity=None, previous=None, resume=None,
               preprocessing="api", preprocessing_id=None, repair=None):
         profile = self.profiles.profile(provider)
+        if profile.get("resource_kind") == "managed":
+            raise ValueError("分析任务暂不管理模型服务生命周期，请选择云端或已启动的借用连接")
         key = self.profiles.key(provider)
         if not profile["model"]:
             raise ValueError("configure the provider model first")

@@ -17,6 +17,31 @@ from seampact import resource_process
 
 
 class WindowResourceChecks(unittest.TestCase):
+    def test_owned_service_counters_separate_generations_and_preserve_unknown(self):
+        selected = []
+        with tempfile.TemporaryDirectory() as directory:
+            observer = observation.WindowObserver({"interval_s": 10}, run_id="r", arm="a",
+                runtime_dir=Path(directory) / "runtime", allocation_sampler=lambda: selected)
+            observer.start()
+            base = time.monotonic()
+            def row(instance, generation, stamp, cpu, memory):
+                return dict(instance_id=instance, generation=generation, group_id="service:m",
+                    identity=instance + str(generation) if cpu is not None else None,
+                    monotonic_s=base + stamp, cpu_seconds=cpu, memory_current_bytes=memory)
+            for record in (row("a", 1, 0, 1, 10), row("a", 1, 1, 2, 30),
+                           row("b", 2, 2, None, None)):
+                selected[:] = [record]
+                observer._capture()
+            selected.clear()
+            result = observer.finish()
+            self.assertEqual(len(result["managed_allocations"]), 2)
+            first, second = result["managed_allocations"]
+            self.assertEqual(first["cpu_seconds_delta"], 1)
+            self.assertEqual(first["memory_byte_s"], 20)
+            self.assertIsNone(second["cpu_seconds_delta"])
+            self.assertIsNone(second["memory_byte_s"])
+            self.assertEqual(first["gpu_memory_status"], "UNKNOWN")
+
     def test_configuration_rejects_implicit_selection_and_invalid_values(self):
         self.assertIsNone(observation.ObservationConfig.from_mapping(None))
         for config in ({"gpu_uuids": ["0"]}, {"interval_s": float("nan")},

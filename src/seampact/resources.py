@@ -3,6 +3,7 @@
 import base64
 import binascii
 import copy
+from contextlib import contextmanager
 import hashlib
 import http.client
 import json
@@ -30,6 +31,28 @@ class ResourceRegistry:
         self.store = store
         self.profiles = profiles
         self.lock = threading.RLock()
+
+    @contextmanager
+    def _connection_request(self, profile):
+        if profile.get("resource_kind") != "managed":
+            yield
+            return
+        manager = self.profiles.managed_services
+        manager.validate_connection(profile)
+        groups = set()
+        def visit(identity):
+            spec = manager.get(identity)
+            group = "service:" + spec["id"]
+            if group in groups:
+                return
+            groups.add(group)
+            for dependency in spec.get("depends_on", []):
+                visit(dependency)
+        visit(profile["managed_service_id"])
+        # Explicit checks never start a model. Existing run ownership and model
+        # readiness are checked before any HTTP operation, including /models.
+        with manager.request_scope(sorted(groups), "connection-check:" + secrets.token_hex(16)):
+            yield
 
     @staticmethod
     def _digest(value):
@@ -271,7 +294,8 @@ class ResourceRegistry:
                 endpoint = "/chat/completions"
                 request = completion_body(profile, [dict(role="user", content=content)])
             result["requests"] = 1
-            data = Transport().send(profile["base_url"].rstrip("/") + endpoint, key, request)
+            with self._connection_request(profile):
+                data = Transport().send(profile["base_url"].rstrip("/") + endpoint, key, request)
             if not isinstance(data, dict):
                 raise ValueError("invalid_provider_response")
             result["usage"] = self._usage(data.get("usage"))
@@ -468,7 +492,7 @@ class ResourceRegistry:
                     return None
             try:
                 request = urllib.request.Request(url, headers=headers, method="GET")
-                with urllib.request.build_opener(NoRedirect).open(request, timeout=20) as response:
+                with self._connection_request(profile), urllib.request.build_opener(NoRedirect).open(request, timeout=20) as response:
                     result.update(http_status=response.status, accessible=True, status="accessible")
                     if profile["protocol"] == "openai-compatible":
                         raw = response.read(2 * 1024 * 1024 + 1)

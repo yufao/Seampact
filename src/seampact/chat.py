@@ -159,6 +159,8 @@ class ChatJobs:
         from .training import BoundProfiles
         bound = BoundProfiles(self.profiles)
         profile = bound.role_profile("chat")
+        if profile.get("resource_kind") == "managed":
+            raise ValueError("受管对话模型请在 joint/1 实验中使用；普通对话请选云端或已启动的借用连接")
         if not profile.get("base_url") or not profile.get("model"):
             raise ValueError("请先配置对话模型地址与型号")
         bound.role_key("chat")

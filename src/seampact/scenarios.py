@@ -11,6 +11,7 @@ import hashlib
 import importlib.util
 import json
 import math
+import uuid
 import sys
 import time
 from pathlib import Path
@@ -336,14 +337,61 @@ class FrozenCatalog:
                 self.units[uid].update(status="READY", execution="REMOTE")
                 self.frozen[uid][2].update(status="READY", execution="REMOTE")
             self.resources = catalog.snapshot_resources(selected, frozen=self.frozen)
+            self.service_placements, self.service_dependencies, self.shared_services = {}, {}, []
+            self.control = {}
+            for record in self.resources.get("units", []):
+                uid = record["unit_id"]
+                entry = self.frozen[uid][1]
+                from .dependencies import entry_uses_dependency
+                rows = {r["id"]: r for r in record["requirements"]}
+                dependencies = set()
+                for identity, selection in record["bindings"].items():
+                    row = rows.get(identity, {})
+                    if row.get("required", True) is False and not entry_uses_dependency(entry, identity):
+                        continue
+                    connection = selection.get("connection") or {}
+                    dependencies.update(self._freeze_service(connection))
+                self.placement[uid]["resource_dependencies"] = sorted(dependencies)
+
+    def _freeze_service(self, connection):
+        if connection.get("resource_kind") != "managed":
+            return []
+        manager = getattr(getattr(self.router, "platform", None), "managed_services", None)
+        if manager is None:
+            raise ValueError("受管连接缺少服务执行器")
+        manager.validate_connection(connection)
+        visited = set()
+        def visit(identity):
+            placement = manager.placement(identity)
+            group_id = placement["group_id"]
+            if group_id in visited:
+                return
+            visited.add(group_id)
+            self.service_placements[group_id] = placement
+            spec = manager.get(identity)
+            dependencies = [manager.placement(dep)["group_id"] for dep in spec.get("depends_on", [])]
+            self.service_dependencies[group_id] = dependencies
+            for dependency in dependencies:
+                visit(dependency)
+        visit(connection["managed_service_id"])
+        return sorted(visited)
+
+    def add_role_services(self, profiles, roles):
+        for role in sorted(set(roles)):
+            self.shared_services = sorted(set(self.shared_services) | set(self._freeze_service(profiles.role_profile(role))))
+
+    def service_snapshot(self):
+        return dict(schema="managed-service-bindings/1", allocations=copy.deepcopy(self.service_placements),
+                    dependencies=copy.deepcopy(self.service_dependencies), shared_services=list(self.shared_services))
 
     def bind_run(self, run_id, control):
-        for value in self.placement.values():
-            if value["kind"] == "REMOTE":
-                value.update(run_id=run_id, start_timeout_s=control["start_timeout_s"])
+        self.control = dict(control)
+        for value in [*self.placement.values(), *self.service_placements.values()]:
+            value.update(run_id=run_id, start_timeout_s=control["start_timeout_s"])
 
     def remote_groups(self):
-        return {value["group_id"]: value for value in self.placement.values() if value["kind"] == "REMOTE"}
+        return {**{value["group_id"]: value for value in self.placement.values() if value["kind"] == "REMOTE"},
+                **self.service_placements}
 
     def public(self):
         return copy.deepcopy(list(self.units.values()))
@@ -365,6 +413,11 @@ class FrozenCatalog:
 
     def dispatch_status(self, unit_id):
         placement = self.placement[unit_id]
+        for group in placement.get("resource_dependencies", []):
+            fact = self.router.runtime_fact(group, None, self.service_placements[group].get("image"))
+            if not fact["ready_instance"]:
+                return dict(status="COLD_STARTABLE" if fact["cold_startable"] else "UNAVAILABLE",
+                            reason=fact.get("reason") or "依赖模型尚未就绪")
         if placement["kind"] == "LOCAL":
             return dict(status="READY_LOCAL")
         fact = self.router.runtime_fact(placement["group_id"], unit_id, placement.get("image"))
@@ -386,6 +439,8 @@ class FrozenCatalog:
             facts.append(dict(local=True, ready_instance=True, warm=binding.initialization_state(entry, unit) == "BOUND",
                               cold_startable=False, accepting=True, busy=binding.active_calls > 0,
                               queue=self.router.queue(group) if self.router and group else 0, state_age_ms=0.0))
+        for group in sorted({group for uid in unit_ids for group in self.placement[uid].get("resource_dependencies", [])}):
+            facts.append(self.router.runtime_fact(group, None, self.service_placements[group].get("image")))
         def every(name):
             values = [fact.get(name) for fact in facts]
             return None if None in values else all(values)
@@ -424,6 +479,25 @@ class FrozenCatalog:
         return copy.deepcopy(self.resources)
 
     def invoke(self, unit_id, arguments, native_arguments=()):
+        groups = self.placement[unit_id].get("resource_dependencies", [])
+        if not groups:
+            return self._invoke(unit_id, arguments, native_arguments)
+        manager = self.router.platform.managed_services
+        owner = _task_context.get() or "call:" + uuid.uuid4().hex
+        try:
+            for group_id in groups:
+                if self.control.get("mode") != "joint/1":
+                    self.router.ensure_ready(self.service_placements[group_id], None)
+                manager.acquire(group_id, owner, self.service_placements[group_id].get("run_id"))
+            # A call lease is distinct from the enclosing task's residency lease.
+            with manager.request_scope(groups, owner, run_id=self.service_placements[groups[0]].get("run_id")):
+                return self._invoke(unit_id, arguments, native_arguments)
+        finally:
+            # Task leases are released by task/evaluation completion, not here.
+            if not _task_context.get():
+                manager.release_lease(owner)
+
+    def _invoke(self, unit_id, arguments, native_arguments=()):
         # Concurrent tasks of one window share this catalog; facts belong to the calling task.
         key = (_task_context.get(), unit_id)
         placement = self.placement.get(unit_id, dict(kind="LOCAL"))
@@ -513,7 +587,7 @@ class SceneContext:
                 after.get("last_binding_duration_ms")) if call["status"] == "RETURN" else None
 
     def complete(self, messages, tools=None, role="chat"):
-        from .providers import Transport, completion_body
+        from .providers import Transport, completion_body, model_request_scope
         started = time.perf_counter()
         profile = self.profiles.role_profile(role)
         if role not in self.model_roles:
@@ -529,8 +603,9 @@ class SceneContext:
         call = dict(role=role, model=profile["model"], usage=None)
         self.model_calls.append(call)
         try:
-            result = Transport().send(profile["base_url"] + "/chat/completions",
-                self.profiles.role_key(role), completion_body(profile, messages, tools))
+            with model_request_scope(self.profiles, role):
+                result = Transport().send(profile["base_url"] + "/chat/completions",
+                    self.profiles.role_key(role), completion_body(profile, messages, tools))
             call["usage"] = result.get("usage")
             for choice in result.get("choices", []):
                 message = choice.get("message", {})

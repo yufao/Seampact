@@ -85,6 +85,8 @@ def make_server(platform, port=8880, host="127.0.0.1", public_port=None):
                     result = platform.profiles.select_role(body["role"], body["connection_id"])
                 elif path == "/api/connections":
                     result = platform.profiles.save_connection(body)
+                elif path == "/api/managed-services":
+                    result = platform.managed_services.configure(body)
                 elif path == "/api/credentials":
                     result = platform.profiles.save_credential(body)
                 elif path == "/api/connections/check":

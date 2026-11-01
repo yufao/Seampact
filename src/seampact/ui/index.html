@@ -124,7 +124,7 @@
         <p class="form-note">保存配置与保存凭据是两个动作。API Key 不回填；清除凭据和环境变量认证在“服务连接”中设置。选择连接不会自动复用其他角色的认证。</p>
       </section>
       <section id="service-configuration" class="config-section" data-config-section="services" hidden>
-        <h2>服务连接</h2><p class="form-note">登记用户已启动的本机、实验室机器或云端 HTTP／HTTPS 服务。localhost 指平台进程或容器自身。保存配置不会启动模型或发起推理。</p>
+        <h2>服务连接</h2><p class="form-note">登记云端、借用或平台管理的模型服务。localhost 指平台进程或容器自身。保存连接或服务规格不会启动模型或发起推理。</p>
         <details class="resource-guide"><summary>本地模型、API 和权重分别在哪里配置？</summary>
           <ul><li>本地或云端模型已提供 OpenAI 兼容 API：在此选择“OpenAI 兼容接口”，再到“模型角色”应用到对话、分析或教师。分析模型还需支持工具调用。</li><li>Harness 使用自有 HTTP 接口：选择“原库专用 HTTP 接口”，保留原客户端及原参数；不能直接作为平台对话或分析模型。</li><li>只有模型权重文件，还没有启动服务：去<a href="/configuration?section=weights">权重资源</a>登记本机目录或文件。原 Harness 按自己的加载器使用这些文件；平台不会仅凭登记路径启动推理服务。</li><li>“API”是调用方式；本地与云端是部署位置。这里选择的是接口格式，HTTP 和 HTTPS 地址均可使用。仓库源码则在<a href="/configuration?section=harnesses">Harness 接入</a>登记。</li></ul>
         </details>
@@ -134,7 +134,7 @@
         <form id="connection-form" class="resource-form">
           <h4 id="connection-form-title">新增命名连接</h4><input name="id" type="hidden"><p class="form-note">编辑会更新原连接。要保留旧模型并登记另一个模型，请先点击“新建”。</p>
           <div class="optional-grid"><label>连接名称<input name="name" required placeholder="如：实验室视觉模型"></label><label>接口格式<select name="protocol"><option value="openai-compatible">OpenAI 兼容接口（本地或云端）</option><option value="http">原库专用 HTTP 接口</option></select></label></div>
-          <p class="form-note">这里登记已启动的服务；如果只有权重文件，请先去<a href="/configuration?section=weights">登记权重路径</a>。无需为本地模型另选一种协议。</p>
+          <p class="form-note">云端和借用连接需已有可用服务；平台管理服务可先登记规格，再由调度器准备。如果只有权重文件，请先<a href="/configuration?section=weights">登记权重路径</a>。</p>
           <label>服务地址<input name="base_url" type="url" required placeholder="http://服务器地址:8000/v1"></label>
           <div class="optional-grid"><label>模型 ID（原服务需要时填写）<input name="model"></label><label>可核对服务／模型版本<input name="service_version" placeholder="未知可留空"></label></div>
           <div class="optional-grid"><label>上下文窗口 token（可选）<input name="context_window" type="number" min="1" step="1" placeholder="未知可留空"></label><label class="context-switch"><input name="context_management" type="checkbox" checked> 自动整理上下文（对话与分析）</label></div>

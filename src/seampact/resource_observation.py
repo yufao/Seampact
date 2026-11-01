@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import copy
 import hashlib
 import io
 import json
@@ -242,13 +243,16 @@ class WindowObserver:
     cannot join two CPU counters. No observers are enabled when config is None.
     """
 
-    def __init__(self, config=None, *, run_id, arm, runtime_dir, pid_resolver=None):
+    def __init__(self, config=None, *, run_id, arm, runtime_dir, pid_resolver=None, allocation_sampler=None):
         self.config = ObservationConfig.from_mapping(config)
         if not str(run_id).strip() or not str(arm).strip():
             raise ValueError("run_id and arm must be nonempty")
         self.run_id, self.arm = str(run_id), str(arm)
         self.runtime_dir = Path(runtime_dir)
         self.pid_resolver = pid_resolver
+        self.allocation_sampler = allocation_sampler
+        if allocation_sampler is not None and not callable(allocation_sampler):
+            raise ValueError("allocation_sampler must be callable")
         if pid_resolver is not None and not callable(pid_resolver):
             raise ValueError("pid_resolver must be callable")
         self._stop = threading.Event()
@@ -295,6 +299,7 @@ class WindowObserver:
                      "process_ids": list(self.config.process_ids),
                      "include_current_process": self.config.include_current_process,
                      "dynamic_explicit_pid_resolver": self.pid_resolver is not None,
+                     "dynamic_owned_allocation_sampler": self.allocation_sampler is not None,
                      "cgroup_paths": [str(path) for path in self.config.cgroup_paths],
                      "pairing": "AUTOMATIC_WINDOW_PREPARATION_THROUGH_RELEASE",
                      "measurement_kind": "MEASURED_RESOURCE_OBSERVATION",
@@ -366,6 +371,14 @@ class WindowObserver:
             "type": "sample", "monotonic_s": time.monotonic(), "utc": utc_now(), "devices": []}
         item.update({"scope": "window", "processes": processes, "cgroups": groups,
                      "pid_resolver_status": resolver_status})
+        item["managed_allocations"] = []
+        item["allocation_sampler_status"] = "NOT_CONFIGURED"
+        if self.allocation_sampler is not None:
+            try:
+                item["managed_allocations"] = copy.deepcopy(self.allocation_sampler())
+                item["allocation_sampler_status"] = "OK"
+            except Exception:
+                item["allocation_sampler_status"] = "UNKNOWN_SAMPLING_FAILED"
         item["phase"] = phase
         with self._lock:
             if not self._closed:
@@ -433,6 +446,19 @@ class WindowObserver:
                 **counter_summary([row for item in self._samples for row in item["cgroups"]
                                    if row["cgroup_index"] == index], elapsed, gap, cgroup=True)}
                                   for index in range(len(self.config.cgroup_paths))]
+            identities = {(r["instance_id"], r["generation"]) for sample in self._samples
+                          for r in sample.get("managed_allocations", [])}
+            result["managed_allocations"] = []
+            for instance, generation in sorted(identities):
+                records = [r for sample in self._samples for r in sample.get("managed_allocations", [])
+                           if (r["instance_id"], r["generation"]) == (instance, generation)]
+                result["managed_allocations"].append(dict(instance_id=instance, generation=generation,
+                    group_id=records[0]["group_id"], scope="managed_service_cgroup",
+                    gpu_memory_status="UNKNOWN", gpu_memory_reason="container cgroup does not measure GPU memory",
+                    probe_overhead_included=True,
+                    **counter_summary(records, elapsed, gap, cgroup=True)))
+            result["allocation_sampling_gaps"] = sum(sample.get("allocation_sampler_status") ==
+                                                       "UNKNOWN_SAMPLING_FAILED" for sample in self._samples)
             self._summary = result
             self._write(result)
             with os.fdopen(os.open(self.summary_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600),

@@ -66,7 +66,8 @@ class PreparationChecks(unittest.TestCase):
                      adapter=dict(files=[dict(path=str(adapter), sha256=training.digest_file(adapter))]))
         jobs = training.TrainingJobs.__new__(training.TrainingJobs)
         jobs.directory = self.root / "runs"
-        catalog = SimpleNamespace(public=lambda: [], remote_groups=lambda: {}, snapshot_resources=lambda: {})
+        catalog = SimpleNamespace(public=lambda: [], remote_groups=lambda: {}, snapshot_resources=lambda: {},
+            add_role_services=lambda *args: None, service_snapshot=lambda: {}, service_placements={})
         bound = SimpleNamespace(public=lambda: {}, resources=lambda: {})
         criteria = dict(dimensions=[])
         with patch.object(training, "freeze_scene", return_value=scene), \

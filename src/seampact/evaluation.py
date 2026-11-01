@@ -10,7 +10,7 @@ import json
 import math
 import time
 
-from .providers import Transport, completion_body, completion_parameters, image_evidence
+from .providers import Transport, completion_body, completion_parameters, image_evidence, model_request_scope
 
 
 TEACHER_RULES = """You evaluate actual task results using the supplied frozen criteria.
@@ -300,7 +300,8 @@ def evaluate(profiles, criteria, evidence, program_metrics, *, transport=None):
             body = completion_body(profile, messages, [_teacher_tool(pending, list(selected_evidence))])
             usage.update(request_count=1, unknown_requests=1,
                          prompt_tokens=None, completion_tokens=None, total_tokens=None)
-            response = (transport or Transport()).send(profile["base_url"].rstrip("/") + "/chat/completions", key, body)
+            with model_request_scope(profiles, role):
+                response = (transport or Transport()).send(profile["base_url"].rstrip("/") + "/chat/completions", key, body)
             raw["teacher_response"] = response
             actual_usage = response.get("usage") or {}
             reported = all(type(actual_usage.get(field)) is int and actual_usage[field] >= 0

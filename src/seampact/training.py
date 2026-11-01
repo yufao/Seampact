@@ -1,6 +1,7 @@
 """Sequential real-environment learning, frozen evaluation and criterion adaptation."""
 
 import copy
+import contextlib
 import hashlib
 import importlib.metadata
 import json
@@ -46,6 +47,8 @@ class BoundProfiles:
     """A run's immutable in-memory model binding; secrets never enter manifests."""
     def __init__(self, profiles):
         self.keys = {}
+        self.managed_services = getattr(profiles, "managed_services", None)
+        self.managed_catalog = None
         with profiles.lock:
             self.profiles = {role: copy.deepcopy(profiles.role_profile(role))
                              for role in ("chat", "analysis", "teacher")}
@@ -65,14 +68,40 @@ class BoundProfiles:
             raise ValueError("运行创建时未取得该模型凭据：" + role)
         return key
 
+    @contextlib.contextmanager
+    def request_scope(self, role):
+        profile = self.role_profile(role)
+        if profile.get("resource_kind") != "managed":
+            yield
+            return
+        from .runtime import _task_context
+        catalog, manager = self.managed_catalog, self.managed_services
+        if catalog is None or manager is None or not _task_context.get():
+            raise ValueError("受管模型角色需要完整的联合任务及服务租约")
+        manager.validate_connection(profile)
+        groups = set()
+        def visit(group):
+            if group in groups:
+                return
+            groups.add(group)
+            for dependency in catalog.service_dependencies.get(group, []):
+                visit(dependency)
+        root = "service:" + profile["managed_service_id"]
+        visit(root)
+        placement = catalog.service_placements[root]
+        with manager.request_scope(sorted(groups), _task_context.get(), run_id=placement["run_id"]):
+            yield
+
     def public(self):
         return {role: dict(model_binding(profile), **{field: copy.deepcopy(profile.get(field)) for field in
-                ("connection_id", "config_digest", "revision", "protocol", "parameters")})
+                ("connection_id", "config_digest", "revision", "protocol", "parameters", "resource_kind",
+                 "managed_service_id", "managed_service_digest")})
                 for role, profile in self.profiles.items()}
 
     def resources(self):
         return {role: {field: copy.deepcopy(profile.get(field)) for field in
-                ("connection_id", "config_digest", "revision", "credential_ref", "credential_version", "auth")}
+                ("connection_id", "config_digest", "revision", "credential_ref", "credential_version", "auth",
+                 "resource_kind", "managed_service_id", "managed_service_digest")}
                 for role, profile in self.profiles.items()}
 
 
@@ -228,6 +257,13 @@ class TrainingJobs:
                 if not bound.role_profile(role).get("base_url"):
                     raise ValueError("请先配置教师模型，或明确选择复用分析模型")
                 bound.role_key(role)
+        roles = set(scene.get("model_roles", ["chat"]))
+        for spec in [criteria, final, *route_specs]:
+            if spec and any(d["provider"] == "teacher" and d.get("applicable", True) for d in spec["dimensions"]):
+                roles.add(spec.get("teacher", {}).get("role", "teacher"))
+        catalog.add_role_services(bound, roles)
+        if catalog.service_placements:
+            bound.managed_catalog = catalog
         algorithm = config.get("algorithm", "double_dqn")
         if algorithm not in LEARNING | REFERENCES:
             raise ValueError("未知学习器或参照策略")
@@ -253,7 +289,8 @@ class TrainingJobs:
             raise ValueError("scheduling_mode 须为 functional/1 或 joint/1")
         if scheduling != joint.MODE and config.get("joint"):
             raise ValueError("joint 配置只用于 scheduling_mode=joint/1")
-        dims = ((len(JOINT_OBSERVATION_SCHEMA), len(JOINT_CANDIDATE_SCHEMA)) if scheduling == joint.MODE
+        resource_dimensions = len((config.get("joint") or {}).get("capacity", {}).get("resources", {}))
+        dims = ((len(JOINT_OBSERVATION_SCHEMA), len(JOINT_CANDIDATE_SCHEMA) + resource_dimensions) if scheduling == joint.MODE
                 else (len(scene["observation_schema"]), len(scene["candidate_schema"])))
         if algorithm in LEARNING:
             resolved = default_config(algorithm)
@@ -274,6 +311,7 @@ class TrainingJobs:
             observation_dim=dims[0], candidate_dim=dims[1],
             criteria=criteria, evaluation_criteria=final, models=bound.public(), role_resources=bound.resources(),
             harness_resources=catalog.snapshot_resources(), lower_policy="FIFO",
+            managed_services=catalog.service_snapshot(),
             missing_rule="exclude_incomplete_episode_keep_budget",
             costs=validate_costs(config.get("costs")),
             upstream_costs=config.get("upstream_costs", {}))
@@ -289,8 +327,11 @@ class TrainingJobs:
             manifest.update(runtime_contracts=contracts, **joint.configure(config, scene=scene, tasks=scene["tasks"],
                 task_ids=task_ids, algorithm=algorithm, criteria=criteria, contracts=contracts,
                 groups=catalog.remote_groups(), deployments=self.platform.deployments, learning=LEARNING,
-                references=REFERENCES, mode=manifest["mode"], placements=catalog.placement))
+                references=REFERENCES, mode=manifest["mode"], placements=catalog.placement,
+                service_dependencies=catalog.service_dependencies, shared_services=catalog.shared_services))
         else:
+            if catalog.service_placements:
+                raise ValueError("受管模型服务的实验请使用 joint/1，以便完整预留容量及记录资源成本")
             manifest.update(scheduling_mode="functional/1", resource_control=resource_control(config.get("resource_control")),
                 feedback_protocol=protocol, reward_timing=protocol["reward_timing"], runtime_contracts=contracts,
                 cost_window=dict(task="each task ledger charges its own measured calls, transport and start waits",
@@ -694,7 +735,7 @@ class TrainingJobs:
                 raise ValueError("固定初始状态要求运行开始时该运行组没有存活实例；请先排空停止：" + group_id)
             if control["initial_state"] == "warm" and control["mode"] != joint.MODE:
                 required = [uid for uid, value in catalog.placement.items() if value.get("group_id") == group_id]
-                unit_id = required[0]
+                unit_id = required[0] if required else None
                 started = time.perf_counter()
                 record = deployments.ensure_ready(placement, unit_id)
                 setup = dict(instance_id=record["id"], start_to_ready_ms=(time.perf_counter() - started) * 1000,

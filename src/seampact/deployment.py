@@ -664,11 +664,18 @@ class Deployments:
     def _current_groups(self):
         sources = {source["id"]: source for source in self.platform.store.list("harness")}
         for group in self.platform.store.list("runtime_group"):
+            if group.get("target_kind") == "model-service":
+                continue
             source = sources.get(group["source_id"])
             if source and source.get("status") != "DETACHED" and group.get("installation_id") == source.get("installation_id"):
                 yield group
 
     def _group(self, identity):
+        if identity.startswith("service:"):
+            group = self.platform.store.get("runtime_group", identity)
+            if not group:
+                raise ValueError("受管服务尚未登记")
+            return group
         group = next((item for item in self._current_groups() if item["id"] == identity), None)
         if not group:
             raise ValueError("没有这个当前运行组")
@@ -759,6 +766,8 @@ class Deployments:
             # Keep older backend objects visible for release after an
             # environment edit, source detachment or platform-code update.
             for group in self.platform.store.list("runtime_group"):
+                if group.get("target_kind") == "model-service":
+                    continue
                 if group["id"] not in groups and any(self._held(item) for item in self._instances(group["id"])):
                     group["environment_gap"] = "旧接入版本的实例尚待释放；该组只允许排空停止"
                     groups[group["id"]] = group
@@ -868,6 +877,8 @@ class Deployments:
                    if (call.get("unit") or {}).get("runtime_group") == group_id and call["physical"] in {"ENABLED", "RESERVED"})
 
     def start_gap(self, group_id, expected_image=None):
+        if group_id.startswith("service:"):
+            return self.platform.managed_services.start_gap(group_id, expected_image)
         group = self.platform.store.get("runtime_group", group_id)
         if not group or not group.get("contract"):
             return "运行组不存在或缺少宿主契约"
@@ -880,6 +891,8 @@ class Deployments:
 
     def runtime_fact(self, group_id, unit_id, expected_image=None):
         """State visible to a scheduling event; unknown parts stay None."""
+        if group_id.startswith("service:"):
+            return self.platform.managed_services.runtime_fact(group_id, unit_id, expected_image)
         task_id = _task_context.get()
         retiring = lambda item: (item.get("pending_stop") or {}).get("reason") == "idle_retire/1"
         with self.lock:
@@ -947,6 +960,8 @@ class Deployments:
 
     def group_view(self, group_id, expected_image=None):
         """Contract facts and held instances a joint decision may read."""
+        if group_id.startswith("service:"):
+            return self.platform.managed_services.group_view(group_id, expected_image)
         fields = ("id", "state", "accepting", "in_flight", "units", "initialization", "generation", "run_id",
                   "start_wall", "ready_wall", "last_activity_wall", "pending_stop", "released")
         with self.lock:
@@ -990,6 +1005,9 @@ class Deployments:
         with self.lock:
             for key in [key for key in self.affinity if key[0] == task_id]:
                 del self.affinity[key]
+        manager = getattr(self.platform, "managed_services", None)
+        if manager is not None:
+            manager.release_lease(task_id)
 
     def instance_fact(self, instance_id):
         """Current outcome facts of one instance, held or already released."""
@@ -1186,6 +1204,8 @@ class Deployments:
         return state["generation"]
 
     def start(self, identity, body, run_id=None, replica=False):
+        if identity.startswith("service:"):
+            return self.platform.managed_services.start(identity, body, run_id, replica)
         return self._once(body, ("add_replica:" if replica else "start:") + identity,
                           lambda: self._start(identity, run_id, replica, (body or {}).get("expected_image")))
 
@@ -1320,6 +1340,8 @@ class Deployments:
             return dict(error=str(error))
 
     def pause(self, identity, body, run_id=None):
+        if identity.startswith("service:"):
+            raise ValueError("受管模型服务请使用排空后停止；该服务没有 worker 停止接单协议")
         def action():
             with self.lock:
                 self._guard(identity, run_id)
@@ -1344,6 +1366,8 @@ class Deployments:
         return dict(id=identity, execution="LOCAL", paused=result["instances"])
 
     def drain_stop(self, identity, body, run_id=None, reason="operator"):
+        if identity.startswith("service:"):
+            return self.platform.managed_services.drain_stop(identity, body, run_id, reason)
         def action():
             with self.lock:
                 self._guard(identity, run_id)
@@ -1390,6 +1414,8 @@ class Deployments:
         return self.drain_stop(identity, dict(body, instance_id=chosen["id"]), reason="remove_replica")
 
     def prewarm(self, identity, body, run_id=None):
+        if identity.startswith("service:"):
+            return self.platform.managed_services.prewarm(identity, body, run_id)
         def action():
             with self.lock:
                 self._guard(identity, run_id)
@@ -1443,6 +1469,9 @@ class Deployments:
         return self._once(body, "prewarm:" + identity, action)
 
     def status(self, identity):
+        if identity.startswith("service:"):
+            self.platform.managed_services.refresh(identity)
+            return dict(group_id=identity, instances=self.live_instances(identity))
         config = self.backend()
         with self.lock:
             targets = [item for item in self._instances(identity) if item["state"] in LIVE]
@@ -1501,6 +1530,7 @@ class Deployments:
     def _advance_stops(self):
         with self.lock:
             pending = [item for item in self.instances.values() if item.get("pending_stop") and self._held(item)
+                       and item.get("target_kind") != "model-service"
                        and not item["pending_stop"].get("blocked")]
         for item in pending:
             if item["state"] in {"READY", "DRAINING"} and not self._drained(item):
@@ -1567,10 +1597,12 @@ class Deployments:
         with self.lock:
             for item in self.instances.values():
                 if (item["state"] == "UNDEPLOYED" and item.get("session") == self.session and item.get("start_wall")
+                        and item.get("target_kind") != "model-service"
                         and time.time() - item["start_wall"] > config["start_timeout_s"]):
                     item.update(state="FAILED", desired="STOPPED", reason="启动未在时限内完成登记（含手动命令未执行）")
                     self._event(item, "start_failed")
             starting = [item for item in self.instances.values() if item["state"] == "STARTING" and item.get("handle")
+                        and item.get("target_kind") != "model-service"
                         and item.get("session") == self.session]
         for item in starting:
             observed = backends.observe(item, config)
@@ -1612,11 +1644,15 @@ class Deployments:
         while not self.closed.wait(1.0):
             try:
                 self._advance_stops()
+                manager = getattr(self.platform, "managed_services", None)
+                if manager is not None:
+                    manager.refresh()
                 self._retire_idle()
                 if time.monotonic() - last >= 10:
                     last = time.monotonic()
                     with self.lock:
                         polled = [item for item in self.instances.values() if item["state"] in {"READY", "DRAINING"}
+                                  and item.get("target_kind") != "model-service"
                                   and item.get("endpoint") and item.get("session") == self.session]
                     for item in polled:
                         self._poll(item)
@@ -1684,6 +1720,15 @@ class Deployments:
         return result, facts
 
     def _ensure(self, placement, unit_id):
+        if placement["group_id"].startswith("service:"):
+            current = self._group(placement["group_id"])
+            if current["contract"]["digest"] != placement["contract_digest"]:
+                raise ProtocolError("受管服务配置已变化，请重新创建运行")
+            gap = self.start_gap(placement["group_id"], placement.get("image"))
+            if gap:
+                raise ProtocolError(gap)
+            result = self.platform.managed_services.prepare(placement["group_id"], run_id=placement["run_id"])
+            return self.instances[result["id"]]
         group = self._group(placement["group_id"])
         if group["contract"]["digest"] != placement["contract_digest"]:
             raise ProtocolError("运行组契约已变化；冻结运行不能改用新契约")
@@ -1803,12 +1848,24 @@ class Deployments:
                 ready = max(0.0, min(finish, end) - max(item.get("ready_wall") or finish, start)) * 1000
                 busy = sum(event.get("worker_ms") or 0 for event in self.event_log if event["instance_id"] == item["id"]
                            and event["kind"] == "call" and start <= event["wall"] <= end)
+                semantics = "worker measured call milliseconds"
+                if item.get("target_kind") == "model-service":
+                    semantics = "union of outer client request scopes; includes SDK work, not GPU kernel time"
+                    intervals = list(item.get("busy_scope_intervals", []))
+                    if item.get("busy_scope_started_wall") is not None:
+                        intervals.append((item["busy_scope_started_wall"], end))
+                    busy = None if item.get("busy_scope_unknown") else sum(
+                        max(0.0, min(b, finish, end) - max(a, begin, start)) * 1000 for a, b in intervals)
                 rows.append(dict(instance_id=item["id"], group_id=item["group_id"], generation=item["generation"],
-                                 resident_ms=resident, ready_ms=ready, call_ms=busy, idle_ready_ms=max(0.0, ready - busy),
+                                 released=item.get("released") is True,
+                                 resident_ms=resident, ready_ms=ready, call_ms=busy,
+                                 idle_ready_ms=max(0.0, ready - busy) if busy is not None else None,
+                                 call_time_semantics=semantics,
                                  end_observed=observed, peak_rss_kb=(item.get("resources") or {}).get("peak_rss_kb")))
         return dict(allocation="UNALLOCATED_WINDOW_TOTAL", window=dict(start=start, end=end), instances=rows,
                     resident_ms=sum(row["resident_ms"] for row in rows), ready_ms=sum(row["ready_ms"] for row in rows),
-                    idle_ready_ms=sum(row["idle_ready_ms"] for row in rows),
+                    idle_ready_ms=sum(row["idle_ready_ms"] for row in rows)
+                        if all(row["idle_ready_ms"] is not None for row in rows) else None,
                     memory_integral=dict(status="UNKNOWN", reason="未测量驻留内存积分；实例只报告可得的峰值 RSS"),
                     gpu_time=dict(status="UNKNOWN", reason="wall time is not GPU kernel time"),
                     note="启动与空闲驻留跨任务发生；此为不分摊的窗口总量，单任务账本只计其实际等待")

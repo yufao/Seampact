@@ -4,6 +4,38 @@ import copy
 import math
 
 
+def envelope_integral(residency, demands, resources):
+    """Declared allocation envelopes, globally once per physical generation.
+
+    This is a reservation integral, never measured process memory or energy.
+    The residency controller supplies full STARTING through confirmed release
+    lifetimes; unknown releases remain held through the window endpoint.
+    """
+    totals = {name: 0.0 for name in resources}
+    unknown, rows, seen = [], [], set()
+    for item in residency.get("instances", []):
+        identity = (item["instance_id"], item.get("generation"))
+        if identity in seen:
+            continue
+        seen.add(identity)
+        demand = demands.get(item["group_id"])
+        if not isinstance(demand, dict) or set(demand) != set(resources):
+            unknown.append(item["group_id"])
+            continue
+        seconds = item["resident_ms"] / 1000
+        values = {name: demand[name] * seconds for name in resources}
+        for name, value in values.items():
+            totals[name] += value
+        rows.append(dict(instance_id=item["instance_id"], generation=item.get("generation"),
+                         group_id=item["group_id"], resource_seconds=values,
+                         release_confirmed=item.get("released") is True))
+    return dict(schema="resource-envelope-integral/1", status="UNKNOWN" if unknown else "KNOWN",
+                resource_seconds=None if unknown else totals, instances=rows,
+                unknown_allocations=sorted(set(unknown)), allocation="UNALLOCATED_WINDOW_TOTAL",
+                semantics="frozen resource envelope multiplied by held lifetime including loading, idle, "
+                          "evaluation and release tail; not measured usage or energy")
+
+
 def _valid(value):
     return type(value) in (int, float) and math.isfinite(value) and value >= 0
 

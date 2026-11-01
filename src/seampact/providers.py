@@ -268,7 +268,8 @@ class Profiles:
         # are part of the execution configuration's model/resource identity.
         fields = {name: connection.get(name) for name in ("protocol", "base_url", "model", "parameters",
                   "service_capabilities", "service_version", "declared_max_output_tokens",
-                  "declared_context_window", "context_management")}
+                  "declared_context_window", "context_management", "resource_kind",
+                  "managed_service_id", "managed_service_digest")}
         return hashlib.sha256(json.dumps(fields, ensure_ascii=False, sort_keys=True,
             separators=(",", ":"), allow_nan=False).encode("utf-8")).hexdigest()
 
@@ -437,6 +438,20 @@ class Profiles:
                 service_version=version, declared_max_output_tokens=ceiling,
                 declared_context_window=window, context_management=manage,
                 created_at=previous.get("created_at", now()), updated_at=now())
+            kind = body.get("resource_kind", previous.get("resource_kind", "borrowed"))
+            if kind not in {"cloud", "borrowed", "managed"}:
+                raise ValueError("连接来源请选择云端、借用服务或平台管理服务")
+            replacement["resource_kind"] = kind
+            replacement.pop("managed_service_id", None)
+            replacement.pop("managed_service_digest", None)
+            if kind == "managed":
+                service_id = body.get("managed_service_id", previous.get("managed_service_id"))
+                manager = getattr(self, "managed_services", None)
+                if manager is None:
+                    raise ValueError("当前平台没有受管服务执行器")
+                service = manager.get(service_id)
+                replacement.update(managed_service_id=service["id"], managed_service_digest=service["spec_digest"])
+                manager.validate_connection(replacement)
             if protocol == "openai-compatible" and connection_id in self.roles.values():
                 completion_parameters(replacement)
             if "auth" in body:
@@ -574,6 +589,7 @@ class Profiles:
             fields = ("id", "name", "protocol", "base_url", "model", "provider", "service_capabilities",
                       "parameters", "service_version", "declared_max_output_tokens", "declared_context_window",
                       "context_management", "docs", "revision",
+                      "resource_kind", "managed_service_id", "managed_service_digest",
                       "created_at", "updated_at", "config_digest")
             connection = {name: copy.deepcopy(stored[name]) for name in fields if name in stored}
             connection["parameters"] = self._parameters(connection.get("parameters", {}))
@@ -696,6 +712,16 @@ class Transport:
         # retained in the new exception's implicit context.
         raise ProviderError(f"provider HTTP {diagnostic['http_status']}：{reason}",
                             kind=diagnostic["category"], diagnostic=diagnostic)
+
+
+def model_request_scope(profiles, role):
+    """Managed role requests use the same frozen task leases as Harness calls."""
+    from contextlib import nullcontext
+    if profiles.role_profile(role).get("resource_kind") != "managed":
+        return nullcontext()
+    if not hasattr(profiles, "request_scope"):
+        raise ValueError("受管模型角色仅在完整联合实验任务中调用")
+    return profiles.request_scope(role)
 
 
 def request_parameters(profile, reserved):

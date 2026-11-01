@@ -8,20 +8,44 @@ between sequential calls to different model groups.
 from .scenarios import task_unit_ids
 
 
-def freeze_working_sets(scene, tasks, placement, resources, demands, reclaimable, retention):
+def dependency_closure(allocations, dependencies):
+    result, pending = set(), list(allocations)
+    while pending:
+        identity = pending.pop()
+        if identity not in result:
+            result.add(identity)
+            pending.extend(dependencies.get(identity, []))
+    return result
+
+
+def freeze_working_sets(scene, tasks, placement, resources, demands, reclaimable, retention,
+                        service_dependencies=None, shared_services=None):
     groups = set(demands)
     pinned = groups - set(reclaimable)
     if retention == "fixed_resident":
         pinned = groups
-    sets = {task["id"]: sorted({placement[u]["group_id"] for u in task_unit_ids(scene, task)
-                              if placement[u]["kind"] == "REMOTE"}) for task in tasks}
+    dependencies = service_dependencies or {}
+    pinned = dependency_closure(pinned, dependencies)
+    sets = {}
+    for task in tasks:
+        required = set(shared_services or [])
+        for unit in task_unit_ids(scene, task):
+            target = placement[unit]
+            if target["kind"] == "REMOTE":
+                required.add(target["group_id"])
+            required.update(target.get("resource_dependencies", []))
+        required = dependency_closure(required, dependencies)
+        if resources and required - groups:
+            raise ValueError("任务依赖没有完整资源需求：" + ", ".join(sorted(required - groups)))
+        sets[task["id"]] = sorted(required)
     for identity, working in sets.items():
         required = pinned | set(working)
         for name, quota in resources.items():
             if sum(demands[g][name] for g in required) > quota:
                 raise ValueError("任务工作集与不可回收常驻组超过容量：" + identity + " / " + name +
                                  "；需满足该任务原有依赖，不能通过删减必需工作放行")
-    return dict(schema="task-working-sets/1", pinned=sorted(pinned), tasks=sets,
+    return dict(schema="task-working-sets/2", pinned=sorted(pinned), tasks=sets,
+                dependencies={g: sorted(v) for g, v in dependencies.items()},
                 semantics="reserve the union of admitted tasks and pinned groups until task owner ends; "
                           "pool size may exceed capacity; reservations are not physical measurements")
 
@@ -34,10 +58,12 @@ class WorkingSets:
     def groups(self):
         return set(self.spec["pinned"]).union(*self.claims.values())
 
-    def admit(self, context, task_id):
+    def admit(self, context, task_id, occupancy=None):
         proposed = set(self.spec["tasks"][task_id])
         combined = self.groups() | proposed
-        if any(sum(self.demands[g][name] for g in combined) > quota
+        actual = occupancy or {}
+        if any(sum(max(actual.get(g, 0), int(g in combined)) * self.demands[g][name]
+                   for g in set(actual) | combined) > quota
                for name, quota in self.resources.items()):
             return False
         self.claims[context] = proposed
