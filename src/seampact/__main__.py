@@ -6,7 +6,7 @@ from pathlib import Path
 def main():
     # The manual worker entry executes the same scoped runtime as the image.
     if len(sys.argv) > 1 and sys.argv[1] == "worker":
-        from .worker import main as worker_main
+        from seampact.worker import main as worker_main
         return worker_main(sys.argv[2:])
     parser = argparse.ArgumentParser(description="SeamPact: conversation, Harness intake, Units and RL. Worker options: seampact worker --help")
     parser.add_argument("command", choices=["serve"], nargs="?", default="serve")
@@ -18,8 +18,8 @@ def main():
     args = parser.parse_args()
     os.umask(0o077)
     sys.stdout.reconfigure(encoding="utf-8")
-    from .service import Platform
-    from .server import make_server
+    from seampact.service import Platform
+    from seampact.server import make_server
     legacy = args.legacy_config
     if not legacy and Path("var/demo/config/providers.json").is_file():
         legacy = "var/demo/config"

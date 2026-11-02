@@ -20,9 +20,9 @@ import urllib.error
 import urllib.request
 from pathlib import Path, PurePosixPath
 
-from .intake import inside_platform_checkout
-from .store import now
-from .providers import ProviderError, Transport, completion_body, completion_parameters, embedding_body, image_evidence
+from seampact.intake import inside_platform_checkout
+from seampact.store import now
+from seampact.providers import ProviderError, Transport, completion_body, completion_parameters, embedding_body, image_evidence
 
 
 class ResourceRegistry:

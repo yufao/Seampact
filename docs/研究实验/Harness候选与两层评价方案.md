@@ -463,9 +463,9 @@ r_t = -\sum_k \lambda_k\Delta C_{k,t}/C_k^{\mathrm{ref}}
 
 ### 6.6 候选关系与价值估计的开发诊断（2026-10-25）
 
-当前 `learners.py` 的 `_scores` 将同一观测与每个候选向量拼接，经共享网络逐候选评分。PPO 的 `_values` 先对**合法候选特征取均值**，再与观测拼接送入状态价值网络，不是先估计各候选价值再平均。动作价值、actor logits 和概率分别解释；PPO／SAC 诊断中的 `scores` 是动作概率，见[学习器](../../src/seampact/learners.py#L183-L231)。
+当前 `learners.py` 的 `_scores` 将同一观测与每个候选向量拼接，经共享网络逐候选评分。PPO 的 `_values` 先对**合法候选特征取均值**，再与观测拼接送入状态价值网络，不是先估计各候选价值再平均。动作价值、actor logits 和概率分别解释；PPO／SAC 诊断中的 `scores` 是动作概率，见[学习器](../../src/seampact/scheduling/learners.py#L183-L231)。
 
-`capability-features/2` 已有已取得输出类型、候选能力、覆盖长度、计划 Unit 数及局部冷暖／忙碌／队列摘要，`joint-features/1` 另有工作负载与组资源摘要。它们仍不是完整关系表示：多 Unit 计划的角色并集和数量不能恢复顺序，结果类型标记也不是 verdict 内容／证据充分性。合法 mask 与执行协议继续约束必需工作、互斥、owner 和就绪条件，但 mask 不传递全部关系依据，均值也无法恢复向量化前已丢失的结构。实现见[共同表示](../../src/seampact/capabilities.py)与[场景合法性](../../src/seampact/scenarios.py)。
+`capability-features/2` 已有已取得输出类型、候选能力、覆盖长度、计划 Unit 数及局部冷暖／忙碌／队列摘要，`joint-features/1` 另有工作负载与组资源摘要。它们仍不是完整关系表示：多 Unit 计划的角色并集和数量不能恢复顺序，结果类型标记也不是 verdict 内容／证据充分性。合法 mask 与执行协议继续约束必需工作、互斥、owner 和就绪条件，但 mask 不传递全部关系依据，均值也无法恢复向量化前已丢失的结构。实现见[共同表示](../../src/seampact/capabilities.py)与[场景合法性](../../src/seampact/scenes/scenarios.py)。
 
 | 待核对关系 | 可能改变选择的区别 | 真实实例的核对依据 |
 |---|---|---|

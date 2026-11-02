@@ -9,8 +9,8 @@ from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from seampact.inspection import Inspector
-from seampact.resource_origins import initialization_gaps, resource_origin_facts
+from seampact.source.inspection import Inspector
+from seampact.configuration.resource_origins import initialization_gaps, resource_origin_facts
 from seampact.runtime import Coordinator, OwnerRuntime
 from seampact.store import Store
 from seampact.units import UnitCatalog

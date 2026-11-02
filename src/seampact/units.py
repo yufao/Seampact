@@ -26,19 +26,19 @@ import time
 import uuid
 from pathlib import Path
 
-from .handoff import ToolListHandoff, install_method_proxy
-from .callsite import lower_callsites
-from .dependencies import DependencyBindings, has_reference as has_resource_reference, reference as resource_reference
-from .inspection import Inspector, digest, native_ast, python_runtime_issue, units
-from .lowering import lower_loop
-from .runtime import ProtocolError
-from .resource_origins import initialization_gaps
-from .execution_context import ContextIssue, explicit_import_roots, process_context
-from .completion import after_completion, before_completion, check_completion
-from .configuration_files import configuration_arguments, configuration_plans, redact_process_result
-from .store import now
-from .verification import check_candidate, source_unit
-from .frozen_inheritance import FrozenInheritance, InheritanceIssue
+from seampact.handoff import ToolListHandoff, install_method_proxy
+from seampact.source.callsite import lower_callsites
+from seampact.configuration.dependencies import DependencyBindings, has_reference as has_resource_reference, reference as resource_reference
+from seampact.source.inspection import Inspector, digest, native_ast, python_runtime_issue, units
+from seampact.source.lowering import lower_loop
+from seampact.runtime import ProtocolError
+from seampact.configuration.resource_origins import initialization_gaps
+from seampact.source.execution_context import ContextIssue, explicit_import_roots, process_context
+from seampact.completion import after_completion, before_completion, check_completion
+from seampact.configuration.configuration_files import configuration_arguments, configuration_plans, redact_process_result
+from seampact.store import now
+from seampact.source.verification import check_candidate, source_unit
+from seampact.source.frozen_inheritance import FrozenInheritance, InheritanceIssue
 
 
 _native_context_lock = threading.RLock()
@@ -1153,9 +1153,9 @@ class NativeBindings:
                 self.completion_contracts[entry["id"]] = check_completion(self.inspector, entry)
             except ValueError as error:
                 raise ContextIssue("completion_contract_unproven", "completion", str(error)) from error
-        from .candidate_checks import candidate_issues
+        from seampact.analysis_support.candidate_checks import candidate_issues
         issues = candidate_issues(self.inspector, entry, self.candidate.get("dependencies", []))
-        from .dependency_closure import dependency_closure
+        from seampact.source.dependency_closure import dependency_closure
         if self.dependency_closure is None:
             self.dependency_closure = dependency_closure(self.inspector, self.candidate)
         closure = self.dependency_closure["entries"].get(entry["id"], {})
@@ -1948,12 +1948,12 @@ class UnitCatalog:
             try:
                 with self.store.transaction():
                     if getattr(inspector, "target_runtime", None):
-                        from .target_runtime import install_catalog
+                        from seampact.target_runtime import install_catalog
                         result = install_catalog(self, inspector, candidate, analysis_id, installation_id)
                     else:
                         result = self._install(inspector, candidate, analysis_id, installation_id)
                     # Preserve matching operator-selected group environments.
-                    from .target_runtime import environment_selection
+                    from seampact.target_runtime import environment_selection
                     basis = environment_selection(inspector.request.get("runtime_environment") or {})
                     for identity in {unit.get("runtime_group") for unit in result} - {None}:
                         group = self.store.get("runtime_group", identity)
@@ -2011,7 +2011,7 @@ class UnitCatalog:
 
     @staticmethod
     def _inspect_entry(binding, binding_error, entry, source_id, duplicates, seen):
-        from .capabilities import capability_card
+        from seampact.capabilities import capability_card
         result = dict(status="MISSING", reason=None, parameters=None, input_schema=None,
                       result_schema={}, native_input_schemas={}, construction=None, fixed_value_bindings=[],
                       operations={"export_entry": {"status": "UNKNOWN", "formal_proof": False}})
@@ -2084,7 +2084,7 @@ class UnitCatalog:
         if getattr(inspector, "target_runtime", None):
             return inspector.target_runtime.call("inspect_candidate", candidate=candidate)
         _, _, rows = self._candidate_checks(inspector, candidate)
-        from .deployment import runtime_groups
+        from seampact.hosting.deployment import runtime_groups
         entries = [dict(id=row["entry_id"], path=row["entry"].get("path"),
             unit=row["entry"].get("unit", "file"), symbol=row["entry"].get("symbol"),
             kind=row["entry"].get("kind"), **row["check"]) for row in rows]
@@ -2172,7 +2172,7 @@ class UnitCatalog:
                         self.bindings.pop(unit["id"], None)
                         self.entry_specs.pop(unit["id"], None)
                         self.store.save("unit", unit["id"], unit, "unit_binding_missing")
-        from .deployment import runtime_groups
+        from seampact.hosting.deployment import runtime_groups
         group_report = runtime_groups(inspector, candidate, rows)
         for group in group_report["groups"]:
             group.update(installation_id=installation_id, analysis_id=analysis_id,
@@ -2205,7 +2205,7 @@ class UnitCatalog:
                     unit.update(status="READY", reason=None, local_status="ENVIRONMENT_DEFERRED")
                 unit["scheduling"] = self.store.get("unit_policy", unit["id"]) or dict(
                     visibility="business", activation="business", declared=False)
-                from .capabilities import capability_card
+                from seampact.capabilities import capability_card
                 unit["capability"] = (self.store.get("unit_capability", unit["id"]) or {}).get(
                     "card", unit.get("capability") or capability_card())
                 result.append(unit)
@@ -2238,7 +2238,7 @@ class UnitCatalog:
         return found[0]
 
     def set_capability(self, body):
-        from .capabilities import capability_card, content_digest
+        from seampact.capabilities import capability_card, content_digest
         unit = self.store.get("unit", body["unit_id"])
         if not unit:
             raise ValueError("没有这个 Unit")

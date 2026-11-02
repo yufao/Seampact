@@ -13,10 +13,10 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from seampact.analysis import content_digest, preparation_input
-from seampact.dependencies import Dependencies, DependencyBindings, _execution_basis
-from seampact.inspection import Inspector
+from seampact.configuration.dependencies import Dependencies, DependencyBindings, _execution_basis
+from seampact.source.inspection import Inspector
 from seampact.intake import RepositoryIntake
-from seampact.revisions import build_review_context
+from seampact.analysis_support.revisions import build_review_context
 from seampact.service import Platform
 from seampact.service import RULESET, NATIVE_PROFILE
 from seampact.store import Store
@@ -376,7 +376,7 @@ class SourceUpdateMemoryChecks(unittest.TestCase):
         old_id = old_units[0]['id']
         old_state = platform.store.get('unit', old_id)
         old_bindings = dict(platform.catalog.bindings)
-        with patch('seampact.deployment.runtime_groups', side_effect=RuntimeError('fixture install failure')):
+        with patch('seampact.hosting.deployment.runtime_groups', side_effect=RuntimeError('fixture install failure')):
             units = platform._connect_units(updated_inspector, job)
         self.assertEqual(units, [])
         self.assertEqual(job['update_installation']['status'], 'NOT_INSTALLED')
@@ -484,7 +484,7 @@ class SourceExecutionEvidenceChecks(unittest.TestCase):
         self.store.create("dependency_binding", "source:model", self.selection)
 
     def record(self):
-        with patch("seampact.dependencies.check_requirements", return_value=[copy.deepcopy(self.row)]):
+        with patch("seampact.configuration.dependencies.check_requirements", return_value=[copy.deepcopy(self.row)]):
             self.registry.record(self.inspector, {})
             bindings = DependencyBindings(None, self.inspector, {})
         bindings.selected = {"model": copy.deepcopy(self.selection)}

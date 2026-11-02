@@ -18,9 +18,9 @@ from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from seampact.deployment import Deployments
-from seampact.inspection import Inspector
-from seampact.lifecycle import RULE, build_lifecycle_evidence
+from seampact.hosting.deployment import Deployments
+from seampact.source.inspection import Inspector
+from seampact.scheduling.lifecycle import RULE, build_lifecycle_evidence
 from seampact.runtime import Coordinator, OwnerRuntime, ProtocolError
 from seampact.store import Store
 from seampact.units import UnitCatalog

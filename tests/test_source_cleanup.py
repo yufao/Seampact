@@ -10,7 +10,7 @@ from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from seampact.dependencies import Dependencies
+from seampact.configuration.dependencies import Dependencies
 from seampact.intake import RepositoryIntake, managed_checkout, remove_checkout
 from seampact.resources import ResourceRegistry
 from seampact.service import Platform

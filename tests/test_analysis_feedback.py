@@ -5,7 +5,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from seampact.analysis_feedback import compact_report
+from seampact.analysis_support.analysis_feedback import compact_report
 
 
 class TestCompactReport(unittest.TestCase):

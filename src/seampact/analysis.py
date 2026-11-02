@@ -8,16 +8,16 @@ import uuid
 import sys
 from pathlib import Path
 
-from .inspection import digest
-from .preprocessing import RULES as PREPROCESS_RULES, TOOLS as PREPROCESS_TOOLS, check_preprocessing
-from .dependencies import check_requirements, DEPENDENCY_RULES
-from .providers import ProviderError, Transport, completion_body, completion_parameters
-from .store import now
-from .verification import check_candidate
-from .intake_feedback import explain_candidate, TASK_ROLE_RULES, TASK_ROLES
-from .analysis_feedback import compact_report
-from .analysis_records import save_report, load_report, read_report
-from .context_memory import ContextMemory
+from seampact.source.inspection import digest
+from seampact.analysis_support.preprocessing import RULES as PREPROCESS_RULES, TOOLS as PREPROCESS_TOOLS, check_preprocessing
+from seampact.configuration.dependencies import check_requirements, DEPENDENCY_RULES
+from seampact.providers import ProviderError, Transport, completion_body, completion_parameters
+from seampact.store import now
+from seampact.source.verification import check_candidate
+from seampact.analysis_support.intake_feedback import explain_candidate, TASK_ROLE_RULES, TASK_ROLES
+from seampact.analysis_support.analysis_feedback import compact_report
+from seampact.analysis_support.analysis_records import save_report, load_report, read_report
+from seampact.context_memory import ContextMemory
 
 RULES = """你是异构 Harness 接入分析 Agent。依据冻结入口和观察契约，从源码探索具体能力、边界和原生执行宿主。
 允许 W 包装、H 原生交接、有限 R 局部重构。不要重写原算法、数据或控制策略。
@@ -162,14 +162,17 @@ class AnalysisJobs:
         self.lock = threading.RLock()
         # Freeze this process's implementation before any model request. Later
         # workspace edits must not change an in-flight experiment's identity.
-        self.implementation_bytes = {name: Path(__file__).with_name(name).read_bytes() for name in
-            ("analysis.py", "preprocessing.py", "inspection.py", "units.py", "verification.py",
-             "lowering.py", "callsite.py", "deployment.py", "dependencies.py", "resources.py", "providers.py",
-             "service.py", "environments.py", "target_runtime.py", "revisions.py", "classification.py", "intake_feedback.py",
-             "resource_flow.py", "resource_origins.py", "candidate_checks.py", "configuration_flow.py",
-             "execution_context.py", "completion.py", "dependency_closure.py", "configuration_binding.py",
-             "process_environment.py", "analysis_feedback.py", "analysis_records.py", "context_memory.py",
-             "frozen_inheritance.py", "external_source_protocols.py", "configuration_file_flow.py", "configuration_files.py", "intake.py", "store.py")}
+        self.implementation_bytes = {name: (Path(__file__).parent / name).read_bytes() for name in
+            ("analysis.py", "analysis_support/preprocessing.py", "source/inspection.py", "units.py", "source/verification.py",
+             "source/lowering.py", "source/callsite.py", "hosting/deployment.py", "configuration/dependencies.py", "resources.py", "providers.py",
+             "service.py", "hosting/environments.py", "target_runtime.py", "analysis_support/revisions.py", "analysis_support/classification.py", "analysis_support/intake_feedback.py",
+             "configuration/resource_flow.py", "configuration/resource_origins.py", "analysis_support/candidate_checks.py", "configuration/configuration_flow.py",
+             "source/execution_context.py", "completion.py", "source/dependency_closure.py", "configuration/configuration_binding.py",
+             "source/process_environment.py", "analysis_support/analysis_feedback.py", "analysis_support/analysis_records.py", "context_memory.py",
+             "source/frozen_inheritance.py", "source/external_source_protocols.py", "configuration/configuration_file_flow.py", "configuration/configuration_files.py", "intake.py", "store.py")}
+        for directory in {Path(name).parent for name in self.implementation_bytes}:
+            name = (directory / "__init__.py").as_posix()
+            self.implementation_bytes[name] = (Path(__file__).parent / name).read_bytes()
         self.implementation = {name: digest(data) for name, data in self.implementation_bytes.items()}
         for old in store.list("analysis"):
             if old["status"] in {"RUNNING", "CANCELLING"}:
@@ -763,7 +766,7 @@ class AnalysisJobs:
                         elif name == 'read_analysis_memory':
                             result = memory.read(**args)
                         elif name == "inspect_environment":
-                            from .environments import discover_environment
+                            from seampact.hosting.environments import discover_environment
                             result = self._await_operation(lambda: dict(discovery=discover_environment(inspector,
                                 (inspector.request.get("runtime_environment") or {}).get("project", "")),
                                 selected=inspector.request.get("runtime_environment"),

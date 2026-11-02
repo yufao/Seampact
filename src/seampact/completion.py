@@ -15,7 +15,7 @@ import struct
 import zipfile
 from pathlib import Path
 
-from .verification import source_unit
+from seampact.source.verification import source_unit
 
 
 SCHEMA = "native-completion/1"

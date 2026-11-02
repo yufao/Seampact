@@ -11,9 +11,9 @@ from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
 
-from seampact.inspection import Inspector
-from seampact.dependencies import Dependencies, DependencyBindings
-from seampact.process_environment import process_environment_flow
+from seampact.source.inspection import Inspector
+from seampact.configuration.dependencies import Dependencies, DependencyBindings
+from seampact.source.process_environment import process_environment_flow
 
 
 CHILD = """import os

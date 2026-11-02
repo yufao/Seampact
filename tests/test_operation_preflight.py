@@ -6,7 +6,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-from seampact.operation_preflight import preflight
+from seampact.hosting.operation_preflight import preflight
 
 
 class Store:
@@ -42,6 +42,13 @@ class PreflightChecks(unittest.TestCase):
         self.store.put("deployment", dict(id="ga", build=dict(status="BUILT", image_id="saved")))
         self.platform.deployments.instances["old"] = dict(id="old", group_id="ga", state="STOPPED", released=True)
         self.assertEqual(preflight(self.platform, "update")["status"], "READY")
+
+    def test_stopped_state_without_backend_release_is_still_a_blocker(self):
+        self.platform.deployments.instances["old"] = dict(id="old", group_id="ga", state="STOPPED",
+            released=False, handle=dict(container="owned-worker"))
+        report = preflight(self.platform, "update")
+        self.assertEqual(report["status"], "DRAIN")
+        self.assertIn("runtime_instance", [row["kind"] for row in report["items"]])
 
     def test_updates_report_activity_and_service_leases_once(self):
         self.store.put("task", dict(id="t", status="RUNNING"))

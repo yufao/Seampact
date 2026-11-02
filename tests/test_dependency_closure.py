@@ -8,8 +8,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
 
-from seampact.dependency_closure import dependency_closure, entry_dependency_issues
-from seampact.inspection import Inspector
+from seampact.source.dependency_closure import dependency_closure, entry_dependency_issues
+from seampact.source.inspection import Inspector
 
 
 class DependencyClosureChecks(unittest.TestCase):

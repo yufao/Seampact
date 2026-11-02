@@ -13,8 +13,8 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from seampact.inspection import Inspector
-from seampact.revisions import _extract, build_review_context
+from seampact.source.inspection import Inspector
+from seampact.analysis_support.revisions import _extract, build_review_context
 from seampact.store import Store
 from seampact.target_runtime import attach_target, checker_identity
 
@@ -42,9 +42,10 @@ class TargetRevisionFactsTests(unittest.TestCase):
         return attach_target(inspector, record)
 
     def protocol(self, payload):
-        environment = dict(os.environ, PYTHONPATH=str(Path(__file__).resolve().parents[1] / "src"))
+        environment = dict(os.environ, PYTHONPATH=str(Path(__file__).resolve().parents[1] / "src"),
+                           PYTHONIOENCODING="utf-8")
         process = subprocess.run([sys.executable, "-B", "-m", "seampact.target_runtime"],
-            input=json.dumps(payload), capture_output=True, text=True, env=environment, timeout=30)
+            input=json.dumps(payload), capture_output=True, text=True, encoding="utf-8", env=environment, timeout=30)
         self.assertEqual(process.returncode, 0, process.stderr)
         return process.stdout
 

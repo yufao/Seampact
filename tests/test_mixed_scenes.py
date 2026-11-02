@@ -10,8 +10,7 @@ import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from seampact.capabilities import SCALES_2
-from seampact.scenarios import (SceneSession, freeze_scene, route_metric_applicability,
-                                route_metric_report, scene_task_criteria, task_route, task_unit_ids)
+from seampact.scenes.scenarios import SceneSession, freeze_scene, route_metric_applicability, route_metric_report, scene_task_criteria, task_route, task_unit_ids
 
 
 ADAPTER = '''

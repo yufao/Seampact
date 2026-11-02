@@ -8,7 +8,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-from seampact.monitoring import ResourceMonitor
+from seampact.observability.monitoring import ResourceMonitor
 
 
 def make_monitor(tmp_path):
@@ -66,7 +66,7 @@ class MonitoringWriteFailureTests(unittest.TestCase):
             monitor._update_summary(sample(11, 2, "first"), 1)
             monitor._update_summary(sample(12, 5, "second"), 1)
             meta = {"started_monotonic_s": 9}
-            with patch("seampact.monitoring.time.monotonic", return_value=13):
+            with patch("seampact.observability.monitoring.time.monotonic", return_value=13):
                 monitor._finish_summary(meta)
             series = monitor.summary["series"]["process:1"]
             self.assertEqual(monitor.summary["elapsed_s"], 4)
@@ -75,6 +75,6 @@ class MonitoringWriteFailureTests(unittest.TestCase):
 
             monitor.summary = {"sample_count": 0, "series": {}, "sampling_errors": 0}
             monitor._update_summary(sample(10, 1, "first"), 1)
-            with patch("seampact.monitoring.time.monotonic", return_value=13):
+            with patch("seampact.observability.monitoring.time.monotonic", return_value=13):
                 monitor._finish_summary(meta)
             self.assertIsNone(monitor.summary["series"]["process:1"]["cpu_time_coverage"])

@@ -16,14 +16,14 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from seampact.capabilities import JOINT_SCALES, SCALES_2
-from seampact.deployment import Deployments
+from seampact.hosting.deployment import Deployments
 from seampact.evaluation import validate_criteria
-from seampact.inspection import Inspector
-from seampact.joint import Window, configure, run_windows
+from seampact.source.inspection import Inspector
+from seampact.scheduling.joint import Window, configure, run_windows
 from seampact.runtime import Coordinator, OwnerRuntime
-from seampact.scenarios import FrozenCatalog, freeze_scene
+from seampact.scenes.scenarios import FrozenCatalog, freeze_scene
 from seampact.store import Store
-from seampact.training import LEARNING, REFERENCES
+from seampact.scheduling.training import LEARNING, REFERENCES
 from seampact.units import UnitCatalog
 
 

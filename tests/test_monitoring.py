@@ -10,7 +10,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-from seampact.monitoring import ResourceMonitor
+from seampact.observability.monitoring import ResourceMonitor
 
 
 class Store:
@@ -80,7 +80,7 @@ class MonitoringTests(unittest.TestCase):
     def test_stop_waits_for_probe_and_capabilities(self):
         tmp_path = self.tmp_path
         monitor = ResourceMonitor(platform(tmp_path))
-        self.enterContext(patch("seampact.monitoring.shutil.which", return_value=None))
+        self.enterContext(patch("seampact.observability.monitoring.shutil.which", return_value=None))
         caps = {item["id"]: item for item in monitor.capabilities()["metrics"]}
         assert not caps["gpu_memory"]["available"]
         with self.assertRaises(ValueError):
@@ -100,7 +100,7 @@ class MonitoringTests(unittest.TestCase):
         release.set()
         monitor.thread.join(2)
         assert monitor._meta(session["id"])["status"] == "COMPLETED"
-        assert monitor._meta(session["id"])["collector_sha256"]["monitoring.py"]
+        assert monitor._meta(session["id"])["collector_sha256"]["observability/monitoring.py"]
         assert monitor.export(session["id"], "json")["session"]["probe_config"]["interval_s"] == .5
 
 
@@ -112,7 +112,7 @@ class MonitoringTests(unittest.TestCase):
         original_list = obj.store.list
         obj.store.list = lambda kind: tasks if kind == "task" else original_list(kind)
         monitor = ResourceMonitor(obj)
-        self.enterContext(patch("seampact.monitoring.shutil.which", return_value="nvidia-smi"))
+        self.enterContext(patch("seampact.observability.monitoring.shutil.which", return_value="nvidia-smi"))
         with self.assertRaisesRegex(ValueError, "请选择至少一张"):
             monitor.start({"metrics": ["gpu_memory"]})
         sample = monitor._capture({"metrics": ["workload"], "started_at": "2020-01-01T23:00:00+00:00", "gpu_uuids": []})
@@ -121,7 +121,7 @@ class MonitoringTests(unittest.TestCase):
 
 
     def test_service_container_is_not_sampled_twice(self):
-        from seampact.deployment import Deployments
+        from seampact.hosting.deployment import Deployments
         manager = Deployments.__new__(Deployments)
         manager.lock = threading.RLock()
         manager.session = "current"

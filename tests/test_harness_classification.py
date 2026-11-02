@@ -10,8 +10,8 @@ from unittest.mock import Mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from seampact.classification import classify_target, inspect_harness
-from seampact.inspection import Inspector
+from seampact.analysis_support.classification import classify_target, inspect_harness
+from seampact.source.inspection import Inspector
 
 
 class HarnessClassificationChecks(unittest.TestCase):

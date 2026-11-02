@@ -10,7 +10,7 @@ import types
 import typing
 import uuid
 
-from .runtime import ProtocolError
+from seampact.runtime import ProtocolError
 
 
 def install_method_proxy(owner, name, proxy):

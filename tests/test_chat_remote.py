@@ -11,7 +11,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from seampact.chat import ChatJobs
-from seampact.deployment import Deployments
+from seampact.hosting.deployment import Deployments
 from seampact.runtime import Coordinator, OwnerRuntime, ProtocolError, _task_context
 from seampact.store import Store
 
@@ -54,7 +54,8 @@ class RemoteCatalog:
 
 
 class ChatRemoteTests(unittest.TestCase):
-    def exercise(self, *, ready=True, fail=False, model_fail=False):
+    def exercise(self, *, ready=True, fail=False, model_fail=False, explicit=False,
+                 final_save_fail=False, close_during_call=False):
         with tempfile.TemporaryDirectory() as directory:
             store = Store(Path(directory) / "state.db")
             runtime = OwnerRuntime(Coordinator(store))
@@ -63,6 +64,8 @@ class ChatRemoteTests(unittest.TestCase):
                 routed.append((copy.deepcopy(placement), _task_context.get(), copy.deepcopy(arguments)))
                 if fail:
                     raise ProtocolError("response unknown; do not replay")
+                if close_during_call:
+                    jobs.close()
                 return dict(original_value=arguments["value"]), dict(execution="REMOTE")
             router = SimpleNamespace(backend=lambda: dict(start_timeout_s=37), start_gap=lambda group: None,
                 invoke_placed=invoke, release_task=released.append)
@@ -81,9 +84,22 @@ class ChatRemoteTests(unittest.TestCase):
                 if model_fail: raise ValueError("model unavailable")
                 return replies.pop(0)
             jobs.transport.send = send
+            save = store.save
+            def save_task(kind, identity, value, *args, **kwargs):
+                if final_save_fail and kind == "task" and value.get("finished_at"):
+                    raise OSError("final task save failed")
+                return save(kind, identity, value, *args, **kwargs)
             try:
-                with patch("seampact.training.BoundProfiles", Bound), patch("seampact.chat.threading.Thread", ImmediateThread):
-                    accepted = jobs.start(dict(messages=[dict(role="user", content="execute original")]))
+                with patch("seampact.scheduling.training.BoundProfiles", Bound), \
+                     patch("seampact.chat.threading.Thread", ImmediateThread), \
+                     patch.object(store, "save", side_effect=save_task):
+                    if final_save_fail:
+                        with self.assertRaisesRegex(OSError, "final task save failed"):
+                            jobs.start_plan(arguments)
+                        accepted = dict(task_id=store.list("task")[0]["id"])
+                    else:
+                        accepted = (jobs.start_plan(arguments) if explicit else
+                                    jobs.start(dict(messages=[dict(role="user", content="execute original")])))
                 task = store.get("task", accepted["task_id"])
                 self.assertEqual(released, [task["id"]])
                 placement = task["placements"]["unit"]
@@ -98,7 +114,13 @@ class ChatRemoteTests(unittest.TestCase):
                 self.assertEqual(routed[0][0], placement)
                 self.assertEqual(routed[0][1], task["id"])
                 self.assertEqual(routed[0][2], dict(value="original input"))
-                self.assertEqual(task["status"], "COMPLETED")
+                expected = "RUNNING" if final_save_fail or close_during_call else "FAILED" if explicit and fail else "COMPLETED"
+                self.assertEqual(task["status"], expected)
+                if final_save_fail or close_during_call:
+                    self.assertNotIn("finished_at", task)
+                if explicit:
+                    self.assertEqual(task["model_calls"], 0)
+                    self.assertEqual(len(replies), 2)
                 result = task["plan"]["results"][0]
                 if fail:
                     self.assertIn("do not replay", result["error"])
@@ -117,8 +139,19 @@ class ChatRemoteTests(unittest.TestCase):
     def test_unknown_result_is_not_replayed_and_lease_is_released(self):
         self.exercise(fail=True)
 
+    def test_explicit_remote_plan_uses_same_placement_and_preserves_unknown_failure(self):
+        for fail in (False, True):
+            with self.subTest(fail=fail):
+                self.exercise(ready=False, fail=fail, explicit=True)
+
     def test_model_failure_also_releases_task_lease(self):
         self.exercise(model_fail=True)
+
+    def test_explicit_final_save_failure_still_releases_remote_task_lease(self):
+        self.exercise(explicit=True, final_save_fail=True)
+
+    def test_explicit_task_exiting_after_close_releases_lease_without_final_store_write(self):
+        self.exercise(explicit=True, close_during_call=True)
 
     def test_remote_plan_cannot_enter_another_runs_locked_group(self):
         deployments = Deployments.__new__(Deployments)

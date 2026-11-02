@@ -9,7 +9,7 @@ import uuid
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from .inspection import inventory_repository
+from seampact.source.inspection import inventory_repository
 
 
 def inside_platform_checkout(home, path):

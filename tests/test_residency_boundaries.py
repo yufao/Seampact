@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-from seampact.residency import WorkingSets, freeze_working_sets
+from seampact.scheduling.residency import WorkingSets, freeze_working_sets
 from seampact.runtime import Coordinator, ProtocolError
 from seampact.store import Store
 

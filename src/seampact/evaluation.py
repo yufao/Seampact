@@ -10,7 +10,7 @@ import json
 import math
 import time
 
-from .providers import Transport, completion_body, completion_parameters, image_evidence, model_request_scope
+from seampact.providers import Transport, completion_body, completion_parameters, image_evidence, model_request_scope
 
 
 TEACHER_RULES = """You evaluate actual task results using the supplied frozen criteria.

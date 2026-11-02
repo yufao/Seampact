@@ -8,8 +8,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from seampact.service import Platform
 from seampact import __version__
-from seampact.inspection import Inspector
-from seampact.scenarios import FrozenCatalog
+from seampact.source.inspection import Inspector
+from seampact.scenes.scenarios import FrozenCatalog
 import test_managed_services as fixtures
 
 

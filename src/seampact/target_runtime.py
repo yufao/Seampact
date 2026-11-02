@@ -16,8 +16,8 @@ from functools import lru_cache
 from pathlib import Path
 from types import MethodType, SimpleNamespace
 
-from . import backends
-from .inspection import Inspector, digest, safe_path
+from seampact.hosting import backends
+from seampact.source.inspection import Inspector, digest, safe_path
 
 
 TOOLS = {"inspect_symbols", "inspect_construction", "inspect_imports", "entry_candidates",
@@ -299,7 +299,7 @@ def install_catalog(catalog, inspector, candidate, analysis_id, installation_id)
                               active_calls=0, resource_binding=resources, module_paths={}, modules={}, notebooks={})
     # The coordinator can check external port values (for example ndarray), but
     # it has no original source classes loaded in this target-only binding.
-    from .units import NativeBindings
+    from seampact.units import NativeBindings
     binding.native_matches = MethodType(NativeBindings.native_matches, binding)
     installed = []
     for index, entry_id, entry, checked in rows:
@@ -315,7 +315,7 @@ def install_catalog(catalog, inspector, candidate, analysis_id, installation_id)
             analysis_id=analysis_id, installation_id=installation_id,
             initialization="NOT_RUN", result_type=None, parallel=False, remote=False,
             boundary_ids=entry.get("boundary_ids", []))
-        from .store import now
+        from seampact.store import now
         unit["installed_at"] = now()
         unit.update({key: copy.deepcopy(value) for key, value in checked.items()
                      if key not in {"id", "path", "unit", "symbol", "kind"}})
@@ -369,7 +369,7 @@ def execute(payload):
                                 else source_files, sort_keys=True).encode())
     if request["source_version"] != version:
         raise ValueError("目标解释器的来源身份与冻结文件清单不一致")
-    from .environments import check_python_version
+    from seampact.hosting.environments import check_python_version
     environment = request["runtime_environment"]
     if ".".join(map(str, sys.version_info[:2])) != environment["python"]:
         raise ValueError("目标解释器实际 Python 与所选环境不一致")
@@ -391,28 +391,28 @@ def execute(payload):
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_bytes(data)
         inspector = Inspector(source, snapshots, request)
-        from .store import Store
-        from .units import UnitCatalog
-        from .worker import HostDependencies
+        from seampact.store import Store
+        from seampact.units import UnitCatalog
+        from seampact.worker import HostDependencies
         catalog = UnitCatalog(root, Store(":memory:"), None)
         catalog.resource_registry = HostDependencies(request)
         method, arguments = payload["method"], payload["arguments"]
         if method == "collect_source_facts":
-            from .revisions import collect_source_facts
+            from seampact.analysis_support.revisions import collect_source_facts
             result = collect_source_facts(inspector, **arguments)
         elif method == "inspect_candidate":
             result = catalog.inspect_candidate(inspector, arguments["candidate"])
         elif method == "check_preprocessing":
-            from .preprocessing import check_preprocessing
+            from seampact.analysis_support.preprocessing import check_preprocessing
             result = check_preprocessing(inspector, arguments["artifact"], catalog.inspect_candidate)
         elif method == "check_candidate":
-            from .verification import check_candidate
+            from seampact.source.verification import check_candidate
             result = check_candidate(inspector, arguments["candidate"])
         elif method == "check_requirements":
-            from .dependencies import check_requirements
+            from seampact.configuration.dependencies import check_requirements
             result = check_requirements(inspector, arguments["candidate"])
         elif method == "classify_target":
-            from .classification import classify_target
+            from seampact.analysis_support.classification import classify_target
             result = classify_target(inspector, arguments["target"])
         else:
             result = getattr(inspector, method)(**arguments)

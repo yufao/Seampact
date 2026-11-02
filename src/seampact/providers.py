@@ -18,7 +18,7 @@ import urllib.request
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from .store import now
+from seampact.store import now
 
 PRESETS = {
     "deepseek": dict(base_url="https://api.deepseek.com", model="deepseek-flash",

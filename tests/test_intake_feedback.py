@@ -13,9 +13,9 @@ from types import SimpleNamespace
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from seampact.analysis import AnalysisJobs
-from seampact.inspection import Inspector
-from seampact.intake_feedback import entry_readiness, candidate_feedback
-from seampact.preprocessing import check_preprocessing
+from seampact.source.inspection import Inspector
+from seampact.analysis_support.intake_feedback import entry_readiness, candidate_feedback
+from seampact.analysis_support.preprocessing import check_preprocessing
 from seampact.store import Store
 from seampact.service import Platform
 from seampact.target_runtime import execute

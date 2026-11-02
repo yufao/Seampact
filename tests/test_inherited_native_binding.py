@@ -9,8 +9,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from seampact.inspection import Inspector
-from seampact.dependency_closure import dependency_closure
+from seampact.source.inspection import Inspector
+from seampact.source.dependency_closure import dependency_closure
 from seampact.runtime import Coordinator, OwnerRuntime
 from seampact.store import Store
 from seampact.units import NativeBindings, UnitCatalog, MissingBinding

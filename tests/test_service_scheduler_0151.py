@@ -7,13 +7,13 @@ from pathlib import Path
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-from seampact.residency import WorkingSets, freeze_working_sets
+from seampact.scheduling.residency import WorkingSets, freeze_working_sets
 from seampact.capabilities import freeze_joint, joint_candidate, JOINT_SCALES
-from seampact.costs import envelope_integral
-from seampact.joint import Window, configure
-from seampact.managed_services import ManagedServices
+from seampact.scheduling.costs import envelope_integral
+from seampact.scheduling.joint import Window, configure
+from seampact.hosting.managed_services import ManagedServices
 from seampact.providers import Profiles
-from seampact.training import LEARNING, REFERENCES, BoundProfiles
+from seampact.scheduling.training import LEARNING, REFERENCES, BoundProfiles
 from seampact.evaluation import validate_criteria
 from seampact.runtime import _task_context
 import test_managed_services as service_fixture

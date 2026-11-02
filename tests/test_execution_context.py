@@ -11,8 +11,8 @@ from unittest.mock import Mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from seampact.execution_context import ContextIssue, explicit_import_roots, process_context
-from seampact.inspection import Inspector
+from seampact.source.execution_context import ContextIssue, explicit_import_roots, process_context
+from seampact.source.inspection import Inspector
 from seampact.runtime import Coordinator, OwnerRuntime
 from seampact.store import Store
 from seampact.units import NativeBindings, UnitCatalog

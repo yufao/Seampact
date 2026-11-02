@@ -12,7 +12,7 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from seampact.resources import ResourceRegistry
 from seampact.store import Store
-from seampact import training
+from seampact.scheduling import training
 
 
 POINTER = b"version https://git-lfs.github.com/spec/v1\noid sha256:" + b"a" * 64 + b"\nsize 1000\n"
@@ -77,8 +77,10 @@ class PreparationChecks(unittest.TestCase):
              patch.object(training, "distributions", return_value=[]):
             manifest = jobs._manifest(dict(scene={}, criteria={}, algorithm="required_only"), bound, catalog)
         files = {item["path"]: item for item in manifest["implementation_files"]}
-        self.assertTrue({"target_runtime.py", "callsite.py", "verification.py", "classification.py",
-                         "intake_feedback.py", "resources.py", "training.py"} <= files.keys())
+        self.assertTrue({"target_runtime.py", "source/callsite.py", "source/verification.py",
+                         "analysis_support/classification.py", "analysis_support/intake_feedback.py",
+                         "resources.py", "scheduling/training.py", "configuration/configuration_files.py",
+                         "source/__init__.py", "scenes/__init__.py"} <= files.keys())
         for item in files.values():
             blob = Path(item["source_blob"])
             self.assertEqual(hashlib.sha256(blob.read_bytes()).hexdigest(), item["sha256"])

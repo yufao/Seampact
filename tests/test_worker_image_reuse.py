@@ -10,9 +10,9 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from seampact import backends
-from seampact.image_build import BASE_LABEL, RECIPE_LABEL, dependency_image_reference, worker_dockerfile
-from seampact.inspection import digest
+from seampact.hosting import backends
+from seampact.hosting.image_build import BASE_LABEL, RECIPE_LABEL, dependency_image_reference, worker_dockerfile
+from seampact.source.inspection import digest
 
 
 BASE = "sha256:" + "a" * 64

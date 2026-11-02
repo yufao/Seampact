@@ -9,7 +9,7 @@ from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from seampact.dependencies import Dependencies, DependencyBindings, check_requirements
+from seampact.configuration.dependencies import Dependencies, DependencyBindings, check_requirements
 
 
 class DependencyBindingChecks(unittest.TestCase):

@@ -15,7 +15,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from seampact.chat import public_result
 from seampact.completion import after_completion, before_completion, check_completion
 from seampact.composition import NativePlanOwner
-from seampact.inspection import Inspector
+from seampact.source.inspection import Inspector
 from seampact.runtime import Coordinator, OwnerRuntime
 from seampact.store import Store
 from seampact.units import UnitCatalog

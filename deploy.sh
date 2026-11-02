@@ -479,7 +479,7 @@ def check_idle():
     busy = busy or any((row.get(key) or {}).get("status") == "RUNNING" for row in state.get("deployments", []) for key in ("build", "publish"))
     busy = busy or bool((state.get("runtime_controller") or {}).get("locks"))
     held = any(instance.get("state") in ("UNDEPLOYED", "STARTING", "READY", "DRAINING", "UNKNOWN") or
-               (instance.get("state") == "FAILED" and (instance.get("handle") or instance.get("endpoint")) and not instance.get("released"))
+               (instance.get("state") in ("FAILED", "STOPPED") and (instance.get("handle") or instance.get("endpoint")) and not instance.get("released"))
                for group in state.get("runtime_groups", []) for instance in group.get("instances", []))
     services = (state.get("resources") or {}).get("managed_services", [])
     if not isinstance(services, list):

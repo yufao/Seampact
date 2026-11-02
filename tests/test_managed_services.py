@@ -15,7 +15,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from seampact.managed_services import ManagedServices
+from seampact.hosting.managed_services import ManagedServices
 from seampact.store import Store
 from seampact.providers import ProviderError
 

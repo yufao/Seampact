@@ -14,8 +14,8 @@ from unittest.mock import patch
 import test_configuration_flow as fixtures
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
-from seampact.dependencies import Dependencies
-from seampact.inspection import Inspector
+from seampact.configuration.dependencies import Dependencies
+from seampact.source.inspection import Inspector
 from seampact.runtime import Coordinator, OwnerRuntime
 from seampact.store import Store
 from seampact.units import UnitCatalog

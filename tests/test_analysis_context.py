@@ -13,8 +13,8 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
 
 from seampact.analysis import AnalysisJobs, RULES, preparation_input, content_digest
-from seampact.analysis_records import load_report, read_report
-from seampact.inspection import Inspector
+from seampact.analysis_support.analysis_records import load_report, read_report
+from seampact.source.inspection import Inspector
 from seampact.providers import ProviderError
 from seampact.store import Store
 from seampact.units import UnitCatalog
@@ -204,7 +204,7 @@ class AnalysisContextChecks(unittest.TestCase):
             self.jobs.start(self.inspector,'analysis',resume=job,preprocessing='none')
 
     def test_cached_source_facts_require_current_material_basis(self):
-        from seampact.revisions import build_review_context
+        from seampact.analysis_support.revisions import build_review_context
         facts=build_review_context(self.inspector,self.inspector,self.store)
         facts['basis']=dict(source_version=self.inspector.request['source_version'],
             input_digest=content_digest(preparation_input(self.inspector)),implementation=dict(self.jobs.implementation))

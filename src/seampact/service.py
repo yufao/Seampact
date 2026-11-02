@@ -10,25 +10,25 @@ import threading
 import time
 from pathlib import Path, PurePosixPath, PureWindowsPath
 
-from . import __version__
-from .analysis import AnalysisJobs, content_digest, preparation_input
-from .chat import ChatJobs
-from .inspection import Inspector
-from .intake import RepositoryIntake, inside_platform_checkout, managed_checkout, remove_checkout
-from .providers import Profiles
-from .resources import ResourceRegistry
-from .dependencies import Dependencies, reference as resource_reference
-from .revisions import build_review_context, candidate_diff, intervention, declared_result, select_candidate_entries
-from .runtime import Coordinator, OwnerRuntime
-from .scheduler import TwoLayerScheduler
-from .store import Store, now
-from .units import UnitCatalog
-from .deployment import Deployments, REMOTE_PROFILE, GROUP_PROFILE
-from .managed_services import ManagedServices
-from .monitoring import ResourceMonitor
-from .training import TrainingJobs
-from .environments import discover_environment, normalize_environment
-from .target_runtime import attach_target, checker_identity, environment_selection, prepare_checker
+from seampact import __version__
+from seampact.analysis import AnalysisJobs, content_digest, preparation_input
+from seampact.chat import ChatJobs
+from seampact.source.inspection import Inspector
+from seampact.intake import RepositoryIntake, inside_platform_checkout, managed_checkout, remove_checkout
+from seampact.providers import Profiles
+from seampact.resources import ResourceRegistry
+from seampact.configuration.dependencies import Dependencies, reference as resource_reference
+from seampact.analysis_support.revisions import build_review_context, candidate_diff, intervention, declared_result, select_candidate_entries
+from seampact.runtime import Coordinator, OwnerRuntime
+from seampact.scheduling.scheduler import TwoLayerScheduler
+from seampact.store import Store, now
+from seampact.units import UnitCatalog
+from seampact.hosting.deployment import Deployments, REMOTE_PROFILE, GROUP_PROFILE
+from seampact.hosting.managed_services import ManagedServices
+from seampact.observability.monitoring import ResourceMonitor
+from seampact.scheduling.training import TrainingJobs
+from seampact.hosting.environments import discover_environment, normalize_environment
+from seampact.target_runtime import attach_target, checker_identity, environment_selection, prepare_checker
 
 NATIVE_PROFILE = dict(id="python311-local-explicit-lifetime/1", confirmed=True,
     interpreter="Python 3.11", host="local-native-process",

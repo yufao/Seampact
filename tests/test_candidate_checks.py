@@ -7,9 +7,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from seampact.candidate_checks import candidate_issues, dictionary_requirements
-from seampact.inspection import Inspector
-from seampact.intake_feedback import explain_candidate
+from seampact.analysis_support.candidate_checks import candidate_issues, dictionary_requirements
+from seampact.source.inspection import Inspector
+from seampact.analysis_support.intake_feedback import explain_candidate
 
 
 class CandidateChecks(unittest.TestCase):
@@ -55,6 +55,30 @@ class CandidateChecks(unittest.TestCase):
         entry = dict(id="run", path="source.py", symbol="run", kind="function")
         self.assertEqual(candidate_issues(inspector, entry), [])
         self.assertNotIn("fixed_arguments", entry)
+
+    def test_dependency_id_cannot_be_misreported_as_a_missing_host_file(self):
+        from seampact.units import NativeBindings, MissingBinding
+
+        inspector = self.source("def run():\n    return 1\n")
+        dependency = dict(id="model_weights")
+        entry = dict(id="run", path="source.py", symbol="run", kind="function", resources=["model_weights"])
+        issue = candidate_issues(inspector, entry, [dependency])[0]
+        self.assertEqual(issue["issue_code"], "resource_identifier_as_path")
+        self.assertEqual(issue["field_paths"], ["resources[0]"])
+        binding = NativeBindings(inspector, dict(entries=[entry], boundaries=[], dependencies=[dependency]), None)
+        binding.environment_gaps = []
+        with self.assertRaises(MissingBinding) as raised:
+            binding.describe(entry)
+        self.assertEqual(raised.exception.code, "resource_identifier_as_path")
+        self.assertEqual(binding.environment_gaps, [])
+
+        # Explicit real paths still go through the original existence check.
+        entry["resources"] = [dict(path="model_weights")]
+        self.assertEqual(candidate_issues(inspector, entry, [dependency]), [])
+        binding._resource_check(entry, [])
+        self.assertIn("native resource is missing", binding.environment_gaps[0])
+        entry["resources"] = ["source.py"]
+        self.assertEqual(candidate_issues(inspector, entry, [dict(id="source.py")]), [])
 
 
 if __name__ == "__main__":

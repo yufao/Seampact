@@ -16,9 +16,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
 from seampact.chat import public_result
 from seampact.completion import after_completion
 from seampact.composition import NativePlanOwner
-from seampact.deployment import (GROUP_PROFILE, REMOTE_PROFILE, PORT_CODEC, Deployments, PortGap,
-                                check_group_host, decode_port, encode_port)
-from seampact.inspection import Inspector
+from seampact.hosting.deployment import GROUP_PROFILE, REMOTE_PROFILE, PORT_CODEC, Deployments, PortGap, check_group_host, decode_port, encode_port
+from seampact.source.inspection import Inspector
 from seampact.runtime import Coordinator, OwnerRuntime, ProtocolError
 from seampact.store import Store
 from seampact.units import UnitCatalog
@@ -91,7 +90,7 @@ class CliGroupResultTests(unittest.TestCase):
                     dict(id='first', unit_id=unit['id'], arguments=dict(code=str(code), counter=str(counter)),
                          native_arguments=[], after=[]),
                     dict(id='next', unit_id='successor', arguments={}, native_arguments=[], after=['first'])])
-                with patch('seampact.deployment.json_request', side_effect=send) as request, \
+                with patch('seampact.hosting.deployment.json_request', side_effect=send) as request, \
                      patch.object(router, '_event'):
                     result, success = NativePlanOwner(plan).execute(SimpleNamespace(invoke=invoke), public_result)
                 self.assertEqual(success, code == 0, result)
@@ -117,7 +116,7 @@ class CliGroupResultTests(unittest.TestCase):
                 original(*args, **kwargs)
                 return {'returncode': 0}
             with patch.object(worker.catalog, 'invoke', side_effect=wrong_result), \
-                 patch('seampact.deployment.json_request', side_effect=send) as request, \
+                 patch('seampact.hosting.deployment.json_request', side_effect=send) as request, \
                  patch.object(router, '_event'):
                 with self.assertRaisesRegex(ProtocolError, 'ValueError: 原实际返回不符合核对的结果类型'):
                     router._call(record, unit, dict(code='0', counter=str(counter)), ())

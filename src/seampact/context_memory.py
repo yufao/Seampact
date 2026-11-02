@@ -5,7 +5,7 @@ import json
 import math
 import uuid
 
-from .analysis_records import identity
+from seampact.analysis_support.analysis_records import identity
 
 
 class ContextError(ValueError):

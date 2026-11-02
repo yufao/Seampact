@@ -1,17 +1,18 @@
 """Conversation tasks use the actual Unit pool and shared runtime."""
 
 import copy
+import hashlib
 import json
 import subprocess
 import threading
 import time
 import uuid
 
-from .providers import Transport, completion_body
-from .composition import compile_plans, NativePlanOwner
-from .scenarios import FrozenCatalog
-from .store import now
-from .context_memory import ContextMemory
+from seampact.providers import Transport, completion_body
+from seampact.composition import compile_plans, NativePlanOwner
+from seampact.scenes.scenarios import FrozenCatalog
+from seampact.store import now
+from seampact.context_memory import ContextMemory
 
 
 def public_result(value, active=None):
@@ -89,14 +90,17 @@ class ChatJobs:
         self.runtime, self.scheduler = runtime, scheduler
         self.transport = Transport()
         self.closed = False
-        for task in self._history_tasks():
+        tasks = self._history_tasks() + [task for task in self.store.list("task")
+                                       if task.get("origin") == "EXPLICIT_TASK_PLAN"]
+        for task in tasks:
             if task.get("status") == "RUNNING":
                 task.update(status="INTERRUPTED", error="平台已重启，原任务未恢复；已保存的对话仍可查看。", finished_at=now())
                 self.store.save("task", task["id"], task)
 
     def _history_tasks(self):
         return [task for task in self.store.list("task")
-                if task.get("conversation_id") or task.get("phase") in {"conversation", "harness_execution"}]
+                if task.get("origin") != "EXPLICIT_TASK_PLAN" and
+                (task.get("conversation_id") or task.get("phase") in {"conversation", "harness_execution"})]
 
     def conversations(self, query=""):
         groups = {}
@@ -156,7 +160,7 @@ class ChatJobs:
                 raise ValueError("对话消息需要user/assistant角色")
             if not isinstance(message.get("content"), (str, list)):
                 raise ValueError("消息内容需要文字或模型支持的多模态内容")
-        from .training import BoundProfiles
+        from seampact.scheduling.training import BoundProfiles
         bound = BoundProfiles(self.profiles)
         profile = bound.role_profile("chat")
         if profile.get("resource_kind") == "managed":
@@ -210,6 +214,57 @@ class ChatJobs:
         if any(set(plan["units"]) - visible for plan in plans):
             raise ValueError("业务模型不能申请透明或平台触发的 Unit")
         return plans
+
+    def start_plan(self, body):
+        """Execute a frozen explicit TaskPlan through the ordinary executor."""
+        request = json.loads(json.dumps(body, ensure_ascii=False, allow_nan=False))
+        catalog = FrozenCatalog(self.catalog)
+        plans = self._plans(request, catalog)
+        identity = uuid.uuid4().hex
+        catalog.bind_run(identity, dict(start_timeout_s=(catalog.router.backend()["start_timeout_s"]
+                                                       if catalog.router else 900)))
+        task = dict(id=identity, origin="EXPLICIT_TASK_PLAN", phase="harness_execution", status="RUNNING",
+            started_at=now(), response=None, error=None, calls=[], model_calls=0, usage=[], latency_ms=None,
+            request=request, request_sha256=hashlib.sha256(json.dumps(request, ensure_ascii=False,
+                sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest(),
+            models={}, harness_resources=catalog.snapshot_resources(), placements=copy.deepcopy(catalog.placement))
+        self.store.save("task", identity, task)
+        threading.Thread(target=self._run_plan, args=(task, plans, catalog), daemon=True).start()
+        return dict(task_id=identity, request_sha256=task["request_sha256"])
+
+    def _execute_plan(self, task, plans, catalog, observation):
+        plan, token = self.scheduler.select_plan(plans, observation)
+        task.update(phase="harness_execution", plan=dict(id=plan["id"], units=plan["units"],
+            requirements=plan["requirements"], candidate_count=len(plans),
+            data_edges=plan["data_edges"], control_edges=plan["control_edges"], placements=plan["placements"],
+            binding_status=plan["binding_status"], semantic_status=plan["semantic_status"]))
+        self.store.save("task", task["id"], task)
+        started = time.perf_counter()
+        with self.runtime.context(task["id"]):
+            result, success = NativePlanOwner(plan).execute(catalog, public_result)
+        task["plan"].update(execution_status=result["execution_status"], results=result["results"])
+        self.store.save("task", task["id"], task)
+        return result, (token, success, (time.perf_counter() - started) * 1000)
+
+    def _run_plan(self, task, plans, catalog):
+        started = time.perf_counter()
+        try:
+            if self.closed:
+                raise ValueError("平台已停止")
+            result, feedback = self._execute_plan(task, plans, catalog, self._observation(catalog))
+            self.scheduler.feedback(*feedback)
+            task.update(status="COMPLETED" if result["completed"] else "FAILED", result=result,
+                        error=None if result["completed"] else "原任务方案未完整成功返回")
+        except Exception as error:
+            task.update(status="FAILED", error=str(error))
+        finally:
+            if catalog.router:
+                catalog.router.release_task(task["id"])
+            task.update(latency_ms=(time.perf_counter() - started) * 1000, finished_at=now())
+            task["calls"] = [call for call in self.runtime.snapshot()["calls"].values()
+                             if call.get("task_id") == task["id"]]
+            if not self.closed:
+                self.store.save("task", task["id"], task)
 
     def _run(self, task, messages, bound, catalog, prior_wire=None, prior_context=None):
         started = time.perf_counter()
@@ -340,19 +395,7 @@ class ChatJobs:
                             token, success, duration = pending_feedback
                             self.scheduler.feedback(token, success, duration, plans, observation)
                             pending_feedback = None
-                        plan, token = self.scheduler.select_plan(plans, observation)
-                        task.update(phase="harness_execution", plan=dict(id=plan["id"], units=plan["units"],
-                            requirements=plan["requirements"], candidate_count=len(plans),
-                            data_edges=plan["data_edges"], control_edges=plan["control_edges"],
-                            placements=plan["placements"],
-                            binding_status=plan["binding_status"], semantic_status=plan["semantic_status"]))
-                        self.store.save("task", task["id"], task)
-                        plan_started = time.perf_counter()
-                        with self.runtime.context(task["id"]):
-                            result, success = NativePlanOwner(plan).execute(catalog, public_result)
-                        task["plan"].update(execution_status=result["execution_status"], results=result["results"])
-                        self.store.save("task", task["id"], task)
-                        pending_feedback = (token, success, (time.perf_counter() - plan_started) * 1000)
+                        result, pending_feedback = self._execute_plan(task, plans, catalog, observation)
                     except (KeyError, TypeError, ValueError) as error:
                         result = dict(error=str(error))
                     raw = dict(role="tool", tool_call_id=call["id"], content=json.dumps(result, ensure_ascii=False))

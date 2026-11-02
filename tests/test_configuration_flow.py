@@ -8,10 +8,10 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
 
-from seampact.dependencies import check_requirements
-from seampact.inspection import Inspector
-from seampact.intake_feedback import explain_candidate
-from seampact.configuration_binding import configuration_file_flow
+from seampact.configuration.dependencies import check_requirements
+from seampact.source.inspection import Inspector
+from seampact.analysis_support.intake_feedback import explain_candidate
+from seampact.configuration.configuration_binding import configuration_file_flow
 
 
 class ConfigurationFlowChecks(unittest.TestCase):

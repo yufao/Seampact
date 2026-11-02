@@ -20,13 +20,12 @@ from concurrent.futures import Future
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-from .deployment import (GROUP_PROFILE, IDENTITY_PROTOCOL, REMOTE_PROFILE, PortGap, binding_fingerprint, decode_port, encode_port,
-                         json_request)
-from .inspection import Inspector, digest, python_runtime_issue, safe_path
-from .resources import ResourceRegistry
-from .runtime import OwnerRuntime, ProtocolError
-from .store import Store
-from .units import UnitCatalog, _matches
+from seampact.hosting.deployment import GROUP_PROFILE, IDENTITY_PROTOCOL, REMOTE_PROFILE, PortGap, binding_fingerprint, decode_port, encode_port, json_request
+from seampact.source.inspection import Inspector, digest, python_runtime_issue, safe_path
+from seampact.resources import ResourceRegistry
+from seampact.runtime import OwnerRuntime, ProtocolError
+from seampact.store import Store
+from seampact.units import UnitCatalog, _matches
 
 
 class RemoteRuntime:
@@ -126,7 +125,7 @@ class Worker:
         if tuple(map(int, expected.split(".")[:2])) != tuple(sys.version_info[:2]):
             raise ValueError("运行组声明 Python " + expected + "，当前解释器为 " +
                              ".".join(map(str, sys.version_info[:2])) + "；请使用匹配的运行镜像")
-        from .environments import check_python_version
+        from seampact.hosting.environments import check_python_version
         checked_python = check_python_version(".".join(map(str, sys.version_info[:3])),
                                               environment.get("python_requirements", []))
         if checked_python["status"] != "SUPPORTED":
@@ -134,7 +133,7 @@ class Worker:
         self.profile = self.spec.get("profile", REMOTE_PROFILE["id"])
         if self.profile not in {REMOTE_PROFILE["id"], GROUP_PROFILE["id"]}:
             raise ValueError("旧版或未知运行组宿主规格；请用当前平台重新生成运行工件")
-        from .target_runtime import core_identity
+        from seampact.target_runtime import core_identity
         if not isinstance(self.spec.get("platform_core"), dict):
             raise ValueError("运行工件缺少平台核对规则版本；请用当前平台重新生成运行工件")
         if self.spec["platform_core"] != core_identity("worker"):

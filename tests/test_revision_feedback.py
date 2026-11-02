@@ -11,7 +11,7 @@ from types import SimpleNamespace
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from seampact.analysis import content_digest
-from seampact.revisions import candidate_diff, declared_result, intervention, select_candidate_entries
+from seampact.analysis_support.revisions import candidate_diff, declared_result, intervention, select_candidate_entries
 from seampact.service import Platform
 from seampact.store import Store
 

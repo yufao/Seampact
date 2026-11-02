@@ -6,8 +6,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
-from . import __version__
-from .operation_preflight import preflight
+from seampact import __version__
+from seampact.hosting.operation_preflight import preflight
 
 
 class PlatformHTTPServer(ThreadingHTTPServer):
@@ -195,6 +195,8 @@ def make_server(platform, port=8880, host="127.0.0.1", public_port=None):
                 elif path == "/api/chat":
                     result = (platform.training.start_chat(body) if "scene_task_id" in body
                               else platform.chat.start(body))
+                elif path == "/api/plans":
+                    result = platform.chat.start_plan(body)
                 elif path == "/api/monitor/start":
                     result = platform.monitor.start(body)
                 elif path == "/api/monitor/stop":
