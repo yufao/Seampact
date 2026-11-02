@@ -34,21 +34,21 @@ function matches(item, selector) {
 }
 function descendants(root) { return [root, ...root.children.flatMap(descendants)]; }
 function load() {
-  const roots = Object.fromEntries(['analysis-list', 'analysis-heading', 'analysis-count', 'deployment-list', 'unit-list', 'unit-count', 'task-list', 'task-count', 'scroller', 'config'].map(id => {
+  const roots = Object.fromEntries(['analysis-list', 'analysis-heading', 'analysis-count', 'harness-list', 'deployment-list', 'unit-list', 'unit-count', 'task-list', 'task-count', 'scroller', 'config'].map(id => {
     const element = new Element('div'); element.id = id; return [id, element];
   }));
   const context = vm.createContext({URLSearchParams, location: {hash: ''},
-    document: {createElement: tag => new Element(tag), getElementById: id => roots[id] || Object.values(roots).flatMap(descendants).find(item => item.id === id),
+    document: {createElement: tag => new Element(tag), createTextNode: text => { const item = new Element('span'); item.textContent = text; return item; }, getElementById: id => roots[id] || Object.values(roots).flatMap(descendants).find(item => item.id === id),
       querySelector: selector => selector === '.observer-scroll' ? roots.scroller : roots.config},
     inspectPage: true, inspectView: 'analyses', inspectQuery: new URLSearchParams(), state: {},
     detailStates: new Map(), renderedSections: new Map(), capabilityDrafts: new Map(),
-    deploymentPreparation: new Map(), deploymentDrafts: new Map(), deploymentSubmitting: new Set(), analysisSubmitting: new Set(),
+    deploymentPreparation: new Map(), deploymentDrafts: new Map(), deploymentSubmitting: new Set(), analysisSubmitting: new Set(), sourceUpdating: new Set(), sourceUpdateOptions: new Map(),
     revisionSelected: new Map(), revisionVersions: new Map(), revisionBusy: new Set(), revisionErrors: new Map(),
-    acceptRevision: () => {}, showNotice: () => {},
+    acceptRevision: () => {}, showNotice: () => {}, isReady: () => true,
     terminalStatuses: new Set(['COMPLETED', 'FAILED']), statusNames: {FAILED: '失败'},
     empty: (root, text) => root.append(new Element('p')), entryCount: () => null,
     inspectLink: (view, parameters) => { const link = new Element('a'); link.href = '/inspect?' + new URLSearchParams({view, ...parameters}); return link; },
-    resourceState: () => ({}), harnessDependencies: () => {},
+    resourceState: () => ({}), harnessDependencies: () => {}, sourceEnvironment: () => {},
     renderRevisionWorkspace: (card, harness, job) => { const target = new Element('section'); target.id = 'analysis-revision-' + job.id; card.append(target); },
     renderDeploymentBackend: () => {}, renderInstance: () => {}, environmentEvidence: () => {},
     analysisProgress: () => new Element('div'), analysisClassification: () => null,
@@ -59,7 +59,7 @@ function load() {
     sourceButton: () => new Element('button'), deleteSourceButton: () => new Element('button')});
   const names = ['textValue', 'node', 'selectedSource', 'detailKey', 'disclosureScope', 'compactText', 'disclosure', 'foldCard',
     'revealSection', 'renderSection', 'statusClass', 'statusLabel', 'pill', 'latency', 'visibleUnits', 'visibleTasks',
-    'analysisOperationLabel', 'sourceIdentity', 'renderAnalyses', 'runtimeGroupIdentity', 'runtimeGroupError',
+    'analysisOperationLabel', 'sourceIdentity', 'renderAnalyses', 'renderHarnesses', 'runtimeGroupIdentity', 'runtimeGroupError',
     'runtimeGroupActive', 'renderDeployments', 'renderUnits', 'renderTasks', 'refreshRevisionDetails', 'revisionAction', 'analysisNextSteps'];
   for (const name of names) {
     if (name === 'node') {
@@ -81,6 +81,38 @@ function state() {
     runtime_groups: [{id: 'rg-hash-one', source_id: 'a', source_version: 'v1', entries: ['run'], status: 'LOCAL_ONLY', instances: []},
       {id: 'rg-hash-two', source_id: 'b', source_version: 'v2', entries: ['other'], status: 'LOCAL_ONLY', instances: []}]};
 }
+test('source update option survives refresh per source and is disabled during analysis', () => {
+  const {context: c, roots} = load();
+  c.state = state();
+  c.state.harnesses[0].revision_ref = 'fixture-topic';
+  c.renderHarnesses();
+  let inputs = roots['harness-list'].querySelectorAll('input');
+  assert.equal(inputs.length, 2);
+  assert.equal(inputs[0].title, '检查引用：fixture-topic');
+  assert.equal(inputs[1].title, '检查默认分支');
+  inputs[0].checked = true; inputs[0].onchange();
+  c.renderHarnesses();
+  inputs = roots['harness-list'].querySelectorAll('input');
+  assert.equal(inputs[0].checked, true);
+  assert.equal(inputs[1].checked, false);
+  c.state.analyses.push({id: 'update', harness_id: 'a', kind: 'SOURCE_UPDATE_ANALYSIS', status: 'RUNNING'});
+  c.renderHarnesses();
+  inputs = roots['harness-list'].querySelectorAll('input');
+  assert.equal(inputs[0].checked, true);
+  assert.equal(inputs[0].disabled, true);
+  assert.equal(inputs[1].disabled, false);
+});
+test('source update operation displays installation result and retained version reason', () => {
+  const {context: c, roots} = load();
+  c.state = state();
+  c.state.analyses.unshift({id: 'update', harness_id: 'a', kind: 'SOURCE_UPDATE_ANALYSIS', status: 'COMPLETED',
+    update_installation: {status: 'NOT_INSTALLED', reason: '锁忙'}});
+  c.renderAnalyses();
+  assert.match(roots['analysis-list'].textContent, /新版本未安装，原版本保留。原因：锁忙/);
+  c.state.analyses[0].update_installation = {status: 'INSTALLED', analysis_id: 'installed'};
+  c.renderAnalyses();
+  assert.match(roots['analysis-list'].textContent, /新版本已安装；各入口的检查和运行状态请查看分析结果/);
+});
 test('detail becoming busy after snapshot does not accept stale data and retries', async () => {
   const {context: c} = load();
   c.state = {analysis_revisions: [{id: 'r'}], analysis_revisions_observation_pending: false};
@@ -100,22 +132,33 @@ test('detail becoming busy after snapshot does not accept stale data and retries
 test('all-source operations stay compact, keep errors/actions, and preserve expansion across status changes', () => {
   const {context: c, roots} = load(); c.state = state();
   const render = () => c.renderSection('analyses', c.state, c.renderAnalyses, ['analysis-list']);
+  const sources = () => roots['analysis-list'].children.filter(item => (item.className || '').includes('source-disclosure'));
+  const records = () => sources().flatMap(source => source.children.filter(item => item.tagName === 'DETAILS'));
   render();
-  let operations = roots['analysis-list'].children.filter(item => item.tagName === 'DETAILS');
+  assert.equal(sources().length, 2); assert.ok(sources().every(source => !source.open));
+  assert.match(sources()[0].children[0].textContent, /来源甲.*2 次操作/);
+  assert.match(sources()[1].children[0].textContent, /来源乙.*0 次操作/);
+  let operations = records();
   assert.equal(operations.length, 3); assert.ok(operations.every(item => !item.open));
   const failed = operations.find(item => item.textContent.includes('原始失败原因'));
   assert.match(failed.children[0].textContent, /失败.*历史记录.*原始失败原因/);
   assert.ok(descendants(failed).some(item => item.tagName === 'BUTTON'));
-  operations[0].open = true;
+  sources()[0].open = true; operations[0].open = true;
   operations[0].querySelector('details').open = true;
   c.state.analyses[0].status = 'RUNNING'; c.state.analyses[0].pipeline_stage = 'analysis'; render();
-  operations = roots['analysis-list'].children.filter(item => item.tagName === 'DETAILS');
+  operations = records();
+  assert.equal(sources()[0].open, true); assert.equal(sources()[1].open, false);
   assert.equal(operations[0].open, true); assert.equal(operations[1].open, false);
   assert.equal(operations[0].querySelector('details').open, true);
   assert.match(operations[0].children[0].textContent, /入口与拆分/);
   c.inspectQuery.set('harness', 'a'); c.renderAnalyses();
-  operations = roots['analysis-list'].children.filter(item => item.tagName === 'DETAILS');
+  assert.equal(sources().length, 1); assert.equal(sources()[0].open, true);
+  operations = records();
   assert.equal(operations[0].open, true); assert.equal(operations[1].open, false);
+  const revision = descendants(operations[1]).find(item => item.id === 'analysis-revision-old');
+  sources()[0].open = false; operations[1].open = false;
+  c.revealSection(revision);
+  assert.equal(sources()[0].open, true); assert.equal(operations[1].open, true); assert.equal(revision.scrolled, true);
 });
 test('deployment groups belong to their source and use original purpose/symbol with IDs retained', () => {
   const {context: c, roots} = load(); c.state = state(); c.renderDeployments();

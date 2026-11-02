@@ -16,6 +16,8 @@ from pathlib import PurePosixPath
 
 from .inspection import units
 from .execution_context import process_context
+from .frozen_inheritance import FrozenInheritance, InheritanceIssue
+from .external_source_protocols import ExternalSourceProtocols, TORCH_NO_GRAD, SPACY_LOAD, SPACY_CALL
 
 
 @dataclass(eq=False)
@@ -79,6 +81,12 @@ class _External:
     local: bool = False
 
 
+@dataclass(frozen=True)
+class _ExternalCallable:
+    factory: str
+    resource: str
+
+
 @dataclass
 class _Instance:
     """Opaque external result, with only explicit original attribute writes."""
@@ -89,7 +97,18 @@ class _Instance:
 
 @dataclass(frozen=True)
 class _Path:
-    value: str
+    value: object
+
+
+@dataclass(frozen=True)
+class _OptionalPath:
+    """An explicit source choice between a Path and literal None."""
+    pass
+
+
+@dataclass(frozen=True)
+class _Alternatives:
+    values: tuple
 
 
 _BUILTINS = frozenset(dir(builtins)) - {"eval", "exec", "__import__"}
@@ -104,6 +123,8 @@ def _branch_environment(env):
     # becoming evidence in its sibling. Frozen callable ASTs are shared.
     memo = {}
     def clone(value):
+        if isinstance(value, _Alternatives):
+            return _Alternatives(tuple(clone(item) for item in value.values))
         if isinstance(value, _Function) and value.closure is None:
             return value
         if not isinstance(value, (dict, list, _Instance, _Function, _BoundMethod)):
@@ -138,6 +159,91 @@ class _Closure:
         self.calls, self.unknown, self.processes = [], [], []
         self.visited = set()
         self.cwd, self.script_contexts = '.', set()
+        self.sdk_source = ExternalSourceProtocols(inspector)
+        self.protocols = []
+        self.call_summaries = {}
+        self.summary_hits = 0
+
+    def call_state(self, target, args, kwargs):
+        """Fingerprint the entire reachable abstract state, including aliasing.
+
+        A summary is reusable only when interpreting the call leaves this state
+        unchanged. In particular, callback captures, instance fields, module
+        rebinding and subprocess contexts are not treated as immutable inputs.
+        """
+        seen, retained = {}, []
+        def freeze(value):
+            if value is None or isinstance(value, (str, int, float, bool)):
+                return value
+            identity = id(value)
+            if identity in seen:
+                return ("ref", seen[identity])
+            seen[identity] = len(seen)
+            retained.append(value)
+            if isinstance(value, dict):
+                return ("dict", tuple((freeze(k), freeze(v)) for k, v in sorted(value.items(), key=lambda p: (type(p[0]).__name__, str(p[0])))))
+            if isinstance(value, (tuple, list)):
+                return (type(value).__name__, tuple(freeze(v) for v in value))
+            if isinstance(value, (_Function, _Class)):
+                fields = (value.closure, value.defaults, value.owner) if isinstance(value, _Function) else (
+                    value.attributes, value.bases, value.fields, value.problem, value.dataclass_init)
+                return (type(value).__name__, value.path, value.name, id(value.node), freeze(fields))
+            if isinstance(value, _Unsupported):
+                return ("unsupported", value.reason, value.path, id(value.node))
+            if hasattr(value, "__dataclass_fields__"):
+                return (type(value).__name__, tuple((k, freeze(getattr(value, k))) for k in value.__dataclass_fields__))
+            return (type(value).__name__, identity)
+        state = freeze((self.modules, target, args, kwargs, self.import_roots,
+                        tuple(sorted(self.unavailable_modules)), self.cwd,
+                        tuple(sorted(self.script_contexts)), tuple(sorted(self.active))))
+        return hashlib.sha256(repr(state).encode()).digest()
+
+    @staticmethod
+    def immutable_result(value):
+        return (value is None or isinstance(value, (str, int, float, bool, _Path, _External, _ExternalCallable, _Unsupported, _Module))
+                or isinstance(value, _Function) and value.closure is None)
+
+    def protocol(self, rule, path, node, **facts):
+        row = dict(rule=rule, status="SOURCE_PROTOCOL_CHECKED", evidence=[_cite(path, node)],
+                   scope="dependency reachability only; native execution retained; no lifecycle or extraction permission", **facts)
+        if row not in self.protocols:
+            self.protocols.append(row)
+
+    def no_grad_wrapper(self, target):
+        decorators = target.node.decorator_list
+        if len(decorators) != 1 or not isinstance(decorators[0], ast.Call):
+            return False
+        decorator = decorators[0]
+        if decorator.args or decorator.keywords:
+            return False
+        module = self.module(target.path)
+        function = self.value(decorator.func, module, target.path, target.name, setup=True)
+        if not isinstance(function, _External) or function.local or function.name != "torch.no_grad":
+            return False
+        root = decorator.func
+        while isinstance(root, ast.Attribute):
+            root = root.value
+        if target.owner is not None and isinstance(root, ast.Name) and root.id in target.owner.attributes:
+            return False
+        if not self.sdk_source.unmodified("torch.no_grad"):
+            return False
+        self.protocol("external-zero-argument-call-wrapper/1", target.path, decorator,
+                      target="torch.no_grad", definition=target.name, reference=TORCH_NO_GRAD)
+        return True
+
+    def spacy_factory(self, node, env, path, scope):
+        if not isinstance(node, ast.Call) or len(node.args) != 1 or node.keywords:
+            return None
+        if not isinstance(node.args[0], ast.Constant) or not isinstance(node.args[0].value, str):
+            return None
+        factory = self.value(node.func, env, path, scope, setup=True)
+        if (not isinstance(factory, _External) or factory.local or factory.name != "spacy.load"
+                or not self.sdk_source.unmodified("spacy.load")):
+            return None
+        self.protocol("external-callable-factory/1", path, node, target="spacy.load", reference=SPACY_LOAD,
+                      result_protocol="spacy.language.Language.__call__", resource=dict(
+                          kind="spacy_pipeline", name=node.args[0].value, status="ENVIRONMENT_NOT_CHECKED"))
+        return _ExternalCallable("spacy.load", node.args[0].value)
 
     def tree(self, path):
         return ast.parse(dict(units(path, self.inspector.data(path)))["file"])
@@ -354,6 +460,9 @@ class _Closure:
         return instance
 
     def call_value(self, function, args, kwargs, path, scope, node):
+        if isinstance(function, _Alternatives):
+            results = [self.call_value(value, args, kwargs, path, scope, node) for value in function.values]
+            return results[0] if all(value == results[0] for value in results) else None
         if isinstance(function, _BoundMethod):
             return self.invoke(function.function, [function.receiver] + args, kwargs, path, scope, node)
         if isinstance(function, _Function):
@@ -412,6 +521,59 @@ class _Closure:
             if isinstance(root, ast.Name) and isinstance(env.get(root.id), _External):
                 env[root.id] = _External("<modified:" + env[root.id].name + ">", True)
 
+    def attribute_value(self, node, parent, path, scope):
+        if isinstance(parent, _Module):
+            module = self.module(parent.path)
+            if parent.path in self.unavailable_modules:
+                return _External(parent.path + "." + node.attr, True)
+            return module.get(node.attr, _Unsupported("source_export_rule_unsupported", path, node))
+        if isinstance(parent, _External):
+            if parent.name == "sys" and node.attr == "executable":
+                return "python"
+            return _External(parent.name + "." + node.attr, parent.local)
+        if isinstance(parent, _Unsupported):
+            return parent
+        if isinstance(parent, _Super):
+            base = parent.cls.bases[0] if parent.cls.bases else None
+            if isinstance(base, _Class):
+                member = self.class_attribute(base, node.attr)
+                return _BoundMethod(member, parent.receiver) if isinstance(member, _Function) else member
+            if isinstance(base, _External):
+                return _External(base.name + "." + node.attr, base.local)
+            return _Unsupported("super_dispatch_unsupported", path, node)
+        if isinstance(parent, _Instance):
+            if node.attr in parent.attributes:
+                return parent.attributes[node.attr]
+            if parent.local_class is None:
+                return _External(parent.origin + '.' + node.attr)
+            member = self.class_attribute(parent.local_class, node.attr)
+            if isinstance(member, _Function):
+                if member.method_kind == "unsupported" and not self.no_grad_wrapper(member):
+                    self.unknown_target(path, node, member.name, "decorated_method_target_unsupported")
+                    self.unknown_target(member.path, member.node, member.name, "decorated_method_target_unsupported")
+                    return _Unsupported("decorated_method_target_unsupported", member.path, member.node)
+                return member if member.method_kind == "staticmethod" else _BoundMethod(
+                    member, parent.local_class if member.method_kind == "classmethod" else parent)
+            return member if member is not None else _Unsupported("local_attribute_target_unsupported", path, node)
+        if isinstance(parent, _Class):
+            member = self.class_attribute(parent, node.attr)
+            return (_BoundMethod(member, parent) if isinstance(member, _Function) and member.method_kind == "classmethod" else
+                    member if member is not None else _Unsupported("local_attribute_target_unsupported", path, node))
+        if isinstance(parent, _Path):
+            if node.attr == "parent":
+                return _Path(posixpath.dirname(parent.value) or ".") if parent.value is not None else _Path(None)
+            if node.attr == "parents":
+                result, current = [], parent.value
+                if current is None:
+                    return None
+                for _ in range(8):
+                    current = posixpath.dirname(current) or "."
+                    result.append(_Path(current))
+                return result
+        if isinstance(parent, dict):
+            return parent.get(node.attr)
+        return None
+
     def value(self, node, env, path, scope, setup=False):
         if node is None:
             return None
@@ -425,55 +587,7 @@ class _Closure:
         if isinstance(node, ast.Name):
             return env.get(node.id)
         if isinstance(node, ast.Attribute):
-            parent = self.value(node.value, env, path, scope, setup)
-            if isinstance(parent, _Module):
-                module = self.module(parent.path)
-                if parent.path in self.unavailable_modules:
-                    return _External(parent.path + "." + node.attr, True)
-                return module.get(node.attr, _Unsupported("source_export_rule_unsupported", path, node))
-            if isinstance(parent, _External):
-                if parent.name == "sys" and node.attr == "executable":
-                    return "python"
-                return _External(parent.name + "." + node.attr, parent.local)
-            if isinstance(parent, _Unsupported):
-                return parent
-            if isinstance(parent, _Super):
-                base = parent.cls.bases[0] if parent.cls.bases else None
-                if isinstance(base, _Class):
-                    member = self.class_attribute(base, node.attr)
-                    return _BoundMethod(member, parent.receiver) if isinstance(member, _Function) else member
-                if isinstance(base, _External):
-                    return _External(base.name + "." + node.attr, base.local)
-                return _Unsupported("super_dispatch_unsupported", path, node)
-            if isinstance(parent, _Instance):
-                if node.attr in parent.attributes:
-                    return parent.attributes[node.attr]
-                if parent.local_class is None:
-                    return _External(parent.origin + '.' + node.attr)
-                member = self.class_attribute(parent.local_class, node.attr)
-                if isinstance(member, _Function):
-                    if member.method_kind == "unsupported":
-                        self.unknown_target(path, node, member.name, "decorated_method_target_unsupported")
-                        return _Unsupported("decorated_method_target_unsupported", member.path, member.node)
-                    return member if member.method_kind == "staticmethod" else _BoundMethod(
-                        member, parent.local_class if member.method_kind == "classmethod" else parent)
-                return member if member is not None else _Unsupported("local_attribute_target_unsupported", path, node)
-            if isinstance(parent, _Class):
-                member = self.class_attribute(parent, node.attr)
-                return (_BoundMethod(member, parent) if isinstance(member, _Function) and member.method_kind == "classmethod" else
-                        member if member is not None else _Unsupported("local_attribute_target_unsupported", path, node))
-            if isinstance(parent, _Path):
-                if node.attr == "parent":
-                    return _Path(posixpath.dirname(parent.value) or ".")
-                if node.attr == "parents":
-                    result, current = [], parent.value
-                    for _ in range(8):
-                        current = posixpath.dirname(current) or "."
-                        result.append(_Path(current))
-                    return result
-            if isinstance(parent, dict):
-                return parent.get(node.attr)
-            return None
+            return self.attribute_value(node, self.value(node.value, env, path, scope, setup), path, scope)
         if isinstance(node, (ast.List, ast.Tuple)):
             result = []
             for item in node.elts:
@@ -507,8 +621,10 @@ class _Closure:
                 return None
         if isinstance(node, ast.BinOp):
             left, right = self.value(node.left, env, path, scope, setup), self.value(node.right, env, path, scope, setup)
-            if isinstance(node.op, ast.Div) and isinstance(left, _Path) and isinstance(right, (str, _Path)):
-                return _Path(posixpath.normpath(posixpath.join(left.value, right.value if isinstance(right, _Path) else right)))
+            if isinstance(node.op, ast.Div) and isinstance(left, _Path):
+                part = right.value if isinstance(right, _Path) else right
+                return (_Path(posixpath.normpath(posixpath.join(left.value, part)))
+                        if isinstance(left.value, str) and isinstance(part, str) else _Path(None))
             if isinstance(node.op, ast.Add) and isinstance(left, (str, list)) and type(left) is type(right):
                 return left + right
             return None
@@ -516,11 +632,43 @@ class _Closure:
             truth = self.truth(node.test, env, path, scope)
             if truth is not None:
                 return self.value(node.body if truth else node.orelse, env, path, scope, setup)
+            values = [self.value(part, _branch_environment(env), path, scope, setup) for part in (node.body, node.orelse)]
+            if all(isinstance(value, _Path) for value in values):
+                return values[0] if values[0] == values[1] else _Path(None)
+            parts = (node.body, node.orelse)
+            if all(isinstance(value, _Path) or isinstance(part, ast.Constant) and part.value is None
+                   for value, part in zip(values, parts)) and any(isinstance(value, _Path) for value in values):
+                return _OptionalPath()
+            if all(isinstance(value, (_Function, _BoundMethod, _Class, _Unsupported, _Alternatives)) or value is None for value in values):
+                return _Alternatives(tuple(values))
+            return values[0] if values[0] == values[1] else None
+        if isinstance(node, ast.BoolOp):
+            values = [self.value(part, env, path, scope, setup) for part in node.values]
+            if isinstance(node.op, ast.Or) and isinstance(values[-1], _Path) and all(
+                    isinstance(value, (_Path, _OptionalPath)) for value in values):
+                return _Path(None)
             return None
+        if isinstance(node, ast.Lambda):
+            function = ast.FunctionDef(name="<lambda>", args=node.args,
+                body=[ast.copy_location(ast.Return(value=node.body), node)], decorator_list=[])
+            ast.copy_location(function, node)
+            target = _Function(path, scope + ".<lambda>@" + str(node.lineno), function, env)
+            target.defaults = self.function_defaults(function, env, path, scope)
+            return target
         if isinstance(node, ast.Call):
-            function = self.value(node.func, env, path, scope, setup)
+            receiver = self.value(node.func.value, env, path, scope, setup) if isinstance(node.func, ast.Attribute) else None
+            function = (self.attribute_value(node.func, receiver, path, scope) if isinstance(node.func, ast.Attribute)
+                        else self.value(node.func, env, path, scope, setup))
             args = [self.value(a, env, path, scope, setup) for a in node.args]
             kwargs = {k.arg: self.value(k.value, env, path, scope, setup) for k in node.keywords}
+            if isinstance(function, _ExternalCallable):
+                self.protocol("external-factory-result-call/1", path, node, target="spacy.language.Language.__call__",
+                              factory=function.factory, resource=function.resource, reference=SPACY_CALL)
+                return _Instance("spacy.tokens.Doc()", {})
+            if isinstance(function, _External) and function.name == "spacy.load":
+                result = self.spacy_factory(node, env, path, scope)
+                if result is not None:
+                    return result
             name = function.name if isinstance(function, _External) else ast.unparse(node.func)
             if function is None and name == "super" and "super" not in env:
                 cls = args[0] if len(args) == 2 else env.get("<method_class>")
@@ -532,13 +680,16 @@ class _Closure:
                          (function is None and name == "str" and "str" not in env)):
                 if name == "str":
                     return args[0].value if isinstance(args[0], _Path) else args[0] if isinstance(args[0], str) else None
-                return args[0] if isinstance(args[0], _Path) else _Path(args[0]) if isinstance(args[0], str) else None
+                return args[0] if isinstance(args[0], _Path) else _Path(args[0]) if isinstance(args[0], str) else _Path(None)
             if name == "sys.executable":
                 return "python"
             if isinstance(node.func, ast.Attribute):
-                receiver = self.value(node.func.value, env, path, scope, setup)
                 if isinstance(receiver, _Path) and node.func.attr in {"resolve", "absolute", "expanduser"}:
                     return receiver
+                if isinstance(receiver, _Path) and node.func.attr == "joinpath":
+                    parts = [value.value if isinstance(value, _Path) else value for value in args]
+                    return (_Path(posixpath.normpath(posixpath.join(receiver.value, *parts)))
+                            if isinstance(receiver.value, str) and all(isinstance(part, str) for part in parts) else _Path(None))
                 if isinstance(receiver, list) and node.func.attr in {"append", "extend"} and args:
                     receiver.extend(args[0] if node.func.attr == "extend" and isinstance(args[0], list) else [args[0]])
                     return None
@@ -558,7 +709,7 @@ class _Closure:
                     # source; analysing arbitrary module initialization is outside this rule.
                     return _Unsupported("module_constructor_unsupported", path, node)
                 return _Instance(name + '()', {}) if isinstance(function, _External) and not function.local else None
-            if isinstance(function, (_Function, _BoundMethod, _Class, _Unsupported)) or isinstance(function, _Instance) and function.local_class is not None:
+            if isinstance(function, (_Function, _BoundMethod, _Class, _Unsupported, _Alternatives)) or isinstance(function, _Instance) and function.local_class is not None:
                 return self.call_value(function, args, kwargs, path, scope, node)
             if name in {"subprocess.run", "subprocess.Popen", "subprocess.call", "subprocess.check_call", "subprocess.check_output"}:
                 self.process(path, scope, node, args[0] if args else kwargs.get("args"), kwargs)
@@ -568,7 +719,9 @@ class _Closure:
             elif function is None and isinstance(node.func, ast.Name) and (node.func.id not in _BUILTINS or node.func.id in env):
                 self.unknown_target(path, node, node.func.id, "dynamic_call_target_unresolved")
             elif function is None and isinstance(node.func, ast.Attribute) and isinstance(
-                    self.value(node.func.value, env, path, scope, setup), (_Instance, _Class)):
+                    receiver, (_Instance, _Class)):
+                self.unknown_target(path, node, ast.unparse(node.func), "dynamic_call_target_unresolved")
+            elif function is None and not isinstance(node.func, (ast.Name, ast.Attribute)):
                 self.unknown_target(path, node, ast.unparse(node.func), "dynamic_call_target_unresolved")
             if name not in {"subprocess.run", "subprocess.Popen", "subprocess.call", "subprocess.check_call", "subprocess.check_output"}:
                 for value in args + list(kwargs.values()):
@@ -595,6 +748,7 @@ class _Closure:
             # Their dataclass equality cannot prove a branch false (or true).
             if isinstance(a, (str, int, float, bool)) and isinstance(b, (str, int, float, bool)):
                 return (a == b) if isinstance(node.ops[0], ast.Eq) else a != b
+            return None
         value = self.value(node, env, path, scope)
         return bool(value) if isinstance(value, (bool, int, str)) else None
 
@@ -642,7 +796,17 @@ class _Closure:
                 states.append(local)
             for name in set().union(*(set(s) for s in states)):
                 values = [s.get(name) for s in states]
-                env[name] = values[0] if all(v == values[0] for v in values) else None
+                if all(v == values[0] for v in values):
+                    env[name] = values[0]
+                elif all(isinstance(v, _Path) for v in values):
+                    env[name] = _Path(None)
+                elif all(isinstance(v, (_Function, _BoundMethod, _Class, _Unsupported, _Alternatives)) or v is None for v in values):
+                    # Both branch bindings are known callables (or explicitly
+                    # unknown); retain every possible call, never select one.
+                    env[name] = _Alternatives(tuple(item for value in values
+                        for item in (value.values if isinstance(value, _Alternatives) else (value,))))
+                else:
+                    env[name] = None
             if results and all(r[0] for r in results):
                 values = [r[1] for r in results]
                 return True, values[0] if all(v == values[0] for v in values) else None
@@ -693,7 +857,8 @@ class _Closure:
         if target.node.decorator_list and target.method_kind not in {"staticmethod", "classmethod"}:
             module = self.module(target.path)
             decorators = [self.value(d, module, target.path, target.name, setup=True) for d in target.node.decorator_list]
-            if any(not isinstance(d, _External) or d.name != "contextlib.contextmanager" for d in decorators):
+            if (any(not isinstance(d, _External) or d.name != "contextlib.contextmanager" for d in decorators)
+                    and not self.no_grad_wrapper(target)):
                 self.unknown_target(path, node, target.name, "decorated_call_target_unresolved")
                 return None
         key = (target.path, target.name)
@@ -726,8 +891,24 @@ class _Closure:
         bindings(target.node.body)
         for name in assigned - declarations.keys():
             local[name] = None
+        path_globals = set()
         for name in assigned & declarations.keys():
             declaration = declarations[name]
+            lazy = (self.sdk_source.lazy_guard(target.path, target.node, name)
+                    if isinstance(declaration, ast.Global) else None)
+            factory = self.spacy_factory(lazy[2], local, target.path, target.name) if lazy else None
+            if factory is not None:
+                # The unique original guard establishes this invariant before
+                # any later read. Analyse both retained/initializing paths with
+                # the same documented external callable result.
+                local[name] = factory
+                self.protocol("module-lazy-external-singleton/1", target.path, lazy[1], variable=name,
+                              initialization=[_cite(target.path, lazy[0]), _cite(target.path, lazy[2])],
+                              factory=factory.factory, resource=factory.resource)
+                continue
+            if isinstance(declaration, ast.Global) and isinstance(self.module(target.path).get(name), _Path):
+                path_globals.add(name)
+                continue
             reason = "lexical_binding_mutation_unsupported"
             self.unknown_target(target.path, declaration, name, reason)
             marker = _Unsupported(reason, target.path, declaration)
@@ -751,8 +932,25 @@ class _Closure:
         if target.node.args.kwarg:
             names = {p.arg for p in parameters + target.node.args.kwonlyargs}
             local[target.node.args.kwarg.arg] = {k: v for k, v in kwargs.items() if k not in names}
+        state = self.call_state(target, args, kwargs)
+        if state in self.call_summaries:
+            self.summary_hits += 1
+            self.active.remove(key)
+            return self.call_summaries[state]
         try:
-            return self.block(target.node.body, local, target.path, target.name)[1]
+            result = self.block(target.node.body, local, target.path, target.name)[1]
+            for name in path_globals:
+                value = local.get(name)
+                if isinstance(value, _Path):
+                    self.module(target.path)[name] = value
+                    self.protocol("source-global-path-assignment/1", target.path, declarations[name], variable=name,
+                                  value=value.value, precision="known" if value.value is not None else "unknown path")
+                else:
+                    self.module(target.path)[name] = _Unsupported("global_path_assignment_unsupported", target.path, declarations[name])
+                    self.unknown_target(target.path, declarations[name], name, "global_path_assignment_unsupported")
+            if self.immutable_result(result) and state == self.call_state(target, args, kwargs):
+                self.call_summaries[state] = result
+            return result
         finally:
             self.active.remove(key)
 
@@ -817,6 +1015,10 @@ class _Closure:
         self.modules, self.import_roots, self.steps, self.active = {}, {}, 0, set()
         self.unavailable_modules = set()
         self.cwd, self.script_contexts = '.', set()
+        self.protocols = []
+        self.call_summaries = {}
+        self.summary_hits = 0
+        binding_facts = None
         path, symbol = entry.get("path"), entry.get("symbol", "__main__")
         def not_covered(reason):
             return dict(entry_id=entry["id"], status="NOT_COVERED", scope_covered=False,
@@ -826,6 +1028,42 @@ class _Closure:
             return not_covered("entry_source_scope_unsupported")
         if entry.get("kind") == "cli":
             self.script(path, process_context(self.inspector, entry)['cwd'])
+        elif entry.get("kind") == "method" and isinstance(entry.get("constructor"), dict):
+            parts = symbol.split(".")
+            if len(parts) != 2 or entry["constructor"].get("symbol") != parts[0]:
+                return not_covered("native_receiver_binding_unsupported")
+            resolver = FrozenInheritance(self.inspector)
+            try:
+                chain, definition = resolver.resolve(path, symbol)
+            except InheritanceIssue as error:
+                location = next(iter(self.tree(path).body), ast.Pass(lineno=1, end_lineno=1))
+                self.unknown_target(path, location, symbol, "native_receiver_source_binding_unsupported")
+            else:
+                binding_facts = resolver.facts(chain, definition)
+                cls = self.module(path).get(parts[0])
+                if not isinstance(cls, _Class):
+                    self.unknown_target(path, chain[0].node, parts[0], "native_receiver_class_binding_unsupported")
+                else:
+                    # Inspect the original constructor and keep this exact
+                    # abstract receiver for inherited self/super dispatch.
+                    receiver = self.construct(cls, [], copy.deepcopy(entry["constructor"].get("arguments", {})),
+                                              path, "<entry-construction>", chain[0].node)
+                    if isinstance(receiver, _Instance):
+                        for initializer in entry.get("initializers", []):
+                            name = initializer["symbol"].split(".")[-1]
+                            initial = self.class_attribute(cls, name)
+                            if isinstance(initial, _Function):
+                                self.invoke(initial, [receiver], copy.deepcopy(initializer.get("arguments", {})),
+                                            initial.path, "<entry-initialization>", initial.node)
+                            else:
+                                self.unknown_target(path, chain[0].node, name, "native_initializer_binding_unsupported")
+                        target = self.class_attribute(cls, parts[1])
+                        if (isinstance(target, _Function) and target.path == definition.path
+                                and target.name == definition.symbol and target.method_kind == "instance"):
+                            self.invoke(target, [receiver], copy.deepcopy(entry.get("fixed_arguments", {})),
+                                        target.path, "<entry>", target.node)
+                        else:
+                            self.unknown_target(path, chain[0].node, symbol, "native_method_effective_binding_unsupported")
         else:
             target = self.module(path).get(symbol)
             if isinstance(target, _Function):
@@ -867,6 +1105,9 @@ class _Closure:
                     entry_id=entry["id"], field_paths=["entries"], evidence=[e for u in targets for e in u["evidence"]],
                     reason=reason, repair_action=repair))
         return dict(entry_id=entry["id"], status="MISSING" if issues else "CHECKED", scope_covered=True,
+                    analysis_steps=self.steps, reused_call_summaries=self.summary_hits,
+                    inheritance_binding=binding_facts,
+                    external_protocols=self.protocols,
                     reachable_entries=reachable, dependency_ids=dependencies, missing_dependency_ids=missing,
                     call_edges=self.calls, process_edges=self.processes, evidence=evidence,
                     unresolved_targets=self.unknown, issues=issues)

@@ -113,7 +113,7 @@ class Platform:
         harnesses = []
         for source in self.store.list("harness"):
             harnesses.append({name: source.get(name) for name in
-                ("id", "name", "address", "root", "revision", "status", "error", "analysis_id", "entry", "resources", "detached_at",
+                ("id", "name", "address", "root", "revision", "revision_ref", "status", "error", "analysis_id", "entry", "resources", "detached_at",
                  "runtime_environment", "environment_discovery", "target_runtime", "environment_pending_recheck")})
             harnesses[-1]["files"] = len(source.get("files", []))
             harnesses[-1]["inventory_count"] = len(source.get("inventory", []))
@@ -364,6 +364,58 @@ class Platform:
         with self.source_lock:
             return self._analyze(identity, preprocessing, preprocessing_id)
 
+    def analyze_update(self, identity):
+        """Freeze an independently obtained update and analyze only changed content."""
+        with self.source_lock:
+            source = self.store.get("harness", identity)
+            if not source or source.get("status") == "DETACHED":
+                raise ValueError("来源尚未接入")
+            if self._source_analysis_running(identity):
+                raise ValueError("这个来源正在分析")
+            previous = self.store.get("analysis", source.get("analysis_id"))
+            if not previous or previous.get("status") != "COMPLETED" or not (previous.get("submitted") or {}).get("candidate"):
+                entry = source.get("entry")
+                if isinstance(entry, dict) and entry.get("status") == "STATIC_CANDIDATES":
+                    entry = None
+                refreshed = self.intake.prepare(source["address"], source.get("revision_ref"), entry, source.get("user_resources") or [])
+                updated = copy.deepcopy(source)
+                updated.update({key: refreshed[key] for key in ("root", "revision", "revision_ref", "entry", "files", "inventory", "resources")})
+                self._remember_managed_clone(updated, source.get("root"))
+                self._remember_managed_clone(updated, updated["root"])
+                self.store.save("harness", identity, updated)
+                try:
+                    return dict(self._analyze(identity), update_status="FIRST_ANALYSIS")
+                except Exception:
+                    self.store.save("harness", identity, source)
+                    if refreshed["root"] != source.get("root"):
+                        self._forget_checkout(identity, refreshed["root"])
+                    raise
+            revision = self.create_revision(dict(analysis_id=previous["id"], mode="update"))["revision"]
+            rid = revision["id"]
+            draft = self.store.get("analysis_revision", rid)
+            if draft["source_version"] == draft["base_source_version"]:
+                self.store.delete("analysis_revision", rid)
+                self.store.delete("request", draft["request_id"])
+                self._forget_checkout(identity, draft["proposed_source"]["root"])
+                return dict(update_status="UNCHANGED")
+            inspector = self._revision_inspector(draft)
+            inspector.request.update(preprocessing_mode="api", preprocessing_id=None)
+            inspector.entry_candidates(path="")
+            aid = uuid.uuid4().hex
+            draft.update(status="ANALYZING", analysis_id=aid, error=None, updated_at=now())
+            draft["analysis_attempts"].append(aid)
+            self.store.save("request", inspector.request["id"], inspector.request)
+            self.store.save("analysis_revision", rid, draft)
+            self.inspectors[inspector.request["id"]] = inspector
+            try:
+                self.analysis.start(inspector, self.profiles.role_identity("analysis"), identity=aid,
+                                    preprocessing="api", staging_revision=rid)
+            except Exception as error:
+                draft.update(status="FAILED", error=str(error), updated_at=now())
+                self.store.save("analysis_revision", rid, draft)
+                raise
+            return dict(update_status="ANALYZING", analysis_id=aid, revision_id=rid)
+
     def _analyze(self, identity, preprocessing="api", preprocessing_id=None):
         source = self.store.get("harness", identity)
         if not source:
@@ -416,6 +468,17 @@ class Platform:
             if job.get("completion_scope") == "candidate_and_report_only":
                 self._complete_revision(inspector, job)
                 self.store.save("analysis", job["id"], job)
+                if job.get("kind") == "SOURCE_UPDATE_ANALYSIS":
+                    report = job["submitted"]["report"]
+                    if (report.get("entry_bindings") or {}).get("has_bindable_entries"):
+                        try:
+                            result = self.install_revision(dict(revision_id=job["revision_id"], require_bindable=True))
+                            job["update_installation"] = dict(status="INSTALLED", analysis_id=result["analysis_id"])
+                            return result["units"]
+                        except Exception as error:
+                            job["update_installation"] = dict(status="NOT_INSTALLED", reason=str(error))
+                    else:
+                        job["update_installation"] = dict(status="NOT_INSTALLED", reason="新版本没有通过检查的入口")
                 return []
             if source.get("analysis_id") != job["id"]:
                 job["status"] = "CANCELLED"
@@ -498,7 +561,7 @@ class Platform:
     @staticmethod
     def _revision_source_basis(source):
         return content_digest({key: source.get(key) for key in
-            ("id", "analysis_id", "request_id", "root", "address", "revision", "entry",
+            ("id", "analysis_id", "request_id", "root", "address", "revision", "revision_ref", "entry",
              "configuration", "user_resources", "runtime_environment")})
 
     def _revision_source(self, revision):
@@ -586,11 +649,12 @@ class Platform:
                     entry = source.get("entry")
                     if isinstance(entry, dict) and entry.get("status") == "STATIC_CANDIDATES":
                         entry = None
-                    refreshed = self.intake.prepare(source["address"], body.get("revision") or None,
+                    requested_ref = (body.get("revision") or None) if "revision" in body else source.get("revision_ref")
+                    refreshed = self.intake.prepare(source["address"], requested_ref,
                         entry, source.get("user_resources") or [])
                     refreshed_root = refreshed["root"]
                     proposed.update({key: refreshed[key] for key in
-                        ("root", "revision", "entry", "files", "inventory", "resources")})
+                        ("root", "revision", "revision_ref", "entry", "files", "inventory", "resources")})
                     self._remember_managed_clone(source, source.get("root"))
                     self._remember_managed_clone(source, refreshed_root)
                     self._remember_managed_clone(proposed, source.get("root"))
@@ -979,7 +1043,7 @@ class Platform:
         self._refresh_revision_scope(revision, inspector, implementation=job["implementation"], checked=True)
         revision["implementation"] = copy.deepcopy(job["implementation"])
         revision["check_identity"] = self._revision_check_identity(revision, inspector)
-        self._revision_action(revision, "MODEL_REFINEMENT",
+        self._revision_action(revision, "SOURCE_UPDATE_ANALYSIS" if job.get("kind") == "SOURCE_UPDATE_ANALYSIS" else "MODEL_REFINEMENT",
             intervention(dict(actor=dict(kind="platform_model", name="analysis"))), before,
             analysis_id=job["id"], check_identity=revision["check_identity"], report=revision["report"],
             outcome=dict(status="CHECK_COMPLETED", target_runtime="NOT_EXECUTED"))
@@ -990,10 +1054,18 @@ class Platform:
         revision = self.store.get("analysis_revision", previous["revision_id"])
         if not revision or revision.get("analysis_id") != previous["id"]:
             raise ValueError("这次修订已被后续尝试替代，请从当前草稿重新修复")
-        repair = previous.get("repair") or {}
-        if (revision["candidate_digest"] != content_digest(repair.get("candidate"))
-                or any(revision.get(key, "") != (repair.get(key) or "") for key in ("guidance", "reason"))):
-            raise ValueError("草稿或提示已修改，请从当前草稿发起新的模型修复，不能续接旧请求")
+        updating = previous.get("kind") == "SOURCE_UPDATE_ANALYSIS"
+        if updating:
+            basis = content_digest({key: revision.get(key) for key in ("candidate", "candidate_digest", "guidance", "reason")})
+            request = self.store.get("request", previous["request_id"])
+            if (previous.get("staging_draft_basis") != basis or not request or
+                    previous.get("staging_request_digest") != content_digest(request)):
+                raise ValueError("更新草稿或冻结请求已修改，请重新分析")
+        else:
+            repair = previous.get("repair") or {}
+            if (revision["candidate_digest"] != content_digest(repair.get("candidate"))
+                    or any(revision.get(key, "") != (repair.get(key) or "") for key in ("guidance", "reason"))):
+                raise ValueError("草稿或提示已修改，请从当前草稿发起新的模型修复，不能续接旧请求")
         self._revision_source(revision)
         if self._source_analysis_running(revision["harness_id"]):
             raise ValueError("该来源还有模型分析正在进行")
@@ -1005,7 +1077,8 @@ class Platform:
             outcome=dict(status="ANALYZING"))
         self.store.save("analysis_revision", revision["id"], revision)
         try:
-            self.analysis.start(inspector, self.profiles.role_identity("analysis"), identity=aid, resume=previous)
+            self.analysis.start(inspector, self.profiles.role_identity("analysis"), identity=aid, resume=previous,
+                                staging_revision=revision["id"] if updating else None)
         except Exception as error:
             if not self.store.get("analysis", aid):
                 revision["analysis_attempts"].remove(aid)
@@ -1024,6 +1097,8 @@ class Platform:
             source = self._revision_source(revision)
             self._environment_guard(source)
             inspector = self._check_revision(revision, attribution)
+            if body.get("require_bindable") and not (revision["report"].get("entry_bindings") or {}).get("has_bindable_entries"):
+                raise ValueError("新版本重检后没有通过检查的入口，继续保留原版本")
             install_event = self._revision_action(revision, "INSTALL", attribution,
                 check_identity=revision["check_identity"], outcome=dict(status="INSTALLING"))
             aid = uuid.uuid4().hex

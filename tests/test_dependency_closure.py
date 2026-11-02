@@ -66,6 +66,26 @@ class DependencyClosureChecks(unittest.TestCase):
                             [self.function('host'), self.function('child', 'tasks.py')])
         self.assertEqual(rows['host']['dependency_ids'], ['service'])
 
+    def test_conditional_imported_call_checks_both_possible_targets(self):
+        rows = self.inspect({'main.py': 'def host(choice):\n    if choice:\n        from a import run as parser\n    else:\n        from b import run as parser\n    parser()\n',
+                             'a.py': 'def run():\n    pass\n', 'b.py': 'def run():\n    pass\n'},
+                            [self.function('host'), self.function('a', 'a.py', 'run'), self.function('b', 'b.py', 'run')],
+                            [dict(id='a-service', entry_ids=['a']), dict(id='b-service', entry_ids=['b'])])
+        self.assertEqual(set(rows['host']['dependency_ids']), {'a-service', 'b-service'})
+        self.assertFalse(rows['host']['unresolved_targets'])
+
+    def test_conditional_missing_binding_remains_unknown(self):
+        rows = self.inspect({'main.py': 'def child():\n    pass\ndef host(choice):\n    if choice:\n        parser = child\n    parser()\n'},
+                            [self.function('host'), self.function('child')])
+        self.assertEqual(rows['host']['dependency_ids'], ['service'])
+        self.assertTrue(any(x['reason'] == 'dynamic_call_target_unresolved' for x in rows['host']['unresolved_targets']))
+
+    def test_nested_callable_survives_unknown_branch(self):
+        rows = self.inspect({'main.py': 'def child():\n    pass\ndef host(choice):\n    def attempt():\n        child()\n    if choice:\n        marker = 1\n    else:\n        marker = 2\n    attempt()\n'},
+                            [self.function('host'), self.function('child')])
+        self.assertEqual(rows['host']['dependency_ids'], ['service'])
+        self.assertFalse(rows['host']['unresolved_targets'])
+
     def test_rebinding_import_does_not_reach_original(self):
         rows = self.inspect({'main.py': 'from tasks import child\ndef host():\n    child = print\n    child()\n',
                              'tasks.py': 'def child():\n    return 1\n'},
@@ -170,6 +190,43 @@ class DependencyClosureChecks(unittest.TestCase):
                              'def host():\n    child()\n'}, [self.function('host'), self.function('child')])
         self.assertEqual(rows['host']['dependency_ids'], [])
         self.assertEqual(rows['host']['unresolved_targets'][0]['reason'], 'decorated_call_target_unresolved')
+
+    def test_known_external_factory_lazy_singleton_keeps_original_call_chain(self):
+        for guard in ('not pipeline', 'pipeline is None'):
+            with self.subTest(guard=guard):
+                source = ('import spacy\npipeline = None\ndef sentences(text):\n    global pipeline\n'
+                          f'    if {guard}:\n        pipeline = spacy.load("test_pipeline")\n'
+                          '    return pipeline(text)\ndef host():\n    sentences("first")\n    sentences("second")\n')
+                rows = self.inspect({'main.py': source}, [self.function('host')], [])
+                self.assertEqual(rows['host']['status'], 'CHECKED', rows['host'])
+                protocols = rows['host']['external_protocols']
+                self.assertEqual({row['rule'] for row in protocols}, {'module-lazy-external-singleton/1',
+                    'external-callable-factory/1', 'external-factory-result-call/1'})
+                factory = next(row for row in protocols if row['rule'] == 'external-callable-factory/1')
+                self.assertEqual(factory['resource']['name'], 'test_pipeline')
+                self.assertEqual(factory['resource']['status'], 'ENVIRONMENT_NOT_CHECKED')
+
+    def test_lazy_global_protocol_rejects_other_writers_factories_and_module_patches(self):
+        source = ('import spacy\npipeline = None\ndef sentences(text):\n    global pipeline\n'
+                  '    if not pipeline:\n        pipeline = spacy.load("test_pipeline")\n'
+                  '    return pipeline(text)\ndef host():\n    sentences("text")\n')
+        cases = [
+            ({'main.py': source.replace('spacy.load(', 'spacy.other(')}),
+            ({'main.py': source.replace('"test_pipeline"', 'unknown_model')}),
+            ({'main.py': source + '\ndef reset():\n    global pipeline\n    pipeline = unknown\n'}),
+            ({'main.py': source, 'patch.py': 'import spacy as sdk\nsdk.load = replacement\n'}),
+            ({'main.py': source, 'patch.py': 'import main as original\noriginal.pipeline = unknown\n'}),
+            ({'main.py': source, 'patch.py': 'import main as original\nsetattr(original, "pipeline", unknown)\n'}),
+            ({'main.py': source.replace('    if not pipeline:', '    before = pipeline(text)\n    if not pipeline:')}),
+            ({'main.py': source + '\ndef expose():\n    return pipeline\n'}),
+            ({'main.py': source + '\ndef configure():\n    pipeline.add_pipe(callback)\n'}),
+        ]
+        for files in cases:
+            with self.subTest(files=files):
+                row = self.inspect(files, [self.function('host')], [])['host']
+                self.assertEqual(row['status'], 'MISSING', row)
+                self.assertFalse(any(protocol['rule'] == 'module-lazy-external-singleton/1'
+                                     for protocol in row['external_protocols']))
 
     def test_frozen_package_root_resolves_absolute_internal_import(self):
         rows = self.inspect({'project/src/__init__.py': '', 'project/src/host.py':
@@ -385,6 +442,59 @@ class DependencyClosureChecks(unittest.TestCase):
                 rows = self.inspect({'main.py': source}, [self.function('host'), self.function('child'), self.function('other')],
                                     [dict(id='service', entry_ids=['child']), dict(id='other-service', entry_ids=['other'])])
                 self.assertEqual(rows['host']['dependency_ids'], ['service' if expected == 'child' else 'other-service'])
+
+    def test_lambda_callbacks_and_branch_bindings_keep_all_targets(self):
+        prefix = ('def child():\n    pass\ndef other():\n    pass\n'
+                  'def host(choice):\n    def attempt(callback):\n        callback()\n')
+        source = prefix + ('    if choice:\n        run = lambda: child()\n'
+                           '    else:\n        run = lambda: other()\n    attempt(run)\n')
+        rows = self.inspect({'main.py': source}, [self.function('host'), self.function('child'), self.function('other')],
+                            [dict(id='service', entry_ids=['child']), dict(id='other-service', entry_ids=['other'])])
+        self.assertEqual(rows['host']['dependency_ids'], ['service', 'other-service'])
+        self.assertEqual(rows['host']['unresolved_targets'], [])
+        source = source.replace('run = lambda: other()', 'run = unknown')
+        rows = self.inspect({'main.py': source}, [self.function('host'), self.function('child')])
+        self.assertEqual(rows['host']['dependency_ids'], ['service'])
+        self.assertTrue(any(u['reason'] == 'dynamic_call_target_unresolved' for u in rows['host']['unresolved_targets']))
+
+    def test_attribute_call_evaluates_its_factory_once(self):
+        source = ('items = []\ndef child():\n    pass\nclass Job:\n    def run(self):\n        pass\n'
+                  'def factory():\n    items.append(child)\n    return Job()\n'
+                  'def host():\n    factory().run()\n    items[1]()\n')
+        rows = self.inspect({'main.py': source}, [self.function('host'), self.function('child')])
+        self.assertEqual(rows['host']['dependency_ids'], [])
+        self.assertTrue(rows['host']['unresolved_targets'])
+
+    def test_call_summary_reuse_preserves_changed_callbacks_and_mutable_returns(self):
+        source = ('def child():\n    pass\ndef other():\n    pass\n'
+                  'def apply(callback):\n    callback()\n    return 1\n'
+                  'def host():\n    apply(child)\n    apply(child)\n    apply(other)\n')
+        rows = self.inspect({'main.py': source}, [self.function('host'), self.function('child'), self.function('other')],
+                            [dict(id='service', entry_ids=['child']), dict(id='other-service', entry_ids=['other'])])
+        self.assertGreater(rows['host']['reused_call_summaries'], 0)
+        self.assertEqual(rows['host']['dependency_ids'], ['service', 'other-service'])
+        source = ('def child():\n    pass\ndef make():\n    return []\n'
+                  'def host():\n    first = make()\n    first.append(child)\n    second = make()\n    second[0]()\n')
+        rows = self.inspect({'main.py': source}, [self.function('host'), self.function('child')])
+        self.assertEqual(rows['host']['dependency_ids'], [])
+        self.assertTrue(rows['host']['unresolved_targets'])
+
+    def test_call_summary_observes_instance_mutation(self):
+        source = ('def child():\n    pass\ndef other():\n    pass\n'
+                  'class Job:\n    def __init__(self):\n        self.callback = child\n'
+                  '    def run(self):\n        self.callback()\n'
+                  'def host():\n    job = Job()\n    job.run()\n    job.callback = other\n    job.run()\n')
+        rows = self.inspect({'main.py': source}, [self.function('host'), self.function('child'), self.function('other')],
+                            [dict(id='service', entry_ids=['child']), dict(id='other-service', entry_ids=['other'])])
+        self.assertEqual(rows['host']['dependency_ids'], ['service', 'other-service'])
+
+    def test_global_path_choice_requires_explicit_path_or_none(self):
+        prefix = 'from pathlib import Path\nROOT = Path("default")\ndef configure(raw):\n    global ROOT\n'
+        for expression, unknown in (('optional or Path("default")', False), ('raw or Path("default")', True)):
+            source = prefix + ('    optional = Path(raw) if raw else None\n    ROOT = ' + expression + '\n'
+                               'def host(raw):\n    configure(raw)\n    ROOT.read_text()\n')
+            rows = self.inspect({'main.py': source}, [self.function('host')], [])
+            self.assertEqual(bool(rows['host']['unresolved_targets']), unknown)
 
 
 if __name__ == '__main__':

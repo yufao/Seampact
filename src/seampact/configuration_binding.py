@@ -487,3 +487,8 @@ def configuration_override_flow(inspector, entry, mapping, evidence):
     except (Unsupported, ValueError, TypeError, KeyError, SyntaxError, OSError) as error:
         return dict(proved=False, issue_code='evidence_incomplete' if proof.missing else 'configuration_flow_unsupported',
                     reason=str(error), missing=proof.missing, trace=proof.trace, facts=proof.facts)
+
+
+def configuration_file_flow(inspector, entry, mapping, evidence):
+    from .configuration_file_flow import configuration_file_flow as prove
+    return prove(inspector, entry, mapping, evidence)

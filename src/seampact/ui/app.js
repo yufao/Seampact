@@ -21,6 +21,7 @@ let historySearchTimer;
 const preparationSummaries = new Map();
 const preparationErrors = new Map();
 const analysisSubmitting = new Set();
+const sourceUpdateOptions = new Map();
 const sourceUpdating = new Set();
 const revisionDetails = new Map();
 const revisionDrafts = new Map();
@@ -2688,11 +2689,16 @@ function renderAnalyses() {
     const jobs = inspectPage ? history.length ? history : [null] :
       [analyses.find(item => item.id === harness.analysis_id) || history[0] || null];
     const steps = new Map([...history].reverse().map((job, index) => [job.id, index + 1]));
-    if (inspectPage && !selectedSource()) {
-      const heading = node('div', undefined, 'source-list-heading');
-      heading.append(node('h3', harness.name || harness.address || harness.id),
-        node('span', jobs.length + ' 次操作', 'card-meta'));
-      root.append(heading);
+    let target = root;
+    if (inspectPage) {
+      const latest = history.find(job => ['RUNNING', 'QUEUED', 'CANCELLING'].includes(job.status)) ||
+        history.find(job => job.id === harness.analysis_id) || history[0];
+      const running = history.filter(job => ['RUNNING', 'QUEUED', 'CANCELLING'].includes(job.status)).length;
+      const sourceGroup = disclosure('analysis-source/' + harness.id, harness.name || harness.address || harness.id, {
+        status: harness.status === 'DETACHED' ? 'DETACHED' : latest?.status || harness.status,
+        meta: history.length + ' 次操作' + (running ? ' · ' + running + ' 次进行中' : ''),
+        error: latest?.error || (!latest ? harness.error : null), open: Boolean(selectedSource())});
+      sourceGroup.classList.add('source-disclosure'); root.append(sourceGroup); target = sourceGroup;
     }
     for (const job of jobs) {
     const card = node('article', undefined, 'status-card');
@@ -2710,6 +2716,12 @@ function renderAnalyses() {
     }
     if (job?.rounds !== undefined) card.append(node('p', '分析模型响应 ' + job.rounds + ' 轮', 'card-meta'));
     if (job) { card.append(analysisProgress(job)); const context = contextDetails(job); if (context) card.append(context); }
+    if (job?.kind === 'SOURCE_UPDATE_ANALYSIS' && job.update_installation?.status === 'INSTALLED') {
+      card.append(node('p', '新版本已安装；各入口的检查和运行状态请查看分析结果。', 'card-note'));
+    } else if (job?.kind === 'SOURCE_UPDATE_ANALYSIS' && job.update_installation?.status === 'NOT_INSTALLED') {
+      card.append(node('p', '新版本未安装，原版本保留。原因：' +
+        (job.update_installation.reason || '未满足安装条件'), 'card-note'));
+    }
     const outcome = job?.outcome || job?.submitted?.report?.outcome;
     const outcomeText = {NEEDS_CANDIDATE_REPAIR: '分析已结束，候选或源码证据还需修正。',
       AWAITING_EXTERNAL_CONDITIONS: '分析已结束，仍有平台支持、资源或运行条件待补齐。',
@@ -2784,6 +2796,24 @@ function renderAnalyses() {
     }
     const actions = node('div', undefined, 'harness-actions');
     if (!inspectPage) actions.append(inspectLink('analyses', {harness: harness.id}));
+    if (inspectPage && job?.id === harness.analysis_id && job?.status === 'COMPLETED' && job.submitted?.candidate) {
+      const update = node('button', '检查更新并分析', 'secondary-button');
+      update.title = harness.revision_ref ? '检查引用：' + harness.revision_ref : '检查默认分支';
+      update.disabled = harness.status === 'DETACHED' || analysisSubmitting.has(harness.id) ||
+        (state.analyses || []).some(item => item.harness_id === harness.id && ['RUNNING', 'CANCELLING'].includes(item.status)) ||
+        !isReady(state.models?.analysis);
+      update.onclick = async () => {
+        if (analysisSubmitting.has(harness.id)) return;
+        analysisSubmitting.add(harness.id); update.disabled = true;
+        try {
+          const result = await api('/api/analyze-update', {harness_id: harness.id});
+          showNotice(result.update_status === 'UNCHANGED' ? '来源没有变化，未重复分析。' :
+            '已开始分析新版本；原版本继续保留，检查通过后才会替换。');
+        } catch (error) { showNotice(error.message); }
+        finally { analysisSubmitting.delete(harness.id); await refresh(); }
+      };
+      actions.append(update);
+    }
     if (job?.id) actions.append(analysisExportButton(job));
     const cancel = cancelAnalysisButton(harness, job);
     if (cancel) actions.append(cancel);
@@ -2823,8 +2853,7 @@ function renderAnalyses() {
       job?.resumable ? '可继续此分析，展开操作' : active ? '展开查看进度与取消操作' : null].filter(Boolean).join(' · ');
     const requestedRevision = inspectQuery.get('revision');
     const revisionTarget = requestedRevision && (state.analysis_revisions || []).some(item => item.id === requestedRevision && item.base_analysis_id === job?.id);
-    root.append(foldCard(card, 'analysis/' + harness.id + '/' + (job?.id || 'source'),
-      inspectPage && !selectedSource() ? (harness.name || harness.id) + ' · ' + title : title,
+    target.append(foldCard(card, 'analysis/' + harness.id + '/' + (job?.id || 'source'), title,
       {status: harness.status === 'DETACHED' ? 'DETACHED' : job?.status || harness.status, meta, error,
         open: Boolean(selectedSource() && current || revisionTarget || location.hash === '#analysis-revision-' + job?.id)}));
     }
@@ -3817,8 +3846,19 @@ function renderHarnesses() {
     if (harness.error) card.append(node('p', textValue(harness.error), 'card-note message-error'));
     const job = (state.analyses || []).find(item => item.id === harness.analysis_id);
     const detached = harness.status === 'DETACHED';
-    const busy = analysisSubmitting.has(harness.id) || ['RUNNING', 'QUEUED', 'ANALYZING', 'CANCELLING'].includes(String(job?.status || harness.status).toUpperCase());
+    const activeJob = (state.analyses || []).find(item => item.harness_id === harness.id && ['RUNNING', 'QUEUED', 'CANCELLING'].includes(item.status));
+    const busy = Boolean(activeJob) || analysisSubmitting.has(harness.id) || ['RUNNING', 'QUEUED', 'ANALYZING', 'CANCELLING'].includes(String(job?.status || harness.status).toUpperCase());
     const action = node('button', busy ? '分析中…' : '分析 Harness', 'secondary-button');
+    const updateOption = document.createElement('input');
+    updateOption.type = 'checkbox';
+    updateOption.checked = sourceUpdateOptions.get(harness.id) || false;
+    updateOption.disabled = detached || busy || sourceUpdating.has(harness.id);
+    updateOption.onchange = () => sourceUpdateOptions.set(harness.id, updateOption.checked);
+    const updateLabel = node('label', undefined, 'form-note');
+    updateLabel.title = harness.revision_ref ? '检查引用：' + harness.revision_ref : '检查默认分支';
+    updateOption.title = updateLabel.title;
+    updateLabel.setAttribute('aria-disabled', String(updateOption.disabled));
+    updateLabel.append(updateOption, document.createTextNode(' 分析前检查上游更新；无变化时不重复分析'));
     action.type = 'button';
     action.disabled = detached || busy || harness.target_runtime?.status === 'PREPARING' || deploymentSubmitting.has('source/' + harness.id) ||
       sourceUpdating.has(harness.id) || !isReady(state.models?.analysis);
@@ -3826,22 +3866,23 @@ function renderHarnesses() {
     action.onclick = async () => {
       analysisSubmitting.add(harness.id);
       action.disabled = true;
+      updateOption.disabled = true;
+      updateLabel.setAttribute('aria-disabled', 'true');
       action.textContent = '正在提交…';
       try {
-        await api('/api/analyze', {harness_id: harness.id});
-        showNotice('Harness 分析已开始，来源与分析状态会持续更新。');
+        const result = await api(updateOption.checked ? '/api/analyze-update' : '/api/analyze', {harness_id: harness.id});
+        showNotice(result.update_status === 'UNCHANGED' ? '来源没有变化，未重复分析。' : 'Harness 分析已开始，来源与分析状态会持续更新。');
       } catch (error) { showNotice(error.message); }
       finally { analysisSubmitting.delete(harness.id); await refresh(); }
     };
     const actions = node('div', undefined, 'harness-actions');
     actions.append(action);
-    const activeJob = (state.analyses || []).find(item => item.harness_id === harness.id && ['RUNNING', 'CANCELLING'].includes(item.status));
     const cancel = cancelAnalysisButton(harness, activeJob);
     if (cancel) actions.append(cancel);
     actions.append(inspectLink('analyses', {harness: harness.id}), sourceButton(harness), deleteSourceButton(harness));
     if (detached) card.append(node('p', '已摘除；重新接入会使用已有分析，不重复调用分析模型。', 'card-note'));
     if (!isReady(state.models?.analysis)) actions.append(node('span', '先配置分析模型', 'form-note'));
-    card.append(actions);
+    card.append(updateLabel, actions);
     sourceEnvironment(card, harness);
     harnessDependencies(card, harness);
     root.append(card);

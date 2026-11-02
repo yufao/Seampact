@@ -3,6 +3,7 @@
 import json
 import sqlite3
 import threading
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -16,6 +17,7 @@ class Store:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.lock = threading.RLock()
+        self._transaction_depth = 0
         self.db = sqlite3.connect(self.path, check_same_thread=False)
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute("PRAGMA synchronous=FULL")
@@ -25,9 +27,23 @@ class Store:
               PRIMARY KEY(kind,id));
         """)
 
+    @contextmanager
+    def transaction(self):
+        with self.lock:
+            outer = self._transaction_depth == 0
+            self._transaction_depth += 1
+            try:
+                if outer:
+                    with self.db:
+                        yield
+                else:
+                    yield
+            finally:
+                self._transaction_depth -= 1
+
     def save(self, kind, identity, data, event=None):
         encoded = json.dumps(data, ensure_ascii=False, allow_nan=False)
-        with self.lock, self.db:
+        with self.transaction():
             self.db.execute("INSERT OR REPLACE INTO documents VALUES (?,?,?)",
                             (kind, identity, encoded))
         if event in {"analysis_started", "analysis_finished", "call_enabled", "started", "physically_retired"}:
@@ -36,7 +52,7 @@ class Store:
     def create(self, kind, identity, data):
         """Create an immutable identity without replacing a previous run."""
         encoded = json.dumps(data, ensure_ascii=False, allow_nan=False)
-        with self.lock, self.db:
+        with self.transaction():
             self.db.execute("INSERT INTO documents VALUES (?,?,?)", (kind, identity, encoded))
 
     def get(self, kind, identity):
@@ -69,7 +85,7 @@ class Store:
         return [json.loads(row[0]) for row in rows]
 
     def delete(self, kind, identity):
-        with self.lock, self.db:
+        with self.transaction():
             self.db.execute("DELETE FROM documents WHERE kind=? AND id=?", (kind, identity))
 
     def events(self, after=0):

@@ -39,6 +39,29 @@ class ResourceFlowChecks(unittest.TestCase):
         self.assertEqual(candidate, original)
         return result
 
+    def test_sdk_class_attributes_are_not_client_constructors(self):
+        for factory, expected in [('OpenAI', 'MAPPING_CHECKED'), ('OpenAI.made_up', 'MISSING'),
+                                  ('OpenAIFake', 'MISSING')]:
+            with self.subTest(factory=factory):
+                files = {'main.py': 'from helper import request\ndef run(url):\n    return request(url)\n',
+                         'helper.py': 'from openai import OpenAI, OpenAIFake\ndef request(endpoint):\n    return '
+                             + factory + '(base_url=endpoint)\n'}
+                result = self.check_flow(files)
+                self.assertEqual(result['status'], expected, result.get('reason'))
+
+    def test_sdk_model_call_requires_a_created_client_and_a_known_operation(self):
+        for client, operation, expected in [('OpenAI()', 'chat.completions.create', 'MAPPING_CHECKED'),
+                                            ('OpenAI', 'chat.completions.create', 'MISSING'),
+                                            ('OpenAI()', 'made_up', 'MISSING')]:
+            with self.subTest(client=client, operation=operation):
+                files = {'main.py': 'from openai import OpenAI\nclass Host:\n'
+                    '    def __init__(self, model_name):\n        self.client = ' + client + '\n'
+                    '        self.model_name = model_name\n'
+                    '    def run(self):\n        return self.client.' + operation
+                    + '(model=self.model_name)\n'}
+                result = self.check_flow(files, constructor=True, field='model', parameter='model_name')
+                self.assertEqual(result['status'], expected, result.get('reason'))
+
     def test_imported_function_forwarding_and_local_alias(self):
         files = {"main.py": "from helper import query\ndef run(url):\n    endpoint = url\n    return query(endpoint)\n",
                  "helper.py": "import requests as transport\ndef query(endpoint):\n    return transport.post(endpoint)\n"}

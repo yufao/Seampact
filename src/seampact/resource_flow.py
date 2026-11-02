@@ -25,6 +25,7 @@ class Target:
 @dataclass
 class External:
     name: str
+    instance: bool = False
 
 
 @dataclass
@@ -228,7 +229,7 @@ class ParameterFlow:
                 name = parent.name + "." + expression.attr
                 if any(name == changed or name.startswith(changed + ".") for changed in self.invalid_external):
                     return None
-                return External(name)
+                return External(name, instance=parent.instance)
             if isinstance(parent, Instance):
                 if expression.attr in parent.attributes:
                     return parent.attributes[expression.attr]
@@ -259,8 +260,15 @@ class ParameterFlow:
                     return True
         if name in {"litellm.completion", "litellm.acompletion", "litellm.batch_completion"}:
             keys = {"base_url", "api_base"} if field == "base_url" else {"api_key"} if field == "credential" else {field}
-        elif name.startswith(("openai.OpenAI", "openai.AsyncOpenAI", "openai.AzureOpenAI", "openai.AsyncAzureOpenAI")):
-            keys = {"api_key"} if field == "credential" else {field}
+        elif name in {"openai.OpenAI", "openai.AsyncOpenAI", "openai.AzureOpenAI", "openai.AsyncAzureOpenAI"} and not function.instance:
+            # A class attribute is not a client constructor, and model is an
+            # operation parameter rather than an OpenAI constructor parameter.
+            keys = {"api_key"} if field == "credential" else {"base_url"} if field == "base_url" else set()
+        elif function.instance and any(name == owner + "." + method
+                for owner in ("openai.OpenAI", "openai.AsyncOpenAI", "openai.AzureOpenAI", "openai.AsyncAzureOpenAI")
+                for method in ("chat.completions.create", "chat.completions.parse", "beta.chat.completions.parse",
+                               "completions.create", "embeddings.create", "responses.create")):
+            keys = {"model"} if field == "model" else {field.split(".", 1)[1]} if field.startswith("parameters.") else set()
         else:
             return False
         return any(matches(keywords.get(k)) for k in keys)
@@ -313,7 +321,7 @@ class ParameterFlow:
         if isinstance(function, External):
             if function.name in {"openai.OpenAI", "openai.AsyncOpenAI", "openai.AzureOpenAI", "openai.AsyncAzureOpenAI",
                                  "httpx.Client", "httpx.AsyncClient"}:
-                return function
+                return External(function.name, instance=True)
         receiver = None
         if isinstance(function, tuple):
             function, receiver = function

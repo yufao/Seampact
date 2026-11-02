@@ -13,7 +13,8 @@ from .intake import inside_platform_checkout
 from .store import now
 from .resource_flow import parameter_flow
 from .configuration_flow import environment_flow, configuration_facts
-from .configuration_binding import configuration_override_flow
+from .configuration_binding import configuration_override_flow, configuration_file_flow
+from .frozen_inheritance import FrozenInheritance
 from .process_environment import process_environment_flow
 from .resource_origins import resource_origin_facts
 
@@ -26,6 +27,7 @@ mapping可提供自己的evidence:[{path,unit:"file",start,end}]；提供时独�
 沿原目标的构造、初始化及请求路径检查依赖，区分基座、adapter、processor/checkpoint等实际资源及其原配置关系，不把其中一项代替整组。required按原owner实际的无条件加载或分支条件填写；拆分不能省略原初始化必需工作。最终候选应保留预处理发现且仍影响所选入口的需求；因入口范围改变而不再适用的需求须在missing说明源码依据，不能静默丢弃。资源未发现完整、映射未覆盖及资源尚未配置要分别说明。
 dependency格式：{id:"ASCII需求标识",kind:"service或weight",description:"实际用途",configurable:true或false,required:true或false,entry_ids:["依赖它的候选entry.id"],read_time:"constructor或call或process_start",owner_scope:"原对象/模块/请求作用域说明",evidence:[{path,unit:"file",start,end}],mappings:[{entry_id,location:"constructor.arguments或entry.fixed_arguments或initializers.原方法或binding_program.arguments或environment",parameter:"原真实参数/变量",field:"base_url或model或credential或path或parameters.非敏感参数"}]}。
 service与本地weight不得互换。原本地from_pretrained/torch.load等必须保留原模型对象路径；不能因为有API连接而改成HTTP或手写包装。service的base_url与model等只填真实原配置入口；credential只能映射到源码可核对的原认证调用参数，秘密从不进入分析上下文。原代码只在导入读环境时，当前同进程宿主不能临时改os.environ；保留MISSING。environment仅支持原CLI process_start且有原os.getenv/os.environ.get依据，值经子进程env传递不进命令行。
+需求范围按所选入口的真实调用及资源作用域核对。原客户端只请求已存在的API服务时，model/model_path若是该服务的模型名不能当作本进程权重加载；仓库内另有本地服务启动脚本，须登记其实际作用，但不能无依据把它的本地权重要求附加给仅使用API的入口。当前入口确实执行本地模型加载或负责启动该服务时，原权重及初始化义务仍须保留。
 environment映射的read_time描述平台注入边界，应为process_start；即使原子进程后来在构造器或请求方法消费该变量，也不能把这个注入时点填成constructor/call。原实际消费位置继续写在owner_scope和源码证据中。CLI候选的错误read_time和缺失/不匹配资源引用属于候选可修项；修正后仍须完整核对配置传递，不自动通过。
 每个mapping的evidence必须同时覆盖原参数定义和该参数进入原调用的位置；base_url/model/parameters.xxx须有同名原调用keyword，base_url也可进入原requests/httpx等HTTP调用的URL位置参数；credential须有原认证keyword（api_key/token/password/access_token/auth_token）。权重path须进入原from_pretrained/torch.load/safetensors加载调用；原构造参数还允许同一作用域顺序中的单赋值局部变量或receiver直接属性，以及已核对pathlib.Path导入的透明包装、参数唯一一次同名Path(parameter)规范化、已为Path的值与字面相对子路径的/连接、一层固定等长tuple/list字面解包。构造函数内已核对且未遮蔽的joblib.load也可作原加载依据。evidence须覆盖参数、每次赋值及加载调用。除此以外的重赋、删除、动态下标、分支赋值、嵌套作用域、跨方法或自定义转换不属于该有限规则；不推断任意对象属性或动态配置数据流，覆盖不了则保留具体MISSING。CLI environment须覆盖原环境读取，服务或加载调用也须有上述字段依据。依赖引用必须实际出现在所映射的entry字段，不能仅列mappings。
 参数值可引用用户所选资源：{"$dependency":{"id":"需求id","field":"base_url/model/credential/path/parameters.xxx"}}，只能放在该需求mappings已列的原参数位置。引用不是原函数参数类型；运行边界由引擎解析为原值。资源未选择仍提交真实需求与MISSING，不自选连接、模型或假权重。
@@ -35,6 +37,7 @@ resource_catalog只提供非敏感连接、权重状态及已有选择；配置�
 新增有限参数传递规则：可核对冻结 Python 中唯一且未遮蔽的函数/构造器调用，连接实参—形参、单赋值别名和同一接收者的单写属性，最多追踪8层；对象后续方法须从当前原入口实际调用到达，不能引用未调用方法冒充使用。每步参数、赋值和完整调用都要有evidence，检查反馈给出缺失的源码范围。解析真实导入后支持LiteLLM的api_base对应base_url，以及原OpenAI客户端中实际model字段/字面键请求字典；不改原SDK字段。动态目标、覆盖、多来源分支值、别名逃逸或循环来源不能确定时保留parameter_flow_unsupported；这只核对资源使用关系，不授予跳过、并行或生命周期许可。
 资源反馈resource_origins区分模型/附加checkpoint、Hub或本地目录、cache及下载目的地。from_pretrained的Hub标识不能当作仓库下固定路径，cache_dir不能当作模型文件；原分支选模型的配置参数不能直接替换成路径。有现成原路径参数时绑定已检查的本地文件/目录；只能经Hub/复杂配置消费的来源保留resource_locator_unsupported，不下载或改原算法。原构造后加载权重、设备和模式设置须沿原initializers或已支持的完整B-CALL保留；缺口不能靠删除依赖或随机初始化消除。
 CLI environment可沿唯一真实导入/调用追踪原模块单赋值常量、无自定义方法的普通dataclass字段及原对象单写属性；仅真实SDK字段或urllib.request.Request进入urlopen的URL、JSON model字段、Bearer Authorization可作消费者证据。各导入、环境读取、字段、赋值和完整调用均须覆盖。配置工厂或客户端名称本身不证明消费；未调用方法、动态读取、环境覆盖、遮蔽及缺失源文件保留具体MISSING。configuration_flow中的SOURCE_SIGNAL只记录配置来源、合并/条件覆盖次序和原字段加载事实，selected_value:UNRESOLVED不表示YAML/YACS值已求解，不可据此放行或将Hub标识当本地路径。原CLI权重可在entry.fixed_arguments声明whole-placeholder资源引用，mapping另填configuration_key:"原点分字段"及cli_override:{parameter:"原argparse.REMAINDER参数"}；command最后须为该字面字段和{资源参数占位符}，read_time须为process_start。检查器须核对真实YACS导入、原字符串键声明、原工作目录的冻结YAML、最后merge_from_list及该字段到torch.load，无后续覆盖或动态剩余选项。此前YAML值不在平台执行，原CLI保持原加载/合并/推理。
+原CLI若通过命名参数读取冻结YAML并以yaml.safe_load加载嵌套服务字段，可声明entry.configuration={原CLI参数:{原嵌套键:资源引用}}，entry.fixed_arguments中的该参数保留冻结YAML相对原cwd的路径，command以{该参数}整体占位。mapping使用location:"configuration",parameter:"原CLI参数",parameter_path:["原嵌套键",...],configuration_file:"同一YAML相对原cwd的路径",field:"base_url/model/credential/parameters.xxx"，read_time:"process_start"。证据覆盖原argparse选项、open/safe_load、完整冻结YAML及字段到实际服务消费者；原线程池submit的唯一同源callback也须追踪，不能用未调用定义证明消费。仅支持可唯一定位的单行标量和普通块映射；重复键、别名/标签、多行字段、动态键或覆盖未决保留MISSING。引擎运行时仅在私有临时副本替换已证资源叶子，其余原配置及原加载流程保留；不在命令参数暴露凭据，不改原文件。原base_url字段如在消费者前拼接唯一字面路径后缀，检查记录该后缀；所选服务地址已带同一后缀时，临时值去除一次，仍由原代码拼接一次。
 """
 
 
@@ -108,11 +111,17 @@ def _callable(inspector, entry, location):
         matches = [n for n in getattr(node, "body", []) if isinstance(n,
             (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and n.name == part]
         if len(matches) != 1:
+            if cell == "file" and hasattr(inspector, "files") and isinstance(symbol, str) and len(symbol.split(".")) == 2:
+                _, method = FrozenInheritance(inspector).resolve(path, symbol)
+                return method.node, method.path, "file"
             raise ValueError("dependency parameter has no unique original callable")
         node = matches[0]
     if isinstance(node, ast.ClassDef):
         matches = [n for n in node.body if isinstance(n, ast.FunctionDef) and n.name == "__init__"]
         if len(matches) != 1:
+            if cell == "file" and hasattr(inspector, "files"):
+                _, method = FrozenInheritance(inspector).resolve(path, node.name + ".__init__")
+                return method.node, method.path, "file"
             raise ValueError("dependency constructor needs its explicit original __init__")
         node = matches[0]
     if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -150,6 +159,8 @@ def _destination(entry, location, parameter, parameter_path=()):
         values = (entry.get("binding_program") or {}).get("arguments", {})
     elif location == "environment":
         values = entry.get("environment", {})
+    elif location == "configuration":
+        values = entry.get("configuration", {})
     elif location.startswith("initializers."):
         matches = [item for item in entry.get("initializers", []) if item.get("symbol") == location[len("initializers."):]]
         if len(matches) != 1:
@@ -649,7 +660,7 @@ def _mapping_shape(entries, row, mapping):
         raise ValueError("dependency mapping entry is absent")
     location, parameter, field = mapping.get("location", ""), mapping.get("parameter"), mapping.get("field")
     if not isinstance(location, str) or (location not in {
-            "constructor.arguments", "entry.fixed_arguments", "binding_program.arguments", "environment"}
+            "constructor.arguments", "entry.fixed_arguments", "binding_program.arguments", "environment", "configuration"}
             and not location.startswith("initializers.")):
         raise ValueError("unsupported original dependency parameter location")
     if not isinstance(parameter, str) or not parameter.isidentifier():
@@ -663,8 +674,10 @@ def _mapping_shape(entries, row, mapping):
     if not isinstance(keys, list) or len(keys) > 8 or any(
             not isinstance(key, str) or not key or key == "$dependency" for key in keys):
         raise ValueError("dependency parameter_path must contain literal dictionary string keys")
-    if keys and (row["kind"] != "service" or location != "entry.fixed_arguments"):
+    if keys and (row["kind"] != "service" or location not in {"entry.fixed_arguments", "configuration"}):
         raise ValueError("dictionary resource fields currently require an original function argument and service")
+    if location == "configuration" and (row["kind"] != "service" or not keys):
+        raise ValueError("CLI configuration mappings require a service and its original scalar key path")
     return entry, location, parameter, field, keys
 
 
@@ -679,6 +692,16 @@ def _check_mapping(inspector, entries, identity, row, mapping, evidence):
     if ref != {"id": identity, "field": field}:
         raise MappingGap("dependency reference does not occupy its declared original destination", "candidate_incomplete",
             "核对原目标位置的资源引用 id/field 与这条映射一致，再完整重检。", ["mappings"])
+    if location == "configuration":
+        if row.get("read_time") != "process_start":
+            raise MappingGap("CLI configuration injection must declare read_time=process_start", "candidate_incomplete",
+                "将原 CLI 配置注入时点声明为 process_start，再核对原配置文件、字段和调用。", ["read_time"])
+        flow = configuration_file_flow(inspector, entry, mapping, evidence)
+        if not flow["proved"]:
+            raise MappingGap(flow.get("reason") or "configuration file lacks its original service consumer",
+                flow["issue_code"], "核对原 CLI 参数、冻结 YAML、原加载器及服务消费者；未支持的覆盖保持缺口。",
+                ["mappings.evidence"] if flow["missing"] else ["mappings"], flow["missing"] or flow["facts"])
+        return flow
     if "configuration_key" in mapping or "cli_override" in mapping:
         if row.get("read_time") != "process_start":
             raise MappingGap("CLI configuration injection must declare read_time=process_start", "candidate_incomplete",
@@ -819,6 +842,7 @@ def check_requirements(inspector, candidate):
                     proof = _check_mapping(inspector, entries, identity, row, mapping,
                                            mapping.get("evidence", evidence))
                     proofs.setdefault(mapping["entry_id"], []).append(dict(parameter=mapping["parameter"],
+                        parameter_path=list(mapping.get("parameter_path", [])),
                         field=mapping["field"], location=mapping["location"], proof=proof))
                 except (ValueError, KeyError, TypeError, SyntaxError, OSError) as error:
                     reason = str(error) if isinstance(error, ValueError) else "original source parameter mapping could not be checked"

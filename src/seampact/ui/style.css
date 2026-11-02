@@ -500,9 +500,6 @@ body:not(.inspect-page) .research-heading h3 { font-size: 13px; }
 .context-details { margin: 8px 0; }
 .context-details summary { cursor: pointer; color: var(--muted); font-size: 12px; }
 
-.source-list-heading { display: flex; align-items: baseline; flex-wrap: wrap; gap: 8px 14px; margin: 8px 0 0; }
-.source-list-heading h3 { margin: 0; font-size: 15px; overflow-wrap: anywhere; }
-.source-list-heading .card-meta { margin: 0; }
 .item-disclosure { min-width: 0; border: 1px solid #cfdad3; border-radius: 10px; background: white; }
 .item-disclosure > summary { position: relative; padding: 16px 18px 16px 36px; cursor: pointer; list-style: none; }
 .item-disclosure > summary::-webkit-details-marker { display: none; }

@@ -164,6 +164,8 @@ def make_server(platform, port=8880, host="127.0.0.1", public_port=None):
                 elif path == "/api/analyze":
                     result = platform.analyze(body["harness_id"], body.get("preprocessing", "api"),
                                               body.get("preprocessing_id"))
+                elif path == "/api/analyze-update":
+                    result = platform.analyze_update(body["harness_id"])
                 elif path == "/api/analysis/resume":
                     result = platform.resume_analysis(body["analysis_id"])
                 elif path == "/api/analysis/cancel":

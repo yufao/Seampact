@@ -35,8 +35,10 @@ from .runtime import ProtocolError
 from .resource_origins import initialization_gaps
 from .execution_context import ContextIssue, explicit_import_roots, process_context
 from .completion import after_completion, before_completion, check_completion
+from .configuration_files import configuration_arguments, configuration_plans, redact_process_result
 from .store import now
 from .verification import check_candidate, source_unit
+from .frozen_inheritance import FrozenInheritance, InheritanceIssue
 
 
 _native_context_lock = threading.RLock()
@@ -377,6 +379,8 @@ class NativeBindings:
         self.approved_entries, self.function_owners, self.owner_keys = {}, {}, {}
         self.programs, self.program_helpers = {}, {}
         self.effective_bindings = {}
+        self.inheritance = FrozenInheritance(self.inspector)
+        self.inherited_entries = {}
         self.fixed_value_bindings = {}
         self.execution_contexts = {}
         self.import_contexts = {}
@@ -552,6 +556,10 @@ class NativeBindings:
                 source, evidence = "ORIGINAL_REQUEST_LITERAL", call_literals[parameter]["line"]
             elif parameter in defaults and _same_literal(value, defaults[parameter]["value"]):
                 source, evidence = "SIGNATURE_LITERAL_DEFAULT", defaults[parameter]["line"]
+            elif location == "entry.fixed_arguments" and parameter in entry.get("configuration", {}):
+                plan = configuration_plans(self.resource_binding, entry).get(parameter)
+                if plan and _same_literal(value, plan["original"]):
+                    source, evidence = "FROZEN_CONFIGURATION_FILE", plan["filename"]
             elif allow_resources and isinstance(value, str):
                 for resource in self.inspector.request.get("user_resources", []):
                     path = resource if isinstance(resource, str) else resource.get("path") if isinstance(resource, dict) else None
@@ -658,9 +666,28 @@ class NativeBindings:
         if entry["kind"] == "cli":
             return {}, {"x-native-type": {"module": "subprocess", "symbol": "CompletedProcess"}}
         path, cell = entry["path"], entry.get("unit", "file")
-        node, _ = _anchor(source_unit(self.inspector, path, cell), entry["symbol"])
+        node, _ = self._entry_anchor(entry)
+        inherited = self.inherited_entries.get(entry["id"])
+        if inherited:
+            path, cell = inherited["method"].path, "file"
         arguments = list(node.args.posonlyargs) + list(node.args.args) + list(node.args.kwonlyargs)
         return {arg.arg: self._port_schema(arg.annotation, path, cell) for arg in arguments}, self._port_schema(node.returns, path, cell)
+
+    def _entry_anchor(self, entry):
+        path, cell, symbol = entry["path"], entry.get("unit", "file"), entry["symbol"]
+        source = source_unit(self.inspector, path, cell)
+        parts = symbol.split(".")
+        if path.endswith(".py") and cell == "file" and len(parts) == 2:
+            classes = [node for node in native_ast(source).body if isinstance(node, ast.ClassDef) and node.name == parts[0]]
+            if len(classes) == 1 and any(not isinstance(base, ast.Name) or base.id != "object" for base in classes[0].bases):
+                try:
+                    chain, method = self.inheritance.resolve(path, symbol)
+                except InheritanceIssue as error:
+                    raise MissingBinding(str(error)) from error
+                self.inherited_entries[entry["id"]] = dict(chain=chain, method=method,
+                    facts=self.inheritance.facts(chain, method))
+                return method.node, chain[0].node
+        return _anchor(source, symbol)
 
     def native_matches(self, value, schema):
         if "anyOf" in schema:
@@ -1043,30 +1070,41 @@ class NativeBindings:
                     if isinstance(node, ast.Call) and isinstance(node.func, ast.Name))
         return False
 
-    def _owner_initialization(self, owner, entry, initialization_names):
+    def _owner_initialization(self, owner, entry, initialization_names, chain=None):
         methods = {node.name: node for node in owner.body if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))}
+        if chain:
+            methods = {node.name: node for item in reversed(chain) for node in item.node.body
+                       if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))}
         def attributes(names):
             reads, writes, visited = set(), set(), set()
-            pending = list(names)
+            pending = [methods[name] for name in names if name in methods]
             while pending:
-                name = pending.pop()
-                if name in visited or name not in methods:
+                method = pending.pop()
+                if id(method) in visited:
                     continue
-                visited.add(name)
-                method = methods[name]
+                visited.add(id(method))
                 positional = list(method.args.posonlyargs) + list(method.args.args)
                 receiver = positional[0].arg if positional else None
                 for node in ast.walk(method):
                     if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name) and node.value.id == receiver:
                         if node.attr in methods:
-                            pending.append(node.attr)
+                            pending.append(methods[node.attr])
                         elif isinstance(node.ctx, ast.Store):
                             writes.add(node.attr)
                         elif isinstance(node.ctx, ast.Load):
                             reads.add(node.attr)
+                    if (chain and isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                            and isinstance(node.func.value, ast.Call) and isinstance(node.func.value.func, ast.Name)
+                            and node.func.value.func.id == "super"):
+                        if node.func.value.args or node.func.value.keywords:
+                            raise MissingBinding("inherited initialization requires the original zero-argument super dispatch")
+                        index = next(index for index, item in enumerate(chain) if method in item.node.body)
+                        inherited = self.inheritance.method(chain[index + 1:], node.func.attr)
+                        if inherited:
+                            pending.append(inherited.node)
             return reads, writes
         known = {"__class__", "__dict__", "__weakref__"}
-        for node in owner.body:
+        for node in ([node for item in chain for node in item.node.body] if chain else owner.body):
             if isinstance(node, ast.Assign):
                 known.update(target.id for target in node.targets if isinstance(target, ast.Name))
             elif isinstance(node, ast.AnnAssign) and node.value is not None and isinstance(node.target, ast.Name):
@@ -1158,8 +1196,14 @@ class NativeBindings:
         if kind == "cli":
             if selected:
                 raise MissingBinding("CLI subprocess cannot bind internal gates to this in-process native owner")
+            if entry.get("configuration"):
+                if self.resource_binding is None:
+                    raise MissingBinding("CLI configuration resources need their checked original bindings")
+                configuration_plans(self.resource_binding, entry)
             self._fixed_values(entry, None, entry.get("fixed_arguments", {}), "entry.fixed_arguments")
             return self._cli_interface(entry)
+        if entry.get("configuration"):
+            raise MissingBinding("configuration file injection requires the original CLI process")
         if kind not in {"function", "method"}:
             raise MissingBinding("unsupported native entry kind")
         if not path.endswith((".py", ".ipynb")):
@@ -1169,7 +1213,11 @@ class NativeBindings:
         source = source_unit(self.inspector, path, cell)
         if path.endswith(".ipynb"):
             _notebook_definitions(self.inspector, path, cell, self.patches)
-        node, owner = _anchor(source, symbol)
+        node, owner = self._entry_anchor(entry)
+        inherited = self.inherited_entries.get(entry["id"])
+        chain = inherited["chain"] if inherited else None
+        if inherited and entry.get("binding_program"):
+            raise MissingBinding("inherited entries currently require their original constructor binding")
         if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             raise MissingBinding("native entry must identify an original callable")
         if any(isinstance(value, (ast.Yield, ast.YieldFrom)) for value in ast.walk(node)):
@@ -1212,13 +1260,19 @@ class NativeBindings:
                 raise MissingBinding("the original owner constructor must be identified")
             if any(ast.unparse(decorator).split(".")[-1] in {"staticmethod", "classmethod"} for decorator in node.decorator_list):
                 raise MissingBinding("static/class receiver needs a distinct native binding")
-            initializer = next((member for member in owner.body if isinstance(member, ast.FunctionDef) and member.name == "__init__"), None)
+            initializer_source = self.inheritance.method(chain, "__init__") if chain else None
+            initializer = (initializer_source.node if initializer_source else None) if chain else next(
+                (member for member in owner.body if isinstance(member, ast.FunctionDef) and member.name == "__init__"), None)
+            if initializer is not None and chain and initializer.decorator_list:
+                raise MissingBinding("inherited constructor decorator has no ordinary instance binding")
+            if isinstance(initializer, ast.AsyncFunctionDef):
+                raise MissingBinding("native constructor cannot be an async instance initializer")
             if any(isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef)) and member.name == "__new__" for member in owner.body):
                 raise MissingBinding("custom native allocation needs its original owner binding")
             if any(isinstance(member, ast.AsyncFunctionDef) and member.name == "__init__" for member in owner.body):
                 raise MissingBinding("native constructor cannot be an async instance initializer")
             if initializer is None:
-                if any(not isinstance(base, ast.Name) or base.id != "object" for base in owner.bases):
+                if not chain and any(not isinstance(base, ast.Name) or base.id != "object" for base in owner.bases):
                     raise MissingBinding("inherited native constructor parameters are not identified")
                 if constructor.get("arguments"):
                     raise MissingBinding("native object constructor accepts no supplied arguments")
@@ -1231,7 +1285,13 @@ class NativeBindings:
                 if initialization["symbol"].count(".") > 1 or ("." in initialization["symbol"] and initialization["symbol"].split(".")[0] != owner.name):
                     raise MissingBinding("original initializer belongs to a different native owner")
                 name = initialization["symbol"].split(".")[-1]
-                initial, initial_owner = _anchor(source, owner.name + "." + name)
+                if chain:
+                    initial_source = self.inheritance.method(chain, name)
+                    if initial_source is None or initial_source.node.decorator_list:
+                        raise MissingBinding("inherited initializer is absent or has an unknown descriptor")
+                    initial, initial_owner = initial_source.node, initial_source.owner
+                else:
+                    initial, initial_owner = _anchor(source, owner.name + "." + name)
                 if initial_owner is None:
                     raise MissingBinding("native initialization owner is not identified")
                 if any(isinstance(value, (ast.Yield, ast.YieldFrom)) for value in ast.walk(initial)):
@@ -1241,13 +1301,20 @@ class NativeBindings:
                 _interface(initial, self._resource_values(entry, "initializers." + initialization["symbol"], initialization.get("arguments", {})),
                            receiver=True, require_all=True)
             self._owner_initialization(owner, entry,
-                [initialization["symbol"].split(".")[-1] for initialization in entry.get("initializers", [])])
+                [initialization["symbol"].split(".")[-1] for initialization in entry.get("initializers", [])], chain=chain)
         elif program:
             if entry.get("constructor") or entry.get("initializers"):
                 raise MissingBinding("source construction program cannot duplicate its original constructor or initialization")
         elif entry.get("constructor") or entry.get("initializers"):
             raise MissingBinding("function entry cannot invent a native object owner")
         for boundary in selected:
+            if inherited:
+                definition = inherited["method"]
+                if (boundary["mode"] != "W" or boundary.get("rule") or boundary.get("native_wiring")
+                        or boundary["path"] != definition.path or boundary["symbol"] != definition.symbol
+                        or boundary.get("unit", "file") != "file" or len(selected) != 1):
+                    raise MissingBinding("inherited native binding supports only its whole original W definition")
+                continue
             wiring = boundary.get("native_wiring")
             if isinstance(wiring, dict):
                 if owner is None or wiring["controller_path"] != path or wiring["controller_symbol"] != owner.name:
@@ -1482,6 +1549,51 @@ class NativeBindings:
             or Path(code.co_filename).resolve() != (self.inspector.root / path).resolve()):
             raise MissingBinding("native callable does not match its frozen source anchor: " + symbol)
 
+    def _assert_inherited_owner(self, class_, binding):
+        chain = binding["chain"]
+        if not inspect.isclass(class_) or type(class_) is not type:
+            raise MissingBinding("native inherited owner is not an ordinary source class")
+        actual = class_.__mro__
+        if len(actual) != len(chain) + 1 or actual[-1] is not object:
+            raise MissingBinding("native inheritance differs from its frozen single-class chain")
+        for original, source in zip(actual, chain):
+            namespace = self._namespace(dict(path=source.path))
+            if (namespace.get(source.node.name) is not original or original.__qualname__ != source.node.name
+                    or original.__module__ != namespace.get("__name__") or type(original) is not type):
+                raise MissingBinding("native inherited class differs from its original frozen definition")
+            expected_names = {member.name for member in source.node.body
+                              if isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef))}
+            actual_names = {name for name, value in original.__dict__.items()
+                            if inspect.isfunction(value) or isinstance(value, (staticmethod, classmethod, property))}
+            if actual_names != expected_names:
+                raise MissingBinding("native inherited class method set differs from frozen source")
+            for member in source.node.body:
+                if not isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    continue
+                descriptor = original.__dict__.get(member.name)
+                if not inspect.isfunction(descriptor):
+                    # Other original builtin descriptors are retained; they
+                    # cannot become the selected inherited instance entry.
+                    if (len(member.decorator_list) == 1 and isinstance(member.decorator_list[0], ast.Name)
+                            and ((member.decorator_list[0].id == "staticmethod" and type(descriptor) is staticmethod)
+                                 or (member.decorator_list[0].id == "classmethod" and type(descriptor) is classmethod))):
+                        descriptor = descriptor.__func__
+                    else:
+                        raise MissingBinding("native inherited method has an unknown runtime descriptor")
+                self._assert_callable(descriptor, source.node.name + "." + member.name, source.path)
+                original_function = inspect.unwrap(descriptor)
+                first_line = min([member.lineno, *(value.lineno for value in member.decorator_list)])
+                if original_function.__code__.co_firstlineno != first_line:
+                    raise MissingBinding("native inherited method was replaced after its source definition")
+
+    def _assert_entry_callable(self, callable_, entry):
+        inherited = self.inherited_entries.get(entry["id"])
+        if inherited:
+            definition = inherited["method"]
+            self._assert_callable(callable_, definition.symbol, definition.path)
+        else:
+            self._assert_callable(callable_, entry["symbol"], entry["path"])
+
     def _owner_key(self, entry):
         # A native constructor may mutate a supplied config object. Its owner
         # identity remains the original binding, rather than the mutated config.
@@ -1599,18 +1711,19 @@ class NativeBindings:
                     command[0] = sys.executable if executable in {"python", "python3", "python.exe"} else shutil.which(command[0])
                     if not command[0]:
                         raise MissingBinding("native CLI interpreter is unavailable")
-                for position in range(index + 1, len(command)):
-                    match = re.fullmatch(r"\{([A-Za-z_][A-Za-z0-9_]*)\}", command[position])
-                    if match:
-                        command[position] = arguments[match.group(1)]
-                environment = os.environ.copy()
-                environment.update(self._resource_values(entry, "environment", entry.get("environment", {}), runtime=True))
-                context = process_context(self.inspector, entry)
-                cwd = self.inspector.root / context["cwd"]
-                observation = before_completion(self.completion_contracts.get(entry["id"]), arguments, cwd)
-                result = subprocess.run(command, cwd=cwd, capture_output=True, check=False, env=environment)
-                after_completion(observation, result)
-                return result
+                with configuration_arguments(self.resource_binding, entry, arguments) as configured:
+                    for position in range(index + 1, len(command)):
+                        match = re.fullmatch(r"\{([A-Za-z_][A-Za-z0-9_]*)\}", command[position])
+                        if match:
+                            command[position] = configured[match.group(1)]
+                    environment = os.environ.copy()
+                    environment.update(self._resource_values(entry, "environment", entry.get("environment", {}), runtime=True))
+                    context = process_context(self.inspector, entry)
+                    cwd = self.inspector.root / context["cwd"]
+                    observation = before_completion(self.completion_contracts.get(entry["id"]), arguments, cwd)
+                    result = subprocess.run(command, cwd=cwd, capture_output=True, check=False, env=environment)
+                    after_completion(observation, result)
+                    return redact_process_result(self.resource_binding, result) if entry.get("configuration") else result
             owner_id = "native-cli-" + uuid.uuid4().hex
             gate = uuid.uuid4().hex + ":" + identity
             self._register(gate, owner_id, unit)
@@ -1637,10 +1750,21 @@ class NativeBindings:
                 class_ = namespace[constructor["symbol"]]
                 if not inspect.isclass(class_) or class_.__qualname__ != constructor["symbol"]:
                     raise MissingBinding("source constructor did not resolve to the original native class")
+                inherited = self.inherited_entries.get(entry["id"])
+                if inherited:
+                    self._assert_inherited_owner(class_, inherited)
                 positional, keyword = _actual_arguments(class_, self._original_defaults(entry, "constructor.arguments", constructor.get("arguments", {})))
                 owner = class_(*positional, **keyword)
                 if inspect.isawaitable(owner):
                     owner = await owner
+                if inherited and type(owner) is not class_:
+                    raise MissingBinding("native inherited construction did not preserve its original owner")
+                if inherited:
+                    self._assert_inherited_owner(class_, inherited)
+                    methods = {member.name for item in inherited["chain"] for member in item.node.body
+                               if isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef))}
+                    if set(getattr(owner, "__dict__", {})) & methods:
+                        raise MissingBinding("native inherited receiver shadows an original method")
                 record = dict(owner=owner, id="native-owner-" + uuid.uuid4().hex, boundaries=set(), hooks=[], initialized=False)
                 self.owners[key] = record
             owner, owner_id = record["owner"], record["id"]
@@ -1670,13 +1794,16 @@ class NativeBindings:
             symbol = self.recipes[boundary["id"]]["helper"] if boundary["mode"] == "R" else boundary["symbol"].split(".")[-1]
             original = getattr(owner, symbol) if owner is not None else namespace[symbol]
             expected = (entry["symbol"].split(".")[0] + "." + symbol) if owner is not None else boundary["symbol"]
+            if entry["id"] in self.inherited_entries:
+                expected = boundary["symbol"]
             self._assert_callable(original, expected, boundary["path"])
             gate = uuid.uuid4().hex + ":" + boundary["id"]
             self._register(gate, owner_id, self._boundary_unit(boundary))
             proxy = self.runtime.wrap(original, gate, owner_id)
             if owner is not None:
                 install_method_proxy(owner, symbol, proxy)
-                if boundary["symbol"] == entry["symbol"] and boundary["mode"] != "R":
+                if ((boundary["symbol"] == entry["symbol"] or entry["id"] in self.inherited_entries)
+                        and boundary["mode"] != "R"):
                     original_entry = proxy
             else:
                 namespace[symbol] = proxy
@@ -1717,7 +1844,7 @@ class NativeBindings:
         callable_ = original_entry or (getattr(owner, entry["symbol"].split(".")[-1]) if owner is not None else namespace[entry["symbol"]])
         if not callable(callable_):
             raise MissingBinding("native source symbol did not resolve to a callable")
-        self._assert_callable(callable_, entry["symbol"], entry["path"])
+        self._assert_entry_callable(callable_, entry)
         if not selected:
             gate = uuid.uuid4().hex + ":" + identity
             self._register(gate, owner_id, unit)
@@ -1817,24 +1944,29 @@ class UnitCatalog:
     def install(self, inspector, candidate, analysis_id, installation_id=None):
         with self.lock:
             installation_id = installation_id or analysis_id
-            if getattr(inspector, "target_runtime", None):
-                from .target_runtime import install_catalog
-                result = install_catalog(self, inspector, candidate, analysis_id, installation_id)
-            else:
-                result = self._install(inspector, candidate, analysis_id, installation_id)
-            # Rebuilding the in-memory catalog must retain the operator's group
-            # environment when its source and selected source environment agree.
-            from .target_runtime import environment_selection
-            basis = environment_selection(inspector.request.get("runtime_environment") or {})
-            for identity in {unit.get("runtime_group") for unit in result} - {None}:
-                group = self.store.get("runtime_group", identity)
-                artifact = self.store.get("deployment", identity) or {}
-                if (artifact.get("source_version") == group["source_version"]
-                        and artifact.get("contract_digest") == group["contract"]["digest"]
-                        and artifact.get("source_runtime_environment") == basis):
-                    group["runtime_environment"] = environment_selection(artifact["environment"])
-                    self.store.save("runtime_group", identity, group)
-            return result
+            old_bindings, old_specs, old_deferred = self.bindings.copy(), self.entry_specs.copy(), self.deferred.copy()
+            try:
+                with self.store.transaction():
+                    if getattr(inspector, "target_runtime", None):
+                        from .target_runtime import install_catalog
+                        result = install_catalog(self, inspector, candidate, analysis_id, installation_id)
+                    else:
+                        result = self._install(inspector, candidate, analysis_id, installation_id)
+                    # Preserve matching operator-selected group environments.
+                    from .target_runtime import environment_selection
+                    basis = environment_selection(inspector.request.get("runtime_environment") or {})
+                    for identity in {unit.get("runtime_group") for unit in result} - {None}:
+                        group = self.store.get("runtime_group", identity)
+                        artifact = self.store.get("deployment", identity) or {}
+                        if (artifact.get("source_version") == group["source_version"]
+                                and artifact.get("contract_digest") == group["contract"]["digest"]
+                                and artifact.get("source_runtime_environment") == basis):
+                            group["runtime_environment"] = environment_selection(artifact["environment"])
+                            self.store.save("runtime_group", identity, group)
+                return result
+            except BaseException:
+                self.bindings, self.entry_specs, self.deferred = old_bindings, old_specs, old_deferred
+                raise
 
     def detach(self, source_id):
         with self.lock:
@@ -1914,6 +2046,7 @@ class UnitCatalog:
                           construction=construction["facts"] if construction else None,
                           fixed_value_bindings=binding.fixed_value_bindings.get(entry.get("id"), []),
                           effective_binding=binding.effective_bindings.get(entry.get("id"), "cli"),
+                          inheritance_binding=(binding.inherited_entries.get(entry.get("id")) or {}).get("facts"),
                           execution_context=binding.execution_contexts.get(entry.get("id")),
                           import_context=list(binding.import_contexts.get(entry.get("path"), {}).values()),
                           completion_contract=binding.completion_contracts.get(entry.get("id")),
@@ -1942,6 +2075,8 @@ class UnitCatalog:
                 result["fixed_value_bindings"] = binding.fixed_value_bindings.get(entry.get("id"), [])
                 if entry.get("id") in binding.effective_bindings:
                     result["effective_binding"] = binding.effective_bindings[entry["id"]]
+                if entry.get("id") in binding.inherited_entries:
+                    result["inheritance_binding"] = binding.inherited_entries[entry["id"]]["facts"]
         return result
 
     def inspect_candidate(self, inspector, candidate):

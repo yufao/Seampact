@@ -1,6 +1,7 @@
 """Source revision materials and execution evidence; no model or remote calls."""
 
 import copy
+import subprocess
 import sys
 import tempfile
 import threading
@@ -17,6 +18,7 @@ from seampact.inspection import Inspector
 from seampact.intake import RepositoryIntake
 from seampact.revisions import build_review_context
 from seampact.service import Platform
+from seampact.service import RULESET, NATIVE_PROFILE
 from seampact.store import Store
 
 
@@ -151,6 +153,320 @@ class SourceUpdateMemoryChecks(unittest.TestCase):
         self.assertIn("new_capability.py", created["source_diff"]["added"])
         self.assertEqual(self.store.get("harness", "source")["analysis_id"], "base")
         self.assertEqual(self.store.get("analysis", "base")["submitted"]["report"], {"status": "READY"})
+
+    def test_update_preserves_requested_git_ref_and_allows_explicit_change(self):
+        def git(*args):
+            return subprocess.run(['git', '-C', str(self.root), *args], check=True,
+                                  capture_output=True, text=True).stdout.strip()
+        git('init')
+        git('config', 'user.name', 'Fixture')
+        git('config', 'user.email', 'fixture@example.invalid')
+        self.write('original.py', 'def main():\n    return 1\n')
+        git('add', 'original.py')
+        git('commit', '-m', 'initial')
+        default_ref = git('branch', '--show-current')
+        git('checkout', '-b', 'fixture-topic')
+        self.write('original.py', 'def main():\n    return 2\n')
+        git('commit', '-am', 'topic')
+        source = self.intake.prepare(self.root.as_uri(), 'fixture-topic')
+        self.assertEqual(source['revision_ref'], 'fixture-topic')
+        self.assertNotEqual(source['revision'], default_ref)
+        source['id'] = 'source'
+        inspector = Inspector.freeze_repository(source, self.home / 'snapshots', 'base-request', 'observation')
+        source.update(analysis_id='base', request_id=inspector.request['id'], status='ANALYZED')
+        self.store.create('request', inspector.request['id'], inspector.request)
+        self.store.create('harness', 'source', source)
+        self.store.create('analysis', 'base', dict(id='base', request_id=inspector.request['id'], status='COMPLETED',
+            submitted=dict(candidate=dict(entries=[], runtime_groups=[]), report={'status': 'READY'})))
+        self.platform.intake = self.intake
+        self.platform.dependencies = SimpleNamespace(selections=lambda source_id: {})
+        self.platform.resource_catalog = lambda: {}
+        self.write('original.py', 'def main():\n    return 3\n')
+        git('commit', '-am', 'topic update')
+        implicit = self.platform.create_revision(dict(analysis_id='base', mode='update'))['revision']
+        proposed = self.store.get('analysis_revision', implicit['id'])['proposed_source']
+        self.assertEqual(proposed['revision_ref'], 'fixture-topic')
+        self.assertEqual(proposed['revision'], git('rev-parse', 'fixture-topic'))
+        self.assertIn('original.py', implicit['source_diff']['modified'])
+        explicit = self.platform.create_revision(dict(analysis_id='base', mode='update', revision=default_ref))['revision']
+        proposed = self.store.get('analysis_revision', explicit['id'])['proposed_source']
+        self.assertEqual(proposed['revision_ref'], default_ref)
+        self.assertEqual(proposed['revision'], git('rev-parse', default_ref))
+        default_source = self.intake.prepare(self.root.as_uri())
+        self.assertIsNone(default_source['revision_ref'])
+
+    def test_check_update_skips_unchanged_without_model_call(self):
+        revision, inspector = self.revision()
+        source = revision["proposed_source"]
+        source.update(analysis_id="base", request_id=inspector.request["id"], status="ANALYZED")
+        self.store.save("harness", "source", source)
+        base = self.store.get("analysis", "base")
+        base.update(status="COMPLETED", submitted={"candidate": revision["candidate"]})
+        self.store.save("analysis", "base", base)
+        self.platform.intake = self.intake
+        self.platform.dependencies = SimpleNamespace(selections=lambda source_id: {})
+        self.platform.resource_catalog = lambda: {}
+        self.platform.analysis.start = lambda *a, **kw: self.fail("unchanged source called model")
+        self.assertEqual(self.platform.analyze_update("source")["update_status"], "UNCHANGED")
+        self.assertEqual(self.store.get("harness", "source")["analysis_id"], "base")
+
+    def test_first_update_reuses_original_reference(self):
+        self.write('original.py', 'pass\n')
+        source, _ = self.freeze('first')
+        source.update(status='CONNECTED', revision_ref='fixture-topic')
+        self.store.save('harness', 'source', source)
+        self.platform.intake = self.intake
+        with patch.object(self.intake, 'prepare', return_value=source) as prepare, \
+                patch.object(self.platform, '_analyze', return_value={'analysis_id': 'new'}):
+            self.assertEqual(self.platform.analyze_update('source')['update_status'], 'FIRST_ANALYSIS')
+        self.assertEqual(prepare.call_args.args[1], 'fixture-topic')
+
+    def test_changed_update_starts_new_discovery_and_keeps_old_source(self):
+        revision, inspector = self.revision()
+        source = revision["proposed_source"]
+        source.update(analysis_id="base", request_id=inspector.request["id"], status="ANALYZED")
+        self.store.save("harness", "source", source)
+        base = self.store.get("analysis", "base")
+        base.update(status="COMPLETED", submitted={"candidate": revision["candidate"]})
+        self.store.save("analysis", "base", base)
+        self.platform.intake = self.intake
+        self.platform.dependencies = SimpleNamespace(selections=lambda source_id: {})
+        self.platform.resource_catalog = lambda: {}
+        self.platform.inspectors = {}
+        self.platform.profiles = SimpleNamespace(role_identity=lambda role: role)
+        calls = []
+        self.platform.analysis.start = lambda *args, **kwargs: calls.append(kwargs)
+        self.write("original.py", "def main():\n    return 2\n")
+        with patch.object(self.platform, "_revision_inspector", side_effect=lambda draft:
+                          Inspector(draft["proposed_source"]["root"], self.home / "snapshots",
+                                    self.store.get("request", draft["request_id"]))):
+            result = self.platform.analyze_update("source")
+        self.assertEqual(result["update_status"], "ANALYZING")
+        self.assertEqual(calls[0]["preprocessing"], "api")
+        self.assertEqual(calls[0]["staging_revision"], result["revision_id"])
+        self.assertNotIn("repair", calls[0])
+        self.assertEqual(self.store.get("harness", "source")["analysis_id"], "base")
+
+    def test_update_with_no_checked_entry_cannot_replace_original(self):
+        self.write("original.py", "def main():\n    pass\n")
+        source, inspector = self.freeze("update-request")
+        source.update(status="ANALYZED", analysis_id="base")
+        self.store.save("harness", "source", source)
+        job = dict(id="update", revision_id="r", kind="SOURCE_UPDATE_ANALYSIS", status="COMPLETED",
+                   completion_scope="candidate_and_report_only", submitted={"report": {"entry_bindings": {"has_bindable_entries": False}}})
+        self.store.save("analysis", job["id"], job)
+        self.platform.analysis.cancels = {}
+        with patch.object(self.platform, "_complete_revision"), patch.object(self.platform, "install_revision") as install:
+            self.assertEqual(self.platform._connect_units(inspector, job), [])
+        install.assert_not_called()
+        self.assertEqual(self.store.get("harness", "source")["analysis_id"], "base")
+        self.assertEqual(job["update_installation"]["status"], "NOT_INSTALLED")
+
+    def test_update_install_failure_keeps_original_and_records_reason(self):
+        self.write("original.py", "def main():\n    pass\n")
+        source, inspector = self.freeze("update-request")
+        source.update(status="ANALYZED", analysis_id="base")
+        self.store.save("harness", "source", source)
+        job = dict(id="update", revision_id="r", kind="SOURCE_UPDATE_ANALYSIS", status="COMPLETED",
+                   completion_scope="candidate_and_report_only", submitted={"report": {"entry_bindings": {"has_bindable_entries": True}}})
+        self.store.save("analysis", job["id"], job)
+        self.platform.analysis.cancels = {}
+        with patch.object(self.platform, "_complete_revision"), patch.object(self.platform, "install_revision", side_effect=ValueError("锁忙")) as install:
+            self.assertEqual(self.platform._connect_units(inspector, job), [])
+        self.assertTrue(install.call_args.args[0]["require_bindable"])
+        self.assertEqual(self.store.get("harness", "source")["analysis_id"], "base")
+        self.assertEqual(job["update_installation"]["status"], "NOT_INSTALLED")
+
+    def test_real_update_install_preserves_old_history_and_frozen_source(self):
+        self.write('original.py', 'def main(value: str) -> str:\n    return "old:" + value\n')
+        platform = Platform(self.home / 'actual-platform')
+        self.addCleanup(platform.store.close)
+        self.addCleanup(platform.runtime.close)
+        identity = platform.add_harness({'address': str(self.root)})['id']
+        source = platform.store.get('harness', identity)
+        before = Inspector.freeze_repository(source, platform.home / 'snapshots', 'original-request', 'original observation')
+        before.request.update(rules=copy.deepcopy(RULESET), entry_profile=copy.deepcopy(NATIVE_PROFILE),
+            resource_catalog=platform.resource_catalog(), dependency_bindings={})
+        candidate = dict(entries=[dict(id='main', kind='function', path='original.py', symbol='main')],
+                         boundaries=[], dependencies=[], runtime_groups=[dict(id='whole', entries=['main'])])
+        report = platform.analysis._check_candidate(before, candidate)
+        self.assertTrue(report['entry_bindings']['has_bindable_entries'])
+        platform.store.save('request', before.request['id'], before.request)
+        old_job = dict(id='original-analysis', harness_id=identity, request_id=before.request['id'], status='COMPLETED',
+                       submitted=dict(candidate=copy.deepcopy(candidate), report=copy.deepcopy(report)),
+                       implementation=platform.analysis.freeze_implementation(before), messages=[], usage=[], model_calls=0)
+        platform.store.save('analysis', old_job['id'], old_job)
+        source.update(status='ANALYZED', analysis_id=old_job['id'], request_id=before.request['id'], installation_id=old_job['id'])
+        platform.store.save('harness', identity, source)
+        platform.dependencies.record(before, candidate)
+        old_units = platform.catalog.install(before, candidate, old_job['id'])
+        self.assertTrue(any(unit['status'] == 'READY' for unit in old_units))
+        old_snapshot = copy.deepcopy(platform.store.get('analysis', old_job['id']))
+        old_bytes = before.data('original.py')
+        self.write('original.py', 'def main(value: str) -> str:\n    return "new:" + value\n')
+        with patch.object(platform.analysis, 'start') as start:
+            platform.profiles.role_identity = lambda role: role
+            update = platform.analyze_update(identity)
+        self.assertEqual(update['update_status'], 'ANALYZING')
+        updated_inspector = start.call_args.args[0]
+        current_report = platform.analysis._check_candidate(updated_inspector, candidate)
+        self.assertTrue(current_report['entry_bindings']['has_bindable_entries'])
+        job = dict(id=update['analysis_id'], revision_id=update['revision_id'], harness_id=identity,
+            kind='SOURCE_UPDATE_ANALYSIS', completion_scope='candidate_and_report_only', status='COMPLETED',
+            submitted=dict(candidate=copy.deepcopy(candidate), report=current_report),
+            implementation=platform.analysis.freeze_implementation(updated_inspector), messages=[], usage=[], model_calls=0)
+        platform.store.save('analysis', job['id'], job)
+        units = platform._connect_units(updated_inspector, job)
+        self.assertEqual(job['update_installation']['status'], 'INSTALLED', job['update_installation'])
+        current = platform.store.get('harness', identity)
+        self.assertEqual(current['analysis_id'], job['update_installation']['analysis_id'])
+        self.assertEqual(current['installation_id'], current['analysis_id'])
+        self.assertTrue(units)
+        visible = [unit for unit in platform.catalog.public() if unit['id'] in units]
+        self.assertEqual(len(visible), 1)
+        self.assertEqual(visible[0]['status'], 'READY')
+        self.assertEqual(platform.catalog.invoke(visible[0]['id'], {'value': 'fixture'}), 'new:fixture')
+        installed = platform.store.get('analysis', current['analysis_id'])
+        self.assertEqual(installed['submitted']['candidate'], candidate)
+        self.assertEqual(platform.store.get('request', installed['request_id'])['source_version'], updated_inspector.request['source_version'])
+        self.assertNotEqual(updated_inspector.request['source_version'], before.request['source_version'])
+        self.assertEqual(platform.store.get('analysis', old_job['id']), old_snapshot)
+        self.assertEqual(before.data('original.py'), old_bytes)
+
+
+    def test_real_update_partial_install_failure_keeps_old_unit_callable(self):
+        self.write('original.py', 'def main(value: str) -> str:\n    return "old:" + value\n')
+        platform = Platform(self.home / 'actual-platform')
+        self.addCleanup(platform.store.close)
+        self.addCleanup(platform.runtime.close)
+        identity = platform.add_harness({'address': str(self.root)})['id']
+        source = platform.store.get('harness', identity)
+        before = Inspector.freeze_repository(source, platform.home / 'snapshots', 'original-request', 'original observation')
+        before.request.update(rules=copy.deepcopy(RULESET), entry_profile=copy.deepcopy(NATIVE_PROFILE),
+            resource_catalog=platform.resource_catalog(), dependency_bindings={})
+        candidate = dict(entries=[dict(id='main', kind='function', path='original.py', symbol='main')],
+                         boundaries=[], dependencies=[], runtime_groups=[dict(id='whole', entries=['main'])])
+        report = platform.analysis._check_candidate(before, candidate)
+        self.assertTrue(report['entry_bindings']['has_bindable_entries'])
+        platform.store.save('request', before.request['id'], before.request)
+        old_job = dict(id='original-analysis', harness_id=identity, request_id=before.request['id'], status='COMPLETED',
+                       submitted=dict(candidate=copy.deepcopy(candidate), report=copy.deepcopy(report)),
+                       implementation=platform.analysis.freeze_implementation(before), messages=[], usage=[], model_calls=0)
+        platform.store.save('analysis', old_job['id'], old_job)
+        source.update(status='ANALYZED', analysis_id=old_job['id'], request_id=before.request['id'], installation_id=old_job['id'])
+        platform.store.save('harness', identity, source)
+        platform.dependencies.record(before, candidate)
+        old_units = platform.catalog.install(before, candidate, old_job['id'])
+        self.assertTrue(any(unit['status'] == 'READY' for unit in old_units))
+        old_snapshot = copy.deepcopy(platform.store.get('analysis', old_job['id']))
+        old_bytes = before.data('original.py')
+        self.write('original.py', 'def main(value: str) -> str:\n    return "new:" + value\n')
+        with patch.object(platform.analysis, 'start') as start:
+            platform.profiles.role_identity = lambda role: role
+            update = platform.analyze_update(identity)
+        self.assertEqual(update['update_status'], 'ANALYZING')
+        updated_inspector = start.call_args.args[0]
+        current_report = platform.analysis._check_candidate(updated_inspector, candidate)
+        self.assertTrue(current_report['entry_bindings']['has_bindable_entries'])
+        job = dict(id=update['analysis_id'], revision_id=update['revision_id'], harness_id=identity,
+            kind='SOURCE_UPDATE_ANALYSIS', completion_scope='candidate_and_report_only', status='COMPLETED',
+            submitted=dict(candidate=copy.deepcopy(candidate), report=current_report),
+            implementation=platform.analysis.freeze_implementation(updated_inspector), messages=[], usage=[], model_calls=0)
+        platform.store.save('analysis', job['id'], job)
+        old_id = old_units[0]['id']
+        old_state = platform.store.get('unit', old_id)
+        old_bindings = dict(platform.catalog.bindings)
+        with patch('seampact.deployment.runtime_groups', side_effect=RuntimeError('fixture install failure')):
+            units = platform._connect_units(updated_inspector, job)
+        self.assertEqual(units, [])
+        self.assertEqual(job['update_installation']['status'], 'NOT_INSTALLED')
+        self.assertEqual(platform.store.get('harness', identity)['analysis_id'], old_job['id'])
+        self.assertEqual(platform.store.get('unit', old_id), old_state)
+        self.assertEqual(platform.catalog.bindings, old_bindings)
+        visible = [unit for unit in platform.catalog.public() if unit['source_id'] == identity]
+        self.assertEqual([unit['id'] for unit in visible], [old_id])
+        self.assertEqual(platform.catalog.invoke(old_id, {'value': 'fixture'}), 'old:fixture')
+
+
+    def test_update_resume_retains_staging_and_rejects_edits(self):
+        self.write('original.py', 'def main(value: str) -> str:\n    return "old:" + value\n')
+        platform = Platform(self.home / 'actual-platform')
+        self.addCleanup(platform.store.close)
+        self.addCleanup(platform.runtime.close)
+        identity = platform.add_harness({'address': str(self.root)})['id']
+        source = platform.store.get('harness', identity)
+        before = Inspector.freeze_repository(source, platform.home / 'snapshots', 'original-request', 'original observation')
+        before.request.update(rules=copy.deepcopy(RULESET), entry_profile=copy.deepcopy(NATIVE_PROFILE),
+            resource_catalog=platform.resource_catalog(), dependency_bindings={})
+        candidate = dict(entries=[dict(id='main', kind='function', path='original.py', symbol='main')],
+                         boundaries=[], dependencies=[], runtime_groups=[dict(id='whole', entries=['main'])])
+        report = platform.analysis._check_candidate(before, candidate)
+        self.assertTrue(report['entry_bindings']['has_bindable_entries'])
+        platform.store.save('request', before.request['id'], before.request)
+        old_job = dict(id='original-analysis', harness_id=identity, request_id=before.request['id'], status='COMPLETED',
+                       submitted=dict(candidate=copy.deepcopy(candidate), report=copy.deepcopy(report)),
+                       implementation=platform.analysis.freeze_implementation(before), messages=[], usage=[], model_calls=0)
+        platform.store.save('analysis', old_job['id'], old_job)
+        source.update(status='ANALYZED', analysis_id=old_job['id'], request_id=before.request['id'], installation_id=old_job['id'])
+        platform.store.save('harness', identity, source)
+        platform.dependencies.record(before, candidate)
+        old_units = platform.catalog.install(before, candidate, old_job['id'])
+        self.assertTrue(any(unit['status'] == 'READY' for unit in old_units))
+        old_snapshot = copy.deepcopy(platform.store.get('analysis', old_job['id']))
+        old_bytes = before.data('original.py')
+        self.write('original.py', 'def main(value: str) -> str:\n    return "new:" + value\n')
+        profile = dict(provider='fixture', base_url='http://localhost', model='fixture', auth={'mode': 'none'})
+        real_start = threading.Thread.start
+        def start_other_threads(thread):
+            if getattr(thread, '_target', None) != platform.analysis._run:
+                return real_start(thread)
+        with patch.object(platform.profiles, 'role_identity', return_value='analysis'), \
+                patch.object(platform.profiles, 'profile', return_value=profile), \
+                patch.object(platform.profiles, 'key', return_value=None), \
+                patch.object(threading.Thread, 'start', start_other_threads):
+            update = platform.analyze_update(identity)
+            previous = platform.store.get('analysis', update['analysis_id'])
+            previous.update(status='FAILED', failure_phase='model_request', error_kind='transport', rounds=1,
+                messages=[previous['messages'][0], previous['messages'][1],
+                          dict(role='assistant', tool_calls=[dict(id='call')]),
+                          dict(role='tool', tool_call_id='call', content='ok')])
+            platform.store.save('analysis', previous['id'], previous)
+            draft = platform.store.get('analysis_revision', update['revision_id'])
+            changed = copy.deepcopy(draft)
+            changed['guidance'] = 'changed'
+            platform.store.save('analysis_revision', draft['id'], changed)
+            with self.assertRaisesRegex(ValueError, '草稿'):
+                platform.resume_analysis(previous['id'])
+            platform.store.save('analysis_revision', draft['id'], draft)
+            request = platform.store.get('request', previous['request_id'])
+            platform.store.save('request', previous['request_id'], dict(request, observation='changed'))
+            with self.assertRaisesRegex(ValueError, '冻结请求'):
+                platform.resume_analysis(previous['id'])
+            platform.store.save('request', previous['request_id'], request)
+            saved_source = platform.store.get('harness', identity)
+            platform.store.save('harness', identity, dict(saved_source, revision='changed'))
+            with self.assertRaisesRegex(ValueError, '改变'):
+                platform.resume_analysis(previous['id'])
+            platform.store.save('harness', identity, saved_source)
+            result = platform.resume_analysis(previous['id'])
+            resumed = platform.store.get('analysis', result['analysis_id'])
+            self.assertEqual(resumed['kind'], 'SOURCE_UPDATE_ANALYSIS')
+            self.assertEqual(resumed['completion_scope'], 'candidate_and_report_only')
+            self.assertEqual(resumed['pipeline_stage'], previous['pipeline_stage'])
+            self.assertEqual(resumed['request_id'], previous['request_id'])
+            self.assertEqual(resumed['revision_id'], update['revision_id'])
+            self.assertNotIn('repair', resumed)
+            self.assertEqual(platform.store.get('harness', identity)['analysis_id'], old_job['id'])
+            self.assertEqual(platform.catalog.invoke(old_units[0]['id'], {'value': 'fixture'}), 'old:fixture')
+            from seampact.analysis import RULES
+            resumed.update(status='FAILED', failure_phase='model_request', error_kind='transport',
+                           rounds=1, pipeline_stage='analysis')
+            resumed['messages'][0] = dict(role='system', content=RULES)
+            platform.store.save('analysis', resumed['id'], resumed)
+            second = platform.resume_analysis(resumed['id'])
+            resumed_analysis = platform.store.get('analysis', second['analysis_id'])
+            self.assertEqual(resumed_analysis['pipeline_stage'], 'analysis')
+            self.assertEqual(resumed_analysis['revision_id'], update['revision_id'])
 
 
 class SourceExecutionEvidenceChecks(unittest.TestCase):

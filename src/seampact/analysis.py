@@ -53,6 +53,7 @@ entry格式：{"id":"ASCII标识","path":"冻结路径","unit":"file或cell:N","
 "kind":"function或method或cli","description":"真实用途及输入输出","constructor":{"symbol":"原Class","arguments":{}},
 "initializers":[{"symbol":"原setup方法","arguments":{}}],"fixed_arguments":{},"boundary_ids":["本入口控制的边界id"],"command":[]}。
 普通实例method必须指出真实原构造器及原初始化顺序，参数只使用真实可绑定的JSON字面值/接入者已给的资源，不编造Model、Context或路径。
+原子类继承的完整实例方法可用entry.path=子类冻结文件、symbol="子类.继承方法"、constructor.symbol="子类"；引擎沿可核对的本地单继承确定父类真实定义，保留子类receiver及原self方法分派。需要整体W门时boundary仍引用父类方法的真实定义文件和symbol。只接入完整原方法，不能把内部叶函数冒充父controller，也不能据此开放内部拆分或生命周期动作。动态继承、无法识别的父类、猴补和自定义属性分派保留具体MISSING。
 原直接类内单个内置@classmethod/@staticmethod仍用kind:method，但省略constructor、initializers、binding_program。引擎绑定原类及描述符，不构造实例；classmethod不暴露cls，staticmethod保留原首参数。当前只覆盖无继承/类装饰器/metaclass的直接类及整体W，不支持property、组合装饰器或内部H/R。
 入口业务输入应暴露为task参数，不得用例句、示例图片或自选颜色填满fixed_arguments令接口变空。固定值必须是原签名字面默认值、已核对原call中的字面值或用户configuration给定值；其余让参数保留在接口/记录真实缺失，不能靠样例填值消除MISSING。
 当入口接收者/对象参数由原函数前缀产生，可用B-CALL有限binding_program，执行的是冻结原操作，不接受你提供代码或表达式。
@@ -167,7 +168,8 @@ class AnalysisJobs:
              "service.py", "environments.py", "target_runtime.py", "revisions.py", "classification.py", "intake_feedback.py",
              "resource_flow.py", "resource_origins.py", "candidate_checks.py", "configuration_flow.py",
              "execution_context.py", "completion.py", "dependency_closure.py", "configuration_binding.py",
-             "process_environment.py", "analysis_feedback.py", "analysis_records.py", "context_memory.py")}
+             "process_environment.py", "analysis_feedback.py", "analysis_records.py", "context_memory.py",
+             "frozen_inheritance.py", "external_source_protocols.py", "configuration_file_flow.py", "configuration_files.py", "intake.py", "store.py")}
         self.implementation = {name: digest(data) for name, data in self.implementation_bytes.items()}
         for old in store.list("analysis"):
             if old["status"] in {"RUNNING", "CANCELLING"}:
@@ -250,7 +252,7 @@ class AnalysisJobs:
                                                enabled=profile.get('context_management', True)))
 
     def start(self, inspector, provider, identity=None, previous=None, resume=None,
-              preprocessing="api", preprocessing_id=None, repair=None):
+              preprocessing="api", preprocessing_id=None, repair=None, staging_revision=None):
         profile = self.profiles.profile(provider)
         if profile.get("resource_kind") == "managed":
             raise ValueError("分析任务暂不管理模型服务生命周期，请选择云端或已启动的借用连接")
@@ -259,7 +261,13 @@ class AnalysisJobs:
             raise ValueError("configure the provider model first")
         if profile.get("auth", {}).get("mode") != "none" and not key:
             raise ValueError("configure the provider credential or select no authentication first")
-        if resume is not None and (resume.get("revision_id") or resume.get("kind") == "CANDIDATE_REFINEMENT"):
+        if resume is not None and resume.get("kind") == "SOURCE_UPDATE_ANALYSIS":
+            if (staging_revision != resume.get("revision_id") or repair is not None
+                    or resume.get("request_id") != inspector.request.get("id")
+                    or resume.get("staging_request_digest") != content_digest(inspector.request)
+                    or resume.get("model_binding") != self.model_binding(profile)):
+                raise ValueError("更新续接的草稿、冻结请求或模型连接已改变，请重新分析")
+        elif resume is not None and (resume.get("revision_id") or resume.get("kind") == "CANDIDATE_REFINEMENT"):
             if not isinstance(resume.get("repair"), dict):
                 raise ValueError("修订续接缺少原修复请求，请从草稿发起新的模型修复")
             if repair is not None and repair != resume.get("repair"):
@@ -410,6 +418,19 @@ class AnalysisJobs:
             model_binding=self.model_binding(profile), pipeline_stage=stage, preprocessing=preparation,
             usage_by_stage={"preprocessing": [], "analysis": []}, implementation=dict(self.implementation),
             report_refs=report_state['report_refs'])
+        if staging_revision is not None:
+            if repair is not None or preprocessing != "api" or (resume is not None and
+                    (resume.get("kind") != "SOURCE_UPDATE_ANALYSIS" or resume.get("revision_id") != staging_revision)):
+                raise ValueError("更新暂存需要完整分析或同一更新的续接")
+            draft = self.store.get("analysis_revision", staging_revision)
+            if not draft:
+                raise ValueError("更新暂存草稿不存在")
+            draft_basis = content_digest({key: draft.get(key) for key in ("candidate", "candidate_digest", "guidance", "reason")})
+            if resume is not None and resume.get("staging_draft_basis") != draft_basis:
+                raise ValueError("更新草稿已修改，请重新分析")
+            job.update(kind="SOURCE_UPDATE_ANALYSIS", revision_id=staging_revision,
+                       harness_id=inspector.request.get("source_id"), completion_scope="candidate_and_report_only",
+                       staging_draft_basis=draft_basis, staging_request_digest=content_digest(inspector.request))
         if repair is not None:
             job.update(kind="CANDIDATE_REFINEMENT", revision_id=repair["revision_id"], repair=repair,
                 refinement_of=repair["base_analysis_id"], completion_scope="candidate_and_report_only",
@@ -544,6 +565,10 @@ class AnalysisJobs:
         with self.lock:
             if self.closed:
                 return
+            if job.get("kind") == "SOURCE_UPDATE_ANALYSIS":
+                request = self.store.get("request", job["request_id"])
+                if request:
+                    job["staging_request_digest"] = content_digest(request)
             if cancellation.is_set():
                 job["status"] = "CANCELLED" if event == "analysis_finished" or job["status"] == "CANCELLED" else "CANCELLING"
             if cancellation.is_set() and not job.get("cancel_requested_at"):

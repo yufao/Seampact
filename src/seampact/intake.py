@@ -114,7 +114,10 @@ class RepositoryIntake:
                 self._git(["clone", "-c", "core.autocrlf=false", "--", address, str(root)])
                 if revision:
                     commit = self._git(["-C", str(root), "rev-parse", "--verify", "--end-of-options",
-                                       revision.strip() + "^{commit}"])
+                                       revision.strip() + "^{commit}"], required=False)
+                    if not commit:
+                        commit = self._git(["-C", str(root), "rev-parse", "--verify", "--end-of-options",
+                                           "refs/remotes/origin/" + revision.strip() + "^{commit}"])
                     self._git(["-C", str(root), "checkout", "--detach", commit])
                 head = self._git(["-C", str(root), "rev-parse", "--verify", "HEAD"])
                 # Even a branch URL is represented by the actual checked-out commit.
@@ -147,6 +150,6 @@ class RepositoryIntake:
                         selected=None, execution="NOT_RUN")
         name = root.name if not remote else Path(urlsplit(address).path.rstrip("/")).name.removesuffix(".git")
         return dict(id=identity, name=name or identity, address=address, root=str(root),
-                    revision=head, entry=entry if entry else inferred,
+                    revision=head, revision_ref=revision.strip() if revision else None, entry=entry if entry else inferred,
                     files=structure["files"], inventory=structure["inventory"],
                     resources=structure["resources"])
