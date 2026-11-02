@@ -279,6 +279,35 @@ def _parser(inspector):
                 environment_digest=_digest(environment)), False
 
 
+def collect_source_facts(inspector, paths):
+    """Target-only batch of the same file-local tools; never import source code."""
+    if (not isinstance(paths, list) or any(not isinstance(path, str) or path not in inspector.files for path in paths)
+            or len(set(paths)) != len(paths)):
+        raise ValueError("source fact paths must be unique frozen files")
+    results = []
+    for path in paths:
+        row = dict(path=path, sha256=inspector.files[path]["sha256"])
+        try:
+            row["facts"] = _extract(inspector, path, remote=True)
+        except (ValueError, SyntaxError, UnicodeError, KeyError, TypeError, OSError):
+            row["error"] = "STRUCTURAL_EXTRACTION_UNAVAILABLE"
+        results.append(row)
+    return dict(schema="source-facts/1", source_version=inspector.request["source_version"], results=results)
+
+
+def _target_facts(inspector, paths):
+    answer = inspector.target_runtime.call("collect_source_facts", paths=paths)
+    if (not isinstance(answer, dict) or answer.get("schema") != "source-facts/1"
+            or answer.get("source_version") != inspector.request["source_version"]
+            or not isinstance(answer.get("results"), list)):
+        raise ValueError("target source fact batch is incomplete")
+    rows = answer["results"]
+    if (any(not isinstance(row, dict) or not isinstance(row.get("path"), str) for row in rows)
+            or len(rows) != len(paths) or {row["path"] for row in rows} != set(paths)):
+        raise ValueError("target source fact paths differ from requested files")
+    return {row["path"]: row for row in rows}
+
+
 def build_review_context(old_inspector, new_inspector, store=None, home=None):
     """Cache facts, never checker permissions; return changed facts and related anchors."""
     owned = None
@@ -299,6 +328,7 @@ def build_review_context(old_inspector, new_inspector, store=None, home=None):
             parser, remote, parser_error = dict(kind="unavailable"), False, True
         reuse["parser"] = parser
         reuse["unavailable_paths"] = []
+        pending = []
         for path, record in new_inspector.files.items():
             if path in difference["withheld"]["current"]:
                 continue
@@ -306,11 +336,29 @@ def build_review_context(old_inspector, new_inspector, store=None, home=None):
             cached = store.get("source_fact", key) if store and not parser_error else None
             if cached:
                 reuse["hits"] += 1
-            else:
+            pending.append((path, record, key, cached))
+        batch = {}
+        if remote and any(not cached for _, _, _, cached in pending):
+            try:
+                batch = _target_facts(new_inspector, [path for path, _, _, cached in pending if not cached])
+            except (ValueError, SyntaxError, UnicodeError, KeyError, TypeError, OSError):
+                pass  # Each missing result below remains unavailable, and is not cached.
+        for path, record, key, cached in pending:
+            if not cached:
                 try:
                     if parser_error:
                         raise ValueError("parser unavailable")
-                    value = _extract(new_inspector, path, remote)
+                    if remote:
+                        row = batch.get(path, {})
+                        value = row.get("facts")
+                        if (row.get("sha256") != record["sha256"] or row.get("error")
+                                or not isinstance(value, dict) or value.get("parse_status") not in {"PARSED", "PARTIAL"}
+                                or value.get("dependency_closure") != "UNKNOWN"
+                                or any(not isinstance(value.get(field), list) for field in
+                                       ("symbols", "imports", "calls", "entry_candidates", "registration_candidates", "unknown"))):
+                            raise ValueError("target source fact unavailable or inconsistent")
+                    else:
+                        value = _extract(new_inspector, path, remote=False)
                     cached = dict(path=path, sha256=record["sha256"], extractor=extractor, parser=parser, **value)
                     if store:
                         store.save("source_fact", key, cached)

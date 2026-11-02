@@ -7,6 +7,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
 from . import __version__
+from .operation_preflight import preflight
 
 
 class PlatformHTTPServer(ThreadingHTTPServer):
@@ -46,6 +47,23 @@ def make_server(platform, port=8880, host="127.0.0.1", public_port=None):
                     return self.send(200, dict(status="ok", version=__version__))
                 if path == "/api/state":
                     return self.send(200, platform.state())
+                if path == "/api/operations/preflight":
+                    query = parse_qs(urlsplit(self.path).query)
+                    return self.send(200, preflight(platform, query.get("operation", ["update"])[0],
+                                                   query.get("source_id", [None])[0]))
+                if path == "/api/monitor":
+                    return self.send(200, platform.monitor.status())
+                if path.startswith("/api/monitor/sessions/"):
+                    query = parse_qs(urlsplit(self.path).query)
+                    identity = path.split("/")[4]
+                    if path.endswith("/export"):
+                        format = query.get("format", ["json"])[0]
+                        if format == "jsonl":
+                            return self.send_record(platform.monitor.export_path(identity), identity + ".jsonl")
+                        return self.send(200, platform.monitor.export(identity, format))
+                    return self.send(200, platform.monitor.detail(identity,
+                        offset=int(query["offset"][0]) if "offset" in query else None,
+                        limit=int(query.get("limit", ["100"])[0])))
                 if path == "/api/chats":
                     query = parse_qs(urlsplit(self.path).query).get("q", [""])[0]
                     return self.send(200, platform.chat.conversations(query))
@@ -71,8 +89,42 @@ def make_server(platform, port=8880, host="127.0.0.1", public_port=None):
                     return self.send(404, dict(error="没有这个接口"))
                 mime = {"index.html": "text/html", "app.js": "text/javascript", "style.css": "text/css"}[filename]
                 self.send(200, (ui / filename).read_bytes(), mime + "; charset=utf-8")
+            except ValueError as error:
+                self.send(400, dict(error=str(error)))
             except Exception as error:
                 self.send(500, dict(error=str(error)))
+
+        def send_record(self, path, filename):
+            # Freeze byte count for active records; future samples remain in the session.
+            try:
+                with path.open("rb") as stream:
+                    remaining = path.stat().st_size
+                    # An active recorder may be appending a sample. Export only
+                    # whole JSONL records that existed at this observation.
+                    end = remaining
+                    while end:
+                        begin = max(0, end - 65536)
+                        stream.seek(begin)
+                        block = stream.read(end - begin)
+                        newline = block.rfind(b"\n")
+                        if newline >= 0:
+                            remaining = begin + newline + 1; break
+                        end = begin
+                    else:
+                        remaining = 0
+                    stream.seek(0)
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/x-ndjson; charset=utf-8")
+                    self.send_header("Content-Disposition", 'attachment; filename="' + filename + '"')
+                    self.send_header("Content-Length", str(remaining))
+                    self.send_header("Cache-Control", "no-store")
+                    self.end_headers()
+                    while remaining:
+                        block = stream.read(min(65536, remaining))
+                        if not block: break
+                        self.wfile.write(block); remaining -= len(block)
+            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                self.close_connection = True
 
         def do_POST(self):
             try:
@@ -141,6 +193,10 @@ def make_server(platform, port=8880, host="127.0.0.1", public_port=None):
                 elif path == "/api/chat":
                     result = (platform.training.start_chat(body) if "scene_task_id" in body
                               else platform.chat.start(body))
+                elif path == "/api/monitor/start":
+                    result = platform.monitor.start(body)
+                elif path == "/api/monitor/stop":
+                    result = platform.monitor.stop(body["session_id"])
                 elif path == "/api/chats/delete":
                     result = platform.chat.delete_conversation(body["conversation_id"])
                 elif path == "/api/chats/restore":

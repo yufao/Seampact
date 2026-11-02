@@ -2,7 +2,7 @@ kind: Cluster
 apiVersion: kind.x-k8s.io/v1alpha4
 name: seampact-prototype
 # Illustrative paths only. Generate a private config for the actual directories
-# using docs/运行组与K8S部署.md before creating a cluster.
+# using docs/部署与操作/运行组与K8S部署.md before creating a cluster.
 nodes:
   - role: control-plane
     extraMounts:

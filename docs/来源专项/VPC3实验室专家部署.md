@@ -1,6 +1,6 @@
 # VPC3 Qwen3-VL 专家服务部署
 
-> 历史专项记录：下文状态和操作按原日期理解；当前实现见[当前实现](当前实现.md)，来源现状见[原生运行考察](../../ccfa-workfiles/experiments/harness-paper-design/native-feasibility.md)。
+> 历史专项记录：下文状态和操作按原日期理解；当前实现见[当前实现](../设计与实现/当前实现.md)，来源现状见[原生运行考察](../../../ccfa-workfiles/experiments/harness-paper-design/native-feasibility.md)。
 
 2026-10-20：以下提供专家服务的资源与接口配置；服务启动和原 VPC3 推理尚为 NOT_RUN。实际机器、下载进度及部署交接记录保存在私有运行目录。
 

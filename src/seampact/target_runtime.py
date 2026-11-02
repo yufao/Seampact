@@ -21,7 +21,7 @@ from .inspection import Inspector, digest, safe_path
 
 
 TOOLS = {"inspect_symbols", "inspect_construction", "inspect_imports", "entry_candidates",
-         "inspect_harness", "classify_target", "check_candidate", "check_preprocessing", "check_requirements", "inspect_candidate"}
+         "inspect_harness", "collect_source_facts", "classify_target", "check_candidate", "check_preprocessing", "check_requirements", "inspect_candidate"}
 ENV_FIELDS = ("python", "base_image", "requirements", "project", "packages", "pip_extra_index_url",
               "python_requirements")
 
@@ -397,7 +397,10 @@ def execute(payload):
         catalog = UnitCatalog(root, Store(":memory:"), None)
         catalog.resource_registry = HostDependencies(request)
         method, arguments = payload["method"], payload["arguments"]
-        if method == "inspect_candidate":
+        if method == "collect_source_facts":
+            from .revisions import collect_source_facts
+            result = collect_source_facts(inspector, **arguments)
+        elif method == "inspect_candidate":
             result = catalog.inspect_candidate(inspector, arguments["candidate"])
         elif method == "check_preprocessing":
             from .preprocessing import check_preprocessing

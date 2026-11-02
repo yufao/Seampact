@@ -7,6 +7,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from seampact.service import Platform
+from seampact import __version__
 from seampact.inspection import Inspector
 from seampact.scenarios import FrozenCatalog
 import test_managed_services as fixtures
@@ -82,7 +83,7 @@ class ManagedBindingChecks(unittest.TestCase):
         result = self.platform.resources.check_connection(self.connection["id"])
         self.assertFalse(result["accessible"])
         self.assertFalse(any(c[:2] == ["docker", "run"] for c in self.docker.commands))
-        self.assertEqual(self.platform.state()["version"], "0.15.1")
+        self.assertEqual(self.platform.state()["version"], __version__)
 
 
 if __name__ == "__main__":

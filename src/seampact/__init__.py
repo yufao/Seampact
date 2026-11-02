@@ -1,3 +1,3 @@
 """SeamPact Harness intake and two-layer scheduling prototype."""
 
-__version__ = "0.15.1"
+__version__ = "0.15.3"

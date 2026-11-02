@@ -25,6 +25,7 @@ from .store import Store, now
 from .units import UnitCatalog
 from .deployment import Deployments, REMOTE_PROFILE, GROUP_PROFILE
 from .managed_services import ManagedServices
+from .monitoring import ResourceMonitor
 from .training import TrainingJobs
 from .environments import discover_environment, normalize_environment
 from .target_runtime import attach_target, checker_identity, environment_selection, prepare_checker
@@ -97,6 +98,7 @@ class Platform:
                     self._invalidate_environment_units(source, str(error))
                     self.store.save("harness", source["id"], source)
         self.training = TrainingJobs(self)
+        self.monitor = ResourceMonitor(self)
 
     def state(self):
         snapshot = self.runtime.snapshot()
@@ -129,11 +131,13 @@ class Platform:
                 request = self.store.get("request", job.get("request_id"))
                 job["harness_id"] = (request or {}).get("source_id")
         requirements, selections = self.dependencies.public()
+        revision_summaries, revision_observation_pending = self._revision_summaries_observation()
         return dict(version=__version__, models=self.profiles.public_roles(), harnesses=harnesses,
             resources=dict(connections=self.public_connections(), weights=self.resources.public_weights(),
                            managed_services=self.managed_services.public(),
                            dependencies=requirements, bindings=selections),
-            analyses=jobs, analysis_revisions=self.revision_summaries(),
+            analyses=jobs, analysis_revisions=revision_summaries,
+            analysis_revisions_observation_pending=revision_observation_pending,
             units=self.catalog.public(), tasks=tasks, rules=RULESET, entry_profile=NATIVE_PROFILE,
             runtime_groups=self.deployments.public(), deployments=self.store.list("deployment"),
             deployment_backend=self.deployments.backend(),
@@ -674,10 +678,12 @@ class Platform:
             return dict(stale=True, stale_reason=str(error))
         return dict(stale=False, stale_reason=None)
 
-    def _public_revision(self, revision):
+    def _public_revision(self, revision, observation_pending=False):
         result = dict({key: copy.deepcopy(value) for key, value in revision.items() if key not in
             {"proposed_source", "base_source_basis", "base_candidate", "materials"}},
-            **self._revision_stale(revision))
+            **(dict(stale=None, stale_reason="来源正在检查，过期状态尚未核实") if observation_pending
+               else self._revision_stale(revision)))
+        result["observation_pending"] = observation_pending
         result.setdefault("intervention", intervention())
         result.setdefault("result", declared_result())
         result.setdefault("result_basis", None)
@@ -691,16 +697,29 @@ class Platform:
         return result
 
     def revision_detail(self, identity):
-        with self.source_lock:
+        acquired = self.source_lock.acquire(blocking=False)
+        try:
             revision = self.store.get("analysis_revision", identity)
             if not revision:
                 raise ValueError("没有这份修订草稿")
-            return self._public_revision(self._sync_revision(revision))
+            if acquired:
+                revision = self._sync_revision(revision)
+            return self._public_revision(revision, observation_pending=not acquired)
+        finally:
+            if acquired:
+                self.source_lock.release()
 
     def revision_summaries(self):
-        with self.source_lock:
-            revisions = [self._sync_revision(revision) for revision in self.store.list("analysis_revision")
+        return self._revision_summaries_observation()[0]
+
+    def _revision_summaries_observation(self):
+        acquired = self.source_lock.acquire(blocking=False)
+        try:
+            revisions = self.store.list("analysis_revision")
+            revisions = [revision for revision in revisions
                          if self.store.get("harness", revision.get("harness_id"))]
+            if acquired:
+                revisions = [self._sync_revision(revision) for revision in revisions]
             patterns = {}
             for revision in revisions:
                 key = ((revision.get("intervention") or {}).get("generalization") or {}).get("pattern_key")
@@ -721,8 +740,14 @@ class Platform:
                     intervention=compact, result=dict(status=result["status"], summary=result["summary"][:240]),
                     result_basis=copy.deepcopy(revision.get("result_basis")),
                     related_revision_ids=[rid for rid in patterns.get(pattern, []) if rid != revision["id"]],
-                    **self._revision_stale(revision)))
-            return summaries
+                    observation_pending=not acquired,
+                    **(self._revision_stale(revision) if acquired else
+                       dict(stale=None, stale_reason="来源正在检查，过期状态尚未核实"))))
+            return summaries, not acquired
+
+        finally:
+            if acquired:
+                self.source_lock.release()
 
     def _revision_action(self, revision, action, attribution=None, before=None, **extra):
         event = dict(kind=action, at=now(), intervention=copy.deepcopy(attribution or intervention()),
@@ -1705,6 +1730,7 @@ class Platform:
         return dict(detached=removed, history="RETAINED", ready_units=len(self.catalog.public()))
 
     def close(self):
+        self.monitor.close()
         self.deployments.close()
         self.training.close()
         self.analysis.close()

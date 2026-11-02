@@ -220,6 +220,68 @@ class RevisionFeedbackChecks(unittest.TestCase):
             self.platform.feedback_revision(dict(revision_id="r", result=dict(status="READY")))
         self.assertEqual(self.store.get("analysis_revision", "r"), before)
 
+    def test_summaries_return_saved_observation_when_source_lock_is_busy(self):
+        self.save(self.revision())
+        before = self.store.get("analysis_revision", "r")
+        locked, release = threading.Event(), threading.Event()
+
+        def hold_source_lock():
+            with self.platform.source_lock:
+                locked.set()
+                release.wait(5)
+
+        holder = threading.Thread(target=hold_source_lock)
+        holder.start()
+        self.addCleanup(holder.join)
+        self.addCleanup(release.set)
+        self.assertTrue(locked.wait(2))
+        self.platform._sync_revision = lambda revision: self.fail("busy observation must not sync")
+        self.platform._revision_stale = lambda revision: self.fail("busy observation must not check staleness")
+        summaries, pending = self.platform._revision_summaries_observation()
+        self.assertTrue(pending)
+        self.assertEqual(len(summaries), 1)
+        self.assertTrue(summaries[0]["observation_pending"])
+        self.assertIsNone(summaries[0]["stale"])
+        self.assertEqual(self.store.get("analysis_revision", "r"), before)
+        self.store.delete("analysis_revision", "r")
+        self.assertEqual(self.platform._revision_summaries_observation(), ([], True))
+        release.set()
+        holder.join(2)
+        self.assertFalse(holder.is_alive())
+        self.platform._sync_revision = lambda revision: revision
+        self.platform._revision_stale = lambda revision: dict(stale=False, stale_reason=None)
+        self.save(before)
+        summaries, pending = self.platform._revision_summaries_observation()
+        self.assertFalse(pending)
+        self.assertFalse(summaries[0]["observation_pending"])
+        self.assertFalse(summaries[0]["stale"])
+
+    def test_detail_does_not_block_if_source_becomes_busy_after_snapshot(self):
+        self.save(self.revision())
+        before = self.store.get("analysis_revision", "r")
+        self.assertFalse(self.platform._revision_summaries_observation()[1])
+        locked, release = threading.Event(), threading.Event()
+
+        def hold_source_lock():
+            with self.platform.source_lock:
+                locked.set()
+                release.wait(5)
+
+        holder = threading.Thread(target=hold_source_lock)
+        holder.start()
+        self.addCleanup(holder.join)
+        self.addCleanup(release.set)
+        self.assertTrue(locked.wait(2))
+        self.platform._sync_revision = lambda revision: self.fail("busy detail must not sync")
+        self.platform._revision_stale = lambda revision: self.fail("busy detail must not check staleness")
+        detail = self.platform.revision_detail("r")
+        self.assertTrue(detail["observation_pending"])
+        self.assertIsNone(detail["stale"])
+        self.assertEqual(self.store.get("analysis_revision", "r"), before)
+        release.set()
+        holder.join(2)
+        self.assertFalse(holder.is_alive())
+
     def test_pattern_links_do_not_share_resolution_and_summaries_are_compact(self):
         for identity, status in (("one", "open"), ("two", "verified")):
             revision = self.revision(identity)

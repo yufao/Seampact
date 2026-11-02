@@ -19,6 +19,7 @@
         <a class="rail-button" href="/inspect?view=analyses">来源与分析</a>
         <a class="rail-button" href="/inspect?view=units">能力池</a>
         <a class="rail-button" href="/inspect?view=deployments">运行组与部署</a>
+        <a class="rail-button" href="/inspect?view=operations">运行与资源</a>
         <a class="rail-button" href="/inspect?view=tasks">任务详情</a>
         <a class="rail-button" href="/inspect?view=scheduler">调度器</a>
       </div>
@@ -64,7 +65,23 @@
         </section>
         <section class="panel-section" data-view="tasks"><div class="panel-heading"><h3>真实任务</h3><span id="task-count" class="count-badge">0</span><a href="/inspect?view=tasks">独立查看</a></div><div id="task-list" class="status-list"><p class="empty-note">尚无任务。</p></div></section>
         <section class="panel-section" data-view="units"><div class="panel-heading"><h3>能力池</h3><span id="unit-count" class="count-badge">0</span><a href="/inspect?view=units">独立查看</a></div><div id="unit-list" class="unit-list"><p class="empty-note">尚无可用的 Harness Unit。</p></div></section>
-        <section class="panel-section" data-view="deployments"><div class="panel-heading"><h3>运行组与部署</h3><a href="/inspect?view=deployments">独立查看</a></div><div id="deployment-list" class="status-list"></div></section>
+        <section class="panel-section" data-view="deployments"><div class="panel-heading"><h3>运行组与部署</h3><a href="/inspect?view=deployments">独立查看</a></div><div id="deployment-update-status" class="operation-banner"><a href="/inspect?view=operations">更新前检查与资源观察</a></div><div id="deployment-list" class="status-list"></div></section>
+        <section class="panel-section" data-view="operations">
+          <div class="panel-heading"><h3>操作前检查</h3><button id="operations-refresh" type="button" class="secondary-button">重新检查</button></div>
+          <p class="card-note">查看哪些工作需要先完成或释放。这里不会停止任务；实际操作仍会重新检查条件。</p>
+          <div class="operation-controls"><label>准备做什么<select id="operations-kind"><option value="update">更新平台</option><option value="source_environment">调整来源环境</option></select></label><label id="operations-source-label" hidden>来源<select id="operations-source"></select></label></div>
+          <div id="operations-status" class="status-list" aria-live="polite"><p class="empty-note">正在读取活动。</p></div>
+          <div class="research-heading"><div><h3>资源观察</h3><p class="card-note">按需采样；离开页面仍会记录，停止记录后结束探针。采样不会启停模型。</p></div></div>
+          <form id="monitor-form" class="model-form">
+            <div class="optional-grid"><label>记录名称<input id="monitor-label" type="text" maxlength="120" placeholder="例如：某来源冷启动观察"></label><label>采样间隔（秒）<input id="monitor-interval" type="number" min="0.5" max="3600" step="0.5" value="2" required></label></div>
+            <fieldset class="monitor-fieldset"><legend>采集指标</legend><div id="monitor-metrics" class="monitor-options"></div></fieldset>
+            <fieldset id="monitor-gpu-fieldset" class="monitor-fieldset" hidden><legend>观察已配置的 GPU</legend><div id="monitor-gpus" class="monitor-options"></div><p class="form-note">整卡数据包含共享设备上的其他负载，不能直接归给某个任务。</p></fieldset>
+            <div class="form-actions"><button id="monitor-start" class="primary-button" type="submit">开始记录</button><button id="monitor-stop" class="secondary-button" type="button" disabled>停止记录</button><span id="monitor-feedback" class="form-status" role="status"></span></div>
+          </form>
+          <div id="monitor-current" class="status-list"></div>
+          <label class="monitor-history-label">查看记录<select id="monitor-session"><option value="">尚无记录</option></select></label>
+          <div id="monitor-record" class="status-list"></div>
+        </section>
         <section class="panel-section" data-view="analyses"><div class="panel-heading"><div id="analysis-heading"><h3>来源与分析</h3></div><span id="analysis-count" class="count-badge">0</span><a href="/inspect?view=analyses">独立查看</a></div><div id="analysis-list" class="status-list"><p class="empty-note">配置 Harness 地址后可开始分析。</p></div></section>
       </div>
     </aside>

@@ -421,10 +421,52 @@ def container_http(container, path):
         return None
 
 
+def container_preflight(container):
+    # Preserve HTTP 404 separately from connection and decoding failures.
+    command = (OLD or {}).get("Config", {}).get("Cmd") or []
+    port = int(command_option(command, "--port", "8880"))
+    url = "http://127.0.0.1:" + str(port) + "/api/operations/preflight?operation=update"
+    code = ("import json,urllib.request,urllib.error\n"
+            "try:\n"
+            " with urllib.request.urlopen(" + repr(url) + ",timeout=5) as r:\n"
+            "  print(json.dumps({'http_status':r.status,'body':json.loads(r.read())}))\n"
+            "except urllib.error.HTTPError as e:\n"
+            " print(json.dumps({'http_status':e.code}))\n")
+    result = docker("exec", container, "python", "-c", code, check=False)
+    if result.returncode:
+        return None
+    try:
+        value = json.loads(result.stdout)
+    except ValueError:
+        return None
+    return value if isinstance(value, dict) else None
+
+
 def check_idle():
     if not OLD or not OLD["State"].get("Running"):
         return
-    state = container_http(OLD["Id"], "/api/state")
+    observation = container_preflight(OLD["Id"])
+    if not isinstance(observation, dict):
+        fail("Cannot observe update readiness. Check the running platform, then retry; no work was stopped.")
+    state = None
+    if observation.get("http_status") == 404:
+        state = container_http(OLD["Id"], "/api/state")
+        if not isinstance(state, dict) or state.get("version") != "0.15.1":
+            fail("The running platform has no recognized update readiness API. Check its work and retry.")
+        print("Platform 0.15.1 has no update readiness API; using its existing activity checks. "
+              "Service leases are not exposed by that version; verify ongoing service requests in the page.")
+    else:
+        readiness = observation.get("body")
+        if (observation.get("http_status") != 200 or not isinstance(readiness, dict)
+                or readiness.get("operation") != "update" or readiness.get("status") not in ("READY", "BLOCKED", "DRAIN", "UNKNOWN")
+                or not isinstance(readiness.get("items"), list)):
+            fail("Update readiness is unavailable or unrecognized. Check the running platform and retry.")
+        if readiness["status"] != "READY" or readiness["items"]:
+            item = next((row for row in readiness["items"] if isinstance(row, dict)), {})
+            reason = str(item.get("reason") or "Update readiness is not confirmed").replace("\n", " ")[:180]
+            next_step = str(item.get("next_step") or "Check the platform activity page").replace("\n", " ")[:180]
+            fail("Update readiness " + readiness["status"] + ": " + reason + ". " + next_step + ".")
+        state = container_http(OLD["Id"], "/api/state")
     if not isinstance(state, dict):
         fail("Cannot read the running platform's /api/state. Stop its work and container explicitly, then rerun update.")
     if any(not isinstance(state.get(key), list) for key in ("tasks", "analyses", "runtime_groups", "deployments")) or not isinstance(state.get("scheduler"), dict):
@@ -439,6 +481,11 @@ def check_idle():
     held = any(instance.get("state") in ("UNDEPLOYED", "STARTING", "READY", "DRAINING", "UNKNOWN") or
                (instance.get("state") == "FAILED" and (instance.get("handle") or instance.get("endpoint")) and not instance.get("released"))
                for group in state.get("runtime_groups", []) for instance in group.get("instances", []))
+    services = (state.get("resources") or {}).get("managed_services", [])
+    if not isinstance(services, list):
+        fail("The running platform has an unrecognized managed service state. Check its services before updating.")
+    held = held or any(instance.get("released") is not True
+                       for group in services for instance in group.get("instances", []))
     if busy or held:
         fail("The platform has active/queued work or retained runtime instances. Stop work and release workers in the page first; "
              "the script does not stop/delete workers or carry sessions across a platform restart.")

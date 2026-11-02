@@ -642,6 +642,57 @@ class Deployments:
         self.thread = threading.Thread(target=self._controller, daemon=True, name="seampact-runtime-controller")
         self.thread.start()
 
+    def sample_resources(self):
+        """Sample only Docker workers launched in this platform session."""
+        import subprocess
+        with self.lock:
+            targets = [copy.deepcopy(item) for item in self.instances.values()
+                       if item.get("session") == self.session and item.get("released") is not True
+                       and item.get("target_kind") != "model-service"
+                       and (item.get("handle") or {}).get("kind") in {"docker", "kubernetes"}]
+        rows = []
+        for item in targets:
+            row = dict(scope="worker_cgroup", instance_id=item["id"], group_id=item["group_id"],
+                       generation=item["generation"], identity=None, monotonic_s=time.monotonic(),
+                       status="UNKNOWN", reason="COUNTERS_UNAVAILABLE", cpu_seconds=None,
+                       memory_current_bytes=None, memory_semantics="memory_current_includes_cache_and_descendants")
+            if item["handle"].get("kind") != "docker":
+                row["reason"] = "BACKEND_COUNTERS_UNSUPPORTED"
+                rows.append(row)
+                continue
+            name = item["handle"].get("container")
+            try:
+                def inspect():
+                    result = subprocess.run(["docker", "inspect", "--format", '{{.Id}} {{.State.Running}} {{index .Config.Labels "seampact.instance"}}', name],
+                                            capture_output=True, text=True, timeout=10, check=False)
+                    return result.stdout.strip().split() if result.returncode == 0 else []
+                before = inspect()
+                if len(before) != 3 or before[1:] != ["true", item["id"]]:
+                    row["reason"] = "BACKEND_IDENTITY_OR_RUNNING_STATE_UNCONFIRMED"
+                else:
+                    probe = subprocess.run(["docker", "exec", before[0], "cat", "/proc/self/cgroup",
+                                            "/sys/fs/cgroup/cpu.stat", "/sys/fs/cgroup/memory.current"],
+                                           capture_output=True, text=True, timeout=10, check=False)
+                    stamp = time.monotonic()
+                    after = inspect()
+                    lines = probe.stdout.strip().splitlines()
+                    if before != after:
+                        row["reason"] = "IDENTITY_CHANGED_DURING_SAMPLE"
+                    elif probe.returncode == 0 and lines and lines[0] == "0::/":
+                        counters = dict(line.split() for line in lines[1:-1])
+                        cpu, memory = int(counters["usage_usec"]), int(lines[-1])
+                        if cpu < 0 or memory < 0:
+                            raise ValueError("negative counter")
+                        row.update(identity=before[0] + ":" + str(item["generation"]),
+                                   monotonic_s=stamp, status="OBSERVED", reason=None,
+                                   cpu_seconds=cpu / 1_000_000, memory_current_bytes=memory)
+                    else:
+                        row["reason"] = "PRIVATE_CGROUP_V2_COUNTERS_UNCONFIRMED"
+            except (OSError, ValueError, KeyError, subprocess.TimeoutExpired):
+                pass
+            rows.append(row)
+        return rows
+
     def close(self):
         self.closed.set()
 
