@@ -100,6 +100,8 @@ class ManagedServices:
             raise ValueError("服务规格须为 JSON 对象")
         value = copy.deepcopy(body)
         identity = service_id(value.get("id", ""))
+        if getattr(self.platform, "images", None):
+            self.platform.images.guard_artifact(group_id(identity))
         if not NAME.fullmatch(identity):
             raise ValueError("服务 id 须为小写字母数字及短横线，最多 40 字符")
         value["id"] = identity
@@ -319,6 +321,13 @@ class ManagedServices:
         return "冻结镜像与当前服务规格不符" if expected_image and expected_image != spec["image_id"] else None
 
     def start(self, identity, body=None, run_id=None, replica=False):
+        from contextlib import nullcontext
+        images = getattr(self.platform, "images", None)
+        scope_id = (body or {}).get("retention_scope_id")
+        with images.launch(group_id(service_id(identity)), run_id, scope_id) if images else nullcontext(None) as frozen:
+            return self._start(identity, body, run_id, replica, frozen)
+
+    def _start(self, identity, body=None, run_id=None, replica=False, frozen=None):
         body = body or {}
         with self.lock:
             self._guard(identity, run_id)
@@ -352,6 +361,8 @@ class ManagedServices:
                 last_activity_wall=time.time(), spec_digest=spec["spec_digest"], image_id=spec["image_id"],
                 handle=dict(kind="docker", container=name, instance_id=instance), service_spec=copy.deepcopy(spec), pending_stop=None)
             self.instances[instance] = item
+            if frozen:
+                item.update(**frozen, startup_kind="COLD_START", model_load_ms=None)
             self._event(item, "start_requested")
             docker = spec["docker"]
             argv = ["docker", "run", "-d", "--pull=never", "--name", name, "--label", "seampact.instance=" + instance,
@@ -376,6 +387,8 @@ class ManagedServices:
             else:
                 item.update(state="UNKNOWN", model_state="UNKNOWN", reason="docker_start_unconfirmed")
             self._event(item, "start_submitted", command_succeeded=status == 0)
+        if frozen:
+            self.platform.images.confirm_start(frozen, item["handle"], status == 0, item["id"])
         self.refresh(identity)
         return copy.deepcopy(item)
 
@@ -604,6 +617,13 @@ class ManagedServices:
         if self.leases.get(item["group_id"]) or item["in_flight"] or item.get("unknown_requests"):
             item["drain_blocked"] = "active_or_unknown_service_users"
             return
+        if item.get("retention_scope_id"):
+            try:
+                images = self.platform.images
+                images.engine(images.get(item["retention_scope_id"])["engine"])
+            except ValueError as error:
+                item.update(state="UNKNOWN", accepting=False, reason=str(error), drain_blocked="daemon_unconfirmed")
+                return
         # Inspect identity before stop; never stop a replacement at the same name.
         observed = self._observe(item)
         if observed["status"] not in {"RUNNING", "EXITED"}:

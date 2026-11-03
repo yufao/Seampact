@@ -371,6 +371,7 @@ class Window:
             samples = [(i["ready_wall"] - i["start_wall"]) * 1000
                 for i in self.deployments.instances.values() if i["group_id"] == group
                 and i.get("ready_wall") and i.get("start_wall")
+                and not i.get("preparation_failure")
                 and (not expected or i.get("spec_digest", i.get("contract_digest")) == expected)]
         return dict(load_ms=sum(samples) / len(samples) if samples else None,
                     load_samples=len(samples), load_uncertainty=1 / math.sqrt(len(samples)) if samples else 1.0)
@@ -612,6 +613,8 @@ class Window:
                 self.resource_due = True
         elif kind == "op_submitted":
             _, op, outcome = event
+            if outcome.get("preparation_failure"):
+                self._fail(dict(type="PreparationFailed", message=outcome["preparation_failure"]))
             self.pending_groups.discard(op["group_id"])
             self.reserved.pop(op["id"], None)
             self.resource_due = True
@@ -821,6 +824,11 @@ class Window:
         return views, self.runtime.call("root_view", self.wid)
 
     def _refresh(self):
+        images = getattr(self.platform, "images", None)
+        scope_id = (self.platform.store.get("scheduler_run", self.rid) or {}).get("retention_scope_id")
+        failure = images.get(scope_id).get("failure") if images and scope_id else None
+        if failure:
+            self._fail(dict(type="PreparationFailed", message=failure["reason"]))
         views, roots = self._state()
         # Parallelism counts roots known to be executing; UNKNOWN roots still hold a slot but are reported apart.
         active = [r for r in roots if r["state"] == "ACTIVE"]
@@ -1468,12 +1476,15 @@ class Window:
                         outcome.update(status="FAILED", reason="实例启动失败：" + str(result.get("reason")))
             except Exception as error:
                 reason = type(error).__name__ + ": " + str(error)
+                from seampact.hosting.images import PreparationFailed
+                if isinstance(error, PreparationFailed):
+                    outcome.update(status="PREPARATION_FAILED", reason=reason, preparation_failure=str(error))
                 created = [item["id"] for item in self.deployments.live_instances(option["group_id"])
                            if item["id"] not in before] if starting else []
                 if created:
                     # The record exists although submission raised; its own state decides the outcome.
                     outcome.update(instance_id=created[0], error=reason)
-                else:
+                elif not outcome.get("preparation_failure"):
                     outcome.update(status="FAILED", reason="执行器拒绝或提交失败：" + reason)
             finally:
                 outcome["submit_ms"] = (time.perf_counter() - started) * 1000
@@ -1565,6 +1576,12 @@ class Window:
     # Window result.
 
     def _item(self):
+        images = getattr(self.platform, "images", None)
+        run = self.platform.store.get("scheduler_run", self.rid) or {}
+        scope_id = run.get("retention_scope_id")
+        preparation_failure = images.get(scope_id).get("failure") if images and scope_id else None
+        if preparation_failure:
+            self.execution_error = dict(type="PreparationFailed", message=preparation_failure["reason"])
         roots = self.runtime.call("root_view", self.wid)
         unfinished = [task for task in self.tasks if task.deadline_status == "UNFINISHED"]
         if unfinished:
@@ -1635,6 +1652,7 @@ class Window:
                       "release_tail_seconds falls after the last event; parallelism counts ACTIVE root requests "
                       "executing at once over span_ms, UNKNOWN roots are reported apart; not the instance count")
         return dict(kind="joint_window", episode=self.number, window_id=self.wid,
+            preparation_failure=preparation_failure,
             resource_observation=self.observation,
             route_metrics=route_metric_report(self.manifest["scene"], task_items, self.manifest["criteria"],
                                              self.manifest["evaluation_criteria"]),
@@ -1755,6 +1773,9 @@ def run_windows(jobs, rid, run, folder, manifest, catalog, bound, learner):
             reward=item["reward"], window_return=item["window_return"], eligible=item["eligible"], stats=stats,
             mean_active_roots=item["parallelism"]["mean_active_roots"], metrics=run["metrics"]))
         jobs.store.save("scheduler_run", rid, run)
+        if item.get("preparation_failure"):
+            from seampact.hosting.images import PreparationFailed
+            raise PreparationFailed(item["preparation_failure"]["reason"], run.get("retention_scope_id"))
         if item["execution_error"]:
             raise ValueError("窗口执行中断，已保留实际调用和费用材料：" + item["execution_error"]["message"])
         if item["environment_changes"]:

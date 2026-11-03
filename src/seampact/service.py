@@ -25,6 +25,7 @@ from seampact.store import Store, now
 from seampact.units import UnitCatalog
 from seampact.hosting.deployment import Deployments, REMOTE_PROFILE, GROUP_PROFILE
 from seampact.hosting.managed_services import ManagedServices
+from seampact.hosting.images import Images
 from seampact.observability.monitoring import ResourceMonitor
 from seampact.scheduling.training import TrainingJobs
 from seampact.hosting.environments import discover_environment, normalize_environment
@@ -61,6 +62,7 @@ class Platform:
         self.catalog.resource_registry = self.dependencies
         self.deployments = Deployments(self)
         self.managed_services = ManagedServices(self)
+        self.images = Images(self)
         self.profiles.managed_services = self.managed_services
         self.analysis = AnalysisJobs(self.store, self.profiles, on_complete=self._connect_units,
                                      check_entries=self.catalog.inspect_candidate)
@@ -141,6 +143,7 @@ class Platform:
             units=self.catalog.public(), tasks=tasks, rules=RULESET, entry_profile=NATIVE_PROFILE,
             runtime_groups=self.deployments.public(), deployments=self.store.list("deployment"),
             deployment_backend=self.deployments.backend(),
+            image_retention=self.images.snapshot(),
             runtime_controller=self.deployments.controller_state(),
             scheduler=dict(status="RUNNING", policy="candidate-RL / FIFO-dispatch", active=active, waiting=waiting,
                 used=snapshot["used"], quota=snapshot["quota"], theory_pending=False,
@@ -268,6 +271,8 @@ class Platform:
             if group["source_id"] != source["id"]:
                 continue
             self.deployments._guard(group["id"], None)
+            if getattr(self, "images", None):
+                self.images.guard_artifact(group["id"])
             if any(self.deployments._held(item) for item in self.deployments._instances(group["id"])):
                 raise ValueError("该来源仍有运行实例；请先排空并停止，再调整运行环境")
             artifact = self.store.get("deployment", group["id"]) or {}
@@ -294,6 +299,8 @@ class Platform:
                 # bindings callable under a newly displayed configuration.
                 self._invalidate_environment_units(source, "运行环境已修改，请零模型重新核对已有候选")
             if body.get("prepare"):
+                operation = self.images.image_operation("checker_prepare")
+                operation.__enter__()
                 # An explicit preparation can restore a removed image even if
                 # the last persisted receipt still says READY.
                 source["target_runtime"] = dict(record, status="PREPARING", started_at=now())
@@ -303,6 +310,8 @@ class Platform:
                         answer = prepare_checker(self.home, environment, config)
                     except Exception as error:
                         answer = dict(status="FAILED", reason=str(error))
+                    finally:
+                        operation.__exit__(None, None, None)
                     with self.source_lock:
                         current = self.store.get("harness", source["id"])
                         current["target_runtime"] = dict(answer, finished_at=now())
@@ -1154,6 +1163,7 @@ class Platform:
         """Bind explicit resources to an existing analysis, without another model call."""
         with self.source_lock:
             source = self.store.get("harness", body["harness_id"])
+            self.images.guard_source(body["harness_id"])
             if not source or source.get("status") in {"DETACHED", "ANALYZING"}:
                 raise ValueError("需要已接入且未在分析的来源")
             if self.catalog.source_running(source["id"]):
@@ -1549,6 +1559,7 @@ class Platform:
         started_at, started = now(), time.perf_counter()
         with self.source_lock:
             source = self.store.get("harness", body["harness_id"])
+            self.images.guard_source(body["harness_id"])
             if not source or source.get("status") in {"DETACHED", "ANALYZING"}:
                 raise ValueError("需要已分析且未摘除的来源")
             if self.catalog.source_running(source["id"]):

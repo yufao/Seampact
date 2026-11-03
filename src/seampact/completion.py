@@ -11,6 +11,7 @@ import json
 import math
 import os
 import re
+import stat
 import struct
 import zipfile
 from pathlib import Path
@@ -280,14 +281,17 @@ def check_completion(inspector, entry):
 
 
 def _fingerprint(path):
-    if not path.is_file():
+    try:
+        info = path.stat()
+    except FileNotFoundError:
         return None
-    stat = path.stat()
+    if not stat.S_ISREG(info.st_mode):
+        return None
     digest = hashlib.sha256()
     with path.open("rb") as stream:
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(chunk)
-    return dict(sha256=digest.hexdigest(), bytes=stat.st_size, mtime_ns=stat.st_mtime_ns)
+    return dict(sha256=digest.hexdigest(), bytes=info.st_size, mtime_ns=info.st_mtime_ns)
 
 
 def before_completion(contract, arguments, root):
@@ -335,9 +339,10 @@ def _npy(stream):
 
 
 def _validity(path, contract):
-    if not path.is_file():
-        return dict(status="MISSING", reason="expected output file is absent")
     try:
+        # Explicit stat preserves access errors; they do not prove absence.
+        if not stat.S_ISREG(path.stat().st_mode):
+            return dict(status="INVALID", reason="expected output is not a regular file")
         if contract["format"] == "json":
             def invalid_constant(value):
                 raise ValueError("non-finite JSON number")
@@ -357,7 +362,11 @@ def _validity(path, contract):
                 with archive.open(name) as stream:
                     arrays[name[:-4]] = _npy(stream)
         return dict(status="VALID", keys=sorted(keys), arrays=arrays)
-    except (OSError, ValueError, SyntaxError, UnicodeError, zipfile.BadZipFile, EOFError, struct.error,
+    except FileNotFoundError:
+        return dict(status="MISSING", reason="expected output file is absent")
+    except OSError as error:
+        return dict(status="UNKNOWN", reason=str(error), error_type=type(error).__name__)
+    except (ValueError, SyntaxError, UnicodeError, zipfile.BadZipFile, EOFError, struct.error,
             AttributeError, TypeError, RuntimeError, NotImplementedError, OverflowError) as error:
         return dict(status="INVALID", reason=str(error))
 
@@ -370,18 +379,30 @@ def after_completion(snapshot, process):
     if snapshot is None:
         report["reason"] = "no single-file completion contract was declared"
     else:
-        output = _fingerprint(snapshot["output_path"])
+        observation_errors = []
+
+        def observe_fingerprint(name):
+            try:
+                return _fingerprint(snapshot[name + "_path"]), True
+            except OSError as error:
+                observation_errors.append(dict(target=name, error_type=type(error).__name__, reason=str(error)))
+                return None, False
+
+        output, output_observed = observe_fingerprint("output")
         before = snapshot["output_before"]
-        changed = output != before and output is not None
+        changed = (output != before and output is not None) if output_observed else None
         validity = _validity(snapshot["output_path"], snapshot["contract"])
-        input_unchanged = _fingerprint(snapshot["input_path"]) == snapshot["input_before"]
+        input_after, input_observed = observe_fingerprint("input")
+        input_unchanged = input_after == snapshot["input_before"] if input_observed else None
         report.update(result=validity, input_unchanged=input_unchanged,
                       output=dict(preexisting=before is not None, changed=changed,
                                   before=before, after=output),
-                      expected_items=1, valid_items=int(validity["status"] == "VALID"),
-                      newly_completed_items=0)
-        if process.returncode != 0 or validity["status"] != "VALID" or not input_unchanged:
+                      expected_items=1, valid_items=None if validity["status"] == "UNKNOWN" else int(validity["status"] == "VALID"),
+                      newly_completed_items=0, observation_errors=observation_errors)
+        if process.returncode != 0 or validity["status"] in {"MISSING", "INVALID"} or input_unchanged is False:
             report.update(task_status="INCOMPLETE", reason="process failure, missing/invalid result, or input changed during execution")
+        elif observation_errors or validity["status"] == "UNKNOWN":
+            report.update(task_status="UNKNOWN", reason="input or output could not be observed; original process result is preserved")
         elif not changed:
             report.update(task_status="UNKNOWN", reason="preexisting valid result was unchanged; its input association and fresh computation are unproved")
         else:

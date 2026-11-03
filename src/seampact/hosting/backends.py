@@ -7,6 +7,7 @@ the remaining manual commands; it never reports a deployment that did not run.
 
 import copy
 import json
+import os
 import re
 import shlex
 import shutil
@@ -82,16 +83,23 @@ def _command_result(argv, started, returncode, stdout="", stderr="", **facts):
                 stdout=stdout, stderr=stderr, output=_tail(stdout + stderr), **facts)
 
 
-def run(argv, timeout, stdin=None):
+def run(argv, timeout, stdin=None, environment=None):
     started = time.monotonic()
+    options = {"env": dict(os.environ, **environment)} if environment else {}
+    def result(returncode, stdout="", stderr="", **facts):
+        stdout, stderr = _text(stdout), _text(stderr)
+        for value in sorted((environment or {}).values(), key=len, reverse=True):
+            if value:
+                stdout, stderr = stdout.replace(value, "[private credential]"), stderr.replace(value, "[private credential]")
+        return _command_result(argv, started, returncode, stdout, stderr, **facts)
     try:
         completed = subprocess.run(argv, input=stdin, capture_output=True, text=True, timeout=timeout,
-                                   encoding="utf-8", errors="replace")
-        return _command_result(argv, started, completed.returncode, completed.stdout, completed.stderr)
+                                   encoding="utf-8", errors="replace", **options)
+        return result(completed.returncode, completed.stdout, completed.stderr)
     except subprocess.TimeoutExpired as error:
-        return _command_result(argv, started, None, error.stdout, error.stderr, timeout=True)
+        return result(None, error.stdout, error.stderr, timeout=True)
     except OSError as error:
-        return _command_result(argv, started, None, stderr=str(error))
+        return result(None, stderr=str(error))
 
 
 def manual(commands, reason):
@@ -159,11 +167,12 @@ def build(folder, image, environment, config, dependency_image=None):
                  dependency_image=None, dependency_image_id=None, observed_cache_hit="NOT_CHECKED")
     facts = dict(image=image, image_id=None, dependency_image=None, requested_base_image=requested_base,
                  resolved_base_id=None, base_resolution=None, dependency_reuse=reuse)
+    builder = "default"
 
     def command(tag, base, **arguments):
-        # The daemon's default builder uses its image store. A selected custom
-        # builder may not see the exact local IDs verified immediately above.
-        argv = ["docker", "buildx", "build", "--load", "--builder", "default", "-t", tag,
+        # Use the docker-driver builder belonging to the current context.
+        # A builder literally named "default" may belong to another context.
+        argv = ["docker", "buildx", "build", "--load", "--builder", builder, "-t", tag,
                 "--build-arg", "BASE_IMAGE=" + base]
         if environment.get("pip_extra_index_url"):
             argv += ["--build-arg", "PIP_EXTRA_INDEX_URL=" + environment["pip_extra_index_url"]]
@@ -187,6 +196,17 @@ def build(folder, image, environment, config, dependency_image=None):
 
     def failure(reason):
         return dict(_result(steps, "BUILT", **facts), status="FAILED", reason=reason)
+
+    context = run(["docker", "context", "show"], config["operation_timeout_s"])
+    steps.append(context)
+    builder = context.get("stdout", "").strip()
+    if context["returncode"] != 0 or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", builder):
+        return failure("无法确认当前 Docker 上下文，未选择其他构建器")
+    driver = run(["docker", "buildx", "inspect", builder], config["operation_timeout_s"])
+    steps.append(driver)
+    if driver["returncode"] != 0 or not re.search(r"^Driver:\s+docker\s*$", driver.get("stdout", ""), re.M):
+        return failure("当前上下文未取得使用本机镜像库的 docker 驱动构建器")
+    facts.update(builder=builder, builder_driver="docker")
 
     def build_reference(image_id):
         # BuildKit does not accept a bare Docker config ID in FROM. Bind a
@@ -336,10 +356,10 @@ def worker_args(record, coordinator, advertise):
             "--instance-id", record["id"], "--generation", str(record["generation"])]
 
 
-def start(record, reference, folder, config):
+def start(record, reference, folder, config, credential_env=None):
     if config["kind"] == "docker":
         name = "seampact-" + record["name"]
-        argv = ["docker", "run", "-d", "--name", name, "--label", "seampact.group=" + record["group_id"],
+        argv = ["docker", "run", "-d", "--pull=never", "--name", name, "--label", "seampact.group=" + record["group_id"],
                 "--label", "seampact.instance=" + record["id"]]
         if config.get("docker_network"):
             argv += ["--network", config["docker_network"]]
@@ -351,7 +371,7 @@ def start(record, reference, folder, config):
             advertise = "http://" + config.get("advertise_host", host) + ":" + str(port)
         if config.get("gpus"):
             argv += ["--gpus", str(config["gpus"])]
-        for name_ in config.get("pass_env", []):
+        for name_ in dict.fromkeys([*config.get("pass_env", []), *(credential_env or {})]):
             argv += ["-e", name_]
         for mount in config.get("mounts", []):
             argv += ["-v", mount["source"] + ":" + mount["target"] + (":ro" if mount.get("read_only", True) else "")]
@@ -359,7 +379,9 @@ def start(record, reference, folder, config):
         gap = docker_available()
         if gap:
             return dict(manual([argv], gap), handle=dict(kind="docker", container=name), applied=False)
-        return _result([run(argv, config["operation_timeout_s"])], "APPLIED",
+        step = (run(argv, config["operation_timeout_s"], environment=credential_env) if credential_env else
+                run(argv, config["operation_timeout_s"]))
+        return _result([step], "APPLIED",
                        handle=dict(kind="docker", container=name))
     labels = {"app": "seampact-worker", "seampact.group": record["group_id"], "seampact.instance": record["id"]}
     container = dict(name="owner", image=reference, imagePullPolicy="IfNotPresent",
@@ -464,16 +486,27 @@ def stop(record, config):
     handle = record.get("handle") or {}
     config = _handle_config(handle, config)
     if "container" in handle:
-        commands = [["docker", "stop", "-t", "30", handle["container"]], ["docker", "rm", handle["container"]]]
+        target = handle.get("container_id") or handle["container"]
+        commands = [["docker", "stop", "-t", "30", target], ["docker", "rm", target]]
         gap = docker_available()
         if gap:
             return manual(commands, gap)
-        probe = run(["docker", "ps", "-a", "--filter", "name=^/" + re.escape(handle["container"]) + "$",
+        selector = "id=" + target if handle.get("container_id") else "name=^/" + re.escape(handle["container"]) + "$"
+        probe = run(["docker", "ps", "-a", "--filter", selector,
                      "--format", "{{.ID}}"], config["operation_timeout_s"])
         if probe["returncode"] != 0:
             return dict(_result([probe], "STOPPED"), status="STOP_PENDING", reason="无法确认原容器是否仍存在")
         if not probe["stdout"].strip():
             return dict(_result([probe], "STOPPED"), reason="已确认原容器不存在")
+        if handle.get("instance_id"):
+            identity = run(["docker", "container", "inspect", "--format",
+                '{{json (index .Config.Labels "seampact.instance")}}', target], config["operation_timeout_s"])
+            try:
+                owned = identity["returncode"] == 0 and json.loads(identity["stdout"]) == handle["instance_id"]
+            except (ValueError, KeyError):
+                owned = False
+            if not owned:
+                return dict(status="STOP_PENDING", reason="后端容器归属未确认；未停止或删除同名对象")
         steps = [probe, run(commands[0], config["operation_timeout_s"])]
         if steps[-1]["returncode"] == 0:
             steps.append(run(commands[1], config["operation_timeout_s"]))

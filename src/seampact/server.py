@@ -71,6 +71,8 @@ def make_server(platform, port=8880, host="127.0.0.1", public_port=None):
                     return self.send(200, platform.chat.conversation(path.rsplit("/", 1)[1]))
                 if path == "/api/runtime/session":
                     return self.send(200, dict(session=platform.deployments.session))
+                if path == "/api/images":
+                    return self.send(200, dict(**platform.images.snapshot(), **platform.images.inventory()))
                 if path.startswith("/api/analysis/revisions/"):
                     return self.send(200, dict(revision=platform.revision_detail(path.rsplit("/", 1)[1])))
                 if path.startswith("/api/analysis/") and path.endswith("/snapshot"):
@@ -219,6 +221,30 @@ def make_server(platform, port=8880, host="127.0.0.1", public_port=None):
                     result = platform.import_analysis(body)
                 elif path == "/api/deployments/backend":
                     result = platform.deployments.configure_backend(body)
+                elif path == "/api/images/prepare":
+                    result = platform.images.prepare(body)
+                elif path == "/api/images/configure":
+                    result = platform.images.configure(body)
+                elif path == "/api/images/begin":
+                    result = platform.images.begin(body["retention_scope_id"])
+                elif path == "/api/images/verify":
+                    result = platform.images.verify(body["retention_scope_id"])
+                elif path == "/api/images/close":
+                    result = platform.images.close(body["retention_scope_id"])
+                elif path == "/api/images/reconcile":
+                    result = platform.images.reconcile(body)
+                elif path == "/api/images/usage":
+                    result = platform.images.usage(body)
+                elif path == "/api/images/result":
+                    result = platform.images.result(body)
+                elif path == "/api/images/backup":
+                    result = platform.images.backup(body)
+                elif path == "/api/images/restore":
+                    result = platform.images.restore(body)
+                elif path == "/api/images/import-backup":
+                    result = platform.images.import_backup(body)
+                elif path == "/api/images/delete":
+                    result = platform.images.delete(body)
                 elif path == "/api/deployments/export":
                     result = platform.deployments.export(body["group_id"], body)
                 elif path == "/api/deployments/build":

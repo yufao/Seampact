@@ -9,6 +9,7 @@ import unittest
 import zipfile
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
@@ -138,6 +139,52 @@ class CompletionTests(unittest.TestCase):
         report = after_completion(snapshot, subprocess.CompletedProcess([], 0))
         self.assertEqual(report['task_status'], 'INCOMPLETE')
         self.assertFalse(report['input_unchanged'])
+
+    def test_unreadable_output_preserves_process_receipt_and_unknown_observation(self):
+        snapshot = before_completion(self.contract(), dict(image='image.bin', result='out.json'), self.root)
+        output = self.root / 'out.json'
+        output.write_text('{"map": 1, "imgsize": [1, 1]}')
+        original_stat, original_open = Path.stat, Path.open
+        for operation in ['stat', 'open']:
+            original = original_stat if operation == 'stat' else original_open
+
+            def deny_output(path, *args, **kwargs):
+                if path == output:
+                    raise PermissionError('output cannot be read')
+                return original(path, *args, **kwargs)
+
+            for code in [0, 3]:
+                with self.subTest(operation=operation, returncode=code), patch.object(Path, operation, deny_output):
+                    process = subprocess.CompletedProcess(['original.py'], code, stdout='original progress', stderr='')
+                    report = after_completion(snapshot, process)
+                self.assertIs(process.seampact_completion, report)
+                self.assertEqual(process.stdout, 'original progress')
+                self.assertEqual(report['process'], dict(returncode=code, succeeded=code == 0))
+                self.assertEqual(report['task_status'], 'UNKNOWN' if code == 0 else 'INCOMPLETE')
+                self.assertEqual(report['result']['status'], 'UNKNOWN')
+                self.assertIsNone(report['valid_items'])
+                self.assertIsNone(report['output']['changed'])
+                self.assertTrue(report['input_unchanged'])
+                self.assertFalse(report['newly_completed'])
+                self.assertEqual(report['observation_errors'][0]['target'], 'output')
+
+    def test_unreadable_input_does_not_claim_input_changed(self):
+        snapshot = before_completion(self.contract(), dict(image='image.bin', result='out.json'), self.root)
+        (self.root / 'out.json').write_text('{"map": 1, "imgsize": [1, 1]}')
+        original_open = Path.open
+
+        def deny_input(path, *args, **kwargs):
+            if path == self.root / 'image.bin':
+                raise PermissionError('input cannot be read')
+            return original_open(path, *args, **kwargs)
+
+        with patch.object(Path, 'open', deny_input):
+            report = after_completion(snapshot, subprocess.CompletedProcess([], 0))
+        self.assertEqual(report['task_status'], 'UNKNOWN')
+        self.assertIsNone(report['input_unchanged'])
+        self.assertEqual(report['result']['status'], 'VALID')
+        self.assertEqual(report['observation_errors'][0]['target'], 'input')
+        self.assertFalse(report['newly_completed'])
 
     def test_no_contract_is_explicitly_unknown(self):
         inspector, entry = self.proposal()

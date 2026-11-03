@@ -35,6 +35,11 @@ const deploymentDrafts = new Map();
 const capabilityDrafts = new Map();
 const deploymentSubmitting = new Set();
 const deploymentPreparation = new Map();
+let imageInventory = null;
+let imageBusy = false;
+let imageError = '';
+const imageSelected = new Set();
+const imageDraft = {};
 let inspectPage = location.pathname === '/inspect';
 let configurationPage = location.pathname === '/configuration';
 const configNames = {models: '模型角色', services: '服务连接', weights: '权重资源', harnesses: 'Harness 接入', research: '研究运行', scope: '入口范围'};
@@ -72,10 +77,11 @@ const researchDetailVersions = new Map();
 const researchLoading = new Set();
 const learnerNames = {double_dqn: 'Double DQN', ppo: 'PPO', discrete_sac: '离散 SAC', required_only: '仅必需工作', all_applicable: '全部适用工作'};
 const researchModeNames = {train: '新训练', freeze: '冻结评价', warmstart: '继续训练', rejudge: '条件重评'};
-const terminalStatuses = new Set(['COMPLETED', 'SUCCEEDED', 'FAILED', 'CANCELLED', 'INTERRUPTED', 'BLOCKED']);
+const terminalStatuses = new Set(['COMPLETED', 'SUCCEEDED', 'FAILED', 'PREPARATION_FAILED', 'CANCELLED', 'INTERRUPTED', 'BLOCKED']);
 const statusNames = {
   RUNNING: '运行中', QUEUED: '排队中', WAITING: '等待中', COMPLETED: '已完成',
   SUCCEEDED: '已完成', FAILED: '失败', CANCELLED: '已取消', CANCELLING: '正在取消', INTERRUPTED: '已中断',
+  PREPARATION_FAILED: '准备条件失败', READY_TO_RUN: '本轮已准备', CLOSING: '等待收尾', CLEANUP_PENDING: '引用待清理', CLOSED: '本轮已结束',
   READY: '源码已绑定', AVAILABLE: '可用', BLOCKED: '待接入', PENDING: '待确认',
   THEORY_PENDING: '理论待确认', IDLE: '空闲', ANALYZING: '分析中', ANALYZED: '已分析',
   REGISTERED: '已登记', CONNECTED: '已接入', MISSING: '待接入', NOT_CONFIGURED: '未配置', ENABLED: '已使能',
@@ -1385,7 +1391,8 @@ function deploymentButton(group, action, path, label, body = () => ({}), done = 
     deploymentSubmitting.add(operation);
     button.disabled = true;
     try {
-      await api('/api/deployments/' + path, {group_id: group.id, operation_id: operationId(), ...body()});
+      await api('/api/deployments/' + path, {group_id: group.id, operation_id: operationId(),
+        ...(['start', 'add-replica'].includes(path) && imageDraft.scope ? {retention_scope_id: imageDraft.scope} : {}), ...body()});
       showNotice(done);
     } catch (error) { showNotice(error.message); }
     finally { deploymentSubmitting.delete(operation); renderedSections.delete('deployments'); await refresh(); }
@@ -1496,6 +1503,115 @@ function runtimeGroupActive(group) {
     ['RUNNING', 'PUBLISHING'].includes(group.artifact?.publish?.status));
 }
 
+function renderImages(root) {
+  const snapshot = state.image_retention || {};
+  const section = disclosure('experiment-images', '实验镜像与备份', {
+    meta: '整轮保留 · 真 worker 照常释放', error: imageError});
+  const card = node('article', null, 'status-card'); section.append(card);
+  card.append(node('p', '开始前保留本轮全部运行镜像。引用容器不启动、不占显卡；结束本轮前先完成原生、平台及评分任务。镜像缺失会终止本轮，已有结果保留。', 'card-note'));
+  const field = (key, label, initial = '') => {
+    const wrapper = node('label', label), input = node('input');
+    input.value = imageDraft[key] ?? initial;
+    input.oninput = () => { imageDraft[key] = input.value; };
+    wrapper.append(input); card.append(wrapper); return input;
+  };
+  const storage = field('storage', 'Docker 存储的已挂载平台内路径', snapshot.settings?.storage_path || '');
+  const directory = field('directory', '备份目录（已有可写挂载，需有足够空间）');
+  const metadata = field('metadata', '已有备份的元数据文件路径（迁移或重新登记时使用）');
+  const comparisons = field('comparisons', '本轮比较单元（名称及子运行）', '[{"id":"pair-1","run_ids":["native","platform"]}]');
+  field('scope', '页面启动实例所用的本轮范围');
+  const action = (parent, label, work) => {
+    const button = node('button', label); button.type = 'button'; button.disabled = imageBusy;
+    button.onclick = async () => {
+      if (imageBusy) return;
+      imageBusy = true; imageError = ''; renderDeployments();
+      try { await work(); }
+      catch (error) { imageError = error.message; }
+      finally { imageBusy = false; renderedSections.delete('deployments'); await refresh(); renderDeployments(); }
+    };
+    parent.append(button); return button;
+  };
+  const controls = node('div', null, 'inline-actions'); card.append(controls);
+  action(controls, imageBusy ? '操作中…' : '刷新本机镜像', async () => { imageInventory = await api('/api/images'); });
+  action(controls, '核对并保存存储位置', () => api('/api/images/configure', {storage_path: storage.value.trim() || null}));
+  const selected = () => [...imageSelected];
+  action(controls, '准备本轮', async () => {
+    const rows = (imageInventory?.images || []).filter(row => imageSelected.has(row.image_id));
+    const groupIds = [...new Set(rows.flatMap(row => row.purposes.filter(p => p.startsWith('worker:') || p.startsWith('service:'))
+      .map(p => p.startsWith('worker:') ? p.slice(7) : p)))];
+    const result = await api('/api/images/prepare', {images: selected(), group_ids: groupIds,
+      comparison_units: JSON.parse(comparisons.value), storage_path: storage.value.trim() || null});
+    if (result.failure) throw new Error(result.failure.reason);
+    imageDraft.scope = result.id;
+    showNotice('本轮镜像已保留。正式运行前选择“开始计量”。');
+  });
+  action(controls, '备份选中镜像', async () => {
+    const result = await api('/api/images/backup', {images: selected(), directory: directory.value.trim()});
+    showNotice('归档及摘要已校验：' + result.path + '；实际恢复核验另记。');
+  });
+  action(controls, '登记已有备份', () => api('/api/images/import-backup', {metadata_path: metadata.value.trim()}));
+  if (!imageInventory) card.append(node('p', '点击刷新后显示实时存在性。历史构建成功不能证明镜像现在仍在本机。', 'card-note'));
+  for (const row of imageInventory?.images || []) {
+    const item = node('div', null, 'status-card'), label = node('label'), check = node('input');
+    check.type = 'checkbox'; check.checked = imageSelected.has(row.image_id); check.disabled = imageBusy;
+    check.onchange = () => check.checked ? imageSelected.add(row.image_id) : imageSelected.delete(row.image_id);
+    label.append(check, node('span', row.purposes.join(' / '))); item.append(label,
+      node('p', row.image_id), node('p', `${row.local_status} · 检查于 ${row.checked_at}`),
+      node('p', '名称：' + (row.facts?.RepoTags || []).join(', ')),
+      node('p', '镜像大小（含共享层）：' + (row.facts?.Size ?? '未知') + ' 字节'),
+      node('p', '持有范围：' + (row.scopes.join(', ') || '无') + ' · 已登记备份：' + row.backups.length));
+    if (row.reason) item.append(node('p', row.reason, 'error'));
+    if (!row.scopes.length && row.local_status === 'PRESENT') action(item, '删除此本机镜像', async () => {
+      if (!window.confirm('删除本机镜像？\n' + row.image_id + '\n用途：' + row.purposes.join(', ') + '\n名称：' + (row.facts?.RepoTags || []).join(', ') + '\n确认没有其他使用者需要此镜像。备份文件保留。')) return;
+      await api('/api/images/delete', {image_id: row.image_id, tags: row.facts?.RepoTags || [], confirm_unused: true});
+      imageInventory = await api('/api/images');
+    });
+    card.append(item);
+  }
+  for (const scope of snapshot.scopes || []) {
+    const item = node('div', null, 'status-card');
+    item.append(node('strong', '本轮 ' + scope.id), node('p', scope.status + ' · ' + scope.images.length + ' 张镜像'),
+      node('p', scope.failure?.reason || scope.cleanup_reason || ''),
+      node('p', '在途操作：' + Object.keys(scope.tickets || {}).length));
+    for (const unit of scope.comparison_units || []) item.append(node('p', `${unit.id}：${unit.status || '待完整完成'} · ${unit.run_ids.join(', ')}`));
+    if (scope.status === 'READY_TO_RUN') action(item, '开始计量', () => api('/api/images/begin', {retention_scope_id: scope.id}));
+    if (scope.status !== 'CLOSED') {
+      action(item, '用于页面启动', async () => { imageDraft.scope = scope.id; });
+      action(item, '核对本轮镜像', () => api('/api/images/verify', {retention_scope_id: scope.id}));
+      action(item, '结束本轮／重试收尾', async () => {
+        const result = await api('/api/images/close', {retention_scope_id: scope.id});
+        if (result.status !== 'CLOSED') showNotice('仍有消费者或待核对事项，引用继续保留：' + result.status);
+      });
+      if (scope.status === 'INTERRUPTED' || Object.values(scope.tickets || {}).some(t => t.session && t.session !== scope.session)) {
+        action(item, '核对重启前的在途操作', async () => {
+          if (!window.confirm('确认旧平台提交的启动命令已结束？平台将再次核对真实实例和 Docker 消费者；未解决的外部脚本票据仍会保留。')) return;
+          await api('/api/images/reconcile', {retention_scope_id: scope.id, confirm_launches_settled: true});
+        });
+      }
+    }
+    card.append(item);
+  }
+  for (const backup of snapshot.backups || []) {
+    if (backup.status === 'DELETED') continue;
+    const item = node('div', null, 'status-card');
+    item.append(node('strong', '备份 ' + backup.id), node('p', backup.path),
+      node('p', `${backup.status} · ${backup.bytes} 字节 · 恢复核验：${backup.restored_at || '尚未执行'}`),
+      node('p', '覆盖镜像：' + backup.images.join(', ')),
+      node('p', '宿主目录：' + (backup.archive_filesystem?.host_path || '未知')));
+    action(item, '准备阶段恢复', async () => {
+      const result = await api('/api/images/restore', {backup_id: backup.id, storage_path: storage.value.trim() || null});
+      if (result.name_conflicts?.length) throw new Error('镜像已恢复，构建名称冲突保留：' + result.name_conflicts.join(', '));
+      imageInventory = await api('/api/images');
+    });
+    action(item, '删除整个归档', async () => {
+      if (!window.confirm('删除此归档及其元数据？\n' + backup.path + '\n覆盖的全部镜像：\n' + backup.images.join('\n') + '\n本机镜像保留。')) return;
+      await api('/api/images/delete', {backup_id: backup.id, images: backup.images});
+    });
+    card.append(item);
+  }
+  root.append(section);
+}
+
 function renderDeployments() {
   const root = $('deployment-list');
   root.replaceChildren();
@@ -1503,6 +1619,7 @@ function renderDeployments() {
     .sort((a, b) => Number(b.host_status === 'HOST_CHECKED') - Number(a.host_status === 'HOST_CHECKED'));
   root.append(node('p', '同组保持原进程、原对象与原生命周期；组外端口只传编码后的数据。生命周期操作按运行组契约逐项允许，未知不授予；重启不恢复原会话。', 'card-note'));
   if (inspectPage) renderDeploymentBackend(root);
+  if (inspectPage && state.image_retention) renderImages(root);
   const ungroupedSources = inspectPage ? (state.harnesses || []).filter(source => source.status !== 'DETACHED' &&
     (!selectedSource() || source.id === selectedSource()) && !groups.some(group => group.source_id === source.id)) : [];
   for (const source of ungroupedSources) {
@@ -4097,7 +4214,7 @@ async function refresh() {
       ['research-readiness', 'research-run-list', 'research-comparison']);
     renderSection('tasks', visibleTasks(), renderTasks, ['task-list']);
     renderSection('units', [visibleUnits(), state.harnesses, selectedSource()], renderUnits, ['unit-list']);
-    renderSection('deployments', [state.runtime_groups, state.deployments, state.deployment_backend, state.harnesses, state.units, state.analyses,
+    renderSection('deployments', [state.runtime_groups, state.deployments, state.deployment_backend, state.image_retention, state.harnesses, state.units, state.analyses,
       state.runtime_controller, selectedSource(), [...deploymentPreparation]], renderDeployments, ['deployment-list']);
     renderSection('analyses', [state.analyses, state.harnesses, state.analysis_revisions, state.analysis_revisions_observation_pending, state.models?.analysis,
       resourceState(), selectedSource(), [...sourceUpdating], [...revisionSelected], [...revisionDetails], [...revisionErrors], [...revisionBusy],

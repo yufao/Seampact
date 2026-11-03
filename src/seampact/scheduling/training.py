@@ -439,6 +439,38 @@ class TrainingJobs:
                 self.stops[rid] = threading.Event()
                 self.bindings[rid] = (bound, catalog)
                 created.append(rid)
+            groups = {}
+            for _, _, catalog in prepared:
+                for group, placement in catalog.remote_groups().items():
+                    if group in groups and groups[group] != placement:
+                        raise ValueError("比较臂必须使用相同的冻结运行工件")
+                    groups[group] = copy.deepcopy(placement)
+            scope = None
+            if groups:
+                images = self.platform.images
+                try:
+                    units = [dict(id="comparison-" + created[0], run_ids=created)]
+                    if body.get("retention_scope_id"):
+                        images.register_runs(body["retention_scope_id"], created, groups, units)
+                        scope = images.get(body["retention_scope_id"])
+                    else:
+                        scope = images.prepare(dict(groups=groups, run_ids=created, comparison_units=units,
+                            storage_path=body.get("storage_path"), owner="training"))
+                    if scope.get("failure"):
+                        raise ValueError(scope["failure"]["reason"])
+                except Exception as error:
+                    for rid in created:
+                        run = self.store.get("scheduler_run", rid)
+                        run.update(status="PREPARATION_FAILED", error=str(error), ended_at=now(),
+                            retention_scope_id=scope["id"] if scope else None)
+                        self.store.save("scheduler_run", rid, run)
+                        self.bindings.pop(rid, None)
+                    return dict(run_ids=created, status="PREPARATION_FAILED", error=str(error))
+            for rid in created:
+                if scope:
+                    run = self.store.get("scheduler_run", rid)
+                    run["retention_scope_id"] = scope["id"]
+                    self.store.save("scheduler_run", rid, run)
                 self.pending.put(rid)
         return dict(run_ids=created)
 
@@ -761,7 +793,18 @@ class TrainingJobs:
                 released[group_id] = deployments.release_run(group_id, rid)
             except Exception as error:
                 released[group_id] = dict(error=str(error))
+        deadline = time.monotonic() + window.get("release_timeout_s", 0)
+        while time.monotonic() < deadline:
+            held = [item for group in window["groups"] for item in deployments.live_instances(group)
+                    if item.get("run_id") == rid]
+            if not held or all((item.get("pending_stop") or {}).get("blocked") for item in held):
+                break
+            if deployments.closed.wait(0.2):
+                break
+        left = {group: [item["id"] for item in deployments.live_instances(group) if item.get("run_id") == rid]
+                for group in window["groups"]}
         result = dict(setup=window["setup"], release=released,
+                      left={group: ids for group, ids in left.items() if ids},
                       setup_scope="warm initial state is run preparation; it is not charged to any task",
                       residency=deployments.residency(set(window["groups"]), window["start"], time.time())
                       if window.get("start") else None)
@@ -837,13 +880,16 @@ class TrainingJobs:
             if digest(manifest) != run["config_digest"]:
                 raise ValueError("运行清单内容身份不符")
             bound, catalog = self.bindings[rid]
+            if run.get("retention_scope_id"):
+                self.platform.images.begin(run["retention_scope_id"], rid)
             learner = self._learner(manifest)
             tasks = {t["id"]: t for t in manifest["scene"]["tasks"]}
             if manifest["mode"] == "rejudge":
                 histories = self._rejudge(manifest, bound)
             else:
                 if catalog.remote_groups():
-                    window = dict(groups=catalog.remote_groups(), setup={}, start=None)
+                    window = dict(groups=catalog.remote_groups(), setup={}, start=None,
+                                  release_timeout_s=manifest["resource_control"]["start_timeout_s"])
                     self._open_window(rid, manifest, catalog, window)
                 if manifest.get("scheduling_mode") == joint.MODE:
                     # Windows record history, curves and learning themselves.
@@ -862,6 +908,12 @@ class TrainingJobs:
                     item = next(histories)
                 except StopIteration:
                     break
+                if run.get("retention_scope_id"):
+                    failure = self.platform.images.get(run["retention_scope_id"]).get("failure")
+                    if failure:
+                        item.update(eligible=False, exclusion_reason="preparation_failed", preparation_failure=failure)
+                        item["feedback"]["reward"] = None
+                        item["execution_error"] = dict(type="PreparationFailed", message=failure["reason"])
                 # Stop only between complete tasks; never discard a paid result.
                 if window is not None:
                     with self.platform.deployments.lock:
@@ -944,6 +996,8 @@ class TrainingJobs:
                     raise ValueError("运行组执行条件在运行中改变（实例失联、进程替换或响应未取得），已保留本任务材料并中断运行")
                 if self.stops[rid].is_set() or self.closed:
                     break
+            if run.get("retention_scope_id"):
+                self.platform.images.verify(run["retention_scope_id"])
             if learner and manifest["mode"] != "freeze" and learner.steps:
                 if manifest["algorithm"] == "ppo":
                     stats = learner.update(force=True)
@@ -959,7 +1013,11 @@ class TrainingJobs:
                     path=str(path), artifact_digest=digest_file(path))
             run["status"] = "STOPPED" if self.stops[rid].is_set() or self.closed else "COMPLETED"
         except Exception as error:
-            run.update(status="FAILED", error=str(error))
+            failure = (self.platform.images.get(run["retention_scope_id"]).get("failure")
+                       if run.get("retention_scope_id") else None)
+            run.update(status="PREPARATION_FAILED" if failure else "FAILED", error=str(error))
+            if failure:
+                run["preparation_failure"] = failure
         finally:
             if session:
                 try:
@@ -968,6 +1026,8 @@ class TrainingJobs:
                     run.update(status="FAILED", error=(run.get("error") or "") + " 场景关闭失败：" + str(error))
             if window is not None:
                 run["runtime_window"] = self._close_window(rid, window)
+                if run["runtime_window"]["left"]:
+                    run.update(status="FAILED", error=(run.get("error") or "") + " 真实实例尚未确认释放；镜像引用继续保留")
             run["ended_at"] = now()
             if run.get("costs") is not None:
                 run["costs"].update(scene_initialization_ms=run.get("initialization_ms"),
@@ -975,6 +1035,15 @@ class TrainingJobs:
             run["artifacts"] = [{"path": str(p), "artifact_digest": digest_file(p)}
                                 for p in sorted(folder.iterdir()) if p.is_file()]
             self.store.save("scheduler_run", rid, run)
+            if run.get("retention_scope_id"):
+                images = self.platform.images
+                scope_id = run["retention_scope_id"]
+                images.record_run_end(scope_id, rid, run["status"])
+                scope = images.get(scope_id)
+                if scope.get("owner") == "training" and all(
+                        (self.store.get("scheduler_run", child) or {}).get("status") not in {"QUEUED", "RUNNING"}
+                        for child in scope["run_ids"]):
+                    images.close(scope_id)
             self.bindings.pop(rid, None)
             print("[SeamPact] learning_finished " + rid + " " + run["status"], flush=True)
 

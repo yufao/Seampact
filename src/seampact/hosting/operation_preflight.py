@@ -32,6 +32,14 @@ def preflight(platform, operation, source_id=None):
     if operation == "source_environment":
         groups = [g for g in groups if g.get("source_id") == source_id]
     group_ids = {g["id"] for g in groups}
+    images = getattr(platform, "images", None)
+    if images and images.operation:
+        add("image_operation", "BLOCKED", "镜像准备、备份、恢复或定向清理正在进行", "等待镜像操作结束")
+    for scope in platform.store.list("image_scope"):
+        if scope.get("status") not in {"PREPARING", "READY_TO_RUN", "RUNNING", "CLOSING", "INTERRUPTED"}:
+            continue
+        if operation == "update" or group_ids.intersection(scope.get("groups", {})):
+            add("image_scope", "BLOCKED", "整轮实验仍持有冻结镜像或有未决消费者", "核对并结束镜像保留范围", id=scope["id"])
     for row in sources:
         if (row.get("target_runtime") or {}).get("status") == "PREPARING":
             add("target_prepare", "BLOCKED", "目标解释器正在准备", "等待准备完成", source_id=row["id"])

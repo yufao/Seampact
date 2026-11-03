@@ -228,6 +228,15 @@ class ChatJobs:
             request=request, request_sha256=hashlib.sha256(json.dumps(request, ensure_ascii=False,
                 sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest(),
             models={}, harness_resources=catalog.snapshot_resources(), placements=copy.deepcopy(catalog.placement))
+        if body.get("retention_scope_id"):
+            images = catalog.router.platform.images
+            selected = {uid for plan in plans for uid in plan["units"]}
+            groups = {catalog.placement[uid]["group_id"] for uid in selected if catalog.placement[uid].get("kind") == "REMOTE"}
+            images.enter_task(body["retention_scope_id"], identity, groups)
+            task["retention_scope_id"] = body["retention_scope_id"]
+            for placement in catalog.placement.values():
+                placement["retention_scope_id"] = body["retention_scope_id"]
+            task["placements"] = copy.deepcopy(catalog.placement)
         self.store.save("task", identity, task)
         threading.Thread(target=self._run_plan, args=(task, plans, catalog), daemon=True).start()
         return dict(task_id=identity, request_sha256=task["request_sha256"])
@@ -265,6 +274,8 @@ class ChatJobs:
                              if call.get("task_id") == task["id"]]
             if not self.closed:
                 self.store.save("task", task["id"], task)
+            if task.get("retention_scope_id"):
+                catalog.router.platform.images.finish_task(task["retention_scope_id"], task["id"])
 
     def _run(self, task, messages, bound, catalog, prior_wire=None, prior_context=None):
         started = time.perf_counter()

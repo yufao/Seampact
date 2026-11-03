@@ -64,7 +64,7 @@ class CliGroupResultTests(unittest.TestCase):
     def worker_route(self, worker):
         router = Deployments.__new__(Deployments)
         router.lock, router.unit_state = threading.RLock(), {}
-        router.platform = SimpleNamespace(store=worker.store, runtime=worker.runtime)
+        router.platform = SimpleNamespace(store=worker.store, runtime=worker.runtime, catalog=worker.catalog)
         record = dict(id=worker.instance, profile=worker.profile, group_id='group', state='READY',
             accepting=True, in_flight=0, endpoint='http://worker.invalid', initialization={},
             **worker.identity())

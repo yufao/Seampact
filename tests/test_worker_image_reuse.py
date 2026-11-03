@@ -31,7 +31,11 @@ class FakeDocker:
     def run(self, argv, timeout, stdin=None):
         self.commands.append(list(argv))
         status, output = 0, ""
-        if argv[:3] == ["docker", "image", "inspect"]:
+        if argv == ["docker", "context", "show"]:
+            output = getattr(self, "context", "default")
+        elif argv[:3] == ["docker", "buildx", "inspect"]:
+            output = "Driver: " + getattr(self, "driver", "docker") + "\n"
+        elif argv[:3] == ["docker", "image", "inspect"]:
             if argv[-1] in self.images:
                 info = self.images[argv[-1]]
                 if self.strict_missing_labels and 'Labels' not in info['Config'] and '.Config.Labels' in argv[4]:
@@ -97,6 +101,21 @@ class WorkerImageReuseTests(unittest.TestCase):
     def final_arguments(self, docker):
         command = next(argv for argv in reversed(docker.commands) if argv[:3] == ["docker", "buildx", "build"])
         return dict(command[i + 1].split("=", 1) for i, item in enumerate(command) if item == "--build-arg")
+
+    def test_nondefault_context_uses_its_local_docker_driver_builder(self):
+        docker = FakeDocker()
+        docker.context = "desktop-linux"
+        result = self.build(docker, self.export())
+        self.assertEqual(result["status"], "BUILT")
+        commands = [c for c in docker.commands if c[:3] == ["docker", "buildx", "build"]]
+        self.assertTrue(all(c[c.index("--builder") + 1] == "desktop-linux" for c in commands))
+
+    def test_separate_builder_storage_is_rejected_before_build(self):
+        docker = FakeDocker()
+        docker.driver = "docker-container"
+        result = self.build(docker, self.export())
+        self.assertEqual(result["status"], "FAILED")
+        self.assertFalse(any(c[:3] == ["docker", "buildx", "build"] for c in docker.commands))
 
     def test_source_only_change_skips_environment_build_and_uses_verified_id(self):
         first = self.export(project=".", packages=["extra==2"])

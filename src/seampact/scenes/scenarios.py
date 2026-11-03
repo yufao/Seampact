@@ -436,7 +436,7 @@ class FrozenCatalog:
                 continue
             binding, entry, unit = self.frozen[uid]
             group = unit.get("runtime_group")
-            facts.append(dict(local=True, ready_instance=True, warm=binding.initialization_state(entry, unit) == "BOUND",
+            facts.append(dict(local=True, ready_instance=True, warm=binding.initialization_state(entry, unit) == "BOUND" and entry.get("kind") != "cli",
                               cold_startable=False, accepting=True, busy=binding.active_calls > 0,
                               queue=self.router.queue(group) if self.router and group else 0, state_age_ms=0.0))
         for group in sorted({group for uid in unit_ids for group in self.placement[uid].get("resource_dependencies", [])}):

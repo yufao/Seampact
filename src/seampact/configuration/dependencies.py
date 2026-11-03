@@ -1098,6 +1098,44 @@ class DependencyBindings:
             if connection:
                 self._freeze_credential(identity, connection)
 
+    def worker_environment(self, entry_ids):
+        """Private Docker-client overrides for credentials used by this group.
+
+        Resolve again at each start, against the frozen connection identity.
+        The returned values must never be stored in a spec or operation receipt.
+        """
+        result, entries = {}, set(entry_ids)
+        required = [(identity, row, [mapping for mapping in row.get("mappings", [])
+                                    if mapping.get("entry_id") in entries and mapping.get("field") == "credential"])
+                    for identity, row in self.rows.items() if row.get("kind") == "service"]
+        required = [(identity, row, needed) for identity, row, needed in required if needed]
+        if not required:
+            return result
+        profiles = self.registry.profiles
+        with profiles.lock:
+            for identity, row, needed in required:
+                for mapping in needed:
+                    self._selection(identity, mapping["entry_id"])
+                connection = self.selected[identity]["connection"]
+                current = profiles.connection_profile(connection["id"])
+                if (current.get("auth") != connection.get("auth") or
+                        current.get("config_digest") != connection.get("config_digest")):
+                    raise ValueError("resource authentication or connection changed; select and rebind for a new runtime")
+                auth = connection.get("auth") or {"mode": "none"}
+                if auth.get("mode") == "none":
+                    continue
+                key = profiles.connection_key(connection["id"])
+                if not key:
+                    raise EnvironmentGap("selected authentication material is unavailable in this execution environment")
+                name = (auth.get("env", "") if auth.get("mode") == "environment" else
+                        "SEAMPACT_CREDENTIAL_" + re.sub(r"[^A-Za-z0-9]", "_", connection["id"]).upper())
+                if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
+                    raise ValueError("worker credential needs a valid environment variable name")
+                if name in result and result[name] != key:
+                    raise ValueError("worker credential environment names conflict")
+                result[name] = key
+        return result
+
     def redact(self, error):
         message = str(error)
         for key in self.keys.values():

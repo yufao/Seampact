@@ -212,6 +212,36 @@ class Joint014Integration(unittest.TestCase):
         self.assertEqual((len(saved["history"]), len(saved["curves"])), (2, 2))
         self.assertEqual(self.store.get("scheduler_run", "check")["metrics"], run["metrics"])
 
+    def test_preparation_failure_keeps_paid_window_but_never_updates_learner(self):
+        from seampact.hosting.images import PreparationFailed
+        window = self.window()
+        window.manifest.update(episodes=1, task_ids=["ta", "tb"], mode="train")
+        failure = dict(category="PREPARATION_FAILED", phase="RUNTIME", reason="REFERENCE_MISSING")
+        conditions = dict(failure=None)
+        self.platform.images = SimpleNamespace(get=lambda identity: dict(conditions))
+        saved = []
+        jobs = window.jobs
+        jobs.store = self.store
+        jobs._append = lambda folder, name, item: saved.append((name, copy.deepcopy(item)))
+        run = dict(id="check", retention_scope_id="scope", episodes=0, interactions=0, choice_interactions=0,
+                   no_choice_episodes=0, eligible_episodes=0, excluded_episodes=0)
+        self.store.save("scheduler_run", "check", run)
+        learner = SimpleNamespace(snapshot=lambda: dict(updates=0),
+            observe=lambda value: self.fail("invalid window reached learner.observe"),
+            update=lambda: self.fail("invalid window reached learner.update"))
+        original_item = Window._item
+        def invalidate_before_return(current):
+            conditions["failure"] = failure
+            return original_item(current)
+        with patch.object(Window, "_item", invalidate_before_return), self.assertRaises(PreparationFailed):
+            run_windows(jobs, "check", run, self.home, window.manifest, window.catalog, window.bound, learner)
+        history = next(item for kind, item in saved if kind == "history")
+        self.assertFalse(history["eligible"])
+        self.assertIsNone(history["reward"])
+        self.assertEqual(history["preparation_failure"], failure)
+        self.assertEqual([t["final_response"] for t in history["tasks"]], [4, 7])
+        self.assertEqual(run["excluded_episodes"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -22,6 +22,7 @@ import sys
 import threading
 import time
 import uuid
+from contextlib import nullcontext
 from pathlib import Path
 from urllib.error import HTTPError
 from urllib.parse import urlsplit
@@ -708,6 +709,9 @@ class Deployments:
         return self.platform.store.get("deployment_backend", "current") or backends.validate_config({"kind": "none"})
 
     def configure_backend(self, body):
+        if getattr(self.platform, "images", None) and any(s["status"] in {"PREPARING", "READY_TO_RUN", "RUNNING", "CLOSING", "INTERRUPTED"}
+                for s in self.platform.images.snapshot()["scopes"]):
+            raise ValueError("请先结束实验镜像范围，再修改部署后端")
         value = backends.validate_config(body)
         value["updated_at"] = now()
         self.platform.store.save("deployment_backend", "current", value)
@@ -962,7 +966,8 @@ class Deployments:
             starting = any(item["state"] in {"UNDEPLOYED", "STARTING"} or retiring(item)
                            for item in self._instances(group_id, LIVE))
             if record is not None:
-                fact = dict(local=False, ready_instance=True, warm=record["initialization"].get(unit_id) == "BOUND",
+                fact = dict(local=False, ready_instance=True, warm=record["initialization"].get(unit_id) == "BOUND" and
+                            self._entry(unit_id).get("kind") != "cli",
                             cold_startable=False, accepting=record["accepting"], busy=record["in_flight"] > 0,
                             state_age_ms=(time.time() - record.get("observed_wall", time.time())) * 1000)
         if record is None:
@@ -1116,6 +1121,8 @@ class Deployments:
     # Build artifacts, images and image reachability.
 
     def _environment(self, value, binding):
+        if value is None:
+            value = environment_selection(binding.inspector.request.get("runtime_environment") or {})
         environment = normalize_environment(value, binding.inspector)
         checked_python = (binding.inspector.request.get("runtime_environment") or {}).get("python", "3.11")
         if environment["python"] != checked_python:
@@ -1124,6 +1131,8 @@ class Deployments:
 
     def _artifact_guard(self, identity):
         self._guard(identity, None)
+        if getattr(self.platform, "images", None):
+            self.platform.images.guard_artifact(identity)
         if any(self._held(item) for item in self._instances(identity)):
             raise ValueError("请先排空并停止该运行组实例，再修改或重建镜像")
         artifact = self.platform.store.get("deployment", identity) or {}
@@ -1192,6 +1201,9 @@ class Deployments:
         artifact = self._artifact(identity)
         if (artifact.get(field) or {}).get("status") == "RUNNING":
             raise ValueError("该操作仍在进行")
+        images = getattr(self.platform, "images", None)
+        operation = images.image_operation(field) if images else nullcontext()
+        operation.__enter__()
         artifact[field] = dict(status="RUNNING", started_at=now())
         self.platform.store.save("deployment", identity, artifact)
         def run():
@@ -1199,6 +1211,8 @@ class Deployments:
                 result = work(artifact)
             except Exception as error:
                 result = dict(status="FAILED", reason=str(error))
+            finally:
+                operation.__exit__(None, None, None)
             current = self.platform.store.get("deployment", identity)
             current[field] = dict(result, finished_at=now())
             if field == "build" and result.get("status") == "BUILT":
@@ -1259,9 +1273,15 @@ class Deployments:
         if identity.startswith("service:"):
             return self.platform.managed_services.start(identity, body, run_id, replica)
         return self._once(body, ("add_replica:" if replica else "start:") + identity,
-                          lambda: self._start(identity, run_id, replica, (body or {}).get("expected_image")))
+                          lambda: self._start(identity, run_id, replica, (body or {}).get("expected_image"),
+                                              (body or {}).get("retention_scope_id")))
 
-    def _start(self, identity, run_id, replica, expected_image=None):
+    def _start(self, identity, run_id, replica, expected_image=None, retention_scope_id=None):
+        images = getattr(self.platform, "images", None)
+        with images.launch(identity, run_id, retention_scope_id) if images else nullcontext(None) as frozen:
+            return self._start_unprotected(identity, run_id, replica, expected_image, frozen)
+
+    def _start_unprotected(self, identity, run_id, replica, expected_image=None, frozen=None):
         with self.platform.source_lock, self.lock:
             self._guard(identity, run_id)
             group = self._group(identity)
@@ -1276,6 +1296,8 @@ class Deployments:
             reference = (artifact.get("publish") or {}).get("reference") or artifact["image"]
             if expected_image is not None and expected_image != reference:
                 raise ValueError("运行组镜像已变化；冻结运行不能改用新镜像")
+            if frozen:
+                reference = frozen["image_id"]
             live = [item for item in self._instances(identity) if self._held(item)]
             if replica and not live:
                 raise ValueError("先启动第一个实例")
@@ -1283,6 +1305,11 @@ class Deployments:
                 raise ValueError("已有实例；该组只允许一个实例，先排空停止" if not contract["replicas"]["replicable"]
                                  else "已有实例；请用增加副本")
             config = self.backend()
+            credentials = {}
+            if config["kind"] == "docker":
+                binding, _, _ = self._binding(group)
+                if binding.resource_binding is not None:
+                    credentials = binding.resource_binding.worker_environment(group["entries"])
             generation = self._next_generation(identity)
             record = dict(id=uuid.uuid4().hex, group_id=identity, generation=generation, name=identity + "-g" + str(generation),
                 session=self.session, profile=contract["host_profile"], contract_digest=contract["digest"],
@@ -1290,15 +1317,20 @@ class Deployments:
                 image_id=(artifact.get("build") or {}).get("image_id"), backend=config["kind"], origin="PLATFORM_STARTED",
                 run_id=run_id, state="UNDEPLOYED", desired="RUNNING", accepting=False, in_flight=0, units=[],
                 initialization={}, created_at=now(), start_wall=time.time(), events=[])
+            if frozen:
+                record.update(**frozen, startup_kind="COLD_START", model_load_ms=None)
             self.instances[record["id"]] = record
             self._event(record, "start_requested", replica=replica)
-        result = backends.start(record, reference, artifact["folder"], config)
+        result = (backends.start(record, reference, artifact["folder"], config, credential_env=credentials) if credentials else
+                  backends.start(record, reference, artifact["folder"], config))
         with self.lock:
             record["apply"] = {key: item for key, item in result.items() if key != "handle"}
             # A manual apply can create the same object later. Retain its identity
             # before registration; shutting down its worker cannot release it.
             if result.get("handle"):
                 record["handle"] = result["handle"]
+                if frozen:
+                    record["handle"]["instance_id"] = record["id"]
             if result["status"] == "APPLIED":
                 if record["state"] == "UNDEPLOYED":
                     record["state"] = "STARTING"
@@ -1308,7 +1340,17 @@ class Deployments:
                 record.update(state="FAILED", desired="STOPPED", accepting=False, reason=result.get("reason"), stopped_wall=time.time())
             self._event(record, "apply", status=result["status"],
                         duration_ms=sum(step["duration_ms"] for step in result.get("steps", [])))
-            return self._view(record)
+        if frozen:
+            try:
+                self.platform.images.confirm_start(frozen, result.get("handle"), result.get("status") == "APPLIED", record["id"])
+                with self.lock:
+                    self.platform.store.save("runtime_instance", record["id"], record)
+            except ValueError as error:
+                with self.lock:
+                    record.update(preparation_failure=str(error), accepting=False, reason=str(error))
+                    self._event(record, "image_preparation_failed")
+                raise
+        return self._view(record)
 
     def attach(self, endpoint):
         endpoint = endpoint.rstrip("/")
@@ -1602,7 +1644,13 @@ class Deployments:
             return
         started = time.perf_counter()
         if item.get("handle"):
-            result = backends.stop(item, self.backend())
+            try:
+                if item.get("retention_scope_id"):
+                    images = self.platform.images
+                    images.engine(images.get(item["retention_scope_id"])["engine"])
+                result = backends.stop(item, self.backend())
+            except ValueError as error:
+                result = dict(status="STOP_PENDING", reason=str(error))
         elif item.get("backend") in {"docker", "kubernetes"}:
             result = dict(status="STOP_PENDING", reason="缺少可确认的后端对象身份；须人工核对并释放，worker 退出不等于后端对象删除")
         elif item.get("endpoint"):
@@ -1777,6 +1825,8 @@ class Deployments:
         waited = None
         with self.lock:
             self._guard(placement["group_id"], placement["run_id"])
+            if getattr(self.platform, "images", None):
+                self.platform.images.dispatch_check(placement["group_id"], placement["run_id"], placement.get("retention_scope_id"))
             record = self._route(placement["group_id"], unit["id"], _task_context.get())
         if record is None:
             started = time.perf_counter()
@@ -1809,7 +1859,8 @@ class Deployments:
             if pending:
                 record = pending[0]
             elif not retiring:
-                record = self.instances[self._start(group["id"], placement["run_id"], False, placement.get("image"))["id"]]
+                record = self.instances[self._start(group["id"], placement["run_id"], False, placement.get("image"),
+                    placement.get("retention_scope_id"))["id"]]
             elif self.closed.wait(0.5):
                 break
         while record is not None and time.monotonic() < deadline:
@@ -1870,6 +1921,8 @@ class Deployments:
             transport_ms=elapsed - worker_ms if type(worker_ms) in (int, float) else None,
             initialization_before=timing.get("initialization_before"),
             initialization_after=timing.get("initialization_after"), binding_duration_ms=timing.get("binding_duration_ms"))
+        facts["startup_kind"] = ("PER_REQUEST_LOAD" if self._entry(unit["id"]).get("kind") == "cli" else
+            "WARM_REUSE" if facts["initialization_before"] == "BOUND" else "MODEL_NOT_READY")
         with self.lock:
             if facts["initialization_after"]:
                 record["initialization"][unit["id"]] = facts["initialization_after"]
