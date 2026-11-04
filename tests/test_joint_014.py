@@ -24,6 +24,7 @@ from seampact.runtime import Coordinator, OwnerRuntime
 from seampact.scenes.scenarios import FrozenCatalog, freeze_scene
 from seampact.store import Store
 from seampact.scheduling.training import LEARNING, REFERENCES
+from seampact.scheduling import budget_policy
 from seampact.units import UnitCatalog
 
 
@@ -155,6 +156,65 @@ class Joint014Integration(unittest.TestCase):
         self.assertEqual([task["final_response"] for task in result["tasks"]], [4, 7])
         self.assertFalse(any(row["kind"] == "boundary" for row in result["decisions"]))
 
+    def test_budget_training_and_freeze_share_artifact_and_change_only_budget_input(self):
+        """Two budgets use fresh decisions, a real PPO update and the parent checkpoint."""
+        import importlib.util
+        if importlib.util.find_spec("torch") is None:
+            self.skipTest("PPO requires the optional PyTorch dependency")
+        from seampact.scheduling.training import TrainingJobs
+        self.platform.profiles = SimpleNamespace(lock=threading.RLock(), role_profile=lambda role: {})
+        for uid in self.units:
+            sid = self.store.get("unit", uid)["source_id"]
+            self.store.save("harness", sid, dict(id=sid, revision="fixture"))
+            self.catalog.scheduling_policy(dict(unit_id=uid, visibility="transparent", activation="platform"))
+        jobs = TrainingJobs(self.platform)
+        self.addCleanup(jobs.close)
+        config = dict(scene=self.scene, algorithm="ppo", scheduling_mode="joint/1", criteria=self.criteria,
+            episodes=2, parameters=dict(epochs=1, hidden_sizes=[8]), joint=dict(
+                functional_policy="required_only", dispatch_policy="learned_ready/1", resource_policy="fixed/1",
+                dispatch_scope="roots", capacity=dict(call_slots=1), age_guard_ms=60000,
+                max_consecutive_resource_ops=1, workload=dict(tasks_per_window=2, arrival=dict(interval_ms=0)),
+                costs=dict(instance_seconds=0, task_seconds=0), scales={k: 1 for k in JOINT_SCALES},
+                budget_policy=dict(latency_budgets=[0.5, 2.0], task_seconds_scale=1., instance_seconds_scale=1.,
+                                   max_unfinished_fraction=0., dual_step=0.1)))
+        # Dispatch competition is deterministic once all arrivals have queued their roots.
+        original = Window._dispatch_stage
+        def paired_dispatch(window):
+            if not any(task.done is not None for task in window.tasks):
+                views = window.runtime.call("root_view", window.wid)
+                if len(views) < 2:
+                    return False
+            return original(window)
+        def execute():
+            rid = jobs.start(dict(config=config))["run_ids"][0]
+            limit = time.monotonic() + 25
+            while self.store.get("scheduler_run", rid)["status"] in ("RUNNING", "QUEUED"):
+                self.assertLess(time.monotonic(), limit)
+                time.sleep(.02)
+            run = jobs.detail(rid)
+            self.assertEqual(run["status"], "COMPLETED", run["error"])
+            return run
+        with patch.object(Window, "_dispatch_stage", paired_dispatch):
+            trained = execute()
+            self.assertGreater(trained["updates"], 0)
+            self.assertEqual(trained["budget_choice_windows"], [1, 1])
+            self.assertTrue(trained["checkpoint"])
+            for window in trained["history"]:
+                bill = window["budget_policy"]
+                decisions = [s["transition"] for s in window["transitions"]]
+                for k in range(3):
+                    self.assertAlmostEqual(bill["raw"][k], bill["before_first_choice"][k] +
+                                           sum(d["raw_cost_delta"][k] for d in decisions))
+                self.assertTrue(all(d["state"][-1] == bill["latency_budget"] for d in decisions))
+            config.update(mode="freeze", parent_run_id=trained["id"], episodes=1)
+            for budget in config["joint"]["budget_policy"]["latency_budgets"]:
+                config["joint"]["budget_policy"]["freeze_budget"] = budget
+                frozen = execute()
+                bill = frozen["history"][0]["budget_policy"]
+                self.assertEqual((bill["latency_budget"], frozen["updates"]), (budget, 0))
+                self.assertEqual(bill["multipliers_after"], bill["multipliers"])
+                self.assertEqual([t["final_response"] for t in frozen["history"][0]["tasks"]], [4, 7])
+
     def test_wake_after_horizon_keeps_already_due_arrivals(self):
         window = self.window(horizon=True)
         refresh = window._refresh
@@ -241,6 +301,40 @@ class Joint014Integration(unittest.TestCase):
         self.assertEqual(history["preparation_failure"], failure)
         self.assertEqual([t["final_response"] for t in history["tasks"]], [4, 7])
         self.assertEqual(run["excluded_episodes"], 1)
+
+
+class BudgetLedgerTests(unittest.TestCase):
+    def setUp(self):
+        self.spec = dict(latency_budgets=[2.0], task_seconds_scale=8.0,
+                         instance_seconds_scale=4.0, max_unfinished_fraction=0.0, dual_step=0.1)
+        self.item = dict(service=dict(arrived=4, completed=3), task_ids=["a", "b", "c", "d"],
+                         parallelism=dict(instance_seconds=12.0, charged_task_seconds=24.0),
+                         eligible=True, exclusion_reason=None, window_return=7.0, reward_components={},
+                         transitions=[dict(transition=dict(cost_at_decision=start, reward=0.0))
+                                      for start in ([2.0, 4.0, 0], [6.0, 12.0, 0])])
+
+    def test_whole_window_budget_and_action_credit(self):
+        dual = [0.5, 2.0]
+        self.assertTrue(budget_policy.settle(self.item, self.spec, 0, dual, True))
+        self.assertEqual(self.item["budget_policy"]["normalized"], [3.0, 3.0, 0.25])
+        self.assertEqual([r["transition"]["reward"] for r in self.item["transitions"]], [-1.5, -2.75])
+        self.assertEqual(self.item["reward"], -5.0)
+        self.assertAlmostEqual(dual[0], 0.6)
+        self.assertAlmostEqual(dual[1], 2.025)
+        frozen = [0.5, 2.0]
+        budget_policy.settle(self.item, self.spec, 0, frozen, False)
+        self.assertEqual(frozen, [0.5, 2.0])
+
+    def test_incomplete_arrivals_exclude_window_without_updating_dual(self):
+        self.item["service"] = dict(arrived=3, completed=3)
+        dual = [0.5, 2.0]
+        self.assertFalse(budget_policy.settle(self.item, self.spec, 0, dual, True))
+        self.assertFalse(self.item["eligible"])
+        self.assertFalse(self.item["budget_policy"]["eligible"])
+        self.assertEqual(self.item["exclusion_reason"], "budget_arrival_coverage")
+        self.assertIsNone(self.item["reward"])
+        self.assertEqual(dual, [0.5, 2.0])
+        self.assertTrue(all(r["transition"]["reward"] == 0.0 for r in self.item["transitions"]))
 
 
 if __name__ == "__main__":

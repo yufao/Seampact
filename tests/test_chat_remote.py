@@ -13,7 +13,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from seampact.chat import ChatJobs
 from seampact.hosting.deployment import Deployments
 from seampact.runtime import Coordinator, OwnerRuntime, ProtocolError, _task_context
+from seampact.source.inspection import Inspector
 from seampact.store import Store
+from seampact.units import UnitCatalog
 
 
 class Bound:
@@ -29,28 +31,20 @@ class ImmediateThread:
     def start(self): self.target(*self.args)
 
 
-class RemoteCatalog:
-    def __init__(self, store, router, ready):
-        self.store, self.remote_router = store, router
-        self.lock, self.bindings = threading.RLock(), {}
-        schema = dict(type="object", properties=dict(value=dict(type="string")), required=["value"])
-        self.row = dict(id="unit", tool_name="call_original", entry_id="entry", source_version="version",
-            path="original.py", symbol="original", description="original entry", status="MISSING",
-            runtime_group="group", parameters=schema, input_schema=schema,
-            scheduling=dict(visibility="business", activation="business"),
-            dispatch=dict(status="READY_INSTANCE" if ready else "COLD_STARTABLE"),
-            operations=dict(group_host=dict(status="HOST_CHECKED"), export_entry=dict(status="SOURCE_BOUND")))
-        store.save("runtime_group", "group", dict(id="group", contract=dict(host_profile="profile", digest="digest")))
-        store.save("deployment", "group", dict(image="image", publish=dict(reference="sha256:fixed")))
-
-    def public(self): return [copy.deepcopy(self.row)]
-    def business_units(self): return self.public()
-    def freeze_resources(self, selected, remote=()):
-        return {uid: (None, {}, copy.deepcopy(self.row)) for uid in selected}
-    def snapshot_resources(self, *args, **kwargs): return {}
-    def _validate_bound_arguments(self, binding, entry, unit, arguments, native_arguments=(), deferred_arguments=()):
-        if set(arguments) != {"value"} or type(arguments["value"]) is not str:
-            raise ValueError("invalid original argument")
+def install_remote_catalog(root, store, runtime, router):
+    (root / "original.py").write_text("def echo(value: str) -> str:\n    return value\n", encoding="utf-8")
+    inspector = Inspector.freeze(root, root / "snapshots", "source", ["original.py"], "echo", "return value")
+    inspector.request["source_id"] = "source"
+    catalog = UnitCatalog(root, store, runtime)
+    unit, = catalog.install(inspector, dict(entries=[
+        dict(id="echo", path="original.py", symbol="echo", kind="function")]), "analysis")
+    uid = unit["id"]
+    # Simulate a platform process without the local binding. Source, host and
+    # operation facts still come from the normal installer.
+    catalog.deferred[uid] = (catalog.bindings.pop(uid), catalog.entry_specs.pop(uid))
+    catalog.remote_router = router
+    store.save("deployment", unit["runtime_group"], dict(image="image", publish=dict(reference="sha256:fixed")))
+    return catalog, unit
 
 
 class ChatRemoteTests(unittest.TestCase):
@@ -68,14 +62,15 @@ class ChatRemoteTests(unittest.TestCase):
                     jobs.close()
                 return dict(original_value=arguments["value"]), dict(execution="REMOTE")
             router = SimpleNamespace(backend=lambda: dict(start_timeout_s=37), start_gap=lambda group: None,
+                dispatch=lambda unit, deferred: dict(status="READY_INSTANCE" if ready else "COLD_STARTABLE"),
                 invoke_placed=invoke, release_task=released.append)
-            catalog = RemoteCatalog(store, router, ready)
+            catalog, unit = install_remote_catalog(Path(directory), store, runtime, router)
             scheduler = SimpleNamespace(select_plan=lambda plans, observation: (plans[0], "token"),
                                         feedback=lambda *args: None)
             jobs = ChatJobs(store, None, catalog, runtime, scheduler)
             requirements = ["Use the original entry once"]
             arguments = dict(requirements=requirements, plans=[dict(id="plan", requirements=requirements,
-                steps=[dict(unit="call_original", arguments=dict(value="original input"))])])
+                steps=[dict(unit=unit["tool_name"], arguments=dict(value="original input"))])])
             replies = [dict(choices=[dict(finish_reason="tool_calls", message=dict(role="assistant", content=None,
                 tool_calls=[dict(id="call", type="function", function=dict(name="execute_harness_plan",
                     arguments=json.dumps(arguments)))]))]),
@@ -102,7 +97,7 @@ class ChatRemoteTests(unittest.TestCase):
                                     jobs.start(dict(messages=[dict(role="user", content="execute original")])))
                 task = store.get("task", accepted["task_id"])
                 self.assertEqual(released, [task["id"]])
-                placement = task["placements"]["unit"]
+                placement = task["placements"][unit["id"]]
                 self.assertEqual(placement["run_id"], task["id"])
                 self.assertEqual(placement["start_timeout_s"], 37)
                 self.assertEqual(placement["image"], "sha256:fixed")

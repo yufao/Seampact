@@ -299,8 +299,21 @@ class FrozenCatalog:
         self.catalog, self.router, self.facts = catalog, catalog.remote_router, {}
         with catalog.lock:
             current = {unit["id"]: unit for unit in catalog.public()}
-            selected = list(dict.fromkeys(unit_ids)) if unit_ids is not None else [
-                unit["id"] for unit in catalog.business_units()]
+            if unit_ids is not None:
+                selected = list(dict.fromkeys(unit_ids))
+            else:
+                # A source may be locally deferred but cold-startable on its
+                # checked host. It still needs an actual deferred binding and
+                # passes the same host/start-gap checks below.
+                selected = []
+                deferred = getattr(catalog, "deferred", {})
+                for uid, unit in current.items():
+                    policy = unit.get("scheduling") or {}
+                    cold = (uid in deferred and (unit.get("dispatch") or {}).get("status") == "COLD_STARTABLE"
+                            and ((unit.get("operations") or {}).get("group_host") or {}).get("status") == "HOST_CHECKED")
+                    if (policy.get("visibility") == "business" and policy.get("activation") == "business"
+                            and (unit.get("status") == "READY" or cold)):
+                        selected.append(uid)
             requested = dict(placement or {})
             if set(requested) - set(selected) or any(value not in {"LOCAL", "REMOTE"} for value in requested.values()):
                 raise ValueError("placement 只能为本次 Unit 指定 LOCAL 或 REMOTE")
@@ -333,6 +346,17 @@ class FrozenCatalog:
             remote = {uid for uid, value in self.placement.items() if value["kind"] == "REMOTE"}
             self.frozen = catalog.freeze_resources(selected, remote=remote)
             self.units = {uid: copy.deepcopy(current[uid]) for uid in selected}
+            # Freeze the same checked operation evidence that will be consumed
+            # by dispatch and execution; readiness is checked separately below.
+            from seampact.typed_contract import require_operation
+            self.contract_digests = {}
+            for uid in selected:
+                stored = catalog.store.get("unit", uid) or {}
+                group = catalog.store.get("runtime_group", stored.get("runtime_group") or "")
+                result = require_operation(stored, "dispatch", group=group)
+                if uid in remote:
+                    require_operation(stored, "remote", group=group)
+                self.contract_digests[uid] = result["contract_digest"]
             for uid in remote:
                 self.units[uid].update(status="READY", execution="REMOTE")
                 self.frozen[uid][2].update(status="READY", execution="REMOTE")
@@ -396,6 +420,36 @@ class FrozenCatalog:
     def public(self):
         return copy.deepcopy(list(self.units.values()))
 
+    def require_operation(self, unit_id, operation):
+        """Recheck current evidence against the identity frozen for this run."""
+        if unit_id not in self.frozen:
+            raise ValueError("Unit 不在本次冻结能力池内")
+        with self.catalog.lock:
+            current = self.catalog.store.get("unit", unit_id) or {}
+            binding, entry, _ = self.frozen[unit_id]
+            result = self.catalog._verify_operation(binding, current, operation=operation)
+            candidate_entries = [item for item in binding.candidate.get("entries", [])
+                                 if isinstance(item, dict) and item.get("id") == current.get("entry_id")]
+            if len(candidate_entries) != 1 or candidate_entries[0] != entry:
+                raise ValueError("冻结入口与已检查的绑定配置不一致")
+            if result["contract_digest"] != self.contract_digests[unit_id]:
+                raise ValueError("Unit 操作契约已改变；请重新冻结运行")
+            return result
+
+    def require_boundary(self, unit_id, call, root, gate):
+        """Check the registered gate's finite scope under this frozen root."""
+        from seampact.typed_contract import require_boundary
+        self.require_operation(unit_id, "dispatch")
+        with self.catalog.lock:
+            unit = self.catalog.store.get("unit", unit_id) or {}
+            group = self.catalog.store.get("runtime_group", unit.get("runtime_group") or "")
+            binding, entry, _ = self.frozen[unit_id]
+            result = require_boundary(unit, group=group, binding=binding, entry=entry,
+                                      call=call, root=root, gate=gate)
+            if result["contract_digest"] != self.contract_digests[unit_id]:
+                raise ValueError("边界所属 Unit 契约已改变；请重新冻结运行")
+            return result
+
     def unit(self, unit_id):
         if unit_id not in self.frozen:
             raise ValueError("Unit 不在本次冻结能力池内")
@@ -412,6 +466,10 @@ class FrozenCatalog:
         return value
 
     def dispatch_status(self, unit_id):
+        try:
+            self.require_operation(unit_id, "dispatch")
+        except ValueError as error:
+            return dict(status="UNAVAILABLE", reason=str(error))
         placement = self.placement[unit_id]
         for group in placement.get("resource_dependencies", []):
             fact = self.router.runtime_fact(group, None, self.service_placements[group].get("image"))
@@ -499,11 +557,13 @@ class FrozenCatalog:
 
     def _invoke(self, unit_id, arguments, native_arguments=()):
         # Concurrent tasks of one window share this catalog; facts belong to the calling task.
+        self.require_operation(unit_id, "invoke")
         key = (_task_context.get(), unit_id)
         placement = self.placement.get(unit_id, dict(kind="LOCAL"))
         if placement["kind"] == "LOCAL":
             self.facts[key] = dict(execution="LOCAL")
             return self.catalog.invoke_frozen(self.frozen, unit_id, arguments, native_arguments)
+        self.require_operation(unit_id, "remote")
         binding, entry, unit = self.frozen[unit_id]
         self.catalog._validate_bound_arguments(binding, entry, unit, arguments, native_arguments)
         if "run_id" not in placement:

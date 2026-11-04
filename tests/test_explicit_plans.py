@@ -79,6 +79,9 @@ class ExplicitPlanTests(unittest.TestCase):
                                              separators=(",", ":")).encode()).hexdigest()
         self.assertEqual(receipt["request_sha256"], expected)
         self.assertEqual(task["model_calls"], 0)
+        installed = next(unit for unit in self.catalog.public() if unit["entry_id"] == "echo")
+        self.assertEqual(task["plan"]["contract_digests"],
+                         {installed["id"]: installed["typed_contract"]["digest"]})
         self.assertEqual(self.feedback[0][0:2], ("token", True))
         self.assertEqual(self.jobs.conversations()["conversations"], [])
 

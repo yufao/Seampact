@@ -120,9 +120,7 @@ def compile_plans(catalog, arguments):
             unit = ready.get(identity)
             if unit is None:
                 raise ValueError("方案包含未绑定的Unit")
-            export = unit.get("operations", {}).get("export_entry", {})
-            if export.get("status") not in {"SOURCE_BOUND", "ADMITTED"}:
-                raise ValueError("内部排期片段不能作为独立入口加入组合")
+            export = catalog.require_operation(identity, "export_entry")
             step_id = proposed_step.get("id", "step_" + str(index + 1))
             if not isinstance(step_id, str) or not step_id or step_id in prior:
                 raise ValueError("方案步骤需要唯一名称")
@@ -163,6 +161,7 @@ def compile_plans(catalog, arguments):
             catalog.validate_arguments(identity, values, deferred_arguments=deferred,
                 native_arguments=native_arguments)
             step = dict(proposed_step, id=step_id, unit_id=identity, after=dependencies,
+                contract_digest=export["contract_digest"],
                 native_arguments=sorted(native_arguments))
             for predecessor in dependencies:
                 controls.append(dict(source_step=predecessor, target_step=step_id, exit="RETURN"))

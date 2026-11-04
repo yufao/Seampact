@@ -350,6 +350,7 @@ def add_tools(spec):
     host = spec["HostConfig"]
     destinations = {row["Target"] for row in host.get("Mounts") or []}
     destinations.update(row.split(":")[1] for row in host.get("Binds") or [] if ":" in row)
+    added = set()
     if "/var/run/docker.sock" in destinations:
         # Existing mounts are intentionally preserved; require them to refer to the selected daemon.
         matches = [row for row in (OLD or {}).get("Mounts", []) if row["Destination"] == "/var/run/docker.sock"]
@@ -357,10 +358,29 @@ def add_tools(spec):
             fail("The old Docker socket mount targets another daemon. Keep its original deployment command or correct the mount explicitly.")
     else:
         host.setdefault("Mounts", []).append(dict(Type="bind", Source=str(SOCKET_PATH), Target="/var/run/docker.sock"))
+        added.add("/var/run/docker.sock")
+    info = api("GET", "/info")
+    storage_source = info.get("DockerRootDir")
+    if not isinstance(storage_source, str) or not storage_source.startswith("/"):
+        fail("The selected daemon did not report an absolute Docker storage directory.")
+    storage_target = "/seampact-docker-storage"
+    if storage_target in destinations:
+        mounts = [row for row in host.get("Mounts") or [] if row["Target"] == storage_target]
+        mounts += [dict(Type=row["Type"], Source=row["Source"], ReadOnly=not row["RW"])
+                   for row in (OLD or {}).get("Mounts", []) if row["Destination"] == storage_target]
+        if not mounts or any(row.get("Type") != "bind" or row.get("Source") != storage_source
+                             or row.get("ReadOnly") is not True for row in mounts):
+            fail("The Docker storage probe mount must refer read-only to the selected daemon's storage directory.")
+    else:
+        host.setdefault("Mounts", []).append(dict(Type="bind", Source=storage_source, Target=storage_target, ReadOnly=True))
+        added.add(storage_target)
     env = inspect_environment(spec.get("Env"))
-    env.update(DOCKER_HOST="unix:///var/run/docker.sock", DOCKER_CONFIG="/data/docker-client")
+    # An adopted container can keep an old generated hostname. The stable
+    # deployment name identifies this platform after candidate rename/start.
+    env.update(DOCKER_HOST="unix:///var/run/docker.sock", DOCKER_CONFIG="/data/docker-client",
+               SEAMPACT_CONTAINER_NAME=CONFIG["container"], SEAMPACT_DOCKER_STORAGE_PATH=storage_target)
     spec["Env"] = [key + "=" + value for key, value in env.items()]
-    rootless = any("rootless" in item for item in api("GET", "/info").get("SecurityOptions", []))
+    rootless = any("rootless" in item for item in info.get("SecurityOptions", []))
     if rootless:
         # Container root maps to the rootless daemon owner and can use that
         # owner's socket. A host-side subordinate GID is not a container GID:
@@ -370,12 +390,13 @@ def add_tools(spec):
         if str(spec.get("User") or "").split(":", 1)[0] not in {"", "0", "root"}:
             fail("Adding Docker tools to a rootless container requires its daemon-owner mapping (container user 0). "
                  "The existing custom user is preserved; configure its socket access explicitly before adoption.")
-        return
+        return added
     groups = host.get("GroupAdd") or []
     gid = str(SOCKET_PATH.stat().st_gid)
     if gid not in groups:
         groups.append(gid)
     host["GroupAdd"] = groups
+    return added
 
 
 def fresh_spec(image):
@@ -645,8 +666,9 @@ def main():
                "--build-arg", "DOCKER_CLI_IMAGE=" + CONFIG["docker_cli_image"], "-t", runtime,
                "-f", str(code / "deploy/Dockerfile.tools"), str(code), visible=True)
     spec = replacement_spec(OLD, runtime) if OLD else fresh_spec(runtime)
+    added_tool_mounts = set()
     if CONFIG["tools"] and (not OLD or ARGS.tools is True):
-        add_tools(spec)
+        added_tool_mounts = add_tools(spec)
     check_idle()
     candidate = CONFIG["container"] + "-next-" + uuid.uuid4().hex[:8]
     # Creation validates Docker options while the old platform is still running.
@@ -658,8 +680,7 @@ def main():
             candidate_info = inspect_container(candidate_id)
             before = sorted((mount_signature(row) for row in OLD["Mounts"] if row["Type"] in ("bind", "volume")), key=lambda row: row["Destination"])
             after = sorted((mount_signature(row) for row in candidate_info["Mounts"] if row["Type"] in ("bind", "volume")), key=lambda row: row["Destination"])
-            if ARGS.tools is True and not any(row["Destination"] == "/var/run/docker.sock" for row in before):
-                after = [row for row in after if row["Destination"] != "/var/run/docker.sock"]
+            after = [row for row in after if row["Destination"] not in added_tool_mounts]
             if before != after:
                 fail("The candidate's persistent mounts differ from the original. No old container was stopped; use the original deployment command.")
         backup_dir.mkdir(parents=True, mode=0o700)

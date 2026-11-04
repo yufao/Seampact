@@ -245,6 +245,7 @@ class ChatJobs:
         plan, token = self.scheduler.select_plan(plans, observation)
         task.update(phase="harness_execution", plan=dict(id=plan["id"], units=plan["units"],
             requirements=plan["requirements"], candidate_count=len(plans),
+            contract_digests={step["unit_id"]: step["contract_digest"] for step in plan["steps"]},
             data_edges=plan["data_edges"], control_edges=plan["control_edges"], placements=plan["placements"],
             binding_status=plan["binding_status"], semantic_status=plan["semantic_status"]))
         self.store.save("task", task["id"], task)

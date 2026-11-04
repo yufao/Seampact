@@ -23,6 +23,7 @@ from seampact.store import now
 from seampact.scheduling.costs import validate_costs, episode_costs, usage_record, summarize_usage
 from seampact.capabilities import JOINT_OBSERVATION_SCHEMA, JOINT_CANDIDATE_SCHEMA
 from seampact.scheduling import joint
+from seampact.scheduling import budget_policy
 
 CANONICAL_VERSION = "seampact-json/1"
 LEARNING = {"double_dqn", "ppo", "discrete_sac"}
@@ -245,6 +246,9 @@ class TrainingJobs:
             pool[-1]["execution_at_creation"] = current[uid].get("execution", "UNKNOWN")
             pool[-1]["capability"] = current[uid].get("capability")
             pool[-1]["placement"] = copy.deepcopy(catalog.placement[uid])
+            contract = catalog.require_operation(uid, "dispatch")
+            pool[-1]["typed_contract"] = copy.deepcopy((self.store.get("unit", uid) or {}).get("typed_contract"))
+            pool[-1]["typed_contract_digest"] = contract["contract_digest"]
         criteria = validate_criteria(config["criteria"])
         final = validate_criteria(config["evaluation_criteria"]) if config.get("evaluation_criteria") else None
         route_specs = [r[s] for r in scene.get("routes", {}).values()
@@ -291,6 +295,8 @@ class TrainingJobs:
         resource_dimensions = len((config.get("joint") or {}).get("capacity", {}).get("resources", {}))
         dims = ((len(JOINT_OBSERVATION_SCHEMA), len(JOINT_CANDIDATE_SCHEMA) + resource_dimensions) if scheduling == joint.MODE
                 else (len(scene["observation_schema"]), len(scene["candidate_schema"])))
+        if (config.get("joint") or {}).get("budget_policy") is not None:
+            dims = (dims[0] + 1, dims[1])
         if algorithm in LEARNING:
             resolved = default_config(algorithm)
             unknown = set(parameters) - set(resolved)
@@ -379,6 +385,22 @@ class TrainingJobs:
             if not parent_id:
                 raise ValueError("该运行方式需要原训练 run_id")
             parent = self.detail(parent_id)
+            budget = manifest.get("joint", {}).get("budget_policy")
+            previous_budget = parent["manifest"].get("joint", {}).get("budget_policy")
+            if budget_policy.training_semantics(budget) != budget_policy.training_semantics(previous_budget):
+                raise ValueError("父工件的预算网格、尺度或训练约束不同")
+            if budget:
+                def contracts(pool):
+                    return {item["id"]: item.get("typed_contract_digest") for item in pool}
+                expected = contracts(parent["manifest"]["pool"])
+                if (not expected or any(not value for value in expected.values())
+                        or expected != contracts(manifest["pool"])):
+                    raise ValueError("预算冻结评价要求与训练相同的 Unit 操作契约身份")
+                selected = budget["latency_budgets"].index(budget["freeze_budget"])
+                counts = parent.get("budget_choice_windows", [])
+                if selected >= len(counts) or not counts[selected] or not parent.get("budget_multipliers"):
+                    raise ValueError("所选预算没有实际参与训练的选择窗口")
+                manifest["trained_budget_multipliers"] = copy.deepcopy(parent["budget_multipliers"])
             artifact = parent.get("checkpoint")
             if parent["status"] not in {"COMPLETED", "STOPPED"} or not artifact:
                 raise ValueError("父运行需要已保存的完整策略工件")
@@ -766,6 +788,8 @@ class TrainingJobs:
                 raise ValueError("固定初始状态要求运行开始时该运行组没有存活实例；请先排空停止：" + group_id)
             if control["initial_state"] == "warm" and control["mode"] != joint.MODE:
                 required = [uid for uid, value in catalog.placement.items() if value.get("group_id") == group_id]
+                for uid in required:
+                    catalog.require_operation(uid, "prepare")
                 unit_id = required[0] if required else None
                 started = time.perf_counter()
                 record = deployments.ensure_ready(placement, unit_id)
@@ -778,6 +802,8 @@ class TrainingJobs:
                 if missing or unsupported:
                     setup.update(status="FAILED", missing_units=missing, preparation_unsupported=unsupported)
                     raise ValueError("暖态准备要求全部所需成员可用且契约允许提前初始化：" + group_id)
+                for uid in required:
+                    catalog.require_operation(uid, "prewarm")
                 started = time.perf_counter()
                 setup["prewarm"] = deployments.prewarm(group_id, dict(instance_id=record["id"], units=required), run_id=rid)
                 setup["prewarm_ms"] = (time.perf_counter() - started) * 1000
@@ -1090,6 +1116,10 @@ class TrainingJobs:
             if manifest.get("harness_resources") is not None and resources != manifest["harness_resources"]:
                 raise ValueError("Harness 资源配置已改变；请按新条件运行冻结评价或适应")
             for item in manifest["pool"]:
+                current_contract = catalog.require_operation(item["id"], "dispatch")
+                if (not item.get("typed_contract_digest") or
+                        current_contract["contract_digest"] != item["typed_contract_digest"]):
+                    raise ValueError("激活策略的 Unit 操作契约已改变；请重新运行冻结评价")
                 if item.get("placement", {}).get("kind") == "REMOTE" and \
                         catalog.placement[item["id"]]["contract_digest"] != item["placement"]["contract_digest"]:
                     raise ValueError("运行组契约已改变；请按新条件运行冻结评价或适应")

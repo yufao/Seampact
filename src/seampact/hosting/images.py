@@ -363,9 +363,10 @@ class Images:
         if type(reserve) is not int or reserve < 0:
             raise ValueError("reserve_bytes 须为非负整数")
         root = Path(engine["root"])
-        candidate = Path(path) if path else root
+        candidate = Path(path or os.environ.get("SEAMPACT_DOCKER_STORAGE_PATH") or root)
         if Path("/.dockerenv").exists():
-            mounts = self._json(["docker", "container", "inspect", "--format", "{{json .Mounts}}", os.environ.get("HOSTNAME", "")])
+            identity = os.environ.get("SEAMPACT_CONTAINER_NAME") or os.environ.get("HOSTNAME", "")
+            mounts = self._json(["docker", "container", "inspect", "--format", "{{json .Mounts}}", identity])
             mapped = any(m.get("Type") == "bind" and Path(m["Source"]) == root and
                 Path(m["Destination"]).resolve() == candidate.resolve() for m in mounts)
         else:

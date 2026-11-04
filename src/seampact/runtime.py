@@ -63,15 +63,22 @@ class Coordinator:
                    if c["physical"] in {"RESERVED", "AUTHORIZED", "STARTED", "UNKNOWN"} and not c.get("root_id"))
 
     def roots_used(self):
-        # Slots belong to the admitting window; a closed window's hosts were drained before it ended.
-        run_id = (self.root_control or {}).get("run_id")
-        return sum(1 for r in self.state["roots"].values() if r["state"] in {"ACTIVE", "UNKNOWN"} and r["run_id"] == run_id)
+        return sum(self._root_held(r) for r in self.state["roots"].values())
+
+    def _root_held(self, root):
+        return root["state"] in {"ACTIVE", "UNKNOWN"} or any(
+            c.get("root_id") == root["id"] and c["physical"] in {"RESERVED", "AUTHORIZED", "STARTED", "UNKNOWN"}
+            for c in self.state["calls"].values())
+
+    def _release_closed_roots(self):
+        if self.root_control and self.root_control.get("closing") and not self.roots_used():
+            self.root_control = None
 
     def _local_held(self):
-        return any(r["state"] in {"ACTIVE", "UNKNOWN"} and r["host"] == "local" for r in self.state["roots"].values())
+        return any(self._root_held(r) and r["host"] == "local" for r in self.state["roots"].values())
 
     def host_busy(self, host):
-        if any(r["state"] in {"ACTIVE", "UNKNOWN"} and r["host"] == host for r in self.state["roots"].values()):
+        if any(self._root_held(r) and r["host"] == host for r in self.state["roots"].values()):
             return True
         # This process runs a local root and a call outside any root one at a time.
         return host == "local" and any(
@@ -83,7 +90,7 @@ class Coordinator:
             return None
         host = (unit or {}).get("instance_id") or "local"
         return next((r for r in self.state["roots"].values()
-                     if r["state"] == "ACTIVE" and r["task_id"] == task_id and r["host"] == host), None)
+                     if self._root_held(r) and r["task_id"] == task_id and r["host"] == host), None)
 
     def owner_busy(self, owner):
         return any(c["owner"] == owner and c["physical"] in {"RESERVED", "AUTHORIZED", "STARTED", "UNKNOWN"}
@@ -111,6 +118,9 @@ class Coordinator:
             raise ProtocolError("inactive gate or stale native-owner generation")
         identity = uuid.uuid4().hex
         root = self._covering_root(task_id, g.get("unit"))
+        if root and (root["state"] != "ACTIVE" or not self.root_control or self.root_control.get("closing")
+                     or root["run_id"] != self.root_control["run_id"]):
+            raise ProtocolError("the covering joint window is closed")
         self.state["calls"][identity] = dict(id=identity, gate=gate, owner=owner,
             generation=generation, slots=g["slots"], physical="ENABLED",
             logical="WAITING", starts=0, receipt=None, permit=None,
@@ -130,7 +140,9 @@ class Coordinator:
         if c["physical"] != "ENABLED" or not g["active"]:
             raise ProtocolError("call not legally reservable")
         if c.get("root_id"):
-            if self.state["roots"][c["root_id"]]["state"] != "ACTIVE":
+            root = self.state["roots"][c["root_id"]]
+            if (root["state"] != "ACTIVE" or not self.root_control or self.root_control.get("closing")
+                    or root["run_id"] != self.root_control["run_id"]):
                 raise ProtocolError("the covering root request is no longer active")
             if self._boundary_controlled(c) and self._boundaries_used() + c["slots"] > self.root_control["boundary_slots"]:
                 raise ProtocolError("managed boundary execution slots exhausted")
@@ -150,6 +162,10 @@ class Coordinator:
         g = self.state["gates"][c["gate"]]
         if c["physical"] != "RESERVED" or not g["active"]:
             raise ProtocolError("reservation invalidated before authorization")
+        if c.get("root_id") and (not self.root_control or self.root_control.get("closing")
+                or self.state["roots"][c["root_id"]]["run_id"] != self.root_control["run_id"]
+                or self.state["roots"][c["root_id"]]["state"] != "ACTIVE"):
+            raise ProtocolError("the covering joint window is closed")
         c.update(physical="AUTHORIZED", permit=uuid.uuid4().hex)
         self._persist("authorized")
         waiter = self.waiters.get(identity)
@@ -187,6 +203,7 @@ class Coordinator:
             self.policy.feedback(token, receipt == "RETURN", c["latency_ms"], following, self._observation())
         self._persist("physically_retired")
         self._notify_roots()
+        self._release_closed_roots()
         await self.pump()
         return True
 
@@ -205,6 +222,19 @@ class Coordinator:
             waiter.cancel()
         self._persist("logically_cancelled")
         await self.pump()
+
+    async def cancel_enabled(self, identity):
+        """Withdraw only a still-enabled waiter, without touching in-flight work."""
+        call = self.state["calls"].get(identity)
+        if not call or call["physical"] != "ENABLED" or call["logical"] != "WAITING":
+            return False
+        call.update(physical="RETIRED", logical="REJECTED")
+        waiter = self.waiters.get(identity)
+        if waiter and not waiter.done():
+            waiter.set_exception(ProtocolError("boundary contract no longer permits dispatch"))
+        self._persist("boundary_rejected")
+        await self.pump()
+        return True
 
     async def invalidate(self, gate):
         self.state["gates"][gate]["active"] = False
@@ -265,10 +295,24 @@ class Coordinator:
     async def configure_roots(self, control):
         if control is None:
             if self.root_control is not None:
+                self.root_control["closing"] = True
+                run_id = self.root_control["run_id"]
                 for identity, r in list(self.state["roots"].items()):
-                    if r["state"] == "ENABLED" and r["run_id"] == self.root_control["run_id"]:
+                    if r["state"] == "ENABLED" and r["run_id"] == run_id:
                         await self.cancel_root(identity, "joint window closed")
-            self.root_control = None
+                roots = {r["id"] for r in self.state["roots"].values() if r["run_id"] == run_id}
+                for call in self.state["calls"].values():
+                    if call.get("root_id") in roots and call["physical"] in {"ENABLED", "RESERVED", "AUTHORIZED"}:
+                        # consume is the central no-start barrier: an issued but
+                        # unconsumed permit cannot enter the original body after this step.
+                        call.update(physical="RETIRED", logical="REJECTED", receipt="JOINT_WINDOW_CLOSED")
+                        waiter = self.waiters.get(call["id"])
+                        if waiter and not waiter.done():
+                            waiter.set_exception(ProtocolError("joint window closed"))
+                self._persist("root_window_closed")
+                # Keep the old limits and boundary classification until every
+                # possibly executing root and inner call has actually retired.
+                self._release_closed_roots()
             await self.pump()
             return
         if self.root_control is not None:
@@ -280,7 +324,7 @@ class Coordinator:
         if type(boundary_slots) is not int or boundary_slots < 1:
             raise ValueError("boundary_slots must be a positive integer")
         self.root_control = dict(run_id=control["run_id"], call_slots=slots, notify=control.get("notify"),
-                                 boundaries=control.get("boundaries", False), boundary_slots=boundary_slots)
+                                 boundaries=control.get("boundaries", False), boundary_slots=boundary_slots, closing=False)
 
     def _boundary_controlled(self, call):
         root = self.state["roots"].get(call.get("root_id"), {})
@@ -310,7 +354,7 @@ class Coordinator:
 
     async def enable_root(self, task_id, unit_id, target):
         control = self.root_control
-        if not control:
+        if not control or control.get("closing"):
             raise ProtocolError("no joint window is admitting root requests")
         if not task_id or target.get("kind") not in {"LOCAL", "REMOTE"}:
             raise ProtocolError("a root request needs its task identity and frozen placement")
@@ -333,7 +377,8 @@ class Coordinator:
 
     async def authorize_root(self, identity, host):
         r, control = self.state["roots"].get(identity), self.root_control
-        if not r or not control or r["state"] != "ENABLED" or r["run_id"] != control["run_id"]:
+        if (not r or not control or control.get("closing") or r["state"] != "ENABLED"
+                or r["run_id"] != control["run_id"]):
             raise ProtocolError("root request is not dispatchable")
         target = r["target"]
         if (host == "local") != (target["kind"] == "LOCAL") or target.get("instance_id") not in (None, host):
@@ -361,6 +406,7 @@ class Coordinator:
                  duration_ms=(finished - r["granted_at"]) * 1000)
         self._persist("root_retired")
         self._notify_roots()
+        self._release_closed_roots()
         await self.pump()
 
     async def cancel_root(self, identity, reason):
@@ -402,7 +448,9 @@ class Coordinator:
                     or self.owner_busy(c["owner"])):
                 continue
             if c.get("root_id"):
-                if (self.state["roots"][c["root_id"]]["state"] == "ACTIVE"
+                if (self.root_control and not self.root_control.get("closing")
+                        and self.state["roots"][c["root_id"]]["run_id"] == self.root_control["run_id"]
+                        and self.state["roots"][c["root_id"]]["state"] == "ACTIVE"
                         and (not self._boundary_controlled(c) or
                              self._boundaries_used() + c["slots"] <= self.root_control["boundary_slots"])):
                     ready.append(c)

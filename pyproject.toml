@@ -1,12 +1,12 @@
 [project]
 name = "seampact-core"
-version = "0.15.6"
+version = "0.15.7"
 description = "Heterogeneous Harness intake, native Units and two-layer RL chat prototype"
 requires-python = ">=3.11"
 dependencies = []
 
 [project.optional-dependencies]
-rl = ["torch>=2.2"]
+rl = ["torch>=2.2", "numpy>=1.26"]
 
 [build-system]
 requires = ["setuptools>=68"]

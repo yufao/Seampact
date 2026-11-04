@@ -30,9 +30,9 @@ class DeploySocketGroupsTests(unittest.TestCase):
 
         def api(method, path):
             self.assertEqual((method, path), ("GET", "/info"))
-            return {"SecurityOptions": ["name=rootless"] if rootless else []}
+            return {"SecurityOptions": ["name=rootless"] if rootless else [], "DockerRootDir": "/var/lib/docker"}
 
-        namespace = dict(SOCKET_PATH=Socket(), OLD=None, Path=Path, fail=fail, api=api,
+        namespace = dict(SOCKET_PATH=Socket(), OLD=None, Path=Path, fail=fail, api=api, CONFIG=dict(container="platform"),
             inspect_environment=lambda env: dict(row.split("=", 1) for row in env or []))
         exec(compile(ast.Module(body=[function], type_ignores=[]), "deploy.sh:add_tools", "exec"), namespace)
         return namespace["add_tools"]
@@ -55,6 +55,24 @@ class DeploySocketGroupsTests(unittest.TestCase):
         add(spec)
         add(spec)
         self.assertEqual(spec["HostConfig"]["GroupAdd"], ["12", "991"])
+
+    def test_adopted_hostname_is_preserved_but_storage_uses_stable_identity(self):
+        spec = dict(User="1000:1000", Hostname="old-generated-hostname", Env=["HOSTNAME=old-generated-hostname"], HostConfig={})
+        add = self.helper(False)
+        self.assertEqual(add(spec), {"/var/run/docker.sock", "/seampact-docker-storage"})
+        self.assertEqual(add(spec), set())
+        self.assertEqual(spec["Hostname"], "old-generated-hostname")
+        self.assertIn("SEAMPACT_CONTAINER_NAME=platform", spec["Env"])
+        self.assertIn("SEAMPACT_DOCKER_STORAGE_PATH=/seampact-docker-storage", spec["Env"])
+        storage = [m for m in spec["HostConfig"]["Mounts"] if m["Target"] == "/seampact-docker-storage"]
+        self.assertEqual(storage, [dict(Type="bind", Source="/var/lib/docker", Target="/seampact-docker-storage", ReadOnly=True)])
+
+    def test_existing_conflicting_storage_mount_is_rejected(self):
+        for source, readonly in [("/other-daemon", True), ("/var/lib/docker", False)]:
+            spec = dict(User="0:0", Env=[], HostConfig=dict(Mounts=[dict(Type="bind", Source=source,
+                Target="/seampact-docker-storage", ReadOnly=readonly)]))
+            with self.subTest(source=source, readonly=readonly), self.assertRaisesRegex(RuntimeError, "storage probe mount"):
+                self.helper(False)(spec)
 
     def test_rootless_custom_user_is_not_silently_replaced(self):
         spec = dict(User="1000:1000", Env=[], HostConfig={})

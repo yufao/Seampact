@@ -3,6 +3,7 @@ import copy
 import hashlib
 import io
 import json
+import os
 from pathlib import Path
 import sys
 import tarfile
@@ -120,6 +121,24 @@ class ImageRetention(unittest.TestCase):
         with patch.object(self.images, "storage", return_value=dict(free_bytes=10 ** 10)):
             result = self.images.prepare(body)
         return result
+
+    def test_storage_probe_uses_deployment_identity_and_real_mapped_filesystem(self):
+        mounts = [dict(Type="bind", Source="/daemon/docker", Destination=str(self.root))]
+        env = dict(HOSTNAME="removed-old-container", SEAMPACT_CONTAINER_NAME="platform",
+                   SEAMPACT_DOCKER_STORAGE_PATH=str(self.root))
+        with patch.dict(os.environ, env), patch.object(Path, "exists", return_value=True), \
+                patch.object(self.images, "_json", return_value=mounts) as inspect:
+            value = self.images.storage(dict(root="/daemon/docker"), reserve=0)
+        self.assertEqual(value["path"], str(self.root))
+        self.assertGreater(value["free_bytes"], 0)
+        self.assertEqual(inspect.call_args.args[0][-1], "platform")
+
+    def test_storage_probe_still_rejects_an_unrelated_filesystem(self):
+        mounts = [dict(Type="bind", Source="/different/daemon", Destination=str(self.root))]
+        with patch.dict(os.environ, dict(SEAMPACT_CONTAINER_NAME="platform")), \
+                patch.object(Path, "exists", return_value=True), patch.object(self.images, "_json", return_value=mounts):
+            with self.assertRaisesRegex(PreparationFailed, "DOCKER_STORAGE_UNKNOWN"):
+                self.images.storage(dict(root="/daemon/docker"), str(self.root), reserve=0)
 
     def test_same_frozen_image_survives_multiple_real_consumer_releases(self):
         scope = self.prepare()

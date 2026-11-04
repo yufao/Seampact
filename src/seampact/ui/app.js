@@ -1033,6 +1033,12 @@ function renderUnits() {
       card.append(operationList);
       detailValue(card, '逐操作依据', unit.operations);
     }
+    if (inspectPage && unit.contract_check) {
+      card.append(node('p', unit.contract_check.valid ? '运行契约已核对' : '运行契约需要重新核对', 'card-meta'));
+      if (unit.contract_check.reason) card.append(node('p', unit.contract_check.reason, 'card-note'));
+      detailValue(card, '当前操作资格', unit.operation_checks);
+      detailValue(card, '冻结运行契约', unit.typed_contract);
+    }
     detailValue(card, '调用输入', unit.input_schema);
     detailValue(card, '共同能力卡', unit.capability);
     if (inspectPage) {
@@ -3067,6 +3073,14 @@ function readResearchConfig() {
     if (!config.joint) throw new Error('joint/1 需要联合配置');
     config.scheduling_mode = 'joint/1';
   } else { delete config.scheduling_mode; delete config.joint; }
+  if (config.joint?.budget_policy) {
+    if (algorithms.length !== 1 || algorithms[0] !== 'ppo')
+      throw new Error('预算条件策略请选择一个 PPO 学习器');
+    if (!['train', 'freeze'].includes(config.mode))
+      throw new Error('预算条件策略支持训练或冻结评价');
+    if (config.mode === 'freeze' && !config.joint.budget_policy.latency_budgets?.includes(config.joint.budget_policy.freeze_budget))
+      throw new Error('冻结预算须选自训练使用的 latency_budgets，并选择对应来源运行');
+  }
   return config;
 }
 
@@ -3375,6 +3389,15 @@ function jointRunSummary(card, run) {
   card.append(node('p', '调度范围：' + (joint.dispatch_scope === 'roots_and_boundaries' ? '根请求及已核验内部边界' : '根请求') +
     ' · 工作集：' + (joint.working_sets ? '按任务准入，允许能力池大于驻留容量' : '历史配置') +
     ' · 资源采样：' + (joint.observation ? '随窗口记录' : '未配置'), 'card-meta'));
+  const budget = joint.budget_policy;
+  if (budget) {
+    card.append(node('p', '预算条件 PPO · ' + (run.mode === 'freeze'
+      ? '冻结预算 ' + displayNumber(budget.freeze_budget) : '训练预算 ' + budget.latency_budgets.map(displayNumber).join('、')) +
+      ' · 累计任务秒尺度 ' + displayNumber(budget.task_seconds_scale) +
+      ' · 实例秒尺度 ' + displayNumber(budget.instance_seconds_scale), 'card-meta'));
+    card.append(node('p', '各预算有效选择窗 ' + (run.budget_choice_windows || []).join(' / ') +
+      ' · 参数更新 ' + (run.updates ?? '—'), 'card-meta'));
+  }
   const summary = run.joint;
   if (summary) {
     const means = (summary.mean_active_roots || []).filter(value => finiteNumber(value));
@@ -3436,9 +3459,11 @@ function jointRunSummary(card, run) {
       details.append(node('p', '设备、进程与容器范围分别报告；设备功率可能包含共享使用。采样空缺不计为零，实例秒是逻辑代理。', 'card-note'));
     }
     const evidence = node('pre'); evidence.textContent = JSON.stringify({routes:item.route_metrics, service:item.service,
-      observation:item.resource_observation}, null, 2); details.append(evidence); card.append(details);
+      observation:item.resource_observation, budget_policy:item.budget_policy}, null, 2); details.append(evidence); card.append(details);
   }
-  card.append(node('p', '并行度按同时执行的根调用计算，不以实例数量代替；窗口回报＝已归属到学习转移的部分＋未归属部分。', 'card-note'));
+  card.append(node('p', budget
+    ? '预算回报按冻结尺度和当窗乘子组合成本。各窗详情保留原始分项、约束与乘子，实例秒为驻留代理。'
+    : '并行度按同时执行的根调用计算，不以实例数量代替；窗口回报＝已归属到学习转移的部分＋未归属部分。', 'card-note'));
 }
 
 function renderResearchComparison() {

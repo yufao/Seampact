@@ -69,7 +69,7 @@ class BuildIdentityTests(unittest.TestCase):
         self.assertNotEqual(self.identities(), consumed)
 
     def test_entrypoint_and_shared_checker_execution_changes_invalidate(self):
-        for name in ("worker.py", "target_runtime.py", "runtime.py", "units.py", "source/verification.py",
+        for name in ("worker.py", "target_runtime.py", "runtime.py", "units.py", "typed_contract.py", "source/verification.py",
                      "source/inspection.py", "source/lowering.py", "hosting/deployment.py", "configuration/dependencies.py", "scheduling/lifecycle.py"):
             with self.subTest(module=name):
                 before = self.identities()
@@ -128,6 +128,22 @@ class BuildIdentityTests(unittest.TestCase):
         self.assertNotIn("__main__.py", copied)
         with patch.object(target_runtime, "__file__", str(destination / "target_runtime.py")):
             self.assertEqual(target_runtime.core_identity("worker"), implementation)
+
+    def test_copied_worker_and_checker_import_typed_contract_in_isolation(self):
+        for scope in ("worker", "checker"):
+            with self.subTest(scope=scope):
+                implementation = target_runtime.core_identity(scope)
+                root = Path(self.temporary.name) / (scope + "-isolated")
+                target_runtime.copy_core(root / "seampact", implementation)
+                program = ("import pathlib,sys; sys.path.insert(0,sys.argv[1]); "
+                           "import seampact.units, seampact.typed_contract as c; "
+                           "assert pathlib.Path(c.__file__).resolve().is_relative_to(pathlib.Path(sys.argv[1]).resolve()); "
+                           "assert len(c.CHECKER_ID)==64")
+                env = dict(os.environ)
+                env.pop("PYTHONPATH", None)
+                result = subprocess.run([sys.executable, "-I", "-B", "-c", program, str(root)],
+                                        cwd=root, env=env, capture_output=True, text=True, timeout=30)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_missing_or_unknown_dynamic_platform_dependencies_fail_closed(self):
         self.change("worker.py", "\nfrom .missing_check import check\n")

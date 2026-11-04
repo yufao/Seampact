@@ -163,7 +163,7 @@ class AnalysisJobs:
         # Freeze this process's implementation before any model request. Later
         # workspace edits must not change an in-flight experiment's identity.
         self.implementation_bytes = {name: (Path(__file__).parent / name).read_bytes() for name in
-            ("analysis.py", "analysis_support/preprocessing.py", "source/inspection.py", "units.py", "source/verification.py",
+            ("analysis.py", "analysis_support/preprocessing.py", "source/inspection.py", "units.py", "typed_contract.py", "source/verification.py",
              "source/lowering.py", "source/callsite.py", "hosting/deployment.py", "configuration/dependencies.py", "resources.py", "providers.py",
              "service.py", "hosting/environments.py", "target_runtime.py", "analysis_support/revisions.py", "analysis_support/classification.py", "analysis_support/intake_feedback.py",
              "configuration/resource_flow.py", "configuration/resource_origins.py", "analysis_support/candidate_checks.py", "configuration/configuration_flow.py",

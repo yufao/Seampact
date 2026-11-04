@@ -1148,6 +1148,12 @@ class Deployments:
         group = self._group(identity)
         if group["host"]["status"] != "HOST_CHECKED":
             raise ValueError("运行组没有通过宿主核对的成员，继续本地执行；请查看缺口")
+        from seampact.typed_contract import build_contract, verify_contract
+        members = [self.platform.store.get("unit", uid) for uid in group["units"]]
+        for member in members:
+            checked = verify_contract(member, group=group)
+            if not checked["valid"]:
+                raise ValueError(checked["reason"])
         binding, _, unit = self._binding(group)
         environment = self._environment(body.get("environment"), binding)
         group["runtime_environment"] = environment_selection(environment)
@@ -1184,8 +1190,21 @@ class Deployments:
             platform_core=spec["platform_core"], build_reuse=reuse,
             created_at=now(), source_version=group["source_version"], build=dict(status="NOT_RUN"),
             publish=dict(status="NOT_RUN"), deployment="NOT_APPLIED", copies_original_code=True, resource_downloads=0)
-        self.platform.store.save("runtime_group", identity, group)
-        self.platform.store.save("deployment", identity, record)
+        # The checked deployment environment is part of contract support.
+        # Publish it and the resulting Unit identities as one transaction.
+        with self.platform.store.transaction():
+            current = self.platform.store.get("runtime_group", identity)
+            for member in members:
+                latest = self.platform.store.get("unit", member["id"])
+                if not latest or latest.get("typed_contract") != member["typed_contract"]:
+                    raise ValueError("构建期间 Unit 操作契约已改变，请重新生成工件")
+                checked = verify_contract(latest, group=current)
+                if not checked["valid"]:
+                    raise ValueError(checked["reason"])
+                latest["typed_contract"] = build_contract(latest, group=group)
+                self.platform.store.save("unit", latest["id"], latest)
+            self.platform.store.save("runtime_group", identity, group)
+            self.platform.store.save("deployment", identity, record)
         return record
 
     def _artifact(self, identity):

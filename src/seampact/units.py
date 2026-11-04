@@ -1537,10 +1537,12 @@ class NativeBindings:
         self.runtime.call("register", gate, owner,
             unit=dict(unit, source_id=self.inspector.request.get("source_id")))
 
-    def _boundary_unit(self, boundary):
+    def _boundary_unit(self, boundary, entry_unit):
         return dict(id=self.inspector.request["source_version"][:16] + ":" + boundary["id"],
                     name=boundary["id"], symbol=boundary["symbol"], path=boundary["path"],
-                    source_id=self.inspector.request.get("source_id"))
+                    source_id=self.inspector.request.get("source_id"), source_version=entry_unit["source_version"],
+                    installation_id=entry_unit["installation_id"], root_unit_id=entry_unit["id"],
+                    boundary_id=boundary["id"], source_unit=boundary.get("unit", "file"), mode=boundary["mode"])
 
     def _assert_callable(self, callable_, symbol, path):
         original = inspect.unwrap(callable_)
@@ -1682,7 +1684,7 @@ class NativeBindings:
         # exact class. Do not construct an instance or overwrite its descriptor.
         record = self.function_owners.setdefault(("native-class", entry["path"], entry.get("unit", "file"), class_name),
             dict(id="native-class-" + uuid.uuid4().hex, boundaries=set(), hooks=[]))
-        boundary_unit = self._boundary_unit(selected[0]) if selected else unit
+        boundary_unit = self._boundary_unit(selected[0], unit) if selected else unit
         gate = uuid.uuid4().hex + ":" + boundary_unit["id"]
         self._register(gate, record["id"], boundary_unit)
         callable_ = self.runtime.wrap(original, gate, record["id"])
@@ -1779,7 +1781,7 @@ class NativeBindings:
                 continue
             if boundary.get("rule") == "inplace-callsite/1":
                 gate = uuid.uuid4().hex + ":" + boundary["id"]
-                self._register(gate, owner_id, self._boundary_unit(boundary))
+                self._register(gate, owner_id, self._boundary_unit(boundary, unit))
                 self.callsite_gates[(boundary["id"], owner_id)] = gate
                 helper = self.recipes[boundary["id"]]["helper"]
                 namespace[helper] = self._callsite_factory(boundary["id"])
@@ -1798,7 +1800,7 @@ class NativeBindings:
                 expected = boundary["symbol"]
             self._assert_callable(original, expected, boundary["path"])
             gate = uuid.uuid4().hex + ":" + boundary["id"]
-            self._register(gate, owner_id, self._boundary_unit(boundary))
+            self._register(gate, owner_id, self._boundary_unit(boundary, unit))
             proxy = self.runtime.wrap(original, gate, owner_id)
             if owner is not None:
                 install_method_proxy(owner, symbol, proxy)
@@ -1839,7 +1841,7 @@ class NativeBindings:
                     raise MissingBinding("original setup did not bind the selected native tools")
                 for binding in hook.bindings:
                     boundary = self.boundaries[binding["id"]]
-                    self.runtime.call("label", binding["gate"], self._boundary_unit(boundary))
+                    self.runtime.call("label", binding["gate"], self._boundary_unit(boundary, unit))
             record["initialized"] = True
         callable_ = original_entry or (getattr(owner, entry["symbol"].split(".")[-1]) if owner is not None else namespace[entry["symbol"]])
         if not callable(callable_):
@@ -1963,6 +1965,27 @@ class UnitCatalog:
                                 and artifact.get("source_runtime_environment") == basis):
                             group["runtime_environment"] = environment_selection(artifact["environment"])
                             self.store.save("runtime_group", identity, group)
+                    from seampact.typed_contract import build_contract, entry_evidence, installation_evidence
+                    evidence = installation_evidence(inspector, candidate)
+                    target_checks = {}
+                    if getattr(inspector, "target_runtime", None) and any(unit["id"] in self.deferred for unit in result):
+                        checked = check_candidate(inspector, dict(candidate, boundaries=candidate.get("boundaries", [])))
+                        if checked.get("source_version") != inspector.request["source_version"]:
+                            raise ValueError("target boundary checks do not match the frozen source")
+                        target_checks = {row["id"]: row for row in checked["boundaries"]}
+                    for raw_entry, unit in zip(candidate["entries"], result):
+                        group = self.store.get("runtime_group", unit.get("runtime_group")) if unit.get("runtime_group") else None
+                        entry = raw_entry if isinstance(raw_entry, dict) else {}
+                        binding = self.bindings.get(unit["id"]) or (self.deferred.get(unit["id"]) or (None,))[0]
+                        checked = getattr(binding, "checked", target_checks)
+                        unit["typed_evidence"] = dict(evidence, **entry_evidence(inspector, candidate, unit, entry, checked))
+                        unit["typed_contract"] = build_contract(unit, group=group)
+                        self.store.save("unit", unit["id"], unit)
+                        if binding is not None:
+                            binding.typed_installation_evidence = evidence
+                            if not hasattr(binding, "typed_entry_evidence"):
+                                binding.typed_entry_evidence = {}
+                            binding.typed_entry_evidence[unit["id"]] = copy.deepcopy(unit["typed_evidence"])
                 return result
             except BaseException:
                 self.bindings, self.entry_specs, self.deferred = old_bindings, old_specs, old_deferred
@@ -2208,6 +2231,11 @@ class UnitCatalog:
                 from seampact.capabilities import capability_card
                 unit["capability"] = (self.store.get("unit_capability", unit["id"]) or {}).get(
                     "card", unit.get("capability") or capability_card())
+                from seampact.typed_contract import contract_checks
+                group = self.store.get("runtime_group", unit.get("runtime_group")) if unit.get("runtime_group") else None
+                binding = self.bindings.get(unit["id"]) or (self.deferred.get(unit["id"]) or (None,))[0]
+                evidence = self._binding_evidence(binding, unit) if binding is not None else None
+                unit.update(contract_checks(unit, group=group, evidence=evidence))
                 result.append(unit)
             return result
 
@@ -2256,10 +2284,32 @@ class UnitCatalog:
     def _checked_unit(self, unit_id):
         unit = self.store.get("unit", unit_id)
         if unit and unit["status"] == "READY" and unit_id in self.bindings:
-            return self.bindings[unit_id], self.entry_specs[unit_id], unit
-        if unit and unit.get("status") not in {"SUPERSEDED", "DETACHED"} and unit_id in self.deferred:
-            return (*self.deferred[unit_id], unit)
-        raise ValueError("native Unit is not ready")
+            binding, entry = self.bindings[unit_id], self.entry_specs[unit_id]
+        elif unit and unit.get("status") not in {"SUPERSEDED", "DETACHED"} and unit_id in self.deferred:
+            binding, entry = self.deferred[unit_id]
+        else:
+            raise ValueError("native Unit is not ready")
+        self._verify_operation(binding, unit)
+        return binding, entry, unit
+
+    @staticmethod
+    def _binding_evidence(binding, unit, full_source_check=False):
+        from seampact.typed_contract import binding_evidence, installation_evidence
+        frozen = getattr(binding, "typed_installation_evidence", {})
+        entry = getattr(binding, "typed_entry_evidence", {}).get(unit["id"], {})
+        basis = (installation_evidence(binding.inspector, binding.candidate) if full_source_check else
+                 binding_evidence(binding.inspector, binding.candidate, frozen))
+        return {**entry, **basis}
+
+    def _verify_operation(self, binding, unit, full_source_check=False, operation="invoke"):
+        from seampact.typed_contract import require_operation
+        if not unit or not unit.get("id"):
+            raise MissingBinding("installed native Unit is missing")
+        if binding.detached:
+            raise MissingBinding("Harness source is detached")
+        evidence = self._binding_evidence(binding, unit, full_source_check=full_source_check)
+        group = self.store.get("runtime_group", unit.get("runtime_group")) if unit.get("runtime_group") else None
+        return require_operation(unit, operation, group=group, evidence=evidence)
 
     @staticmethod
     def _validate_bound_arguments(binding, entry, unit, arguments, native_arguments=(), deferred_arguments=()):
@@ -2297,7 +2347,7 @@ class UnitCatalog:
 
         Units placed on a runtime-group host resolve credentials in that host.
         """
-        frozen, bindings = {}, {}
+        frozen, bindings, sources_checked = {}, {}, set()
         with self.lock:
             for unit_id in dict.fromkeys(unit_ids):
                 try:
@@ -2306,6 +2356,9 @@ class UnitCatalog:
                     raise MissingBinding("cannot freeze an unavailable native Unit") from None
                 if unit_id not in remote and (unit["status"] != "READY" or unit_id not in self.bindings):
                     raise MissingBinding("cannot freeze an unavailable native Unit")
+                if id(binding) not in sources_checked:
+                    self._verify_operation(binding, unit, full_source_check=True)
+                    sources_checked.add(id(binding))
                 frozen[unit_id] = (binding, entry, copy.deepcopy(unit))
                 if unit_id not in remote:
                     bindings.setdefault(id(binding), (binding, set()))[1].add(entry["id"])
@@ -2341,6 +2394,10 @@ class UnitCatalog:
         if unit_id not in frozen:
             raise MissingBinding("native Unit is absent from this run's frozen resources")
         binding, entry, unit = frozen[unit_id]
+        current = self.store.get("unit", unit_id)
+        if current is None or current.get("typed_contract") != unit.get("typed_contract"):
+            raise MissingBinding("frozen native Unit contract changed; recheck and freeze the task again")
+        self._verify_operation(binding, current)
         self._validate_bound_arguments(binding, entry, unit, arguments, native_arguments)
         return self._invoke_bound(binding, entry, unit, arguments)
 

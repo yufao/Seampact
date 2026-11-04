@@ -1072,6 +1072,8 @@ class _Closure:
                 return not_covered("callable_scope_unsupported")
         reachable = []
         for other in self.candidate.get("entries", []):
+            if not isinstance(other, dict):
+                continue
             key = (other.get("path"), "__main__" if other.get("kind") == "cli" else other.get("symbol"))
             if other.get("id") != entry.get("id") and key in self.visited:
                 reachable.append(other["id"])
@@ -1128,6 +1130,8 @@ def dependency_closure(inspector, candidate):
     checker = _Closure(inspector, candidate)
     entries = {}
     for entry in candidate.get("entries", []):
+        if not isinstance(entry, dict):
+            continue  # UnitCatalog reports malformed entry rows as MISSING.
         result = checker.entry(entry)
         if result is not None:
             entries[entry["id"]] = result
