@@ -1123,6 +1123,9 @@ class TrainingJobs:
                 if item.get("placement", {}).get("kind") == "REMOTE" and \
                         catalog.placement[item["id"]]["contract_digest"] != item["placement"]["contract_digest"]:
                     raise ValueError("运行组契约已改变；请按新条件运行冻结评价或适应")
+                if item.get("placement", {}).get("kind") == "REMOTE" and \
+                        catalog.placement[item["id"]].get("gpu_devices") != item["placement"].get("gpu_devices"):
+                    raise ValueError("运行组 GPU 分配已改变；请按新条件运行冻结评价或适应")
             manifest.update(mode="freeze", parent_run_id=source["id"],
                 parent_checkpoint=copy.deepcopy(active["checkpoint"]), parent_config_digest=source["config_digest"],
                 harness_resources=resources, role_resources=bound.resources())

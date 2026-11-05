@@ -60,7 +60,7 @@ class Joint014Integration(unittest.TestCase):
         self.addCleanup(self.runtime.close)
         self.catalog = UnitCatalog(self.home, self.store, self.runtime)
         self.platform = SimpleNamespace(home=self.home, store=self.store, runtime=self.runtime,
-                                        catalog=self.catalog, profiles=object())
+                                        catalog=self.catalog, profiles=object(), source_lock=threading.RLock())
         self.platform.deployments = Deployments(self.platform)
         self.addCleanup(self.platform.deployments.close)
         self.units = []

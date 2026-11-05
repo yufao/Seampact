@@ -17,6 +17,7 @@ import time
 from pathlib import Path
 
 from seampact.hosting.image_build import BASE_LABEL, RECIPE_LABEL, dependency_image_reference
+from seampact.observability.resource_observation import resolve_gpu_devices
 
 KINDS = {"none", "docker", "kubernetes"}
 IMAGE_ACCESS = {"local", "kind", "registry", "preloaded"}
@@ -25,6 +26,27 @@ ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 IMAGE_IDENTITY_FORMAT = ('{{$labels := index .Config "Labels"}}{"Id":{{json .Id}},"Config":{"Labels":{'
     + ",".join('"' + label + '":{{if $labels}}{{json (index $labels "' + label +
                '")}}{{else}}null{{end}}' for label in (RECIPE_LABEL, BASE_LABEL)) + "}}}")
+
+
+def gpu_selectors(value):
+    """Only explicit device identities; counts/all would enumerate other GPUs."""
+    if value is None or value == "":
+        return []
+    if isinstance(value, list):
+        return list(value)
+    if isinstance(value, str) and value.strip('"').startswith("device="):
+        selectors = value.strip('"')[len("device="):].split(",")
+        if selectors and all(selector.strip() for selector in selectors):
+            return [selector.strip() for selector in selectors]
+    raise ValueError("GPU 分配须指定设备编号或完整 UUID；不接受 all 或 GPU 数量")
+
+
+def gpu_runtime_arguments(devices):
+    """Keep runtime visibility explicit, including CUDA images on NVIDIA defaults."""
+    selector = "device=" + ",".join(devices)
+    # Docker parses this argument as CSV even when subprocess uses no shell.
+    result = ["--gpus", '"' + selector + '"' if len(devices) > 1 else selector] if devices else []
+    return result + ["-e", "NVIDIA_VISIBLE_DEVICES=" + (",".join(devices) if devices else "void")]
 
 
 def validate_config(body):
@@ -369,10 +391,12 @@ def start(record, reference, folder, config, credential_env=None):
             port = _free_port(host)
             argv += ["-p", host + ":" + str(port) + ":8890"]
             advertise = "http://" + config.get("advertise_host", host) + ":" + str(port)
-        if config.get("gpus"):
-            argv += ["--gpus", str(config["gpus"])]
+        devices = record.get("gpu_devices")
+        if devices is None:
+            devices = [item["gpu_uuid"] for item in resolve_gpu_devices(gpu_selectors(config.get("gpus")))]
         for name_ in dict.fromkeys([*config.get("pass_env", []), *(credential_env or {})]):
             argv += ["-e", name_]
+        argv += gpu_runtime_arguments(devices)
         for mount in config.get("mounts", []):
             argv += ["-v", mount["source"] + ":" + mount["target"] + (":ro" if mount.get("read_only", True) else "")]
         argv += [reference] + worker_args(record, config["coordinator_url"], advertise)

@@ -32,6 +32,7 @@ const revisionBusy = new Set();
 const revisionErrors = new Map();
 const revisionVersions = new Map();
 const deploymentDrafts = new Map();
+const gpuAllocationDrafts = new Map();
 const capabilityDrafts = new Map();
 const deploymentSubmitting = new Set();
 const deploymentPreparation = new Map();
@@ -62,6 +63,11 @@ let monitorDetail = null;
 let monitorSelection = '';
 let monitorMetricsSignature = '';
 let monitorBusy = false;
+let monitorGpuBusy = false;
+let monitorGpuHydrated = false;
+let monitorGpuDirty = false;
+let monitorGpuRevision = 0;
+let taskDeleteBusy = false;
 let operationsError = '';
 let operationsRequestVersion = 0;
 let monitorSeriesChoice = '';
@@ -946,12 +952,39 @@ function renderChatContext() {
   $('chat-context-status').textContent = contextDescription(chatContextTask) || '上下文用量：暂无记录';
 }
 
+function taskRecordFinished(task) {
+  return ['COMPLETED', 'FAILED', 'INTERRUPTED', 'CANCELLED', 'STOPPED', 'TIMEOUT', 'TIMED_OUT', 'CANCELED'].includes(task.status);
+}
+
+async function deleteTaskRecords(tasks) {
+  if (taskDeleteBusy || !tasks.length) return;
+  if (!window.confirm('从任务列表删除这 ' + tasks.length + ' 条已结束记录？\n\n执行依据、会话和研究结果保留。正在执行或仍有调用未收尾的任务不能删除。')) return;
+  taskDeleteBusy = true;
+  renderTasks();
+  try {
+    const result = await api('/api/tasks/delete', {task_ids: tasks.map(task => task.id)});
+    const deleted = new Set(result.deleted || []);
+    state.tasks = (state.tasks || []).filter(task => !deleted.has(task.id));
+    showNotice('已从任务列表删除 ' + deleted.size + ' 条记录，执行依据保留。');
+  } catch (error) { showNotice(error.message); }
+  finally { taskDeleteBusy = false; renderTasks(); await refresh(); }
+}
+
 function renderTasks() {
   const tasks = visibleTasks();
   const root = $('task-list');
   root.replaceChildren();
   $('task-count').textContent = tasks.length;
   if (!tasks.length) return empty(root, '尚无任务。发送消息后在这里观察真实调用。');
+  if (inspectPage) {
+    const finished = tasks.filter(taskRecordFinished);
+    const actions = node('div', undefined, 'form-actions');
+    const clear = node('button', taskDeleteBusy ? '正在清理…' : '清理已结束记录（' + finished.length + '）', 'secondary-button danger-button');
+    clear.type = 'button'; clear.disabled = taskDeleteBusy || !finished.length;
+    clear.onclick = () => { void deleteTaskRecords(finished); };
+    actions.append(clear, node('span', '仅清理当前筛选范围；执行依据、会话和研究结果保留。', 'card-note'));
+    root.append(actions);
+  }
   const ordered = [...tasks].sort((a, b) => String(b.started_at || b.created_at || '').localeCompare(String(a.started_at || a.created_at || '')));
   for (const task of ordered) {
     const card = node('article', undefined, 'status-card');
@@ -969,6 +1002,13 @@ function renderTasks() {
     const detail = callDetails(task.calls);
     if (detail) card.append(detail);
     else card.append(node('p', '暂无 Unit 调用记录。', 'card-meta'));
+    if (inspectPage) {
+      const remove = node('button', '删除记录', 'secondary-button danger-button'); remove.type = 'button';
+      remove.disabled = taskDeleteBusy || !taskRecordFinished(task);
+      if (!taskRecordFinished(task)) remove.title = '任务结束并完成调用收尾后可删除';
+      remove.onclick = () => { void deleteTaskRecords([task]); };
+      card.append(remove);
+    }
     if (!inspectPage) card.append(inspectLink('tasks', {task: task.id}));
     const active = !terminalStatuses.has(task.status);
     root.append(foldCard(card, 'task/' + task.id, '任务 ' + task.id, {status: task.status,
@@ -1443,6 +1483,113 @@ function renderInstance(card, instance, sourceId) {
   card.append(box);
 }
 
+function gpuAllocationDraft(group) {
+  const spec = group.service_spec, allocation = group.gpu_allocation || {};
+  const saved = spec ? Object.keys(spec.resource_envelope?.devices || {}) : allocation.devices || [];
+  const signature = JSON.stringify([saved, spec?.spec_digest, allocation.source]);
+  let draft = gpuAllocationDrafts.get(group.id);
+  if (!draft || !draft.dirty && !draft.busy && draft.signature !== signature) {
+    draft = {signature, selected: new Set(saved), known: new Map(), extra: '', busy: false, dirty: false, feedback: '',
+      memory: Object.fromEntries(Object.entries(spec?.resource_envelope?.devices || {}).map(([id, facts]) => [id, facts.memory_mb])),
+      basis: spec?.resource_envelope?.basis || ''};
+    gpuAllocationDrafts.set(group.id, draft);
+  }
+  for (const device of [...(state.gpu_devices || []), ...(allocation.device_facts || [])]) draft.known.set(device.gpu_uuid, device);
+  for (const id of draft.selected) if (!draft.known.has(id)) draft.known.set(id, {gpu_uuid: id});
+  return draft;
+}
+
+async function probeGpuAllocation(group) {
+  const draft = gpuAllocationDraft(group);
+  if (draft.busy) return;
+  const devices = monitorGpuSelectors(draft.extra);
+  if (!devices.length) { draft.feedback = '请先填写 GPU UUID 或设备序号。'; renderDeployments(); return; }
+  draft.busy = true; draft.feedback = '正在识别指定设备…'; renderDeployments();
+  try {
+    const result = await api('/api/gpus/probe', {devices});
+    for (const device of result.devices) {
+      if (device.input !== device.gpu_uuid && draft.selected.delete(device.input) && draft.memory[device.input] != null) {
+        draft.memory[device.gpu_uuid] = draft.memory[device.input]; delete draft.memory[device.input];
+      }
+      draft.known.set(device.gpu_uuid, device); draft.selected.add(device.gpu_uuid);
+    }
+    draft.extra = ''; draft.dirty = true; draft.feedback = '已识别并勾选，请保存 GPU 分配后启动。';
+  } catch (error) { draft.feedback = error.message; }
+  finally { draft.busy = false; renderedSections.delete('deployments'); renderDeployments(); }
+}
+
+async function saveGpuAllocation(group) {
+  const draft = gpuAllocationDraft(group);
+  if (draft.busy) return;
+  draft.busy = true; draft.feedback = '正在核对并保存 GPU 分配…'; renderDeployments();
+  try {
+    const devices = [...draft.selected], managed = Boolean(group.service_spec);
+    const body = managed ? {service_id: group.managed_service_id || group.service_spec.id, devices,
+      memory_mb: Object.fromEntries(devices.map(id => [id, Number(draft.memory[id])])), basis: draft.basis.trim()} : {group_id: group.id, devices};
+    if (managed && (devices.some(id => !Number.isFinite(body.memory_mb[id]) || body.memory_mb[id] <= 0) || !body.basis)) {
+      throw new Error('请为每张所选设备填写正数显存需求上界，并说明依据。');
+    }
+    await api(managed ? '/api/managed-services/gpus' : '/api/deployments/gpus', body);
+    gpuAllocationDrafts.delete(group.id);
+    showNotice('GPU 分配已保存，新启动的实例使用该配置。' + (managed ? '服务规格已更新，请正常重绑引用它的连接。' : ''));
+    await refresh();
+  } catch (error) { draft.feedback = error.message; }
+  finally { draft.busy = false; renderedSections.delete('deployments'); renderDeployments(); }
+}
+
+function renderGpuAllocationControls(card, group) {
+  const draft = gpuAllocationDraft(group), managed = Boolean(group.service_spec);
+  const saved = managed ? Object.keys(group.service_spec.resource_envelope?.devices || {}) : group.gpu_allocation?.devices || [];
+  const section = disclosure('gpu-allocation/' + group.id, '任务 GPU 分配', {
+    meta: saved.length ? saved.join(', ') : group.gpu_allocation?.source === 'backend' ? '继承后端配置' : '未分配 GPU'});
+  const form = node('form', undefined, 'model-form');
+  const held = (group.instances || []).some(instance => instance.released !== true && (managed || !['STOPPED', 'FAILED'].includes(instance.state)));
+  const disabled = draft.busy || Boolean(group.locked_by_run) || held || group.gpu_allocation?.editable === false || state.deployment_backend?.kind !== 'docker';
+  form.append(node('p', '保存后启动的实例使用所选设备，同组任务随实例执行。已有实例须先排空并确认释放后再换卡；这里设置 GPU 可见范围，不独占整卡。', 'card-note'));
+  const label = node('label', '添加 GPU UUID 或设备序号'), input = node('input'); input.type = 'text'; input.value = draft.extra;
+  input.placeholder = 'GPU-完整 UUID 或 0, 1'; input.dataset.deploymentField = 'gpu-probe/' + group.id; input.disabled = disabled;
+  input.oninput = () => { draft.extra = input.value; draft.dirty = true; }; label.append(input);
+  const probe = node('button', draft.busy ? '处理中…' : '探查设备', 'secondary-button'); probe.type = 'button'; probe.disabled = disabled;
+  probe.onclick = () => { void probeGpuAllocation(group); }; form.append(label, probe);
+  const choices = node('fieldset', undefined, 'monitor-fieldset'); choices.append(node('legend', '选择执行设备'));
+  if (!draft.known.size) choices.append(node('p', '填写设备标识后探查；资源观察中已识别的设备也可在这里选择。', 'card-note'));
+  for (const [id, device] of draft.known) {
+    const row = node('div', undefined, 'operation-item'), option = node('label', undefined, 'checkbox-label'), checked = node('input');
+    checked.type = 'checkbox'; checked.value = id; checked.checked = draft.selected.has(id); checked.disabled = disabled;
+    checked.onchange = () => { checked.checked ? draft.selected.add(id) : draft.selected.delete(id); draft.dirty = true; };
+    option.append(checked, node('span', [device.name, device.index != null ? '设备 ' + device.index : '', id].filter(Boolean).join(' · '))); row.append(option);
+    if (managed) {
+      const memoryLabel = node('label', '此设备的显存需求上界（MiB）'), memory = node('input'); memory.type = 'number'; memory.min = '0.01'; memory.step = 'any';
+      memory.value = draft.memory[id] ?? ''; memory.disabled = disabled; memory.placeholder = '填写模型加载及并发所需上界'; memory.dataset.deploymentField = 'gpu-memory/' + group.id + '/' + id;
+      memory.oninput = () => { draft.memory[id] = memory.value; draft.dirty = true; }; memoryLabel.append(memory); row.append(memoryLabel);
+    }
+    choices.append(row);
+  }
+  form.append(choices);
+  if (managed) {
+    const basisLabel = node('label', '资源需求依据'), basis = node('input'); basis.type = 'text'; basis.value = draft.basis; basis.disabled = disabled;
+    basis.dataset.deploymentField = 'gpu-basis/' + group.id; basis.oninput = () => { draft.basis = basis.value; draft.dirty = true; };
+    basisLabel.append(basis); form.append(basisLabel, node('p', '这里填写服务所需显存，探查到的整卡总显存不会自动填入需求。保存后按现有流程重新绑定服务连接。', 'card-note'));
+  } else form.append(node('p', '研究运行的 GPU 容量与显存需求仍在研究配置中声明，并与所选 UUID 核对。取消全部勾选并保存表示不提供 GPU。', 'card-note'));
+  const save = node('button', '保存 GPU 分配', 'secondary-button'); save.type = 'submit'; save.disabled = disabled;
+  form.onsubmit = event => { event.preventDefault(); void saveGpuAllocation(group); }; form.append(save);
+  if (disabled && !draft.busy) form.append(node('p', group.gpu_allocation?.edit_reason || group.gpu_allocation?.reason || (state.deployment_backend?.kind !== 'docker' ? '此入口用于 Docker 后端；先配置部署后端。' : '实例或研究运行仍在使用该组，请先结束并确认释放。'), 'card-note'));
+  if (draft.feedback) form.append(node('p', draft.feedback, 'form-status'));
+  section.append(form); card.append(section);
+}
+
+function renderServiceGpuAllocations(root) {
+  const services = entries(resourceState().managed_services);
+  if (!inspectPage || !services.length) return;
+  const section = disclosure('managed-gpu-allocations', '受管模型服务 GPU 分配', {meta: services.length + ' 个已登记服务'});
+  for (const service of services) {
+    const card = node('article', undefined, 'status-card'); card.dataset.itemId = service.id;
+    card.append(node('h4', service.service_spec?.model || service.managed_service_id || service.id));
+    renderGpuAllocationControls(card, service); section.append(card);
+  }
+  root.append(section);
+}
+
 function renderDeploymentBackend(root) {
   const card = node('article', undefined, 'status-card');
   card.dataset.itemId = 'deployment-backend';
@@ -1626,6 +1773,7 @@ function renderDeployments() {
   root.append(node('p', '同组保持原进程、原对象与原生命周期；组外端口只传编码后的数据。生命周期操作按运行组契约逐项允许，未知不授予；重启不恢复原会话。', 'card-note'));
   if (inspectPage) renderDeploymentBackend(root);
   if (inspectPage && state.image_retention) renderImages(root);
+  renderServiceGpuAllocations(root);
   const ungroupedSources = inspectPage ? (state.harnesses || []).filter(source => source.status !== 'DETACHED' &&
     (!selectedSource() || source.id === selectedSource()) && !groups.some(group => group.source_id === source.id)) : [];
   for (const source of ungroupedSources) {
@@ -1655,6 +1803,7 @@ function renderDeployments() {
       '执行位置：' + statusLabel(group.execution), '存活实例 ' + live.length,
       group.contract?.replicas?.replicable ? '可增加副本' : '单实例', group.locked_by_run ? '运行占用中' : null].filter(Boolean).join(' · '), 'card-meta'));
     card.append(node('p', identity.purpose, 'card-note'), node('p', '运行组 ID：' + group.id, 'card-meta'));
+    if (inspectPage) renderGpuAllocationControls(card, group);
     if (group.environment_gap) card.append(node('p', group.environment_gap, 'card-note message-error'));
     card.append(node('p', '成员：' + group.entries.length + ' 个' + (group.entries.length <= 3 ? ' · ' + group.entries.join('、') : '，展开宿主核对查看完整成员。'), 'card-note'));
     if (group.host) detailValue(card, '宿主核对（逐成员）', group.host.members);
@@ -4237,9 +4386,9 @@ async function refresh() {
     renderSection('scheduler', state.scheduler, renderScheduler, ['scheduler-summary']);
     renderSection('research', [state.scheduler?.research, state.units, state.harnesses], renderResearch,
       ['research-readiness', 'research-run-list', 'research-comparison']);
-    renderSection('tasks', visibleTasks(), renderTasks, ['task-list']);
+    renderSection('tasks', [visibleTasks(), taskDeleteBusy], renderTasks, ['task-list']);
     renderSection('units', [visibleUnits(), state.harnesses, selectedSource()], renderUnits, ['unit-list']);
-    renderSection('deployments', [state.runtime_groups, state.deployments, state.deployment_backend, state.image_retention, state.harnesses, state.units, state.analyses,
+    renderSection('deployments', [state.runtime_groups, resourceState().managed_services, state.gpu_devices, state.deployments, state.deployment_backend, state.image_retention, state.harnesses, state.units, state.analyses,
       state.runtime_controller, selectedSource(), [...deploymentPreparation]], renderDeployments, ['deployment-list']);
     renderSection('analyses', [state.analyses, state.harnesses, state.analysis_revisions, state.analysis_revisions_observation_pending, state.models?.analysis,
       resourceState(), selectedSource(), [...sourceUpdating], [...revisionSelected], [...revisionDetails], [...revisionErrors], [...revisionBusy],
@@ -4364,11 +4513,58 @@ function monitorFigure(series) {
   figure.append(svg, node('p', '最近样本窗口；缺失与过长采样间隔不连线。', 'card-note')); return figure;
 }
 
+function monitorGpuSelectors(value) {
+  return value.trim().split(/[,，\s]+/).filter(Boolean);
+}
+
+function renderMonitorGpuDevices(capabilities) {
+  const devices = capabilities.gpu_devices || [];
+  const input = $('monitor-gpu-devices');
+  if (!monitorGpuHydrated && !monitorGpuDirty && !monitorGpuBusy) {
+    input.value = devices.map(device => device.gpu_uuid).join(', ');
+    monitorGpuHydrated = true;
+  }
+  input.disabled = monitorGpuBusy;
+  $('monitor-gpu-save').disabled = monitorGpuBusy;
+  $('monitor-gpu-save').textContent = monitorGpuBusy ? '正在探查…' : '探查并保存';
+  const root = $('monitor-gpu-identities'); root.replaceChildren();
+  if (!devices.length) root.append(node('p', '尚未手动保存观察设备。部署中已配置的 GPU 也会出现在下方选择列表。', 'card-note'));
+  for (const device of devices) {
+    root.append(node('p', [device.name || 'GPU', device.index != null ? '设备 ' + device.index : '',
+      device.memory_total_mib != null ? device.memory_total_mib + ' MiB' : '', device.gpu_uuid].filter(Boolean).join(' · '), 'card-note'));
+  }
+}
+
+async function saveMonitorGpus(event) {
+  event.preventDefault();
+  if (monitorGpuBusy) return;
+  const devices = monitorGpuSelectors($('monitor-gpu-devices').value);
+  monitorGpuBusy = true; monitorGpuRevision++;
+  $('monitor-gpu-feedback').textContent = devices.length ? '正在识别指定 GPU…' : '正在清除手动观察设备…';
+  if (monitorSnapshot) renderMonitor();
+  try {
+    const result = await api('/api/monitor/gpus', {devices});
+    // Keep the verified UUIDs even if the following status refresh fails.
+    $('monitor-gpu-devices').value = result.devices.map(device => device.gpu_uuid).join(', ');
+    monitorGpuDirty = false; monitorGpuHydrated = true;
+    if (monitorSnapshot) {
+      monitorSnapshot.capabilities.gpu_devices = result.devices;
+      monitorSnapshot.capabilities.gpu_uuids = result.gpu_uuids;
+    }
+    $('monitor-gpu-feedback').textContent = (result.devices.length ? '已识别并保存 ' + result.devices.length + ' 张 GPU。请勾选设备及 GPU 指标。' : '已清除手动设备；部署中配置的 GPU 仍可选择。') +
+      (['RUNNING', 'STOPPING'].includes(monitorSnapshot?.current?.status) ? '新配置用于后续记录，当前记录的设备保持固定。' : '');
+    monitorSnapshot = await api('/api/monitor');
+  } catch (error) { $('monitor-gpu-feedback').textContent = error.message; }
+  finally { monitorGpuBusy = false; if (monitorSnapshot) renderMonitor(); }
+}
+
 function renderMonitor() {
   if (!monitorSnapshot) return;
   const capabilities = monitorSnapshot.capabilities || {}, current = monitorSnapshot.current;
-  const metrics = capabilities.metrics || [], gpus = capabilities.gpu_uuids || [];
-  const signature = JSON.stringify([metrics, gpus]);
+  renderMonitorGpuDevices(capabilities);
+  const running = ['RUNNING', 'STOPPING'].includes(current?.status);
+  const metrics = capabilities.metrics || [], gpus = [...new Set([...(capabilities.gpu_uuids || []), ...(running ? current.gpu_uuids || [] : [])])];
+  const signature = JSON.stringify([metrics, gpus, capabilities.gpu_devices]);
   if (signature !== monitorMetricsSignature) {
     const chosen = new Set([...$('monitor-metrics').querySelectorAll('input:checked')].map(input => input.value));
     const selectedGpus = new Set([...$('monitor-gpus').querySelectorAll('input:checked')].map(input => input.value));
@@ -4382,19 +4578,21 @@ function renderMonitor() {
       $('monitor-metrics').append(label);
     }
     for (const uuid of gpus) {
-      const label = node('label', undefined, 'monitor-option'), input = node('input'); input.type = 'checkbox'; input.value = uuid; input.checked = selectedGpus.has(uuid);
-      label.append(input, node('span', uuid)); $('monitor-gpus').append(label);
+      const label = node('label', undefined, 'monitor-option'), input = node('input'); input.type = 'checkbox'; input.value = uuid;
+      input.checked = running ? (current.gpu_uuids || []).includes(uuid) : selectedGpus.has(uuid);
+      const identity = (capabilities.gpu_devices || []).find(device => device.gpu_uuid === uuid);
+      label.append(input, node('span', identity?.name ? identity.name + ' · ' + uuid : uuid)); $('monitor-gpus').append(label);
     }
     $('monitor-gpu-fieldset').hidden = !gpus.length; monitorMetricsSignature = signature;
   }
-  const running = ['RUNNING', 'STOPPING'].includes(current?.status);
-  $('monitor-start').disabled = running || monitorBusy;
+  $('monitor-start').disabled = running || monitorBusy || monitorGpuBusy;
   $('monitor-stop').disabled = !running || current?.status === 'STOPPING' || monitorBusy;
   for (const input of document.querySelectorAll('#monitor-form input')) input.disabled = running || monitorBusy ||
     (input.type === 'checkbox' && metrics.find(metric => metric.id === input.value)?.available === false);
   const active = $('monitor-current'); active.replaceChildren();
   active.append(node('p', current?.status === 'STOPPING' ? '正在等待当前探针结束。记录尚未关闭，请勿启动另一条记录。' : running ? '正在记录：' + (current.label || current.id) + ' · ' + current.interval_s + ' 秒／次。关闭页面不会停止记录。' :
     '当前未采样。已保存的记录和权重不会启动探针或加载模型。', 'card-note'));
+  if (running && current.gpu_uuids?.length) active.append(node('p', '本次固定观察 GPU：' + current.gpu_uuids.join(', ') + '。新保存的设备配置用于后续记录。', 'card-note'));
   const records = monitorSnapshot.sessions || [];
   if (!monitorSelection || !records.some(row => row.id === monitorSelection)) monitorSelection = current?.id || monitorSnapshot.latest?.id || records[0]?.id || '';
   const selector = $('monitor-session'); selector.replaceChildren();
@@ -4470,7 +4668,7 @@ function renderMonitorRecordContent() {
 
 async function refreshOperationalViews(force = false) {
   if (operationsLoading || !state || (!force && !(inspectPage && ['operations', 'deployments'].includes(inspectView)))) return;
-  operationsLoading = true; const version = operationsRequestVersion;
+  operationsLoading = true; const version = operationsRequestVersion, gpuRevision = monitorGpuRevision;
   try {
     const selected = $('operations-source').value;
     const sources = (state.harnesses || []).filter(source => source.status !== 'DETACHED');
@@ -4487,7 +4685,7 @@ async function refreshOperationalViews(force = false) {
     if (results[0].status === 'fulfilled') { operationsSnapshot = results[0].value; operationsError = ''; }
     else operationsError = results[0].reason.message;
     renderOperationPreflight();
-    if (results[1].status === 'fulfilled' && results[1].value) {
+    if (results[1].status === 'fulfilled' && results[1].value && gpuRevision === monitorGpuRevision && !monitorGpuBusy) {
       monitorSnapshot = results[1].value; renderMonitor();
       if (monitorSelection) {
         const selectedId = monitorSelection;
@@ -4703,6 +4901,8 @@ for (const id of ['operations-kind', 'operations-source']) $(id).onchange = () =
   void refreshOperationalViews(true);
 };
 $('monitor-form').onsubmit = event => { event.preventDefault(); void submitMonitor(); };
+$('monitor-gpu-form').onsubmit = saveMonitorGpus;
+$('monitor-gpu-devices').oninput = () => { monitorGpuDirty = true; };
 $('monitor-stop').onclick = () => { void submitMonitor(true); };
 $('monitor-session').onchange = () => { monitorSelection = $('monitor-session').value; monitorDetail = null; renderMonitorRecord(); void refreshOperationalViews(true); };
 $('open-observer').onclick = () => observerOpen(!document.body.classList.contains('observer-open'));

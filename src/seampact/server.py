@@ -8,6 +8,7 @@ from urllib.parse import parse_qs, urlsplit
 
 from seampact import __version__
 from seampact.hosting.operation_preflight import preflight
+from seampact.observability.resource_observation import resolve_gpu_devices
 
 
 class PlatformHTTPServer(ThreadingHTTPServer):
@@ -203,6 +204,19 @@ def make_server(platform, port=8880, host="127.0.0.1", public_port=None):
                     result = platform.monitor.start(body)
                 elif path == "/api/monitor/stop":
                     result = platform.monitor.stop(body["session_id"])
+                elif path == "/api/monitor/gpus":
+                    result = platform.monitor.configure_gpus(body)
+                elif path == "/api/gpus/probe":
+                    if not isinstance(body, dict) or set(body) != {"devices"}:
+                        raise ValueError("GPU 探查只接收 devices 列表")
+                    devices = resolve_gpu_devices(body["devices"])
+                    result = dict(devices=devices, gpu_uuids=[device["gpu_uuid"] for device in devices])
+                elif path == "/api/deployments/gpus":
+                    result = platform.deployments.configure_gpus(body)
+                elif path == "/api/managed-services/gpus":
+                    result = platform.managed_services.set_gpu_devices(body)
+                elif path == "/api/tasks/delete":
+                    result = platform.delete_tasks(body)
                 elif path == "/api/chats/delete":
                     result = platform.chat.delete_conversation(body["conversation_id"])
                 elif path == "/api/chats/restore":

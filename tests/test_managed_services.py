@@ -20,6 +20,9 @@ from seampact.store import Store
 from seampact.providers import ProviderError
 
 IMAGE = "sha256:" + "a" * 64
+GPU_A = "GPU-12345678-1234-1234-1234-123456789abc"
+GPU_B = "GPU-aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+GPU_C = "GPU-bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
 
 
 class FakeDocker:
@@ -145,6 +148,7 @@ class ServiceTest(unittest.TestCase):
         self.assertEqual((record["state"], record["model_state"]), ("READY", "MODEL_READY"))
         argv = next(argv for argv in self.docker.commands if argv[:2] == ["docker", "run"])
         self.assertEqual(argv[argv.index(IMAGE) + 1:], self.spec["argv"])
+        self.assertIn("NVIDIA_VISIBLE_DEVICES=void", argv)
         self.assertNotIn("/invoke", argv)
         self.assertIn("/health", Handler.paths)
         self.assertIn("/v1/models", Handler.paths)
@@ -361,6 +365,124 @@ class ServiceTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "同一个 service id"):
             self.manager.configure(second)
         self.assertEqual(len(self.manager.groups()), 1)
+
+    def gpu_probe(self):
+        def query(fields, selected):
+            self.assertEqual(fields, "index,uuid,name,memory.total")
+            self.assertEqual(len(selected), 1)
+            identities = {"0": GPU_A, "1": GPU_B, "2": GPU_C}
+            identity = identities.get(str(selected[0]), selected[0])
+            if identity not in identities.values():
+                return None, "COMMAND_FAILED"
+            index = next(index for index, device in identities.items() if device == identity)
+            return [[index, identity, "Example GPU", "80000"]], None
+        return patch("seampact.observability.resource_observation.query", side_effect=query)
+
+    def test_full_gpu_spec_normalizes_indices_with_original_per_device_demands(self):
+        spec = copy.deepcopy(self.spec)
+        spec["docker"]["gpus"] = '"device=0,1"'
+        spec["resource_envelope"]["devices"] = {"0": dict(memory_mb=512), "1": dict(memory_mb=1024)}
+        with self.gpu_probe():
+            saved = self.manager.configure(spec)
+        self.assertEqual(saved["docker"]["gpus"], '"device=' + GPU_A + ',' + GPU_B + '"')
+        self.assertEqual(saved["resource_envelope"]["devices"], {GPU_A: dict(memory_mb=512), GPU_B: dict(memory_mb=1024)})
+        self.assertEqual(saved["argv"], self.spec["argv"])
+        self.assertEqual(saved["resource_envelope"]["host_memory_mb"], 512)
+
+    def test_explicit_service_gpu_assignment_is_frozen_in_real_start_argv(self):
+        original = self.manager.get("model-a")
+        with self.gpu_probe():
+            saved = self.manager.set_gpu_devices(dict(service_id="model-a", devices=[2],
+                memory_mb={GPU_C: 512}, basis="explicit original model upper bound"))
+            record = self.manager.start("model-a", dict(gpu_devices=[2]))
+        self.assertNotEqual(saved["spec_digest"], original["spec_digest"])
+        for key in ("argv", "model", "model_identity", "weight_identity", "contract"):
+            self.assertEqual(saved[key], original[key])
+        self.assertEqual(saved["resource_envelope"]["devices"], {GPU_C: dict(memory_mb=512)})
+        self.assertEqual(record["gpu_devices"], [GPU_C])
+        self.assertEqual(record["service_spec"]["spec_digest"], saved["spec_digest"])
+        argv = next(argv for argv in self.docker.commands if argv[:2] == ["docker", "run"])
+        self.assertEqual(argv[argv.index("--gpus") + 1], "device=" + GPU_C)
+        self.assertIn("NVIDIA_VISIBLE_DEVICES=" + GPU_C, argv)
+
+    def test_equal_gpu_demand_moves_without_substituting_whole_card_capacity(self):
+        with self.gpu_probe():
+            self.manager.set_gpu_devices(dict(service_id="model-a", devices=[GPU_A], memory_mb={GPU_A: 768}, basis="model upper bound"))
+            moved = self.manager.set_gpu_devices(dict(service_id="model-a", devices=[GPU_B]))
+        self.assertEqual(moved["resource_envelope"]["devices"], {GPU_B: dict(memory_mb=768)})
+        self.assertEqual(moved["resource_envelope"]["basis"], "model upper bound")
+
+    def test_heterogeneous_or_resized_gpu_demand_needs_explicit_mapping(self):
+        with self.gpu_probe():
+            original = self.manager.set_gpu_devices(dict(service_id="model-a", devices=[GPU_A, GPU_B],
+                memory_mb={GPU_A: 512, GPU_B: 1024}, basis="per-device model upper bounds"))
+            for devices in ([GPU_B, GPU_C], [GPU_A], []):
+                with self.subTest(devices=devices), self.assertRaises(ValueError):
+                    self.manager.set_gpu_devices(dict(service_id="model-a", devices=devices))
+                self.assertEqual(self.manager.get("model-a"), original)
+            moved = self.manager.set_gpu_devices(dict(service_id="model-a", devices=[GPU_B, GPU_C],
+                memory_mb={GPU_B: 1024, GPU_C: 512}, basis="explicit per-device transfer"))
+        self.assertEqual(moved["resource_envelope"]["devices"], {GPU_B: dict(memory_mb=1024), GPU_C: dict(memory_mb=512)})
+
+    def test_invalid_gpu_assignment_keeps_the_complete_previous_spec(self):
+        previous = self.manager.get("model-a")
+        invalid = [dict(devices=["9"], memory_mb={GPU_A: 512}, basis="explicit"),
+            dict(devices=[GPU_A], memory_mb={GPU_A: True}, basis="explicit"),
+            dict(devices=[GPU_A], memory_mb={GPU_B: 512}, basis="explicit"),
+            dict(devices=[GPU_A], memory_mb={GPU_A: 512}),
+            dict(devices=[GPU_A]), dict(devices="0")]
+        with self.gpu_probe():
+            for body in invalid:
+                with self.subTest(body=body), self.assertRaises(ValueError):
+                    self.manager.set_gpu_devices(dict(service_id="model-a", **body))
+                self.assertEqual(self.manager.get("model-a"), previous)
+        with self.gpu_probe(), self.assertRaisesRegex(ValueError, "同一 GPU"):
+            spec = copy.deepcopy(self.spec)
+            spec["docker"]["gpus"] = "device=0," + GPU_A
+            spec["resource_envelope"]["devices"] = {"0": dict(memory_mb=512), GPU_A: dict(memory_mb=512)}
+            self.manager.configure(spec)
+        self.assertEqual(self.manager.get("model-a"), previous)
+
+    def test_service_gpu_assertion_cannot_override_frozen_spec_or_hot_swap(self):
+        with self.gpu_probe():
+            saved = self.manager.set_gpu_devices(dict(service_id="model-a", devices=[GPU_A], memory_mb={GPU_A: 512}, basis="explicit"))
+            with self.assertRaisesRegex(ValueError, "冷态保存"):
+                self.manager.start("model-a", dict(gpu_devices=[GPU_B]))
+            self.assertFalse(any(argv[:2] == ["docker", "run"] for argv in self.docker.commands))
+            record = self.manager.start("model-a", dict(gpu_devices=[0]))
+            with self.assertRaisesRegex(ValueError, "冷态保存"):
+                self.manager.set_gpu_devices(dict(service_id="model-a", devices=[GPU_B]))
+        self.assertEqual(record["gpu_devices"], [GPU_A])
+        self.assertEqual(self.manager.get("model-a"), saved)
+
+    def test_service_gpu_update_is_blocked_by_lease_run_or_image_scope(self):
+        body = dict(service_id="model-a", devices=[GPU_A], memory_mb={GPU_A: 512}, basis="explicit")
+        previous = self.manager.get("model-a")
+        self.manager.acquire("model-a", "task")
+        with patch("seampact.hosting.managed_services.resolve_gpu_devices") as probe:
+            with self.assertRaisesRegex(ValueError, "仍被运行"):
+                self.manager.set_gpu_devices(body)
+            with self.assertRaisesRegex(ValueError, "仍被运行"):
+                self.manager.configure(self.spec)
+        probe.assert_not_called()
+        self.manager.release_lease("task")
+        self.platform.deployments.run_locks["service:model-a"] = dict(run_id="research")
+        with self.assertRaisesRegex(ValueError, "仍被运行"):
+            self.manager.set_gpu_devices(body)
+        self.platform.deployments.run_locks.clear()
+        self.platform.images = SimpleNamespace(guard_artifact=lambda _: (_ for _ in ()).throw(ValueError("frozen image scope")))
+        with self.assertRaisesRegex(ValueError, "frozen image scope"):
+            self.manager.set_gpu_devices(body)
+        self.assertEqual(self.manager.get("model-a"), previous)
+
+    def test_legacy_numeric_service_spec_must_be_saved_before_start(self):
+        spec = self.manager.get("model-a")
+        spec["docker"]["gpus"] = "device=0"
+        spec["resource_envelope"]["devices"] = {"0": dict(memory_mb=512)}
+        self.store.save("managed_service", "model-a", spec)
+        with self.gpu_probe(), self.assertRaisesRegex(ValueError, "冷态保存"):
+            self.manager.start("model-a", {})
+        self.assertFalse(any(argv[:2] == ["docker", "run"] for argv in self.docker.commands))
 
 
 if __name__ == "__main__":

@@ -37,6 +37,7 @@ from seampact.hosting.environments import normalize_environment
 from seampact.hosting.image_build import worker_dockerfile
 from seampact.target_runtime import core_identity, copy_core, environment_selection
 from seampact.scheduling.lifecycle import build_lifecycle_evidence
+from seampact.observability.resource_observation import resolve_gpu_devices
 
 REMOTE_PROFILE = dict(id="python-native-scalar-worker/2", confirmed=True, python_versions=["3.10", "3.11", "3.12", "3.13"],
     process_per_group=1, replicas=1, preserve_original_lifetimes=True,
@@ -709,13 +710,86 @@ class Deployments:
         return self.platform.store.get("deployment_backend", "current") or backends.validate_config({"kind": "none"})
 
     def configure_backend(self, body):
+        with self.platform.source_lock, self.lock:
+            return self._configure_backend(body)
+
+    def _configure_backend(self, body):
         if getattr(self.platform, "images", None) and any(s["status"] in {"PREPARING", "READY_TO_RUN", "RUNNING", "CLOSING", "INTERRUPTED"}
                 for s in self.platform.images.snapshot()["scopes"]):
             raise ValueError("请先结束实验镜像范围，再修改部署后端")
         value = backends.validate_config(body)
+        if value.get("gpus") != self.backend().get("gpus"):
+            with self.lock:
+                if self.run_locks or any(self._held(item) for item in self.instances.values()):
+                    raise ValueError("请先结束研究运行并释放实例，再修改全局 GPU 分配")
+            if value.get("kind") == "docker":
+                facts = resolve_gpu_devices(backends.gpu_selectors(value.get("gpus")))
+                devices = [fact["gpu_uuid"] for fact in facts]
+                value["gpus"] = "device=" + ",".join(devices) if devices else ""
         value["updated_at"] = now()
         self.platform.store.save("deployment_backend", "current", value)
         return value
+
+    def _gpu_configuration_guard(self, identity):
+        self._guard(identity, None)
+        if getattr(self.platform, "images", None):
+            self.platform.images.guard_artifact(identity)
+        if any(self._held(item) for item in self._instances(identity)):
+            raise ValueError("已有实例或状态未确认的对象，请先排空释放后再修改 GPU 分配")
+
+    def configure_gpus(self, body):
+        identity = body.get("group_id")
+        if not isinstance(identity, str) or identity.startswith("service:"):
+            raise ValueError("请选择原生 worker 运行组；模型服务沿用服务资源配置")
+        with self.platform.source_lock, self.lock:
+            self._group(identity)
+            if self.backend()["kind"] != "docker":
+                raise ValueError("逐运行组 GPU 选择目前仅支持同一 Docker 后端")
+            self._gpu_configuration_guard(identity)
+            facts = resolve_gpu_devices(body.get("devices"))
+            value = dict(group_id=identity, devices=[fact["gpu_uuid"] for fact in facts],
+                         source="group", device_facts=facts, checked_at=now(), status="VERIFIED")
+            self.platform.store.save("runtime_group_gpu", identity, value)
+            return value
+
+    def gpu_allocation(self, identity, probe=False):
+        """Resolve on explicit preparation only; panel polling reads saved facts."""
+        if self.backend()["kind"] != "docker":
+            return dict(devices=[], source="backend", status="NOT_APPLICABLE", checked_at=None)
+        configured = self.platform.store.get("runtime_group_gpu", identity)
+        source = "group" if configured is not None else "backend"
+        selected = configured["devices"] if configured is not None else self.backend().get("gpus")
+        if configured is not None and not probe:
+            return configured
+        cached = self.platform.store.get("runtime_gpu_observation", identity)
+        if not probe and cached and cached.get("selection") == selected:
+            return cached["allocation"]
+        try:
+            selectors = backends.gpu_selectors(selected)
+        except ValueError as error:
+            if probe:
+                raise
+            return dict(devices=[], source=source, status="UNRESOLVED", reason=str(error), checked_at=None)
+        if not probe:
+            identities = [value for value in selectors if isinstance(value, str) and value.startswith(("GPU-", "MIG-"))]
+            return dict(devices=identities if len(identities) == len(selectors) else [], selectors=selectors,
+                        source=source, status="UNRESOLVED" if selectors else "VERIFIED", checked_at=None)
+        facts = resolve_gpu_devices(selectors)
+        allocation = dict(devices=[fact["gpu_uuid"] for fact in facts], source=source,
+                          device_facts=facts, status="VERIFIED", checked_at=now())
+        self.platform.store.save("runtime_gpu_observation", identity, dict(selection=selected, allocation=allocation))
+        return allocation
+
+    def check_gpu_placement(self, placement):
+        """A frozen request cannot silently use a different physical device."""
+        if "gpu_devices" not in placement or placement["group_id"].startswith("service:"):
+            return
+        current = self.gpu_allocation(placement["group_id"])
+        if current["devices"] != placement["gpu_devices"]:
+            raise ValueError("运行组 GPU 分配已变化，请重新冻结运行")
+        if any(self._held(item) and item.get("gpu_devices") != placement["gpu_devices"]
+               for item in self._instances(placement["group_id"])):
+            raise ValueError("现有实例 GPU 分配与冻结运行不一致，请先排空释放")
 
     def _current_groups(self):
         sources = {source["id"]: source for source in self.platform.store.list("harness")}
@@ -846,6 +920,13 @@ class Deployments:
                                          None if clearable else "没有可清理的已释放实例记录"),
                     locked_by_run=lock["run_id"] if lock else None,
                     actions=self._actions(group, artifacts.get(group["id"])) if group.get("contract") else {})
+                group["gpu_allocation"] = self.gpu_allocation(group["id"])
+                try:
+                    self._gpu_configuration_guard(group["id"])
+                    gpu_reason = None if self.backend()["kind"] == "docker" else "逐组 GPU 选择仅支持 Docker 后端"
+                except ValueError as error:
+                    gpu_reason = str(error)
+                group["gpu_allocation"].update(editable=gpu_reason is None, edit_reason=gpu_reason)
                 if group.get("environment_gap"):
                     for name, action in group["actions"].items():
                         if name != "drain_stop":
@@ -982,6 +1063,7 @@ class Deployments:
     def lock_groups(self, run_id, placements, control):
         with self.lock:
             for group_id in placements:
+                self.check_gpu_placement(placements[group_id])
                 if control.get("mode") == "idle_retire/1" and not self._idle_rebuild_allowed(self._group(group_id)):
                     raise ValueError("原生有状态运行组须使用 fixed_resident；尚未核对任务/owner 结束及可重建契约：" + group_id)
                 owner = self.run_locks.get(group_id)
@@ -1291,16 +1373,18 @@ class Deployments:
     def start(self, identity, body, run_id=None, replica=False):
         if identity.startswith("service:"):
             return self.platform.managed_services.start(identity, body, run_id, replica)
+        if "gpu_devices" in (body or {}) and not isinstance(body["gpu_devices"], list):
+            raise ValueError("gpu_devices 须为设备编号或完整 UUID 数组；空数组表示不给 GPU")
         return self._once(body, ("add_replica:" if replica else "start:") + identity,
                           lambda: self._start(identity, run_id, replica, (body or {}).get("expected_image"),
-                                              (body or {}).get("retention_scope_id")))
+                                              (body or {}).get("retention_scope_id"), (body or {}).get("gpu_devices")))
 
-    def _start(self, identity, run_id, replica, expected_image=None, retention_scope_id=None):
+    def _start(self, identity, run_id, replica, expected_image=None, retention_scope_id=None, gpu_devices=None):
         images = getattr(self.platform, "images", None)
         with images.launch(identity, run_id, retention_scope_id) if images else nullcontext(None) as frozen:
-            return self._start_unprotected(identity, run_id, replica, expected_image, frozen)
+            return self._start_unprotected(identity, run_id, replica, expected_image, frozen, gpu_devices)
 
-    def _start_unprotected(self, identity, run_id, replica, expected_image=None, frozen=None):
+    def _start_unprotected(self, identity, run_id, replica, expected_image=None, frozen=None, gpu_devices=None):
         with self.platform.source_lock, self.lock:
             self._guard(identity, run_id)
             group = self._group(identity)
@@ -1324,11 +1408,35 @@ class Deployments:
                 raise ValueError("已有实例；该组只允许一个实例，先排空停止" if not contract["replicas"]["replicable"]
                                  else "已有实例；请用增加副本")
             config = self.backend()
+            allocation = None
+            update_gpu_default = False
+            if gpu_devices is not None and config["kind"] != "docker":
+                raise ValueError("启动时 GPU 选择目前仅支持同一 Docker 后端")
+            if config["kind"] == "docker":
+                if gpu_devices is None:
+                    allocation = self.gpu_allocation(identity, probe=True)
+                else:
+                    facts = resolve_gpu_devices(gpu_devices)
+                    allocation = dict(group_id=identity, devices=[fact["gpu_uuid"] for fact in facts], source="group",
+                                      device_facts=facts, checked_at=now(), status="VERIFIED")
+                    previous = self.gpu_allocation(identity)
+                    if previous["status"] != "VERIFIED" or allocation["devices"] != previous["devices"]:
+                        self._gpu_configuration_guard(identity)
+                        update_gpu_default = True
+                if any(item.get("gpu_devices") != allocation["devices"] for item in live):
+                    raise ValueError("现有实例 GPU 分配不同，请先排空释放，不能改变活动组的设备")
+                locked = self.run_locks.get(identity)
+                if locked:
+                    self.check_gpu_placement(locked["placement"])
+                    if locked["placement"].get("gpu_devices", allocation["devices"]) != allocation["devices"]:
+                        raise ValueError("启动 GPU 与冻结研究运行不一致")
             credentials = {}
             if config["kind"] == "docker":
                 binding, _, _ = self._binding(group)
                 if binding.resource_binding is not None:
                     credentials = binding.resource_binding.worker_environment(group["entries"])
+            if update_gpu_default:
+                self.platform.store.save("runtime_group_gpu", identity, allocation)
             generation = self._next_generation(identity)
             record = dict(id=uuid.uuid4().hex, group_id=identity, generation=generation, name=identity + "-g" + str(generation),
                 session=self.session, profile=contract["host_profile"], contract_digest=contract["digest"],
@@ -1336,6 +1444,8 @@ class Deployments:
                 image_id=(artifact.get("build") or {}).get("image_id"), backend=config["kind"], origin="PLATFORM_STARTED",
                 run_id=run_id, state="UNDEPLOYED", desired="RUNNING", accepting=False, in_flight=0, units=[],
                 initialization={}, created_at=now(), start_wall=time.time(), events=[])
+            if allocation is not None:
+                record.update(gpu_devices=allocation["devices"], gpu_allocation=copy.deepcopy(allocation))
             if frozen:
                 record.update(**frozen, startup_kind="COLD_START", model_load_ms=None)
             self.instances[record["id"]] = record
@@ -1844,6 +1954,7 @@ class Deployments:
         waited = None
         with self.lock:
             self._guard(placement["group_id"], placement["run_id"])
+            self.check_gpu_placement(placement)
             if getattr(self.platform, "images", None):
                 self.platform.images.dispatch_check(placement["group_id"], placement["run_id"], placement.get("retention_scope_id"))
             record = self._route(placement["group_id"], unit["id"], _task_context.get())
@@ -1866,6 +1977,7 @@ class Deployments:
             result = self.platform.managed_services.prepare(placement["group_id"], run_id=placement["run_id"])
             return self.instances[result["id"]]
         group = self._group(placement["group_id"])
+        self.check_gpu_placement(placement)
         if group["contract"]["digest"] != placement["contract_digest"]:
             raise ProtocolError("运行组契约已变化；冻结运行不能改用新契约")
         deadline = time.monotonic() + placement["start_timeout_s"]

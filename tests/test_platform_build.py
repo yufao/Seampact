@@ -31,6 +31,7 @@ class FakeDocker:
         self.environment_builds = []
 
     def resolve_base(self, reference):
+        self.images[reference] = dict(self.base)
         return dict(self.base)
 
     def inspect(self, reference):
@@ -172,6 +173,45 @@ class PlatformBuildTests(unittest.TestCase):
         self.assertIn("--no-build-isolation", dockerfile)
         self.assertIn("--no-deps", dockerfile)
 
+    def test_platform_build_uses_existing_environment_name_without_an_extra_alias(self):
+        docker = FakeDocker()
+        environment = self.prepare(docker)
+        docker.commands.clear()
+        # A tag cleanup may have removed every content alias. The retained
+        # environment name is sufficient and must be the actual FROM input.
+        for name in list(docker.images):
+            if name.startswith("seampact-build-input:"):
+                del docker.images[name]
+        builder.build_platform(docker, self.code, environment, "platform:test")
+        command = docker.commands[-1]
+        self.assertIn("DEPENDENCY_IMAGE=" + environment["image"], command)
+        self.assertFalse(any(args[0] == "tag" for args in docker.commands))
+
+    def test_missing_environment_name_is_restored_from_verified_id(self):
+        docker = FakeDocker()
+        environment = self.prepare(docker)
+        del docker.images[environment["image"]]
+        builder.build_platform(docker, self.code, environment, "platform:test")
+        self.assertEqual(docker.images[environment["image"]]["Id"], environment["image_id"])
+
+    def test_conflicting_environment_name_is_rejected_without_overwriting(self):
+        docker = FakeDocker()
+        environment = self.prepare(docker)
+        other = dict(Id=OTHER_BASE, Config=dict(Labels={}))
+        docker.images[environment["image"]] = other
+        docker.commands.clear()
+        with self.assertRaisesRegex(ValueError, "not overwritten"):
+            builder.build_platform(docker, self.code, environment, "platform:test")
+        self.assertEqual(docker.images[environment["image"]], other)
+        self.assertFalse(docker.commands)
+
+    def test_bare_base_id_gets_a_verified_buildkit_name(self):
+        docker = FakeDocker()
+        self.prepare(docker, base_image=BASE)
+        command = next(args for args in docker.commands if args[:2] == ["buildx", "build"])
+        self.assertIn("BASE_IMAGE=seampact-build-input:sha256-" + BASE[7:],
+                      command)
+
     def test_refresh_skips_previous_lock_and_forces_resolution(self):
         docker = FakeDocker()
         first = self.prepare(docker)
@@ -190,6 +230,7 @@ class PlatformBuildTests(unittest.TestCase):
         values = dict(line.split("=", 1) for line in output.read_text().splitlines())
         reference = values["SEAMPACT_DEPENDENCY_IMAGE"]
         self.assertFalse(reference.startswith("sha256:"))
+        self.assertTrue(reference.startswith("seampact-platform-environment:"))
         self.assertIn(docker.images[reference]["Id"], docker.observed)
         self.assertEqual(values["SEAMPACT_VERSION"], "1.0")
         self.assertEqual(values["SEAMPACT_REVISION"], "example")

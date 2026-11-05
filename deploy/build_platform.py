@@ -140,13 +140,19 @@ def read_environment(docker, image_id):
     return value
 
 
-def build_reference(docker, image_id):
-    # BuildKit FROM requires an image reference, not Docker's local config ID.
-    # Give the verified ID its own local tag and check that mapping before use.
+def build_reference(docker, image_id, preferred=None):
+    # Use the selected base/environment name instead of creating an extra alias
+    # which an external tag cleanup can remove while the image stays referenced.
+    # Bare config IDs still need a BuildKit-compatible local name.
     if not re.fullmatch(r"sha256:[0-9a-f]{64}", image_id):
         raise ValueError("invalid resolved image ID")
-    reference = "seampact-build-input:sha256-" + image_id.split(":", 1)[1]
-    docker.run(["tag", image_id, reference])
+    reference = preferred if preferred and not re.fullmatch(r"sha256:[0-9a-f]{64}", preferred) else (
+        "seampact-build-input:sha256-" + image_id.split(":", 1)[1])
+    existing = docker.inspect(reference)
+    if existing and existing["Id"] != image_id:
+        raise ValueError("local build reference points to another image; not overwritten")
+    if not existing:
+        docker.run(["tag", image_id, reference])
     inspected = docker.inspect(reference)
     if not inspected or inspected["Id"] != image_id:
         raise ValueError("local build reference does not match the verified image ID")
@@ -178,7 +184,7 @@ def prepare(code, state_dir, docker, *, base_image="python:3.11-slim", refresh=F
         if lock and observed["lock"] != lock:
             raise ValueError("environment image does not match the saved dependency lock")
     else:
-        base_reference = build_reference(docker, base["Id"])
+        base_reference = build_reference(docker, base["Id"], base_image)
         with tempfile.TemporaryDirectory(prefix="build-", dir=state_dir) as temporary:
             context = Path(temporary)
             save(context / "request.json", request)
@@ -208,7 +214,7 @@ def prepare(code, state_dir, docker, *, base_image="python:3.11-slim", refresh=F
 
 
 def build_platform(docker, code, environment, image, revision="UNKNOWN", owner=None):
-    reference = build_reference(docker, environment["image_id"])
+    reference = build_reference(docker, environment["image_id"], environment["image"])
     args = ["buildx", "build", "--load", "--builder", "default", "-f", str(Path(code) / "deploy/Dockerfile"),
         "--build-arg", "DEPENDENCY_IMAGE=" + reference,
         "--build-arg", "SEAMPACT_EXTRAS=" + ",".join(environment["request"]["extras"]),
@@ -252,7 +258,7 @@ def main(argv=None):
     if args.receipt:
         save(args.receipt, result)
     if args.compose_env:
-        reference = build_reference(docker, result["image_id"])
+        reference = build_reference(docker, result["image_id"], result["image"])
         args.compose_env.parent.mkdir(parents=True, exist_ok=True)
         args.compose_env.write_text("\n".join([
             "SEAMPACT_DEPENDENCY_IMAGE=" + reference,

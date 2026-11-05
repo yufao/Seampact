@@ -16,7 +16,7 @@ from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
 
-from seampact.observability.resource_observation import ATTRIBUTION, DEVICE_QUERY, gpu_uuid, number, query, utc_now
+from seampact.observability.resource_observation import ATTRIBUTION, DEVICE_QUERY, gpu_uuid, number, query, resolve_gpu_devices, utc_now
 from seampact.observability.resource_process import process_sample
 
 METRICS = ("platform_cpu", "platform_memory", "container_cpu", "container_memory",
@@ -35,6 +35,10 @@ class ResourceMonitor:
         self.thread = None
         self.previous = {}
         self.summary = None
+        self.gpu_settings_path = self.folder / "gpu-devices.json"
+        self.gpu_settings = {"devices": [], "checked_at": None}
+        if self.gpu_settings_path.exists():
+            self.gpu_settings = json.loads(self.gpu_settings_path.read_text(encoding="utf-8"))
         for path in self.folder.glob("*.meta.json"):
             try:
                 meta = json.loads(path.read_text(encoding="utf-8"))
@@ -56,7 +60,8 @@ class ResourceMonitor:
         values = [self.platform.deployments.backend().get("gpus", "")]
         values.extend((item.get("docker") or {}).get("gpus", "")
                       for item in self.platform.store.list("managed_service"))
-        ids = set()
+        with self.lock:
+            ids = {item["gpu_uuid"] for item in self.gpu_settings["devices"]}
         for value in values:
             value = str(value).strip().strip('"')
             if value.startswith("device="):
@@ -66,6 +71,24 @@ class ResourceMonitor:
                     except Exception:
                         pass
         return sorted(ids)
+
+    def configure_gpus(self, body):
+        if not isinstance(body, dict) or set(body) != {"devices"}:
+            raise ValueError("GPU 观察配置只接收 devices 列表")
+        # Resolve every requested identity before changing persisted settings.
+        devices = resolve_gpu_devices(body["devices"])
+        settings = dict(devices=devices, checked_at=utc_now())
+        with self.lock:
+            temp = self.gpu_settings_path.with_suffix(".tmp")
+            try:
+                with os.fdopen(os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w", encoding="utf-8") as stream:
+                    json.dump(settings, stream, ensure_ascii=False, allow_nan=False)
+                os.replace(temp, self.gpu_settings_path)
+            finally:
+                if temp.exists():
+                    temp.unlink()
+            self.gpu_settings = settings
+            return dict(status="SAVED", **copy.deepcopy(settings), gpu_uuids=self._configured_gpus())
 
     def capabilities(self):
         labels = {
@@ -108,7 +131,7 @@ class ResourceMonitor:
                          "status": "UNKNOWN_UNTIL_SAMPLED" if available else "UNSUPPORTED",
                          "available": available, "reason": reason})
         return {"metrics": rows,
-                "gpu_uuids": gpu_ids, "attribution": ATTRIBUTION,
+                "gpu_uuids": gpu_ids, "gpu_devices": copy.deepcopy(self.gpu_settings["devices"]), "attribution": ATTRIBUTION,
                 "unknown": "unavailable readings are null with status/reason; no scope totals are combined"}
 
     def start(self, body):

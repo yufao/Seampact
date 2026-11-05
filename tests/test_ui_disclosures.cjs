@@ -40,7 +40,7 @@ function load() {
   const context = vm.createContext({URLSearchParams, location: {hash: ''},
     document: {createElement: tag => new Element(tag), createTextNode: text => { const item = new Element('span'); item.textContent = text; return item; }, getElementById: id => roots[id] || Object.values(roots).flatMap(descendants).find(item => item.id === id),
       querySelector: selector => selector === '.observer-scroll' ? roots.scroller : roots.config},
-    inspectPage: true, inspectView: 'analyses', inspectQuery: new URLSearchParams(), state: {},
+    inspectPage: true, inspectView: 'analyses', inspectQuery: new URLSearchParams(), state: {}, taskDeleteBusy: false,
     detailStates: new Map(), renderedSections: new Map(), capabilityDrafts: new Map(),
     deploymentPreparation: new Map(), deploymentDrafts: new Map(), deploymentSubmitting: new Set(), analysisSubmitting: new Set(), sourceUpdating: new Set(), sourceUpdateOptions: new Map(),
     revisionSelected: new Map(), revisionVersions: new Map(), revisionBusy: new Set(), revisionErrors: new Map(),
@@ -51,6 +51,7 @@ function load() {
     resourceState: () => ({}), harnessDependencies: () => {}, sourceEnvironment: () => {},
     renderRevisionWorkspace: (card, harness, job) => { const target = new Element('section'); target.id = 'analysis-revision-' + job.id; card.append(target); },
     renderDeploymentBackend: () => {}, renderInstance: () => {}, environmentEvidence: () => {},
+    renderGpuAllocationControls: () => {}, renderServiceGpuAllocations: () => {},
     analysisProgress: () => new Element('div'), analysisClassification: () => null,
     analysisResultSummary: () => null, preprocessingSummary: () => null, analysisNextSteps: () => null,
     contextDetails: () => null, callDetails: () => null, planDetails: () => null,
@@ -60,7 +61,7 @@ function load() {
   const names = ['textValue', 'node', 'selectedSource', 'detailKey', 'disclosureScope', 'compactText', 'disclosure', 'foldCard',
     'revealSection', 'renderSection', 'statusClass', 'statusLabel', 'pill', 'latency', 'visibleUnits', 'visibleTasks',
     'analysisOperationLabel', 'sourceIdentity', 'renderAnalyses', 'renderHarnesses', 'runtimeGroupIdentity', 'runtimeGroupError',
-    'runtimeGroupActive', 'renderDeployments', 'renderUnits', 'renderTasks', 'refreshRevisionDetails', 'revisionAction', 'analysisNextSteps'];
+    'runtimeGroupActive', 'renderDeployments', 'renderUnits', 'taskRecordFinished', 'deleteTaskRecords', 'renderTasks', 'refreshRevisionDetails', 'revisionAction', 'analysisNextSteps'];
   for (const name of names) {
     if (name === 'node') {
       vm.runInContext(source.slice(source.indexOf('const node ='), source.indexOf('\nconst messages =')), context); continue;
@@ -81,6 +82,44 @@ function state() {
     runtime_groups: [{id: 'rg-hash-one', source_id: 'a', source_version: 'v1', entries: ['run'], status: 'LOCAL_ONLY', instances: []},
       {id: 'rg-hash-two', source_id: 'b', source_version: 'v2', entries: ['other'], status: 'LOCAL_ONLY', instances: []}]};
 }
+test('task cleanup uses the current source filter and leaves active tasks and execution evidence alone', async () => {
+  const {context: c, roots} = load();
+  c.inspectView = 'tasks'; c.inspectQuery = new URLSearchParams({harness: 'a'});
+  c.state = {units: [], analyses: [], tasks: [
+    {id: 'done-a', status: 'COMPLETED', calls: [{unit: {source_id: 'a'}}]},
+    {id: 'active-a', status: 'RUNNING', calls: [{unit: {source_id: 'a'}}]},
+    {id: 'done-b', status: 'FAILED', calls: [{unit: {source_id: 'b'}}]}]};
+  const calls = [], confirmations = [];
+  c.window = {confirm: text => { confirmations.push(text); return true; }};
+  c.api = async (url, body) => { calls.push({url, body}); return {deleted: body.task_ids}; };
+  c.refresh = async () => {};
+  c.renderTasks();
+  const cleanup = roots['task-list'].querySelectorAll('button').find(button => button.textContent.startsWith('清理已结束'));
+  assert.equal(cleanup.textContent, '清理已结束记录（1）');
+  assert.equal(roots['task-list'].querySelectorAll('button').filter(button => button.textContent === '删除记录' && button.disabled).length, 1);
+  cleanup.onclick();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].url, '/api/tasks/delete');
+  assert.deepEqual(Array.from(calls[0].body.task_ids), ['done-a']);
+  assert.deepEqual(Array.from(c.state.tasks, task => task.id), ['active-a', 'done-b']);
+  assert.match(confirmations[0], /执行依据、会话和研究结果保留/);
+});
+
+test('cancelling task cleanup sends nothing and a rejected cleanup keeps records visible', async () => {
+  const {context: c} = load();
+  const task = {id: 'done', status: 'COMPLETED'}; c.state = {tasks: [task]};
+  let calls = 0, notice = '';
+  c.window = {confirm: () => false}; c.refresh = async () => {};
+  c.api = async () => { calls++; throw new Error('调用仍在收尾'); };
+  c.showNotice = message => { notice = message; };
+  await c.deleteTaskRecords([task]);
+  assert.equal(calls, 0);
+  c.window.confirm = () => true;
+  await c.deleteTaskRecords([task]);
+  assert.equal(calls, 1); assert.equal(c.state.tasks.length, 1);
+  assert.equal(c.taskDeleteBusy, false); assert.equal(notice, '调用仍在收尾');
+});
 test('source update option survives refresh per source and is disabled during analysis', () => {
   const {context: c, roots} = load();
   c.state = state();

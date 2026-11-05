@@ -107,7 +107,7 @@ class Platform:
         active = [call for call in snapshot["calls"].values() if call["physical"] in {"AUTHORIZED", "STARTED"}]
         waiting = [call for call in snapshot["calls"].values() if call["physical"] in {"ENABLED", "RESERVED"}]
         tasks = [{key: value for key, value in task.items() if key != "messages"}
-                 for task in self.store.list("task")]
+                 for task in self.store.task_history()]
         for task in tasks:
             calls = [call for call in snapshot["calls"].values() if call.get("task_id") == task["id"]]
             if calls or task.get("status") == "RUNNING":
@@ -142,6 +142,7 @@ class Platform:
             analysis_revisions_observation_pending=revision_observation_pending,
             units=self.catalog.public(), tasks=tasks, rules=RULESET, entry_profile=NATIVE_PROFILE,
             runtime_groups=self.deployments.public(), deployments=self.store.list("deployment"),
+            gpu_devices=copy.deepcopy(self.monitor.gpu_settings["devices"]),
             deployment_backend=self.deployments.backend(),
             image_retention=self.images.snapshot(),
             runtime_controller=self.deployments.controller_state(),
@@ -152,6 +153,38 @@ class Platform:
 
     def public_connections(self):
         return self.resources.public_connections()
+
+    def delete_tasks(self, body):
+        """Remove ended tasks from the panel, retaining execution references."""
+        identities = body.get("task_ids") if isinstance(body, dict) else None
+        if (not isinstance(identities, list) or not identities
+                or any(not isinstance(identity, str) or not identity.strip() for identity in identities)):
+            raise ValueError("task_ids 需要非空的任务标识数组")
+        identities = list(dict.fromkeys(identities))
+        selected = set(identities)
+        # Snapshot before the store transaction: the coordinator may persist
+        # while answering. Ended task identities are never reused for new work.
+        runtime = self.runtime.snapshot()
+        if any(call.get("task_id") in selected and call.get("physical") != "RETIRED"
+               for call in runtime["calls"].values()):
+            raise ValueError("所选任务仍有未结束或状态未确认的调用，请等待执行收尾后再删除记录")
+        if any(root.get("task_id") in selected and root.get("state") not in {"RETIRED", "CANCELLED"}
+               for root in runtime.get("roots", {}).values()):
+            raise ValueError("所选任务仍有未结束或状态未确认的根请求，请等待执行收尾后再删除记录")
+        with self.deployments.lock, self.managed_services.lock, self.store.transaction():
+            if any(task_id in selected for task_id, _ in self.deployments.affinity):
+                raise ValueError("所选任务仍占用运行实例，请等待任务租约释放后再删除记录")
+            if any(selected.intersection(leases) for leases in self.managed_services.leases.values()):
+                raise ValueError("所选任务仍占用模型服务，请等待服务租约释放后再删除记录")
+            finished = {"COMPLETED", "FAILED", "INTERRUPTED", "CANCELLED", "CANCELED", "TIMEOUT", "TIMED_OUT", "STOPPED"}
+            for identity in identities:
+                task = self.store.get("task", identity)
+                if task is None:
+                    raise ValueError("没有这个任务：" + identity)
+                if task.get("status") not in finished:
+                    raise ValueError("只能删除已结束的任务记录，请等待所选任务结束")
+            self.store.hide_tasks(identities)
+        return dict(deleted=identities)
 
     def resource_catalog(self):
         weights = [record for record in self.resources.public_weights()

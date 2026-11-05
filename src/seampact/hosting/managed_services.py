@@ -20,6 +20,7 @@ from urllib.parse import urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 from seampact.hosting import backends
+from seampact.observability.resource_observation import resolve_gpu_devices
 from seampact.store import now
 from seampact.runtime import ProtocolError
 
@@ -198,11 +199,12 @@ class ManagedServices:
         if not isinstance(docker.get("gpus", ""), str):
             raise ValueError("gpus 须为显式 device=<设备列表> 字符串")
         selected = docker.get("gpus", "").strip('"')
+        device_ids = []
         if selected:
             if not selected.startswith("device="):
                 raise ValueError("gpus 须为明确 device=<设备列表>，不能使用 all 或数量推断设备")
             device_ids = selected.removeprefix("device=").split(",")
-            if (any(not re.fullmatch(r"[A-Za-z0-9_.:-]+", device) for device in device_ids)
+            if (any(not re.fullmatch(r"[A-Za-z0-9_.:/-]+", device) for device in device_ids)
                     or len(set(device_ids)) != len(device_ids) or set(device_ids) != set(devices)):
                 raise ValueError("Docker 设备列表须与资源包络设备集合一致")
             # Docker's --gpus argument is CSV; multiple device names need one
@@ -215,8 +217,17 @@ class ManagedServices:
             raise ValueError("depends_on 须为服务 id 列表")
         value["depends_on"] = list(dict.fromkeys(service_id(item) for item in dependencies))
         with self.lock:
-            if self._held(identity) or group_id(identity) in self.run_locks:
+            if self._held(identity) or group_id(identity) in self.run_locks or self.leases.get(group_id(identity)):
                 raise ValueError("服务仍被运行使用或未确认释放，不能修改规格")
+            if device_ids:
+                resolved = resolve_gpu_devices(device_ids)
+                canonical = [device["gpu_uuid"] for device in resolved]
+                if len(canonical) != len(device_ids):
+                    raise ValueError("多个设备标识指向同一 GPU；请只保留一个完整 UUID")
+                envelope["devices"] = {device: copy.deepcopy(devices[original])
+                                       for original, device in zip(device_ids, canonical)}
+                selector = "device=" + ",".join(canonical)
+                docker["gpus"] = '"' + selector + '"' if len(canonical) > 1 else selector
             def network_target(spec):
                 settings = spec["docker"]
                 if settings.get("network"):
@@ -252,6 +263,49 @@ class ManagedServices:
             self.platform.store.save("managed_service", identity, value)
             self.platform.store.save("runtime_group", group_id(identity), self._group(value))
             return copy.deepcopy(value)
+
+    def set_gpu_devices(self, body):
+        """Change a cold service's explicit devices, retaining its full contract."""
+        if (not isinstance(body, dict) or set(body) - {"service_id", "devices", "memory_mb", "basis"}
+                or not isinstance(body.get("service_id"), str) or "devices" not in body):
+            raise ValueError("服务 GPU 配置须有 service_id 和 devices 列表")
+        identity = service_id(body["service_id"])
+        with self.lock:
+            spec = copy.deepcopy(self.get(identity))
+            if self._held(identity) or group_id(identity) in self.run_locks or self.leases.get(group_id(identity)):
+                raise ValueError("服务仍被运行使用或未确认释放，不能修改 GPU；请先完成任务并冷态保存")
+            if getattr(self.platform, "images", None):
+                self.platform.images.guard_artifact(group_id(identity))
+            devices = resolve_gpu_devices(body["devices"])
+            selected = [device["gpu_uuid"] for device in devices]
+            previous = spec["resource_envelope"]["devices"]
+            if previous and not selected:
+                raise ValueError("不能通过设备选择移除已有 GPU 需求；请按完整服务规格核对 CPU 执行条件")
+            explicit = "memory_mb" in body
+            memory = body.get("memory_mb")
+            if explicit:
+                if (not isinstance(memory, dict) or set(memory) != set(selected)
+                        or any(type(value) not in (int, float) or not math.isfinite(value) or value <= 0
+                               for value in memory.values())):
+                    raise ValueError("memory_mb 须为每个所选完整 UUID 提供正数需求上界")
+                if not isinstance(body.get("basis"), str) or not body["basis"].strip():
+                    raise ValueError("修改显存需求须明确提供资源包络 basis")
+            elif set(previous) == set(selected):
+                memory = {device: previous[device]["memory_mb"] for device in selected}
+            elif previous and len(previous) == len(selected) and len({value["memory_mb"] for value in previous.values()}) == 1:
+                # Equal per-device model requirements can move to new devices;
+                # observed whole-card capacity never supplies this demand.
+                amount = next(iter(previous.values()))["memory_mb"]
+                memory = {device: amount for device in selected}
+            else:
+                raise ValueError("设备数量或不同设备的需求映射发生变化；请明确提供 memory_mb 和 basis")
+            if "basis" in body:
+                if not isinstance(body["basis"], str) or not body["basis"].strip():
+                    raise ValueError("basis 须为非空资源包络依据")
+                spec["resource_envelope"]["basis"] = body["basis"]
+            spec["resource_envelope"]["devices"] = {device: dict(memory_mb=memory[device]) for device in selected}
+            spec["docker"]["gpus"] = "device=" + ",".join(selected) if selected else ""
+            return self.configure(spec)
 
     def get(self, identity):
         value = self.platform.store.get("managed_service", service_id(identity))
@@ -332,6 +386,11 @@ class ManagedServices:
         with self.lock:
             self._guard(identity, run_id)
             spec = self._spec(identity)
+            chosen = resolve_gpu_devices(body.get("gpu_devices", list(spec["resource_envelope"]["devices"])))
+            gpu_devices = [device["gpu_uuid"] for device in chosen]
+            if set(gpu_devices) != set(spec["resource_envelope"]["devices"]):
+                raise ValueError("所指定 GPU 与冻结服务规格不一致；请先停止并确认释放，再冷态保存 GPU 配置及资源包络")
+            gpu_devices = list(spec["resource_envelope"]["devices"])
             if replica:
                 raise ValueError("首版单模型服务不支持复制")
             gap = self.start_gap(identity, body.get("expected_image"))
@@ -357,7 +416,7 @@ class ManagedServices:
                 backend="docker", desired="READY", accepting=False, released=False, in_flight=0, unknown_requests=0,
                 busy_scope_started_wall=None, busy_scope_intervals=[], busy_scope_unknown=False,
                 busy_scope_basis="OUTER_REQUEST_SCOPE_WALL_NOT_GPU_TIME",
-                units=[], initialization={}, endpoint=spec["endpoint"], start_wall=time.time(), start_at=now(),
+                units=[], initialization={}, endpoint=spec["endpoint"], gpu_devices=gpu_devices, start_wall=time.time(), start_at=now(),
                 last_activity_wall=time.time(), spec_digest=spec["spec_digest"], image_id=spec["image_id"],
                 handle=dict(kind="docker", container=name, instance_id=instance), service_spec=copy.deepcopy(spec), pending_stop=None)
             self.instances[instance] = item
@@ -371,10 +430,9 @@ class ManagedServices:
                 argv += ["--network", docker["network"], "--network-alias", docker["network_alias"]]
             else:
                 argv += ["-p", docker["publish_host"] + ":" + str(docker["publish_port"]) + ":" + str(docker["container_port"])]
-            if docker.get("gpus"):
-                argv += ["--gpus", str(docker["gpus"])]
             for name_ in docker.get("pass_env", []):
                 argv += ["-e", name_]
+            argv += backends.gpu_runtime_arguments(gpu_devices)
             for mount in docker.get("mounts", []):
                 argv += ["--mount", "type=bind,source=" + mount["source"] + ",target=" + mount["target"] +
                          (",readonly" if mount.get("read_only", True) else "")]

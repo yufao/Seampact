@@ -343,6 +343,10 @@ class FrozenCatalog:
                     image=(artifact.get("publish") or {}).get("reference") or artifact.get("image"),
                     image_id=(artifact.get("build") or {}).get("image_id"),
                     binding_fingerprint=artifact.get("binding_fingerprint"))
+                if self.router.backend().get("kind") == "docker":
+                    allocation = self.router.gpu_allocation(group["id"], probe=True)
+                    self.placement[uid]["gpu_devices"] = allocation["devices"]
+                    self.router.check_gpu_placement(self.placement[uid])
             remote = {uid for uid, value in self.placement.items() if value["kind"] == "REMOTE"}
             self.frozen = catalog.freeze_resources(selected, remote=remote)
             self.units = {uid: copy.deepcopy(current[uid]) for uid in selected}

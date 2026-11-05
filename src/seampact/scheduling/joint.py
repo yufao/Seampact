@@ -55,6 +55,23 @@ def _count(value, label, default=None):
     return value
 
 
+def validate_worker_gpu_envelopes(groups, resources, demands):
+    """Check declared device budgets against frozen assignment, never card size."""
+    if not resources:
+        return  # Slot-only development runs retain unknown GPU reservation costs.
+    gpu_resources = {name[len("gpu:"):-len(":memory_mb")]: name for name in resources
+                     if name.startswith("gpu:") and name.endswith(":memory_mb")}
+    for group, placement in groups.items():
+        if group.startswith("service:"):
+            continue  # Managed-service envelopes are checked separately below.
+        devices = set(placement.get("gpu_devices", []))
+        requested = {device for device, name in gpu_resources.items() if demands[group][name] > 0}
+        if requested - devices:
+            raise ValueError("worker GPU 驻留需求必须对应冻结分配的 UUID：" + group)
+        if devices - set(gpu_resources) or devices - requested:
+            raise ValueError("worker 已分配 GPU 须声明同 UUID 的显存配额与正值驻留需求：" + group)
+
+
 def configure(config, *, scene, tasks, task_ids, algorithm, criteria, contracts, groups, deployments,
               learning, references, mode, placements=None, service_dependencies=None, shared_services=None):
     """Validate and freeze one joint/1 run; every compared policy shares these values."""
@@ -135,6 +152,8 @@ def configure(config, *, scene, tasks, task_ids, algorithm, criteria, contracts,
         # Unknown residency demands are not filled with zero.
         if not isinstance(row, dict) or set(row) != set(resources) or any(not _number(v) or v < 0 for v in row.values()):
             raise ValueError("声明资源配额后，每个远程运行组须给出每项资源的实例驻留需求：" + group_id)
+    observation = ObservationConfig.from_mapping(value.get("observation"))
+    validate_worker_gpu_envelopes(groups, resources, demands)
     for group_id in services:
         spec = deployments.platform.managed_services.get(group_id)
         envelope = spec["resource_envelope"]
@@ -221,7 +240,6 @@ def configure(config, *, scene, tasks, task_ids, algorithm, criteria, contracts,
     dispatch_scope = value.get("dispatch_scope", "roots_and_boundaries")
     if dispatch_scope not in {"roots", "roots_and_boundaries"}:
         raise ValueError("dispatch_scope 须为 roots 或 roots_and_boundaries")
-    observation = ObservationConfig.from_mapping(value.get("observation"))
     timeout = _count(value.get("start_timeout_s"), "start_timeout_s", 900)
     frozen = dict(version=MODE, functional_policy=functional, dispatch_policy=dispatch, resource_policy=resource,
         learned=learned, retention=retention, queue_threshold=threshold,

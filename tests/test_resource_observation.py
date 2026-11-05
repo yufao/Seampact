@@ -27,6 +27,36 @@ class Clock:
 
 
 class ResourceObservationChecks(unittest.TestCase):
+    def test_device_identity_probe_resolves_exact_index_without_enumerating(self):
+        identity = "GPU-12345678-1234-1234-1234-123456789abc"
+        with patch.object(observation.subprocess, "run", return_value=subprocess.CompletedProcess(
+                [], 0, "2, " + identity + ", Example GPU, 40000\n")) as run:
+            devices = observation.resolve_gpu_devices([2, "02", identity])
+        self.assertEqual(len(devices), 1)
+        self.assertEqual(devices[0]["gpu_uuid"], identity)
+        self.assertEqual(devices[0]["index"], 2)
+        self.assertEqual(devices[0]["memory_total_mib"], 40000)
+        self.assertEqual(run.call_count, 2)
+        self.assertIn("--id=2", run.call_args_list[0].args[0])
+        self.assertIn("--id=" + identity, run.call_args_list[1].args[0])
+        self.assertTrue(all("--query-gpu=index,uuid,name,memory.total" in c.args[0] for c in run.call_args_list))
+        self.assertTrue(all(not c.kwargs.get("shell") for c in run.call_args_list))
+
+    def test_device_identity_probe_rejects_partial_uuid_and_mismatched_receipts(self):
+        identity = "GPU-12345678-1234-1234-1234-123456789abc"
+        for values in (["GPU-1234"], ["all"], ["0; echo private"], [-1], [True], "0"):
+            with self.subTest(values=values), patch.object(observation.subprocess, "run") as run:
+                with self.assertRaises(ValueError):
+                    observation.resolve_gpu_devices(values)
+                run.assert_not_called()
+        receipts = ["1, " + identity + ", GPU, 10\n", "0, GPU-partial, GPU, 10\n",
+                    "0, " + identity + ", GPU, 10\n1, " + identity + ", GPU, 10\n"]
+        for output in receipts:
+            with self.subTest(output=output), patch.object(observation.subprocess, "run",
+                    return_value=subprocess.CompletedProcess([], 0, output)):
+                with self.assertRaises(ValueError):
+                    observation.resolve_gpu_devices([0])
+
     def test_csv_unknown_values_and_uuid_isolation(self):
         device_csv = "GPU-a, Example A, 100, N/A, , 0\nGPU-b, Example B, 200, 50, 20, 10\nGPU-secret, Private, 1, 1, 1, 1\n"
         apps_csv = "GPU-a, 11, N/A\nGPU-a, 12, 8\nGPU-b, N/A, N/A\nGPU-secret, 99, 1\n"

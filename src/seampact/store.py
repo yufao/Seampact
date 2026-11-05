@@ -67,6 +67,26 @@ class Store:
                                    (kind,)).fetchall()
         return [json.loads(row[0]) for row in rows]
 
+    def task_history(self):
+        """Visible task records; retained execution evidence stays in task."""
+        with self.lock:
+            rows = self.db.execute("""
+                SELECT task.data FROM documents AS task
+                WHERE task.kind='task' AND NOT EXISTS (
+                    SELECT 1 FROM documents AS hidden
+                    WHERE hidden.kind='task_deleted' AND hidden.id=task.id)
+                ORDER BY task.rowid DESC
+            """).fetchall()
+        return [json.loads(row[0]) for row in rows]
+
+    def hide_tasks(self, identities):
+        """Hide checked, finished records without removing their evidence."""
+        stamp = now()
+        with self.transaction():
+            self.db.executemany("INSERT OR IGNORE INTO documents VALUES ('task_deleted',?,?)",
+                [(identity, json.dumps(dict(id=identity, deleted_at=stamp), ensure_ascii=False))
+                 for identity in identities])
+
     def analysis_summaries(self, source_ids):
         """Read visible history without decoding its full model conversations."""
         if not source_ids:

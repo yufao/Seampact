@@ -31,6 +31,7 @@ ATTRIBUTION = "UNVERIFIED_SHARED_DEVICE"
 METRICS = ("memory_total_mib", "memory_used_mib", "utilization_gpu_percent", "power_draw_w")
 DEVICE_QUERY = "uuid,name,memory.total,memory.used,utilization.gpu,power.draw"
 PROCESS_QUERY = "gpu_uuid,pid,used_gpu_memory"
+IDENTITY_QUERY = "index,uuid,name,memory.total"
 
 
 def utc_now():
@@ -65,6 +66,44 @@ def query(fields, uuids):
         return list(csv.reader(io.StringIO(result.stdout), skipinitialspace=True)), None
     except csv.Error:
         return None, "INVALID_CSV"
+
+
+def resolve_gpu_devices(values):
+    """Resolve only explicitly requested devices; never enumerate other GPUs."""
+    if not isinstance(values, list):
+        raise ValueError("GPU 设备须为 UUID 或编号列表")
+    hex_uuid = r"[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}"
+    uuid_pattern = r"(?:GPU-" + hex_uuid + r"|MIG-" + hex_uuid + r"|MIG-GPU-" + hex_uuid + r"/[0-9]+/[0-9]+)"
+    selectors = []
+    for value in values:
+        if type(value) is int and value >= 0:
+            selector = str(value)
+        elif isinstance(value, str):
+            selector = value.strip()
+            if re.fullmatch(r"[0-9]+", selector):
+                selector = str(int(selector))
+            elif not re.fullmatch(uuid_pattern, selector):
+                raise ValueError("GPU 设备须为完整 GPU／MIG UUID 或非负整数编号")
+        else:
+            raise ValueError("GPU 设备须为完整 GPU／MIG UUID 或非负整数编号")
+        if selector not in selectors:
+            selectors.append(selector)
+    devices, seen = [], set()
+    for selector in selectors:
+        rows, error = query(IDENTITY_QUERY, [selector])
+        if error or len(rows or []) != 1 or len(rows[0]) != 4:
+            raise ValueError("无法识别 GPU：" + selector + "；请确认当前平台容器可访问该设备及 nvidia-smi")
+        index, identity, name, memory = (cell.strip() for cell in rows[0])
+        if (not re.fullmatch(r"[0-9]+", index) or not re.fullmatch(uuid_pattern, identity)
+                or not name or (selector.isdigit() and int(index) != int(selector))
+                or (not selector.isdigit() and identity.lower() != selector.lower())):
+            raise ValueError("GPU 探查回执与所选设备不一致：" + selector)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        devices.append(dict(input=selector, gpu_uuid=identity, index=int(index), name=name,
+                            memory_total_mib=number(memory), status="VERIFIED", checked_at=utc_now()))
+    return devices
 
 
 def sample(uuids, expected_pids=()):

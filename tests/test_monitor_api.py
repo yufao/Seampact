@@ -5,6 +5,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest.mock import patch
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -75,6 +76,19 @@ class MonitorAPIChecks(unittest.TestCase):
             self.request("/api/monitor/start", {"metrics": ["not_supported"]})
         self.assertEqual(raised.exception.code, 400)
         self.assertIsNone(self.platform.monitor.status()["current"])
+
+    def test_frontend_gpu_configuration_and_task_cleanup_routes(self):
+        identity = "GPU-12345678-1234-1234-1234-123456789abc"
+        with patch("seampact.observability.resource_observation.query", return_value=(
+                [["0", identity, "Example", "10000"]], None)):
+            saved = self.request("/api/monitor/gpus", dict(devices=["0"]))
+        self.assertEqual(saved["devices"][0]["gpu_uuid"], identity)
+        self.assertIn(identity, self.request("/api/monitor")["capabilities"]["gpu_uuids"])
+        self.assertIsNone(self.request("/api/monitor")["current"])
+        self.platform.store.save("task", "ended", dict(id="ended", status="COMPLETED", response="evidence"))
+        self.assertEqual(self.request("/api/tasks/delete", dict(task_ids=["ended"])), dict(deleted=["ended"]))
+        self.assertEqual(self.request("/api/state")["tasks"], [])
+        self.assertEqual(self.platform.store.get("task", "ended")["response"], "evidence")
 
 
 if __name__ == "__main__":
