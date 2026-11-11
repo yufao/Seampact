@@ -4,6 +4,7 @@ import copy
 import sys
 import textwrap
 import unittest
+from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -174,6 +175,7 @@ class DependencyBindingChecks(unittest.TestCase):
         records = {"resource_dependency": {row["id"]: row}, "dependency_binding": {}}
         store = SimpleNamespace(get=lambda kind, identity: records[kind].get(identity),
             list=lambda kind: list(records[kind].values()),
+            transaction=nullcontext,
             save=lambda kind, identity, value: records[kind].update({identity: value}))
         profiles = SimpleNamespace(public_connections=lambda: [dict(id="connection", auth=dict(mode="none"))])
         dependencies = Dependencies(store, profiles, None)

@@ -17,6 +17,7 @@ import threading
 import time
 import uuid
 from concurrent.futures import Future
+from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -25,7 +26,9 @@ from seampact.source.inspection import Inspector, digest, python_runtime_issue, 
 from seampact.resources import ResourceRegistry
 from seampact.runtime import OwnerRuntime, ProtocolError
 from seampact.store import Store
-from seampact.units import UnitCatalog, _matches
+from seampact.units import UnitCatalog, _result_matches
+from seampact.source.record_ports import FrozenRecordPorts
+from seampact.hosting.background import census as python_thread_census, required as python_work_required, quiescent as python_work_quiescent, cleanup_obligations
 
 
 class RemoteRuntime:
@@ -141,6 +144,7 @@ class Worker:
         self.group = self.spec["group"]
         root = self.spec_path.parent
         inspector = Inspector(root / "source", root / "snapshots", self.spec["request"])
+        self.record_ports = FrozenRecordPorts(inspector)
         withheld = inspector.request.get("withheld_sources")
         version = digest(json.dumps(dict(files=inspector.request["files"], withheld_sources=withheld) if withheld
                                     else inspector.request["files"], sort_keys=True).encode())
@@ -174,6 +178,7 @@ class Worker:
         units = self.catalog.install(inspector, self.spec["candidate"], self.spec["analysis_id"], self.spec["installation_id"])
         if set(unit["id"] for unit in units) != set(self.group["units"]):
             raise ValueError("运行组成员与可绑定能力不一致")
+        self.guarded_units = set()
         if self.profile == REMOTE_PROFILE["id"]:
             if group["status"] != "REMOTE_CHECKED" or any(unit["status"] != "READY" for unit in units):
                 raise ValueError("此运行组未满足远程宿主规则")
@@ -182,28 +187,68 @@ class Worker:
             if group["contract"]["digest"] != self.spec.get("contract_digest"):
                 raise ValueError("宿主重新核对后的运行组契约与工件不一致")
             hosted = set(group["host"]["host_entries"])
-            self.units = {unit["id"] for unit in units if unit["status"] == "READY" and unit["entry_id"] in hosted}
+            structural = set(group['host'].get('structure_entries', []))
+            self.units = {unit["id"] for unit in units if unit["status"] in {'READY', 'CALL_CONDITION_DEFERRED'} and unit["entry_id"] in hosted}
+            self.guarded_units = {unit['id'] for unit in units if unit.get('status') == 'STRUCTURE_ONLY'
+                                  and unit['entry_id'] in structural}
             self.missing = {unit["id"]: unit.get("reason") or group["host"]["members"][unit["entry_id"]].get("reason")
                             for unit in units if unit["id"] not in self.units}
-            if not self.units:
+            if not self.units and not self.guarded_units:
                 raise ValueError("宿主环境中没有可执行成员：" + json.dumps(self.missing, ensure_ascii=False))
+            if self.guarded_units and (self.units or len(self.guarded_units) != 1 or len(units) != 1):
+                raise ValueError('guarded material requires one separate structural root')
         self.prepare_rules = {unit["id"]: group["host"]["members"][unit["entry_id"]]["prepare"] for unit in units}
+        self.catalog._worker_call_identity = self.identity()
+        installed_group = self.store.get("runtime_group", self.group["id"])
+        self.resource_observations = dict(schema="worker-resource-startup-observation/1", scope="STARTUP_SNAPSHOT",
+            observed_wall=time.time(), process_identity=self.identity(),
+            entries=installed_group.get("resource_observations", []),
+            validity="installation-time asset check only; not a continuing disk identity guarantee")
         self.accepting, self.in_flight, self.preparing, self.lock = True, 0, 0, threading.Lock()
+        self.host_threads = {id(threading.current_thread()): threading.current_thread()}
         self.server = None
         lock = os.environ.get("SEAMPACT_ENVIRONMENT_LOCK")
         self.environment = dict(python=sys.version.split()[0], revision=os.environ.get("SEAMPACT_REVISION", "UNKNOWN"),
             lock_sha256=hashlib.sha256(Path(lock).read_bytes()).hexdigest() if lock and Path(lock).is_file() else None)
+        self._guarded_scopes = {}
+        if self.guarded_units:
+            from seampact.source.value_conditioned_process import begin_worker_scope
+            for unit_id in self.guarded_units:
+                self._guarded_scopes[unit_id] = begin_worker_scope(self, unit_id)
 
     def _initialization(self):
         result = {}
         for unit_id in self.units:
-            binding, entry = self.catalog.bindings[unit_id], self.catalog.entry_specs[unit_id]
+            binding, entry = ((self.catalog.bindings[unit_id], self.catalog.entry_specs[unit_id])
+                              if unit_id in self.catalog.bindings else self.catalog.deferred[unit_id])
             result[unit_id] = binding.initialization_state(entry, self.store.get("unit", unit_id))
         return result
 
     def identity(self):
         return dict(session=self.session, instance_id=self.instance, generation=self.generation,
                     process_nonce=self.process_nonce)
+
+    @contextmanager
+    def hosting_thread(self):
+        current = threading.current_thread()
+        with self.lock:
+            self.host_threads[id(current)] = current
+        try:
+            yield
+        finally:
+            with self.lock:
+                self.host_threads.pop(id(current), None)
+
+    def _python_threads(self):
+        with self.lock:
+            known = list(getattr(self, "host_threads", {id(threading.main_thread()): threading.main_thread()}).values())
+        # These are exact platform-owned loop objects, not names supplied by a
+        # source. Source/SDK threads are deliberately not put on this list.
+        for binding in getattr(self.catalog, "bindings", {}).values():
+            thread = getattr(binding, "thread", None)
+            if thread is not None:
+                known.append(thread)
+        return python_thread_census(known)
 
     def health(self):
         resources = {}
@@ -218,10 +263,12 @@ class Worker:
             source_version=self.group["source_version"], binding_fingerprint=binding_fingerprint(self.spec),
             contract_digest=self.spec.get("contract_digest"), installation_id=self.spec["installation_id"],
             units=sorted(self.units), missing=self.missing, accepting=self.accepting, in_flight=self.in_flight,
+            guarded_units=sorted(getattr(self, 'guarded_units', set())),
             preparation_in_flight=self.preparing, process_ready=True,
             initialization_ready={unit_id: state == "BOUND" for unit_id, state in initialization.items()},
             initialization=initialization, environment=self.environment, resources=resources,
-            session_recovery=False)
+            session_recovery=False, python_threads=self._python_threads(), resource_observations=self.resource_observations,
+            sdk_cleanup=cleanup_obligations(self.group.get("contract") or {}))
 
     def _identify(self, body):
         if any(body.get(key) != value for key, value in self.identity().items()):
@@ -237,12 +284,20 @@ class Worker:
         with self.lock:
             if not self.accepting:
                 return dict(rejected="实例已停止接单", **self.identity())
+            selected = self.store.get('unit', body['unit']) or {}
+            if selected.get('call_condition') and (self.in_flight or self.preparing):
+                return dict(rejected='conditional original owner is busy; call state is UNKNOWN', **self.identity())
             self.in_flight += 1
         unit_id = body["unit"]
         started = time.perf_counter()
         timing = {}
         try:
+            unit = self.store.get('unit', unit_id)
+            if unit.get('call_condition'):
+                from seampact.source.call_value_conditions import ordinary
+                ordinary(body['arguments'])
             arguments = body["arguments"] if self.profile == REMOTE_PROFILE["id"] else decode_port(body["arguments"])
+            self.catalog.require_call_conditions(unit_id, arguments, instance_identity=self.identity())
             with self.runtime.context(body.get("task_id")):
                 result = self.catalog.invoke(unit_id, arguments)
             unit = self.store.get("unit", unit_id)
@@ -255,13 +310,18 @@ class Worker:
                     raise ValueError("原返回未满足核对的标量接口；不转换原对象")
                 encoded = result
             else:
-                encoded = encode_port(result)
+                encoded = encode_port(result, self.record_ports)
             schema = unit.get("result_schema") or {}
+            actual_entry = self.catalog.entry_specs.get(unit_id)
+            if actual_entry is None and unit_id in self.catalog.deferred:
+                actual_entry = self.catalog.deferred[unit_id][1]
+            if actual_entry is None or actual_entry.get('kind') != unit.get('kind'):
+                raise ValueError('原实际入口与核对的结果端口种类不一致；后继不使能')
             cli_result = (self.profile == GROUP_PROFILE["id"] and
-                self.catalog.entry_specs[unit_id].get("kind") == "cli" and
+                unit.get('kind') == "cli" and
                 schema == {"x-native-type": {"module": "subprocess", "symbol": "CompletedProcess"}} and
                 type(result) is subprocess.CompletedProcess)
-            if schema and not (_matches(result, schema) or cli_result):
+            if schema and not (_result_matches(result, schema) or cli_result):
                 raise ValueError("原实际返回不符合核对的结果类型；后继不使能")
             return dict(result=encoded, **self.identity(), timing=timing)
         except Exception as error:
@@ -272,11 +332,75 @@ class Worker:
             with self.lock:
                 self.in_flight -= 1
 
+    def check_call(self, body):
+        """Pure pre-action check; never import/prepare/invoke original source."""
+        self._identify(body)
+        unit_id = body.get('unit')
+        with self.lock:
+            guarded = unit_id in getattr(self, 'guarded_units', set())
+            if not self.accepting or (unit_id not in self.units and not guarded) or self.in_flight or self.preparing:
+                code = ('WORKER_NONACCEPTING' if not self.accepting else
+                        'MEMBER_MISSING' if unit_id not in self.units and not guarded else 'WORKER_BUSY')
+                return dict(status='UNKNOWN', allowed=False, reason_code=code,
+                            reason='worker/member is not accepting', **self.identity())
+            # The pure check and a concurrent import/invoke must not observe
+            # each other's partially changed original module state.
+            from seampact.source.call_value_conditions import ordinary
+            try:
+                values = ordinary(body.get('arguments'))
+                evidence = self.catalog.check_call_conditions(unit_id, values, instance_identity=self.identity())
+                if guarded:
+                    return self._check_guarded_worker(unit_id, values, evidence)
+                return dict(evidence, **self.identity())
+            except (ValueError, TypeError, KeyError) as error:
+                return dict(status='UNKNOWN', allowed=False, reason=str(error), **self.identity())
+
+    def _check_guarded_worker(self, unit_id, arguments, source_proof):
+        """Read partial worker facts; neither this route nor H authorizes use."""
+        if source_proof.get('status') != 'CONTROLLER_SOURCE_CHECKED':
+            return dict(source_proof, **self.identity())
+        from seampact.units import _native_context_lock
+        from seampact.source.value_conditioned_process import verify_scope
+        from seampact.source.value_conditioned_worker import check_worker_targets
+        binding, entry = self.catalog.structural[unit_id]
+        unit = self.store.get('unit', unit_id)
+        structure = unit['structure_admission']
+        proof = source_proof['source_proof']
+        with binding.lock, _native_context_lock:
+            process = verify_scope(self._guarded_scopes.get(unit_id), binding, unit, structure, self.identity())
+            targets = check_worker_targets(binding, entry, unit, structure, proof, arguments, self.identity())
+        return dict(status='UNKNOWN', allowed=False, can_start=False, reason_code='WORKER_BINDING_UNKNOWN',
+            reason='guarded source facts do not grant original prefix, call or resource permission',
+            source_proof=proof, process_proof=process, target_proof=targets, **self.identity())
+
+    def import_only(self, body):
+        """Run only the independently checked original import prefix."""
+        self._identify(body)
+        unit_id, plan_digest = body.get('unit'), body.get('plan_digest')
+        with self.lock:
+            if not self.accepting or unit_id not in self.units or self.in_flight or self.preparing:
+                return dict(status='FAILED', reason='worker/member is not idle and accepting', **self.identity())
+            self.in_flight += 1
+            self.preparing += 1
+        started = time.perf_counter()
+        try:
+            result = self.catalog.prepare_import_only(unit_id, plan_digest)
+            return dict(result, **self.identity(), duration_ms=(time.perf_counter() - started) * 1000)
+        except Exception as error:
+            return dict(status='FAILED', reason=str(error), **self.identity(),
+                        duration_ms=(time.perf_counter() - started) * 1000)
+        finally:
+            with self.lock:
+                self.in_flight -= 1
+                self.preparing -= 1
+
     def prewarm(self, body):
         self._identify(body)
         with self.lock:
             if not self.accepting:
                 raise ProtocolError("实例已停止接单；不再接受预热")
+            if self.in_flight and any((self.store.get('unit', uid) or {}).get('call_condition') for uid in body.get('units', [])):
+                raise ProtocolError('conditional original owner is busy; preparation state is UNKNOWN')
             # Preparing may import code or construct the original owner. It is
             # physical work even without an /invoke request and must drain.
             self.in_flight += 1
@@ -293,9 +417,11 @@ class Worker:
                     results[unit_id] = dict(status="NOT_PREPARED", initialization_ready=False,
                                            reason=rule.get("basis") or "该成员不支持提前准备")
                     continue
-                binding, entry = self.catalog.bindings[unit_id], self.catalog.entry_specs[unit_id]
+                binding, entry = ((self.catalog.bindings[unit_id], self.catalog.entry_specs[unit_id])
+                                  if unit_id in self.catalog.bindings else self.catalog.deferred[unit_id])
                 unit = self.store.get("unit", unit_id)
                 try:
+                    self.catalog.require_initialization_conditions(unit_id)
                     with self.runtime.context(None):
                         facts = binding.prepare(entry, unit)
                     unit.update(initialization=facts["initialization_after"])
@@ -328,6 +454,8 @@ class Worker:
         with self.lock:
             if self.accepting or self.in_flight:
                 raise ProtocolError("实例仍在接单或有在途调用；先排空")
+        if python_work_required(self.group.get("contract") or {}) and not python_work_quiescent(self._python_threads()):
+            raise ProtocolError("原调用返回后仍有未归属的 Python 后台线程；结束操作尚未排空")
         if self.server is not None:
             threading.Thread(target=self.server.shutdown, daemon=True).start()
         return dict(**self.identity(), stopping=True)
@@ -352,7 +480,8 @@ def make_worker_server(worker, host, port):
             self.send(404, dict(error="没有这个运行组接口"))
 
         def do_POST(self):
-            action = {"/invoke": worker.invoke, "/prewarm": worker.prewarm, "/drain": worker.drain,
+            action = {"/invoke": worker.invoke, "/check_call": worker.check_call, "/import_only": worker.import_only,
+                      "/prewarm": worker.prewarm, "/drain": worker.drain,
                       "/shutdown": worker.shutdown}.get(self.path)
             if action is None:
                 return self.send(404, dict(error="没有这个运行组接口"))
@@ -361,7 +490,11 @@ def make_worker_server(worker, host, port):
                 self.send(200, action(body))
             except Exception as error:
                 self.send(400, dict(error=str(error), **worker.identity()))
-    server = ThreadingHTTPServer((host, port), Handler)
+    class Server(ThreadingHTTPServer):
+        def process_request_thread(self, request, client_address):
+            with worker.hosting_thread():
+                super().process_request_thread(request, client_address)
+    server = Server((host, port), Handler)
     worker.server = server
     return server
 
@@ -383,10 +516,19 @@ def main(argv=None):
     worker = Worker(args.spec, args.coordinator, args.instance_id, args.generation)
     server = make_worker_server(worker, args.host, args.port)
     if args.advertise_url:
-        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        def serve():
+            with worker.hosting_thread():
+                server.serve_forever()
+        thread = threading.Thread(target=serve, daemon=True)
         thread.start()
         try:
             json_request(worker.coordinator + "/api/workers/attach", dict(endpoint=args.advertise_url), timeout=120)
+            if worker.guarded_units:
+                from seampact.source.value_conditioned_process import bind_worker_birth
+                for token in worker._guarded_scopes.values():
+                    birth = bind_worker_birth(token)
+                    if birth.get('status') != 'MANAGED_BIRTH_BOUND':
+                        raise ValueError('normal managed worker birth is not independently checked')
             print("[SeamPact] worker_ready " + worker.instance, flush=True)
             thread.join()
         except KeyboardInterrupt:

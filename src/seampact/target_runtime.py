@@ -16,6 +16,7 @@ from functools import lru_cache
 from pathlib import Path
 from types import MethodType, SimpleNamespace
 
+from seampact.configuration.dependencies import DependencyBindings
 from seampact.hosting import backends
 from seampact.source.inspection import Inspector, digest, safe_path
 
@@ -30,7 +31,7 @@ def environment_selection(environment):
     return {key: copy.deepcopy(environment[key]) for key in ENV_FIELDS if key in environment}
 
 
-CORE_SCOPES = {"worker": "worker", "checker": "target_runtime"}
+CORE_SCOPES = {"worker": "worker", "checker": "target_runtime", "capability_worker": "capability_worker"}
 
 
 @lru_cache(maxsize=128)
@@ -225,6 +226,9 @@ class TargetRuntime:
         if (self.record.get("status") != "READY" or not self.record.get("image_id")
                 or self.record.get("identity") != checker_identity(environment)):
             raise ValueError("请先准备与所选环境及当前平台代码一致的目标解释器；尚未调用分析模型")
+        reference = backends.content_image_reference(self.record["image_id"])
+        if self.record.get("image_reference") != reference:
+            raise ValueError("目标解释器缺少匹配实际镜像身份的内容保留引用；请重新准备环境")
         frozen = self.inspector.request.get("target_runtime") or {}
         if frozen and any(frozen.get(key) != self.record.get(key) for key in ("identity", "image_id")):
             raise ValueError("目标解释器镜像与原分析冻结身份不同；请按当前环境零模型重新核对候选")
@@ -238,8 +242,11 @@ class TargetRuntime:
             gap = backends.docker_available(min(self.timeout, 20))
             if gap:
                 raise ValueError("BACKEND_UNAVAILABLE：目标解释器需要本机可用的 Docker 后端；" + gap)
+            observed, actual = backends._inspect_image(reference, min(self.timeout, 20))
+            if observed["returncode"] != 0 or not actual or actual["Id"] != self.record["image_id"]:
+                raise ValueError("目标解释器内容保留引用已缺失或指向不同镜像；请重新准备环境")
             command = ["docker", "run", "--rm", "-i", "--network", "none",
-                       self.record["image_id"]]
+                       reference]
             result = backends.run(command, self.timeout, stdin=encoded)
             if result["returncode"] != 0:
                 raise ValueError("目标解释器源码核对失败或不可用：" + result["output"][-1000:])
@@ -283,18 +290,14 @@ def install_catalog(catalog, inspector, candidate, analysis_id, installation_id)
     counts = {}
     for _, entry_id, _, _ in rows:
         counts[str(entry_id)] = counts.get(str(entry_id), 0) + 1
-    requirements = inspector.target_runtime.call("check_requirements", candidate=candidate)
-    selections = copy.deepcopy(inspector.request.get("dependency_bindings", {}))
-    def resource_snapshot(entry_ids=None):
-        selected = [row for row in requirements if entry_ids is None or set(row.get("entry_ids", [])) & set(entry_ids)]
-        return copy.deepcopy(dict(requirements=selected,
-            bindings={row["id"]: selections[row["id"]] for row in selected if row["id"] in selections}))
+    # Source checks still run in the selected interpreter. Keep the ordinary
+    # frozen binding interface for snapshots and private worker credentials.
+    resources = DependencyBindings(catalog.resource_registry, inspector, candidate)
     source_id = inspector.request.get("source_id")
     for previous in catalog.store.list("unit"):
         if previous.get("source_id") == source_id and previous.get("installation_id", previous.get("analysis_id")) != installation_id:
             previous.update(status="SUPERSEDED", superseded_by=analysis_id)
             catalog.store.save("unit", previous["id"], previous, "unit_superseded")
-    resources = SimpleNamespace(snapshot=resource_snapshot)
     binding = SimpleNamespace(inspector=inspector, candidate=copy.deepcopy(candidate), detached=False,
                               active_calls=0, resource_binding=resources, module_paths={}, modules={}, notebooks={})
     # The coordinator can check external port values (for example ndarray), but
@@ -319,7 +322,10 @@ def install_catalog(catalog, inspector, candidate, analysis_id, installation_id)
         unit["installed_at"] = now()
         unit.update({key: copy.deepcopy(value) for key, value in checked.items()
                      if key not in {"id", "path", "unit", "symbol", "kind"}})
-        if counts[str(entry_id)] == 1 and (checked["status"] == "READY" or checked.get("host_condition")):
+        if counts[str(entry_id)] == 1 and checked.get('call_condition'):
+            unit.update(status='CALL_CONDITION_DEFERRED')
+            catalog.deferred[identity] = (binding, entry)
+        elif counts[str(entry_id)] == 1 and (checked["status"] == "READY" or checked.get("host_condition")):
             gaps = list((checked.get("host_condition") or {}).get("gaps", []))
             gaps.append("该能力在独立环境核对；请构建并登记匹配的运行组实例")
             unit.update(status="MISSING", reason="; ".join(gaps),

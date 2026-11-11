@@ -13,6 +13,28 @@ from seampact.source.inspection import Inspector
 
 
 class ResourceFlowChecks(unittest.TestCase):
+    def test_original_named_keyword_forwarding_reaches_sdk_credential(self):
+        files = {'main.py': 'from helper import request\ndef run(**kwargs):\n    return request(**kwargs)\n',
+                 'helper.py': 'from litellm import batch_completion\ndef request(**kwargs):\n    return batch_completion(model="x", **kwargs)\n'}
+        result = self.check_flow(files, field='credential', parameter='api_key')
+        self.assertEqual(result['status'], 'MAPPING_CHECKED', result.get('reason'))
+
+    def test_keyword_removal_unknown_mutation_and_wrong_sink_do_not_prove_credential(self):
+        for change in ('kwargs.pop("api_key")', 'kwargs.clear()', 'kwargs.update(unknown)', 'kwargs = {}'):
+            files = {'main.py': 'from litellm import batch_completion\ndef run(**kwargs):\n    '
+                     + change + '\n    return batch_completion(model="x", **kwargs)\n'}
+            with self.subTest(change=change):
+                result = self.check_flow(files, field='credential', parameter='api_key')
+                self.assertEqual(result['status'], 'MISSING', result)
+        result = self.check_flow({'main.py': 'from litellm import fake\ndef run(**kwargs):\n    return fake(**kwargs)\n'},
+                                 field='credential', parameter='api_key')
+        self.assertEqual(result['status'], 'MISSING')
+
+    def test_nonvariadic_function_cannot_invent_keyword_resource(self):
+        result = self.check_flow({'main.py': 'from litellm import batch_completion\ndef run(value):\n    return batch_completion(api_key=value)\n'},
+                                 field='credential', parameter='api_key')
+        self.assertEqual(result['status'], 'MISSING')
+
     def check_flow(self, files, *, field="base_url", parameter="url", constructor=False, evidence=None):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)

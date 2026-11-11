@@ -16,7 +16,7 @@ import sys
 import time
 from pathlib import Path
 
-from seampact.capabilities import freeze_representation, represent
+from seampact.capabilities import VERSION_2, freeze_representation, represent
 from seampact.runtime import _task_context
 
 
@@ -28,10 +28,35 @@ def digest_file(path):
     return value.hexdigest()
 
 
+def _freeze_research_binding(value):
+    if "research_protocol" not in value:
+        if "research_data" in value:
+            raise ValueError("research_data requires an explicit research_protocol")
+        return None
+    if value["research_protocol"] != "multisource-review/1":
+        raise ValueError("unknown research_protocol")
+    binding = value.get("research_data")
+    if not isinstance(binding, dict) or binding.get("schema") != "research-data-binding/1":
+        raise ValueError("multisource-review/1 requires research-data-binding/1")
+    path, expected = binding.get("manifest_path"), binding.get("manifest_sha256")
+    if not isinstance(path, str) or not path.strip() or path != path.strip():
+        raise ValueError("research data binding requires a manifest path")
+    if not isinstance(expected, str) or len(expected) != 64 or any(c not in "0123456789abcdef" for c in expected):
+        raise ValueError("research data binding requires a lowercase sha256")
+    path = Path(path).resolve()
+    if digest_file(path) != expected:
+        raise ValueError("research data manifest sha256 mismatch")
+    value["research_data"] = dict(schema="research-data-binding/1", manifest_path=str(path), manifest_sha256=expected)
+    return dict(path=str(path), sha256=expected)
+
+
 def freeze_scene(spec, capabilities=None):
     value = copy.deepcopy(spec)
     if not value.get("id") or not value.get("version"):
         raise ValueError("场景需要 id 与 version")
+    if "research_protocol" in value and "research_task_ids" in value:
+        raise ValueError("research_task_ids are set only by run validation")
+    research_resource = _freeze_research_binding(value)
     if "routes" in value:
         return _freeze_mixed_scene(value, capabilities or {})
     freeze_representation(value, capabilities or {})
@@ -89,6 +114,8 @@ def freeze_scene(spec, capabilities=None):
         path = Path(resource if isinstance(resource, str) else resource["path"]).resolve()
         files = sorted(p for p in path.rglob("*") if p.is_file() and ".cache" not in p.parts) if path.is_dir() else [path]
         resources.extend(dict(path=str(p), sha256=digest_file(p)) for p in files)
+    if research_resource:
+        resources.append(research_resource)
     value["resource_files"] = resources
     return value
 
@@ -97,7 +124,7 @@ def _freeze_mixed_scene(value, capabilities):
     """Freeze task routes inside the existing arrival/resource window.
 
     Routes are ordinary scene adapters, with their own installed Unit subset and
-    criteria. The union uses one capability-features/2 schema; route names and
+    criteria. The union uses one capability-features/3 schema; route names and
     task classes are result metadata, never learned features.
     """
     routes = value.get("routes")
@@ -105,8 +132,10 @@ def _freeze_mixed_scene(value, capabilities):
             not isinstance(key, str) or not key or not isinstance(route, dict)
             for key, route in routes.items()):
         raise ValueError("mixed routes must be named scene objects")
-    if (value.get("representation") or {}).get("version") != "capability-features/2":
-        raise ValueError("mixed routes require the shared capability-features/2 representation")
+    if any("research_data" in route or "research_protocol" in route for route in routes.values()):
+        raise ValueError("research data binding belongs to the shared mixed scene")
+    if (value.get("representation") or {}).get("version") != VERSION_2:
+        raise ValueError("mixed routes require the shared capability-features/3 representation")
     tasks = value.get("tasks", [])
     if value.get("tasks_path"):
         path = Path(value["tasks_path"]).resolve()
@@ -309,7 +338,7 @@ class FrozenCatalog:
                 deferred = getattr(catalog, "deferred", {})
                 for uid, unit in current.items():
                     policy = unit.get("scheduling") or {}
-                    cold = (uid in deferred and (unit.get("dispatch") or {}).get("status") == "COLD_STARTABLE"
+                    cold = (uid in deferred and (unit.get("dispatch") or {}).get("status") in {"COLD_STARTABLE", "READY_INSTANCE"}
                             and ((unit.get("operations") or {}).get("group_host") or {}).get("status") == "HOST_CHECKED")
                     if (policy.get("visibility") == "business" and policy.get("activation") == "business"
                             and (unit.get("status") == "READY" or cold)):
@@ -362,10 +391,13 @@ class FrozenCatalog:
                     require_operation(stored, "remote", group=group)
                 self.contract_digests[uid] = result["contract_digest"]
             for uid in remote:
-                self.units[uid].update(status="READY", execution="REMOTE")
-                self.frozen[uid][2].update(status="READY", execution="REMOTE")
+                for value in (self.units[uid], self.frozen[uid][2]):
+                    value["execution"] = "REMOTE"
+                    if value.get("status") != "CALL_CONDITION_DEFERRED":
+                        value["status"] = "READY"
             self.resources = catalog.snapshot_resources(selected, frozen=self.frozen)
             self.service_placements, self.service_dependencies, self.shared_services = {}, {}, []
+            self.role_services = {}
             self.control = {}
             for record in self.resources.get("units", []):
                 uid = record["unit_id"]
@@ -406,11 +438,17 @@ class FrozenCatalog:
 
     def add_role_services(self, profiles, roles):
         for role in sorted(set(roles)):
-            self.shared_services = sorted(set(self.shared_services) | set(self._freeze_service(profiles.role_profile(role))))
+            groups = self._freeze_service(profiles.role_profile(role))
+            self.role_services[role] = groups
+            self.shared_services = sorted(set(self.shared_services) | set(groups))
+
+    def services_for_roles(self, roles):
+        return sorted({group for role in roles for group in self.role_services.get(role, [])})
 
     def service_snapshot(self):
         return dict(schema="managed-service-bindings/1", allocations=copy.deepcopy(self.service_placements),
-                    dependencies=copy.deepcopy(self.service_dependencies), shared_services=list(self.shared_services))
+                    dependencies=copy.deepcopy(self.service_dependencies), shared_services=list(self.shared_services),
+                    role_services=copy.deepcopy(self.role_services))
 
     def bind_run(self, run_id, control):
         self.control = dict(control)
@@ -469,32 +507,52 @@ class FrozenCatalog:
             value["initialization"] = binding.initialization_state(entry, unit)
         return value
 
-    def dispatch_status(self, unit_id):
+    def runtime_observer(self):
+        # One event's descriptive facts only. Later decisions and invocation
+        # use the ordinary fresh methods; no permission is retained here.
+        facts = {}
+        return (lambda units: self.runtime_state(units, _facts=facts),
+                lambda unit: self.dispatch_status(unit, _facts=facts))
+
+    def _runtime_fact(self, group, unit, image, facts):
+        if facts is None:
+            return self.router.runtime_fact(group, unit, image)
+        key = (group, unit, image)
+        if key not in facts:
+            facts[key] = self.router.runtime_fact(group, unit, image)
+        return facts[key]
+
+    def dispatch_status(self, unit_id, *, _facts=None):
         try:
             self.require_operation(unit_id, "dispatch")
         except ValueError as error:
             return dict(status="UNAVAILABLE", reason=str(error))
         placement = self.placement[unit_id]
+        condition = self.units[unit_id].get("status") == "CALL_CONDITION_DEFERRED"
+        def status(value, **facts):
+            if condition:
+                facts["call_condition"] = "REQUIRES_ACTUAL_VALUES"
+            return dict(status=value, **facts)
         for group in placement.get("resource_dependencies", []):
-            fact = self.router.runtime_fact(group, None, self.service_placements[group].get("image"))
+            fact = self._runtime_fact(group, None, self.service_placements[group].get("image"), _facts)
             if not fact["ready_instance"]:
-                return dict(status="COLD_STARTABLE" if fact["cold_startable"] else "UNAVAILABLE",
-                            reason=fact.get("reason") or "依赖模型尚未就绪")
+                return status("COLD_STARTABLE" if fact["cold_startable"] else "UNAVAILABLE",
+                              reason=fact.get("reason") or "依赖模型尚未就绪")
         if placement["kind"] == "LOCAL":
-            return dict(status="READY_LOCAL")
-        fact = self.router.runtime_fact(placement["group_id"], unit_id, placement.get("image"))
+            return status("READY_LOCAL")
+        fact = self._runtime_fact(placement["group_id"], unit_id, placement.get("image"), _facts)
         if fact["ready_instance"]:
-            return dict(status="READY_INSTANCE")
+            return status("READY_INSTANCE")
         if fact["cold_startable"]:
-            return dict(status="COLD_STARTABLE")
-        return dict(status="UNAVAILABLE", reason=fact.get("reason") or "实例结果未决或不可启动")
+            return status("COLD_STARTABLE")
+        return status("UNAVAILABLE", reason=fact.get("reason") or "实例结果未决或不可启动")
 
-    def runtime_state(self, unit_ids):
+    def runtime_state(self, unit_ids, *, _facts=None):
         facts = []
         for uid in unit_ids:
             placement = self.placement[uid]
             if placement["kind"] == "REMOTE":
-                facts.append(self.router.runtime_fact(placement["group_id"], uid, placement.get("image")))
+                facts.append(self._runtime_fact(placement["group_id"], uid, placement.get("image"), _facts))
                 continue
             binding, entry, unit = self.frozen[uid]
             group = unit.get("runtime_group")
@@ -502,7 +560,7 @@ class FrozenCatalog:
                               cold_startable=False, accepting=True, busy=binding.active_calls > 0,
                               queue=self.router.queue(group) if self.router and group else 0, state_age_ms=0.0))
         for group in sorted({group for uid in unit_ids for group in self.placement[uid].get("resource_dependencies", [])}):
-            facts.append(self.router.runtime_fact(group, None, self.service_placements[group].get("image")))
+            facts.append(self._runtime_fact(group, None, self.service_placements[group].get("image"), _facts))
         def every(name):
             values = [fact.get(name) for fact in facts]
             return None if None in values else all(values)
@@ -537,10 +595,62 @@ class FrozenCatalog:
         return self.catalog._validate_bound_arguments(binding, entry, unit, arguments,
             native_arguments=native_arguments, deferred_arguments=deferred_arguments)
 
+    def check_call_conditions(self, unit_id, arguments, native_arguments=(), deferred_arguments=(), *, instance_identity=None):
+        if unit_id not in self.frozen:
+            raise ValueError("Unit 不在本次冻结能力池内")
+        if self.placement[unit_id]["kind"] != "REMOTE" and self.frozen[unit_id][2].get("call_condition"):
+            return dict(schema="per-call-condition-evidence/1", status="UNKNOWN", allowed=False,
+                        reason="conditional call requires a group host")
+        result = self.catalog.check_call_conditions(unit_id, arguments, native_arguments, deferred_arguments,
+            frozen=self.frozen[unit_id], instance_identity=instance_identity)
+        if self.placement[unit_id]["kind"] != "REMOTE" and result["status"] != "NOT_REQUIRED":
+            return dict(result, status="UNKNOWN", allowed=False, reason="conditional call requires a group host")
+        return result
+
+    def require_call_conditions(self, unit_id, arguments, native_arguments=(), deferred_arguments=(), *, instance_identity=None):
+        result = self.check_call_conditions(unit_id, arguments, native_arguments, deferred_arguments,
+                                            instance_identity=instance_identity)
+        if not result["allowed"]:
+            raise ValueError("调用条件未满足：" + str(result.get("reason")))
+        return result
+
+    def require_call_condition_structure(self, unit_id):
+        placement = self.placement.get(unit_id) or {}
+        if placement.get("kind") != "REMOTE" or unit_id not in self.frozen:
+            raise ValueError("条件成员只能冻结为已核对的远程组")
+        result = self.catalog.require_call_condition_structure(unit_id, frozen=self.frozen[unit_id])
+        if (result.get("status") != "STRUCTURE_CHECKED" or
+                result.get("call_permission") != "REQUIRES_ACTUAL_CALL" or
+                result.get("runtime_group") != placement.get("group_id") or
+                result.get("contract_digest") != self.contract_digests.get(unit_id)):
+            raise ValueError("条件成员的冻结组或契约身份已改变")
+        self.require_operation(unit_id, "dispatch")
+        self.require_operation(unit_id, "remote")
+        group = self.catalog.store.get("runtime_group", placement["group_id"]) or {}
+        if (group.get("contract") or {}).get("digest") != placement.get("contract_digest"):
+            raise ValueError("条件成员的运行组契约已改变")
+        artifact = self.catalog.store.get("deployment", placement["group_id"]) or {}
+        if ((artifact.get("build") or {}).get("image_id") != placement.get("image_id") or
+                artifact.get("binding_fingerprint") != placement.get("binding_fingerprint")):
+            raise ValueError("条件成员的冻结镜像或资源绑定身份已改变")
+        gap = self.router.start_gap(placement["group_id"], placement.get("image"))
+        if gap:
+            raise ValueError("条件成员的宿主工件身份未满足：" + str(gap))
+        return result
+
+    def require_import_only_plan(self, unit_id, proposal=None):
+        self.require_call_condition_structure(unit_id)
+        self.require_operation(unit_id, "prepare")
+        if proposal is not None:
+            return self.catalog.validate_worker_import_plan(unit_id, proposal, frozen=self.frozen[unit_id])
+        return self.catalog.require_import_only_plan(unit_id, frozen=self.frozen[unit_id])
+
     def snapshot_resources(self):
         return copy.deepcopy(self.resources)
 
     def invoke(self, unit_id, arguments, native_arguments=()):
+        self.require_operation(unit_id, "invoke")
+        self.require_call_conditions(unit_id, arguments, native_arguments)
         groups = self.placement[unit_id].get("resource_dependencies", [])
         if not groups:
             return self._invoke(unit_id, arguments, native_arguments)
@@ -591,6 +701,64 @@ class SceneContext:
         self.upstream_costs = {}
         # A joint window replaces this with its root-request admission.
         self.admission = lambda unit_id: contextlib.nullcontext()
+        self.call_arguments = None
+        self.clear_failure_evidence()
+
+    def clear_failure_evidence(self):
+        self.failure_evidence, self.failure_output_artifacts, self.raw_results = {}, [], []
+        self.failure_evaluation_snapshot = self.active_failure_terminal = None
+        self.evidence_blocked, self.evaluation_error = False, None
+        self.failure_capture_gaps = []
+
+    def record_failure_evidence(self, evidence, output_artifacts=()):
+        """Keep actual scene values for passive capture if continuation fails."""
+        self.failure_evidence = self._failure_value(evidence)
+        self.failure_output_artifacts = self._failure_value(output_artifacts)
+
+    def _failure_value(self, value, active=None):
+        from seampact.scenes.evaluation_evidence import passive_value, PassiveEvidenceGap
+        try:
+            return passive_value(value)
+        except PassiveEvidenceGap as error:
+            # A later mutation cannot turn a previously unsupported actual
+            # return into proof that its owner can be released.
+            self.failure_capture_gaps.append(str(error))
+            active = set() if active is None else active
+            kind = type(value)
+            if any(kind is candidate for candidate in (dict, list, tuple)) and id(value) not in active:
+                active.add(id(value))
+                try:
+                    if kind is dict and all(type(key) is str for key in value):
+                        return {key: self._failure_value(item, active) for key, item in value.items()}
+                    if kind is list or kind is tuple:
+                        return [self._failure_value(item, active) for item in value]
+                finally:
+                    active.remove(id(value))
+            # Unsupported leaves stay as exact live references, never serialized.
+            return value
+
+    def freeze_failure_evidence(self, *, criteria=(), destination=None, interrupted_event=None,
+                                reason="execution_error"):
+        from seampact.scenes.evaluation_evidence import passive_evaluation_snapshot, PassiveEvidenceGap
+        # Raw returns are retained before any adapter projection/artifact work.
+        # Unsupported leaves must block capture, never disappear with the owner.
+        terminal = dict(kind="terminal", terminated=False, truncated=True, reason=reason,
+            evidence=dict(scene=self.failure_evidence, actual_unit_results=self.raw_results),
+            output_artifacts=self.failure_output_artifacts, interrupted_event=interrupted_event)
+        # Preserve the scene's existing evidence fields for downstream evaluation.
+        if type(self.failure_evidence) is dict:
+            terminal["evidence"] = dict(self.failure_evidence, actual_unit_results=self.raw_results)
+        try:
+            if self.failure_capture_gaps:
+                raise PassiveEvidenceGap(self.failure_capture_gaps[0])
+            snapshot = passive_evaluation_snapshot(terminal, self.calls, self.model_calls,
+                criteria=criteria, destination=destination)
+        except PassiveEvidenceGap as error:
+            self.active_failure_terminal, self.evidence_blocked = terminal, True
+            self.evaluation_error = dict(type="PassiveEvidenceGap", message=str(error))
+            raise
+        self.failure_evaluation_snapshot = snapshot
+        return snapshot
 
     def invoke(self, unit_id, arguments, native_arguments=()):
         if unit_id not in self.allowed:
@@ -598,8 +766,12 @@ class SceneContext:
         started = time.perf_counter()
         call = dict(unit_id=unit_id, status="RUNNING", initialization_before=None)
         self.calls.append(call)
+        raw = dict(call_index=len(self.calls) - 1, unit_id=unit_id, status="RUNNING",
+                   arguments=self._failure_value(arguments), native_arguments=self._failure_value(native_arguments))
+        self.raw_results.append(raw)
         facts, after = dict(execution="LOCAL"), None
         try:
+            self.call_arguments = (unit_id, arguments, native_arguments)
             with self.platform.runtime.context(self.run_id), self.admission(unit_id) as root:
                 if root is not None:
                     # Queueing before the grant is task time, kept in root.wait_ms, not module duration.
@@ -608,6 +780,7 @@ class SceneContext:
                 call["initialization_before"] = self.catalog.unit(unit_id).get("initialization")
                 try:
                     result = self.catalog.invoke(unit_id, arguments, native_arguments)
+                    raw.update(status="RETURN", result=self._failure_value(result))
                 finally:
                     facts = self.catalog.facts.pop((self.run_id, unit_id), facts)
                     after = self.catalog.unit(unit_id)
@@ -636,8 +809,10 @@ class SceneContext:
             return result
         except Exception as error:
             call.update(status="ERROR", reason=str(error))
+            raw.update(status="ERROR", error=dict(type=type(error).__name__, message=str(error)))
             raise
         finally:
+            self.call_arguments = None
             call["duration_ms"] = (time.perf_counter() - started) * 1000
             call.update({key: facts.get(key) for key in ("execution", "group_id", "instance_id", "generation",
                          "start_wait_ms", "cold_instance", "round_trip_ms", "worker_ms", "transport_ms") if key in facts})
@@ -666,10 +841,21 @@ class SceneContext:
                         message["reasoning_content"] = recorded
         call = dict(role=role, model=profile["model"], usage=None)
         self.model_calls.append(call)
+        raw = None
         try:
+            body = completion_body(profile, messages, tools)
+            from seampact.scenes.evaluation_evidence import passive_value
+            # This is the sender's actual input, without authentication headers.
+            # Keep it for successful runs as well as the failure-only snapshot.
+            call["request"] = passive_value(body)
+            call["request_provenance"] = "transport_input_before_send"
+            raw = dict(model_call_index=len(self.model_calls) - 1, role=role, status="RUNNING",
+                       request=self._failure_value(body))
+            self.raw_results.append(raw)
             with model_request_scope(self.profiles, role):
                 result = Transport().send(profile["base_url"] + "/chat/completions",
-                    self.profiles.role_key(role), completion_body(profile, messages, tools))
+                    self.profiles.role_key(role), body)
+            raw.update(status="RETURN", result=self._failure_value(result))
             call["usage"] = result.get("usage")
             for choice in result.get("choices", []):
                 message = choice.get("message", {})
@@ -677,6 +863,10 @@ class SceneContext:
                     for tool in message.get("tool_calls") or []:
                         self.wire_reasoning[tool["id"]] = message["reasoning_content"]
             return result
+        except Exception as error:
+            if raw is not None:
+                raw.update(status="ERROR", error=dict(type=type(error).__name__, message=str(error)))
+            raise
         finally:
             call["duration_ms"] = (time.perf_counter() - started) * 1000
 
@@ -723,6 +913,11 @@ class RouteCatalog:
         self._check([unit_id])
         return self._catalog.validate_arguments(unit_id, arguments, native_arguments, deferred_arguments)
 
+    def check_call_conditions(self, unit_id, arguments, native_arguments=(), deferred_arguments=(), *, instance_identity=None):
+        self._check([unit_id])
+        return self._catalog.check_call_conditions(unit_id, arguments, native_arguments, deferred_arguments,
+                                                   instance_identity=instance_identity)
+
     def invoke(self, unit_id, arguments, native_arguments=()):
         self._check([unit_id])
         return self._catalog.invoke(unit_id, arguments, native_arguments)
@@ -762,6 +957,78 @@ class SceneSession:
         self.context.native_usage = copy.deepcopy(spec.get("native_usage", {}))
         self.environment = getattr(module, adapter["symbol"])(copy.deepcopy(adapter.get("config", {})), self.context)
 
+    def _call_condition_checks(self, candidate):
+        preview = getattr(self.environment, "preview_calls", None)
+        calls = preview(candidate) if preview else []
+        units = set(candidate.get("units", []))
+        if any(call.get("unit_id") not in units for call in calls):
+            raise ValueError("调用预览超出候选的冻结 Unit")
+        covered = {call["unit_id"] for call in calls}
+        calls = list(calls) + [dict(unit_id=unit, arguments=None) for unit in sorted(units - covered)]
+        return [(call["unit_id"], self.context.catalog.check_call_conditions(call["unit_id"], call.get("arguments")))
+                for call in calls]
+
+    def _call_conditions(self, candidate):
+        return [result for _, result in self._call_condition_checks(candidate)]
+
+    def candidate_intent(self, candidate):
+        """Describe a checked call intent; this never grants invocation permission."""
+        denied = dict(allowed=False, groups=[], signatures=[], imports=[])
+        if not candidate["legal"] or any(self.context.catalog.dispatch_status(unit)["status"] == "UNAVAILABLE"
+                                         for unit in candidate.get("units", [])):
+            return denied
+        groups, signatures, imports = set(), [], []
+        for unit, result in self._call_condition_checks(candidate):
+            if result.get("status") != "NOT_REQUIRED":
+                signatures.append((unit, result.get("recipe_digest"), result.get("payload_digest")))
+            if result.get("allowed"):
+                continue
+            reason = result.get("reason_code")
+            if reason not in {"NO_WORKER", "DEFAULT_BINDING_UNKNOWN", "GENERATOR_BINDING_UNKNOWN", "REGISTRATION_BINDING_UNKNOWN", "SDK_BINDING_UNKNOWN"} or not result.get("recipe_digest") or not result.get("payload_digest"):
+                return denied
+            placement = self.catalog.placement.get(unit) or {}
+            if placement.get("kind") != "REMOTE":
+                return denied
+            try:
+                self.catalog.require_call_condition_structure(unit)
+                if reason in {"DEFAULT_BINDING_UNKNOWN", "GENERATOR_BINDING_UNKNOWN", "REGISTRATION_BINDING_UNKNOWN", "SDK_BINDING_UNKNOWN"}:
+                    identity = result.get("instance_identity")
+                    if type(identity) is not dict or not identity.get("instance_id"):
+                        return denied
+                    if reason == 'SDK_BINDING_UNKNOWN':
+                        if type(result.get('import_plan')) is not dict:
+                            return denied
+                        plan = self.catalog.require_import_only_plan(unit, proposal=result['import_plan'])
+                    else:
+                        plan = self.catalog.require_import_only_plan(unit)
+                    if plan.get("status") != "CHECKED" or not plan.get("plan_digest"):
+                        return denied
+                    request = dict(unit=unit, group_id=placement["group_id"], instance_identity=identity,
+                                   plan_digest=plan["plan_digest"])
+                    if request not in imports:
+                        imports.append(request)
+            except ValueError:
+                return denied
+            if reason == "NO_WORKER":
+                groups.add(placement["group_id"])
+        return dict(allowed=True, groups=sorted(groups), signatures=signatures, imports=imports)
+
+    def candidate_legal(self, candidate, *, preview=True):
+        if not candidate["legal"]:
+            return False
+        if any(self.context.catalog.dispatch_status(unit)["status"] == "UNAVAILABLE"
+               for unit in candidate.get("units", [])):
+            return False
+        conditions = (self._call_conditions(candidate) if preview else
+                      [self.context.catalog.check_call_conditions(unit, None) for unit in candidate.get("units", [])])
+        return all(item["allowed"] for item in conditions)
+
+    def decision_mask(self, event, *, preview=True):
+        mask = [self.candidate_legal(candidate, preview=preview) for candidate in event["candidates"]]
+        for candidate, allowed in zip(event["candidates"], mask):
+            candidate["decision_legal"] = allowed
+        return mask
+
     def _event(self, event):
         started = time.perf_counter()
         if not isinstance(event, dict) or event.get("kind") not in {"decision", "terminal"}:
@@ -782,8 +1049,16 @@ class SceneSession:
         # Reject foreign candidates before representation looks up their cards.
         if any(set(candidate.get("units", [])) - pool for candidate in event.get("candidates", [])):
             raise ValueError("候选包含当前任务路由以外的 Unit")
+        # Share descriptive runtime facts only within this candidate event.
+        # Conditions below and all subsequent action checks remain fresh.
+        observer = getattr(self.catalog, "runtime_observer", None)
+        runtime_state, dispatch_status = (observer() if observer else
+                                         (getattr(self.catalog, "runtime_state", None), self.catalog.dispatch_status))
+        represent_ms = 0.0
         if self.spec.get("representation"):
-            represent(event, self.spec["representation"], self.catalog.runtime_state)
+            represent_started = time.perf_counter()
+            represent(event, self.spec["representation"], runtime_state)
+            represent_ms = (time.perf_counter() - represent_started) * 1000
         _vector(event.get("observation"), len(self.spec["observation_schema"]), "观测")
         event["raw_observation"] = list(event["observation"])
         event["observation"] = [value / scale for value, scale in zip(event["observation"], self.spec["observation_scales"])]
@@ -794,6 +1069,7 @@ class SceneSession:
         if any(not isinstance(i, str) for i in ids) or len(set(ids)) != len(ids):
             raise ValueError("本次候选需要不重复 id")
         required = set(event.get("required_units", []))
+        dispatch_conditions_ms = 0.0
         for candidate in candidates:
             _vector(candidate.get("features"), len(self.spec["candidate_schema"]), "候选特征")
             units = set(candidate.get("units", []))
@@ -805,24 +1081,45 @@ class SceneSession:
             groups = candidate.get("exclusive_groups", [])
             semantic = candidate["legal"] and required <= units and len(groups) == len(set(groups))
             # Semantic legality is the task/rule judgement; dispatchability is the current runtime fact.
-            dispatch = {uid: self.catalog.dispatch_status(uid) for uid in sorted(units)}
+            dispatch_started = time.perf_counter()
+            dispatch = {uid: dispatch_status(uid) for uid in sorted(units)}
             dispatchable = all(item["status"] != "UNAVAILABLE" for item in dispatch.values())
+            conditions = self._call_conditions(candidate)
+            dispatch_conditions_ms += (time.perf_counter() - dispatch_started) * 1000
             candidate.update(semantic_legal=semantic, dispatch=dispatch, dispatchable=dispatchable,
-                             legal=semantic and dispatchable)
+                             call_conditions=[dict(status=item["status"], reason=item.get("reason"),
+                                                   reason_code=item.get("reason_code")) for item in conditions],
+                             legal=semantic,
+                             decision_legal=semantic and dispatchable and all(item["allowed"] for item in conditions))
         if not any(c["legal"] for c in candidates):
-            reasons = {c["id"]: "语义不合法" if not c["semantic_legal"] else
-                       {uid: item.get("reason") for uid, item in c["dispatch"].items() if item["status"] == "UNAVAILABLE"}
+            reasons = {c["id"]: "语义不合法" if not c["semantic_legal"] else dict(
+                       dispatch={uid: item.get("reason") for uid, item in c["dispatch"].items() if item["status"] == "UNAVAILABLE"},
+                       call_conditions=c["call_conditions"])
                        for c in candidates}
             raise ValueError("当前无可执行且满足必需工作的候选：" + json.dumps(reasons, ensure_ascii=False))
         self.last = event
+        event["represent_duration_ms"] = represent_ms
+        event["dispatch_conditions_duration_ms"] = dispatch_conditions_ms
         event["representation_duration_ms"] = (time.perf_counter() - started) * 1000
         return event
 
     def reset(self, task, seed):
+        if self.context.evidence_blocked:
+            raise ValueError("场景失败证据仍依赖原owner，不能重置并清除实际材料")
+        if self.spec.get("research_protocol") == "multisource-review/1":
+            selected = self.spec.get("research_task_ids")
+            if not isinstance(selected, list) or task.get("id") not in selected:
+                raise ValueError("research task is outside the validated run selection")
+            frozen = next((item for item in self.spec["tasks"] if item["id"] == task.get("id")), None)
+            if frozen is None or frozen != task:
+                raise ValueError("research task does not match the frozen task")
+            if not self.spec.get("routes"):
+                self._verify(self.spec)
         self.last = None
         self.context.allowed.clear()
         self.context.calls.clear()
         self.context.model_calls.clear()
+        self.context.clear_failure_evidence()
         self.context.wire_reasoning.clear()
         self.context.upstream_costs = copy.deepcopy(task.get("upstream_costs", {}))
         if self.spec.get("routes"):
@@ -847,6 +1144,8 @@ class SceneSession:
         candidate = event["candidates"][index]
         if not candidate["legal"]:
             raise ValueError("不可选择非法候选")
+        if not self.candidate_legal(candidate):
+            raise ValueError("动作的逐次调用条件已不再满足")
         self.context.allowed = set(candidate.get("units", []))
         first_call = len(self.context.calls)
         try:
@@ -859,6 +1158,8 @@ class SceneSession:
             self.context.allowed.clear()
 
     def close(self):
+        if self.context.evidence_blocked:
+            return
         close = getattr(self.environment, "close", None)
         if close:
             close()
@@ -866,4 +1167,4 @@ class SceneSession:
 
 def arrays(event):
     return dict(state=event["observation"], candidates=[c["features"] for c in event["candidates"]],
-                legal=[c["legal"] for c in event["candidates"]])
+                legal=[c.get("decision_legal", c["legal"]) for c in event["candidates"]])

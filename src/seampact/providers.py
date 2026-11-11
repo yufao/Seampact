@@ -5,6 +5,7 @@ import copy
 import ctypes
 import hashlib
 import http.client
+import itertools
 import json
 import os
 import re
@@ -608,11 +609,95 @@ class Profiles:
         return self.profile(connection_id)
 
 
+class FrozenProfiles:
+    """Freeze ordinary Agent model bindings without importing an experiment driver."""
+    def __init__(self, profiles):
+        self.managed_services = getattr(profiles, "managed_services", None)
+        self.keys = {}
+        with profiles.lock:
+            self.profiles = {role: copy.deepcopy(profiles.role_profile(role)) for role in ROLES}
+            for role, profile in self.profiles.items():
+                if profile.get("base_url") and profile.get("model"):
+                    try:
+                        self.keys[role] = profiles.role_key(role)
+                    except Exception:
+                        self.keys[role] = None
+
+    def role_profile(self, role):
+        return copy.deepcopy(self.profiles[role])
+
+    def role_key(self, role):
+        if self.keys.get(role) is None:
+            raise ValueError("运行创建时未取得该模型凭据：" + role)
+        return self.keys[role]
+
+    def public(self):
+        result = {}
+        for role, profile in self.profiles.items():
+            parameters = completion_parameters(profile)
+            result[role] = dict(provider=profile.get("provider"), base_url=profile.get("base_url"),
+                model=profile.get("model"), service_version=profile.get("service_version"),
+                max_output_tokens=parameters.get("max_tokens", parameters.get("max_completion_tokens")),
+                **{name: copy.deepcopy(profile.get(name)) for name in (
+                    "connection_id", "config_digest", "revision", "protocol", "parameters", "resource_kind",
+                    "managed_service_id", "managed_service_digest")})
+            if profile.get("parameters"):
+                result[role]["request_parameters"] = parameters
+        return result
+
+    def resources(self):
+        return {role: {name: copy.deepcopy(profile.get(name)) for name in (
+            "connection_id", "config_digest", "revision", "credential_ref", "credential_version", "auth",
+            "resource_kind", "managed_service_id", "managed_service_digest")} for role, profile in self.profiles.items()}
+
+
 class ProviderError(RuntimeError):
     def __init__(self, message, *, kind=None, diagnostic=None):
         super().__init__(message)
         self.kind = kind
         self.diagnostic = diagnostic
+
+
+class RequestCancelled(ProviderError):
+    """Client delivery stopped; the provider has not confirmed remote stop."""
+    def __init__(self):
+        super().__init__("已停止交付；提供方是否停止计算尚未确认", kind="response_incomplete")
+
+
+class RequestControl:
+    """Per-request transport observation and best-effort connection cancellation."""
+    def __init__(self):
+        self.cancelled = threading.Event()
+        self.received = False
+        self.response = None
+        self.lock = threading.Lock()
+
+    def check(self):
+        if self.cancelled.is_set():
+            raise RequestCancelled()
+
+    def progress(self, data):
+        if data:
+            self.received = True
+        self.check()
+
+    def attach(self, response):
+        with self.lock:
+            self.response = response
+        self.check()
+
+    def cancel(self):
+        self.cancelled.set()
+        with self.lock:
+            response = self.response
+        if response is not None:
+            # Closing a client connection is not an engine cancellation receipt.
+            def close():
+                try:
+                    response.close()
+                except (OSError, ValueError):
+                    pass
+            threading.Thread(target=close, daemon=True, name="seampact-model-disconnect").start()
 
 
 def _http_diagnostic(error):
@@ -638,7 +723,10 @@ def _http_diagnostic(error):
     # provider data is carried into the exception or its diagnostic.
     text = " ".join(value.lower() for name in ("code", "type", "message")
                     if isinstance((value := fields.get(name)), str))
-    if status not in (401, 403, 413, 429) and not 500 <= status <= 599:
+    if status in (400, 422, 501) and re.search(r"\bstream(?:ing|_options)?\b", text) and re.search(
+            r"not supported|unsupported|not implemented|must be false|only.{0,15}false", text):
+        category = "stream_options_unsupported" if re.search(r"\bstream_options\b", text) else "stream_unsupported"
+    elif status not in (401, 403, 413, 429) and not 500 <= status <= 599:
         if (re.search(r"context[_ -]?(length|window)|maximum context|context.{0,30}(too long|exceed|limit)", text)):
             category = "context_length"
         elif re.search(r"(request|payload|body|content)[_ -]?(too[_ -]?(large|big)|size[_ -]?limit)|"
@@ -658,6 +746,8 @@ def _http_diagnostic(error):
         "context_length": "输入超出上下文长度限制",
         "request_too_large": "请求内容超过大小限制",
         "output_limit": "输出 token 参数超出限制",
+        "stream_unsupported": "服务明确不支持流式请求",
+        "stream_options_unsupported": "服务明确不支持流式用量选项",
         "invalid_request": "请求参数或内容无效",
         "authentication": "认证或访问权限失败",
         "rate_limit": "请求频率或额度受限",
@@ -668,8 +758,20 @@ def _http_diagnostic(error):
 
 
 class Transport:
-    def send(self, url, key="", body=None):
-        headers = {"Accept": "application/json"}
+    def send(self, url, key="", body=None, *, control=None):
+        return self._send(url, key, body, control=control)
+
+    def stream(self, url, key, body, on_delta, *, include_usage=True, control=None):
+        """Read one completion incrementally; never retry a received completion."""
+        request = dict(body, stream=True)
+        if include_usage:
+            request["stream_options"] = dict(include_usage=True)
+        else:
+            request.pop("stream_options", None)
+        return self._send(url, key, request, on_delta, control=control)
+
+    def _send(self, url, key, body, on_delta=None, control=None):
+        headers = {"Accept": "text/event-stream, application/json" if on_delta else "application/json"}
         if key:
             headers["Authorization"] = "Bearer " + key
         if body is not None:
@@ -680,8 +782,17 @@ class Transport:
             def redirect_request(self, req, fp, code, msg, hdrs, newurl):
                 return None
         try:
+            if control is not None:
+                control.check()
             with urllib.request.build_opener(NoRedirect).open(request, timeout=600) as response:
-                return json.load(response)
+                if control is not None:
+                    control.attach(response)
+                if on_delta:
+                    return _stream_completion(response, on_delta, control=control)
+                result = json.load(response)
+                if control is not None:
+                    control.progress(True)
+                return result
         except urllib.error.HTTPError as error:
             diagnostic, reason = _http_diagnostic(error)
         except (http.client.IncompleteRead, http.client.RemoteDisconnected) as error:
@@ -705,13 +816,106 @@ class Transport:
             if code is None and getattr(reason, "errno", None) is not None:
                 detail = f" (errno={reason.errno})"
             raise ProviderError(f"provider transport/{category}{detail}", kind="transport") from None
-        except (OSError, ValueError) as error:
+        except (OSError, ValueError, TypeError, KeyError, AttributeError) as error:
             raise ProviderError(f"provider transport/{type(error).__name__}",
                                 kind="transport" if isinstance(error, OSError) else "invalid_response") from None
         # Raise outside the handler so the original HTTPError and body are not
         # retained in the new exception's implicit context.
         raise ProviderError(f"provider HTTP {diagnostic['http_status']}：{reason}",
                             kind=diagnostic["category"], diagnostic=diagnostic)
+
+
+def _stream_completion(response, on_delta, control=None):
+    """Assemble the same message contract as send(), exposing only content deltas."""
+    first = response.readline()
+    if control is not None:
+        control.progress(first)
+    # Some compatible endpoints ignore stream=True and return a single JSON body.
+    if first.lstrip().startswith(b"{"):
+        result = json.loads(first + response.read())
+        content = result["choices"][0]["message"].get("content")
+        if isinstance(content, str) and content:
+            on_delta(content)
+        return result
+    content, reasoning, calls, metadata, data = [], [], {}, {}, []
+    finish, usage = None, None
+
+    def incomplete():
+        return ProviderError("provider response：模型流式响应未完整取得", kind="response_incomplete")
+
+    def consume(raw):
+        nonlocal finish, usage
+        if raw == "[DONE]":
+            return True
+        chunk = json.loads(raw)
+        if not isinstance(chunk, dict) or chunk.get("error"):
+            raise incomplete()
+        for name in ("id", "model", "created", "system_fingerprint"):
+            if name in chunk:
+                metadata[name] = chunk[name]
+        if chunk.get("usage") is not None:
+            usage = chunk["usage"]
+        for choice in chunk.get("choices", []):
+            if choice.get("index", 0) != 0:
+                raise ValueError("multiple streamed choices")
+            if choice.get("finish_reason") is not None:
+                finish = choice["finish_reason"]
+            delta = choice.get("delta") or {}
+            for name, parts in (("content", content), ("reasoning_content", reasoning)):
+                value = delta.get(name)
+                if value is not None:
+                    if not isinstance(value, str):
+                        raise ValueError("non-text completion delta")
+                    parts.append(value)
+                    if name == "content" and value:
+                        on_delta(value)
+            for item in delta.get("tool_calls") or []:
+                index = item.get("index")
+                if type(index) is not int or index < 0:
+                    raise ValueError("missing tool call index")
+                call = calls.setdefault(index, dict(id=[], name=[], arguments=[], type="function"))
+                if item.get("type") is not None:
+                    if item["type"] != "function":
+                        raise ValueError("unsupported tool call type")
+                function = item.get("function") or {}
+                for value, parts in ((item.get("id"), call["id"]),
+                                     (function.get("name"), call["name"]),
+                                     (function.get("arguments"), call["arguments"])):
+                    if value is not None:
+                        if not isinstance(value, str):
+                            raise ValueError("invalid tool call fragment")
+                        parts.append(value)
+        return False
+
+    done = False
+    for line in itertools.chain([first], response):
+        if control is not None:
+            control.progress(line)
+        line = line.decode("utf-8").rstrip("\r\n")
+        if not line:
+            if data:
+                done = consume("\n".join(data))
+                data = []
+                if done:
+                    break
+        elif line.startswith("data:"):
+            data.append(line[5:].lstrip(" "))
+    if data and not done:
+        consume("\n".join(data))
+    if finish is None:
+        raise incomplete()
+    message = dict(role="assistant", content="".join(content) if content else None)
+    if reasoning:
+        message["reasoning_content"] = "".join(reasoning)
+    if calls:
+        message["tool_calls"] = [dict(id="".join(call["id"]), type=call["type"],
+            function=dict(name="".join(call["name"]), arguments="".join(call["arguments"])))
+            for _, call in sorted(calls.items())]
+        ids = [call["id"] for call in message["tool_calls"]]
+        if len(set(ids)) != len(ids) or any(not call["id"] or not call["function"]["name"]
+                                          for call in message["tool_calls"]):
+            raise incomplete()
+    return dict(metadata, choices=[dict(index=0, finish_reason=finish, message=message)], usage=usage)
 
 
 def model_request_scope(profiles, role):

@@ -43,7 +43,7 @@ const imageSelected = new Set();
 const imageDraft = {};
 let inspectPage = location.pathname === '/inspect';
 let configurationPage = location.pathname === '/configuration';
-const configNames = {models: '模型角色', services: '服务连接', weights: '权重资源', harnesses: 'Harness 接入', research: '研究运行', scope: '入口范围'};
+const configNames = {models: '模型角色', services: '服务连接', weights: '权重资源', harnesses: '仓库接入', scope: '执行说明'};
 let configSection = new URLSearchParams(location.search).get('section') || 'models';
 if (!configNames[configSection]) configSection = 'models';
 let configurationReturnUrl = '/';
@@ -55,7 +55,7 @@ let pendingSectionHash = location.hash;
 let pendingRevisionId = inspectQuery.get('revision');
 let pendingInspectItem = inspectQuery.get('unit') || inspectQuery.get('task');
 let inspectView = inspectQuery.get('view') || 'analyses';
-const viewNames = {analyses: '来源与分析', units: '能力池', tasks: '任务详情', scheduler: '调度器', deployments: '运行组与部署', operations: '运行与资源'};
+const viewNames = {analyses: '来源与能力', units: '能力池', tasks: '任务详情', scheduler: '调度器', deployments: '运行组与部署', operations: '运行与资源'};
 let operationsLoading = false;
 let operationsSnapshot = null;
 let monitorSnapshot = null;
@@ -68,15 +68,15 @@ let monitorGpuHydrated = false;
 let monitorGpuDirty = false;
 let monitorGpuRevision = 0;
 let taskDeleteBusy = false;
+let olderTasks = [];
+let olderTasksCursor;
+let olderTasksBusy = false;
 let operationsError = '';
 let operationsRequestVersion = 0;
 let monitorSeriesChoice = '';
 if (!viewNames[inspectView]) inspectView = 'analyses';
 const renderedSections = new Map();
 const detailStates = new Map();
-let researchHydrated = false;
-let researchDraft = {};
-let researchDirty = false;
 const researchSelected = new Set();
 const researchDetails = new Map();
 const researchDetailVersions = new Map();
@@ -88,7 +88,7 @@ const statusNames = {
   RUNNING: '运行中', QUEUED: '排队中', WAITING: '等待中', COMPLETED: '已完成',
   SUCCEEDED: '已完成', FAILED: '失败', CANCELLED: '已取消', CANCELLING: '正在取消', INTERRUPTED: '已中断',
   PREPARATION_FAILED: '准备条件失败', READY_TO_RUN: '本轮已准备', CLOSING: '等待收尾', CLEANUP_PENDING: '引用待清理', CLOSED: '本轮已结束',
-  READY: '源码已绑定', AVAILABLE: '可用', BLOCKED: '待接入', PENDING: '待确认',
+  READY: '已登记', AVAILABLE: '可用', NEEDS_INPUT: '需补充', PREPARING: '准备中', NOT_PREPARED: '待准备', BLOCKED: '已阻止', PENDING: '待确认',
   THEORY_PENDING: '理论待确认', IDLE: '空闲', ANALYZING: '分析中', ANALYZED: '已分析',
   REGISTERED: '已登记', CONNECTED: '已接入', MISSING: '待接入', NOT_CONFIGURED: '未配置', ENABLED: '已使能',
   AUTHORIZED: '已派发', RESERVED: '已占槽', UNKNOWN: '状态未知',
@@ -217,7 +217,8 @@ function visibleTasks() {
   const source = selectedSource();
   const sourceAnalyses = new Set((state.analyses || []).filter(job => job.harness_id === source).map(job => job.id));
   const sourceUnits = new Set((state.units || []).filter(unit => unit.source_id === source).map(unit => unit.id));
-  return (state.tasks || []).filter(task =>
+  const current = new Set((state.tasks || []).map(task => task.id));
+  return [...(state.tasks || []), ...olderTasks.filter(task => !current.has(task.id))].filter(task =>
     (!inspectPage || !inspectQuery.get('task') || task.id === inspectQuery.get('task')) &&
     (!source || (task.calls || []).some(call => call.unit?.source_id === source) ||
       (task.plan?.units || []).some(id => sourceUnits.has(id) || sourceAnalyses.has(id.split(':')[0]))));
@@ -442,20 +443,11 @@ function detailValue(root, label, value, open = false) {
 }
 
 function renderProfile() {
-  const profile = state.entry_profile;
   for (const id of ['entry-profile-summary', 'config-entry-profile']) {
-    const root = $(id);
-    if (!root) continue;
-    root.replaceChildren();
-    if (!profile) {
-      empty(root, '平台尚未提供入口支持范围。');
-      continue;
-    }
-    root.append(node('p', [profile.interpreter + '（平台本地基线；运行组另选目标 Python）', profile.host === 'local-native-process' ? '本地原生进程' : profile.host,
-      profile.explicit_lifetime ? '显式生命周期' : null,
-      profile.frame_observation_excluded ? '不使用栈 / frame 反射' : null].filter(Boolean).join(' · '), 'card-note'));
-    root.append(node('p', (profile.confirmed ? '已确认范围：' : '范围待确认：') + profile.id, 'card-meta'));
-    detailValue(root, '宿主范围说明', profile);
+    const root = $(id); if (!root) continue;
+    root.replaceChildren(node('p', '完整仓库生成能力包，由独立实例执行。对话共用流式宿主，可直接回答、调用能力或交付文件。', 'card-note'));
+    root.append(node('p', '未配置检查插件时正常交付；应用要求的检查必须在对应操作或交付前完成。', 'card-note'));
+    root.append(node('p', '停止交付会请求取消；远端停算仅在引擎确认后记录。', 'card-note'));
   }
 }
 
@@ -604,18 +596,19 @@ function resetChat(push = true) {
   welcome.append(node('h2', '有什么想一起完成的？'), node('p', '发送消息开始新对话；历史会话仍保留。'));
   $('conversation').append(welcome);
   $('chat-title').textContent = '新对话';
-  $('chat-input').value = ''; $('scene-task-selector').value = '';
+  $('chat-input').value = '';
   setChatAddress(null, push); showNotice(''); resizeComposer();
   if (!$('chat-history').hidden) loadChatHistory();
 }
 
-async function loadChatHistory() {
+async function loadChatHistory(offset = 0) {
   const version = ++historySearchVersion;
   const root = $('chat-history-list');
   try {
-    const result = await api('/api/chats?q=' + encodeURIComponent($('chat-history-search').value.trim()));
+    const result = await api('/api/chats?q=' + encodeURIComponent($('chat-history-search').value.trim()) + '&limit=50&offset=' + offset);
     if (version !== historySearchVersion) return;
-    root.replaceChildren();
+    if (offset) root.querySelector('.chat-history-more')?.remove();
+    else root.replaceChildren();
     for (const chat of result.conversations || []) {
       const button = node('button', undefined, 'chat-history-item'); button.type = 'button';
       button.setAttribute('aria-current', String(chat.id === activeChatId));
@@ -630,6 +623,12 @@ async function loadChatHistory() {
       remove.disabled = Boolean(pendingTask) || chatRestoring || chat.status === 'RUNNING';
       remove.onclick = () => deleteConversation(chat.id, remove);
       row.append(button, remove); root.append(row);
+    }
+    if (offset + (result.conversations || []).length < result.total) {
+      const more = node('button', '更多会话', 'secondary-button chat-history-more');
+      more.type = 'button';
+      more.onclick = () => loadChatHistory(offset + 50);
+      root.append(more);
     }
     if (!root.childElementCount) empty(root, '没有匹配的历史会话。');
   } catch (error) { if (version === historySearchVersion) root.replaceChildren(node('p', error.message, 'message-error')); }
@@ -668,15 +667,20 @@ async function loadConversation(identity, push = false) {
     for (const message of messages) appendMessage(message.role, responseText(message.content));
     const first = messages.find(message => message.role === 'user');
     $('chat-title').textContent = chat.legacy ? '旧对话记录' : first ? responseText(first.content).slice(0, 32) : '对话';
-    $('chat-input').value = ''; $('scene-task-selector').value = '';
+    $('chat-input').value = '';
     const task = chat.task;
     chatContextTask = task; renderChatContext();
     if (task.status === 'RUNNING') {
       const output = appendMessage('assistant', '正在运行…', false); output.item.classList.add('message-pending');
-      pendingTask = {id: task.id, output, sceneTaskId: null};
+      pendingTask = {id: task.id, output, sceneTaskId: null, partial: ''};
+      void followChatEvents(pendingTask);
     } else if (!['COMPLETED', 'SUCCEEDED'].includes(task.status)) {
-      const output = appendMessage('assistant', task.error || statusLabel(task.status), false); output.item.classList.add('message-error');
+      const partial = typeof task.partial_response === 'string' ? task.partial_response : '';
+      const output = appendMessage('assistant', partial || task.error || statusLabel(task.status), Boolean(partial));
+      output.item.classList.add('message-error');
+      if (partial) output.meta.textContent = [statusLabel(task.status), '未完成的内容', task.error].filter(Boolean).join(' · ');
     }
+    if (task.files?.length) renderDeliveredFiles($('conversation').querySelector('.chat-message.assistant:last-child'), task.files);
     setChatAddress(chat.id, push);
     showNotice(chat.legacy ? '这条旧记录只保存了回答，原问题无法恢复。请新建对话继续。' : '');
     $('chat-history').hidden = true; $('toggle-chat-history').setAttribute('aria-expanded', 'false');
@@ -691,48 +695,22 @@ function restoreChatFromLocation() {
   else if (!identity && activeChatId && !pendingTask) resetChat(false);
 }
 
-function hydrateSceneTasks() {
-  const selector = $('scene-task-selector');
-  const active = researchState().active_checkpoint;
-  const tasks = Array.isArray(active?.task_ids) ? active.task_ids : [];
-  $('scene-task-label').hidden = tasks.length === 0;
-  const signature = JSON.stringify([active?.run_id, active?.scene_id, tasks]);
-  if (selector.dataset.options !== signature) {
-    const selected = selector.dataset.binding === active?.run_id ? selector.value : '';
-    selector.replaceChildren(node('option', '普通对话')); selector.firstChild.value = '';
-    for (const identity of tasks) {
-      const option = node('option', (active.scene_id || '已保存场景') + ' · ' + identity);
-      option.value = String(identity); selector.append(option);
-    }
-    selector.value = tasks.some(identity => String(identity) === selected) ? selected : '';
-    selector.dataset.binding = active?.run_id || '';
-    selector.dataset.options = signature;
-  }
-  selector.disabled = Boolean(pendingTask);
-}
 
 function updateComposer() {
-  const selectedSceneTask = $('scene-task-selector').value;
-  const active = researchState().active_checkpoint;
-  const ready = connected && (selectedSceneTask ? Boolean(active?.run_id) : isReady(state?.models?.chat));
-  $('send-message').disabled = !ready || Boolean(pendingTask) || chatRestoring || (chatLegacy && !selectedSceneTask) || !$('chat-input').value.trim();
+  const ready = connected && isReady(state?.models?.chat);
+  $('send-message').disabled = !ready || Boolean(pendingTask) || chatRestoring || chatLegacy || !$('chat-input').value.trim();
   $('new-chat').disabled = Boolean(pendingTask) || chatRestoring;
-  $('scene-task-selector').disabled = Boolean(pendingTask);
-  $('send-message').querySelector('.send-label').textContent = pendingTask ? '运行中' : selectedSceneTask ? '运行任务' : '发送';
-  $('chat-input').placeholder = selectedSceneTask ? '如：运行所选任务（文字仅作为本次运行附言）' : '发送消息…';
-  $('composer-hint').textContent = selectedSceneTask ? '执行已保存场景任务，不改写原任务；文字作为运行附言记录。' : 'Enter 发送 · Shift + Enter 换行';
-  if (chatRestoring) $('composer-hint').textContent = '正在读取历史会话…';
-  else if (chatLegacy && !selectedSceneTask) $('composer-hint').textContent = '此旧记录没有保存问题，请点击“新对话”。';
-  $('chat-model-name').textContent = selectedSceneTask ? '冻结策略 · ' + (active?.scene_id || '已保存场景') :
-    isReady(state?.models?.chat) ? state.models.chat.model : '对话模型未配置';
-  $('chat-model-name').className = 'status-pill ' + ((selectedSceneTask ? active?.run_id : isReady(state?.models?.chat)) ? 'ready' : 'pending');
-  const units = state?.units || [];
-  const available = units.filter(unit => ['READY', 'AVAILABLE'].includes(String(unit.status).toUpperCase())).length;
-  const hint = !connected ? '平台未连接。' : selectedSceneTask ?
-    '冻结场景：' + (active?.scene_id || '—') + ' · 任务 ' + selectedSceneTask + ' · 来源运行 ' + (active?.run_id || '—') : !isReady(state?.models?.chat) ?
-    '先在配置中填写对话模型接口。' : available ?
-    '对话已就绪 · 能力池中有 ' + available + ' 个源码已绑定入口。' :
-    '对话已就绪 · 当前没有可调用 Unit；Harness 状态见右侧。';
+  $('send-message').querySelector('.send-label').textContent = pendingTask ? '运行中' : '发送';
+  $('stop-message').hidden = !pendingTask;
+  $('stop-message').disabled = !pendingTask?.id || Boolean(pendingTask?.cancelling);
+  $('stop-message').textContent = pendingTask?.cancelling ? '正在停止…' : '停止交付';
+  $('chat-input').placeholder = '发送消息…';
+  $('composer-hint').textContent = chatRestoring ? '正在读取历史会话…' : chatLegacy ? '请新建对话继续。' : 'Enter 发送 · Shift + Enter 换行';
+  $('chat-model-name').textContent = isReady(state?.models?.chat) ? state.models.chat.model : '对话模型未配置';
+  $('chat-model-name').className = 'status-pill ' + (ready ? 'ready' : 'pending');
+  const available = (state?.capabilities || []).filter(unit => unit.dispatch?.status !== 'UNAVAILABLE' && unit.availability?.status === 'AVAILABLE').length;
+  const hint = !connected ? '平台未连接。' : !ready ? '先在配置中填写对话模型接口。' :
+    '对话已就绪 · ' + (available ? available + ' 个能力可按需调用。' : '当前可直接对话；仓库准备进度见“来源与能力”。');
   $('chat-readiness').textContent = hint;
   if ($('welcome-context')) $('welcome-context').textContent = hint;
 }
@@ -740,39 +718,78 @@ function updateComposer() {
 async function sendMessage(event) {
   event.preventDefault();
   const content = $('chat-input').value.trim();
-  const sceneTaskId = $('scene-task-selector').value;
-  const sceneRunId = researchState().active_checkpoint?.run_id;
-  if (!content || pendingTask || chatRestoring || (chatLegacy && !sceneTaskId) || !connected ||
-      (sceneTaskId ? !sceneRunId : !isReady(state?.models?.chat))) return;
-  if (!sceneTaskId) { messages.push({role: 'user', content}); chatContextTask = null; renderChatContext(); }
-  const user = appendMessage('user', content);
-  if (sceneTaskId) user.meta.textContent = '运行附言 · 已保存任务 ' + sceneTaskId + ' · 不改写原任务';
-  $('chat-input').value = '';
-  resizeComposer();
+  if (!content || pendingTask || chatRestoring || chatLegacy || !connected || !isReady(state?.models?.chat)) return;
+  messages.push({role: 'user', content}); chatContextTask = null; renderChatContext();
+  appendMessage('user', content);
+  $('chat-input').value = ''; resizeComposer();
   const output = appendMessage('assistant', '正在提交任务…', false);
   output.item.classList.add('message-pending');
-  pendingTask = {id: null, output, sceneTaskId: sceneTaskId || null};
-  updateComposer();
-  showNotice('');
+  pendingTask = {id: null, output, sceneTaskId: null, partial: '', files: []};
+  updateComposer(); showNotice('');
   try {
-    const body = sceneTaskId ? {scene_task_id: sceneTaskId, scene_run_id: sceneRunId, messages: [{role: 'user', content}]} :
-      {messages, ...(activeChatId ? {conversation_id: activeChatId} : {})};
-    const result = await api('/api/chat', body);
+    const result = await api('/api/chat', {messages, ...(activeChatId ? {conversation_id: activeChatId} : {})});
     if (!result.task_id) throw new Error('平台未返回任务 ID');
     pendingTask.id = result.task_id;
-    if (!sceneTaskId && result.conversation_id) {
+    if (result.conversation_id) {
       activeChatId = result.conversation_id; setChatAddress(activeChatId);
       $('chat-title').textContent = responseText(messages.find(message => message.role === 'user')?.content || '对话').slice(0, 32);
     }
     setMessageBody(output.body, '正在运行…', false);
+    updateComposer();
+    void followChatEvents(pendingTask);
     await refresh();
   } catch (error) {
     setMessageBody(output.body, error.message, false);
-    output.item.classList.remove('message-pending');
-    output.item.classList.add('message-error');
+    output.item.classList.remove('message-pending'); output.item.classList.add('message-error');
     pendingTask = null;
     if (!$('chat-history').hidden) loadChatHistory();
     updateComposer();
+  }
+}
+
+function renderDeliveredFiles(container, files) {
+  if (!container || !Array.isArray(files) || !files.length) return;
+  let list = container.querySelector('.delivered-files');
+  if (!list) { list = node('div', undefined, 'delivered-files'); (container.querySelector('.message-content') || container).append(list); }
+  list.replaceChildren();
+  for (const file of files) {
+    if (!/^[0-9a-f]{64}$/.test(file.sha256 || '')) continue;
+    const link = node('a', file.name || file.path || '下载文件', 'detail-link');
+    link.href = '/api/artifacts/' + encodeURIComponent(file.sha256);
+    link.download = (file.name || file.path || 'artifact').split(/[\\/]/).pop();
+    list.append(link, node('span', file.media_type || '', 'card-meta'));
+  }
+}
+
+async function followChatEvents(pending) {
+  let cursor = 0;
+  while (pendingTask === pending) {
+    try {
+      const batch = await api('/api/chat/' + encodeURIComponent(pending.id) + '/events?after=' + cursor);
+      if (pendingTask !== pending) return;
+      const nearBottom = $('conversation').scrollHeight - $('conversation').scrollTop - $('conversation').clientHeight < 100;
+      for (const event of batch.events || []) {
+        if (!Number.isSafeInteger(event.id) || event.id <= cursor) continue;
+        cursor = event.id;
+        if (event.type === 'reset' || event.type === 'start') pending.partial = typeof event.text === 'string' ? event.text : '';
+        else if (event.type === 'delta' && typeof event.text === 'string') pending.partial += event.text;
+        else if (event.type === 'file' && event.data?.file) {
+          pending.files = [...(pending.files || []), event.data.file]; renderDeliveredFiles(pending.output.item, pending.files);
+        }
+      }
+      setMessageBody(pending.output.body, pending.partial || '正在运行…', Boolean(pending.partial));
+      pending.output.meta.textContent = '运行中';
+      if (nearBottom) pending.output.item.scrollIntoView({block: 'end', behavior: 'auto'});
+      if (batch.done) {
+        const task = await api('/api/chat/' + encodeURIComponent(pending.id) + '/task');
+        if (pendingTask === pending) synchronizeTaskRecord(task);
+        if (pendingTask !== pending) return;
+        await new Promise(resolve => setTimeout(resolve, 250));
+      }
+    } catch (error) {
+      // A dropped connection must not resubmit the model request. Resume at the last event.
+      await new Promise(resolve => setTimeout(resolve, 1000));
+    }
   }
 }
 
@@ -780,24 +797,36 @@ function synchronizeTask() {
   if (!pendingTask?.id) return;
   const task = (state.tasks || []).find(item => item.id === pendingTask.id);
   if (!task) return;
+  synchronizeTaskRecord(task);
+}
+
+function synchronizeTaskRecord(task) {
+  if (!pendingTask || task.id !== pendingTask.id) return;
   if (!pendingTask.sceneTaskId) { chatContextTask = task; renderChatContext(); }
   const status = String(task.status || '').toUpperCase();
   const {output} = pendingTask;
-  const text = responseText(task.response);
+  // Ordinary in-flight output is owned by the event stream, not the slower state poll.
+  if (!pendingTask.sceneTaskId && !terminalStatuses.has(status)) return;
+  const success = ['COMPLETED', 'SUCCEEDED'].includes(status);
+  const text = success ? responseText(task.response) :
+    (pendingTask.sceneTaskId ? responseText(task.response) :
+      (typeof task.partial_response === 'string' ? task.partial_response : pendingTask.partial));
   const nearBottom = $('conversation').scrollHeight - $('conversation').scrollTop - $('conversation').clientHeight < 100;
   setMessageBody(output.body, text || (task.error ? textValue(task.error) : statusLabel(task.status) + '…'), Boolean(text));
   const duration = latency(task.latency_ms);
   output.meta.textContent = [statusLabel(task.status), duration].filter(Boolean).join(' · ');
   if (terminalStatuses.has(status)) {
     output.item.classList.remove('message-pending');
-    if (['COMPLETED', 'SUCCEEDED'].includes(status)) {
+    if (success) {
       if (text) {
         if (!pendingTask.sceneTaskId) messages.push({role: 'assistant', content: text});
-      } else setMessageBody(output.body, '任务已完成，平台未返回对话内容。', false);
+      } else setMessageBody(output.body, task.files?.length ? '文件已生成，可在下方下载。' : '任务已完成，平台未返回对话内容。', false);
     } else {
       output.item.classList.add('message-error');
+      if (text) output.meta.textContent += ' · 未完成的内容';
       if (text && task.error) output.meta.textContent += ' · ' + textValue(task.error);
     }
+    if (task.files?.length) renderDeliveredFiles(output.item, task.files);
     pendingTask = null;
     updateComposer();
     if (!$('chat-history').hidden) loadChatHistory();
@@ -806,71 +835,30 @@ function synchronizeTask() {
 }
 
 function renderScheduler() {
-  const scheduler = state.scheduler;
-  const badge = $('scheduler-status');
-  const root = $('scheduler-summary');
+  const execution = state.scheduler?.execution, root = $('scheduler-summary'), badge = $('scheduler-status');
   root.replaceChildren();
-  if (!scheduler) {
-    badge.textContent = '未提供状态';
-    badge.className = 'status-pill pending';
-    empty(root, '平台尚未返回调度状态。');
-    return;
-  }
-  badge.textContent = statusLabel(scheduler.status);
-  badge.className = 'status-pill ' + statusClass(scheduler.status);
-  root.append(node('p', scheduler.policy ? '策略：' + scheduler.policy : '策略尚未提供', 'card-meta'));
-  const grid = node('div', undefined, 'state-grid');
-  for (const [label, value] of [['执行中', scheduler.active], ['等待中', scheduler.waiting]]) {
-    const count = entryCount(value);
-    const stat = node('div', undefined, 'state-stat');
-    stat.append(node('label', label), node('strong', count === null ? '—' : count));
-    grid.append(stat);
-  }
-  root.append(grid);
-  if (typeof scheduler.used === 'number' && typeof scheduler.quota === 'number') {
-    root.append(node('p', '执行槽：' + scheduler.used + ' / ' + scheduler.quota, 'card-meta'));
-  }
-  if (scheduler.learning) {
-    root.append(node('p', '历史表格 Q 状态仅供旧实现追溯。新的研究运行使用共享候选评分，上层选择获准干预，下层固定 FIFO；单候选执行不能说明学习收益。', 'card-note'));
-    const layers = node('div', undefined, 'rl-layers');
-    for (const [key, label] of [['upper', '上层 · 方案选择'], ['lower', '下层 · 调用调度']]) {
-      const learning = scheduler.learning[key];
-      if (!learning) continue;
-      const card = node('div', undefined, 'status-card');
-      card.dataset.itemId = key;
-      card.append(node('strong', label));
-      const count = learning.candidate_count;
-      card.append(node('p', '最近候选：' + (count === null || count === undefined ? '尚未选择' : count) + ' · 累计更新：' + (learning.updates ?? '—'), 'card-meta'));
-      if (learning.action_key) {
-        const selected = node('details');
-        selected.append(node('summary', '最近选择'), node('pre', learning.action_key));
-        card.append(selected);
-      }
-      layers.append(card);
-    }
-    root.append(layers);
-  }
-  if (scheduler.theory_pending) root.append(node('p', scheduler.theory_pending === true ?
-    'RL 调度理论待确认。当前显示平台返回的执行状态。' : textValue(scheduler.theory_pending), 'theory-note'));
-  for (const [label, value] of [['执行中', scheduler.active], ['等待中', scheduler.waiting]]) {
-    const calls = entries(value);
-    if (!calls.length) continue;
-    const detail = node('details');
-    detail.append(node('summary', label + '调用'), node('pre', textValue(calls)));
-    root.append(detail);
-  }
+  badge.textContent = execution?.controller_error ? '调度异常' : '运行中';
+  badge.className = 'status-pill ' + (execution?.controller_error ? 'error' : 'ready');
+  if (!execution) { empty(root, '尚未取得执行状态。'); return; }
+  root.append(node('p', '规则调度 · ' + execution.active_tasks + ' 项活动任务 · ' + execution.queued_calls +
+    ' 项排队调用 · ' + execution.running_calls + ' 项执行中调用', 'card-note'));
+  if (execution.controller_error) root.append(node('p', execution.controller_error, 'message-error'));
+  detailValue(root, '任务与成本统计', execution.objective);
+  detailValue(root, '当前固定配置', execution.config);
+  detailValue(root, '最近调度决定', execution.recent_decisions);
+  for (const limitation of execution.limitations || []) root.append(node('p', limitation, 'card-note'));
 }
 
 function callDetails(calls) {
   const values = entries(calls);
   if (!values.length) return null;
   const detail = node('details', undefined, 'call-list');
-  detail.append(node('summary', 'Unit 调用 · ' + values.length));
+  detail.append(node('summary', '能力调用 · ' + values.length));
   for (const call of values) {
     const row = node('div', undefined, 'call-row');
     if (typeof call === 'string') row.append(node('span', call));
     else {
-      const title = call.unit?.name || call.unit_id || call.unit?.id || call.unit || call.name || call.gate || call.id || 'Unit 调用';
+      const title = call.unit?.name || call.unit_id || call.unit?.id || call.unit || call.name || call.gate || call.call_id || call.id || '能力调用';
       row.append(node('strong', textValue(title)));
       if (call.status || call.physical) row.append(pill(call.status || call.physical));
       if (latency(call.latency_ms)) row.append(node('span', latency(call.latency_ms), 'card-meta'));
@@ -965,9 +953,36 @@ async function deleteTaskRecords(tasks) {
     const result = await api('/api/tasks/delete', {task_ids: tasks.map(task => task.id)});
     const deleted = new Set(result.deleted || []);
     state.tasks = (state.tasks || []).filter(task => !deleted.has(task.id));
+    olderTasks = olderTasks.filter(task => !deleted.has(task.id));
     showNotice('已从任务列表删除 ' + deleted.size + ' 条记录，执行依据保留。');
   } catch (error) { showNotice(error.message); }
   finally { taskDeleteBusy = false; renderTasks(); await refresh(); }
+}
+
+function retainDisplacedTasks(previous, current) {
+  // Once older pages are loaded, a task that newer ones push off the polled page stays listed.
+  if (olderTasksCursor === undefined) return;
+  const kept = new Set([...(current || []), ...olderTasks].map(task => task.id));
+  olderTasks = [...(previous || []).filter(task => !kept.has(task.id)), ...olderTasks];
+}
+
+async function loadOlderTasks() {
+  if (olderTasksBusy) return;
+  const cursor = olderTasksCursor === undefined ? state.tasks_older : olderTasksCursor;
+  if (cursor === null || cursor === undefined) return;
+  olderTasksBusy = true;
+  renderTasks();
+  try {
+    const result = await api('/api/tasks?before=' + encodeURIComponent(cursor) + '&limit=30');
+    const seen = new Set([...(state.tasks || []), ...olderTasks].map(task => task.id));
+    for (const task of result.tasks || []) {
+      if (seen.has(task.id)) continue;
+      seen.add(task.id);
+      olderTasks.push(task);
+    }
+    olderTasksCursor = result.older;
+  } catch (error) { showNotice(error.message); }
+  finally { olderTasksBusy = false; renderTasks(); await refresh(); }
 }
 
 function renderTasks() {
@@ -975,7 +990,20 @@ function renderTasks() {
   const root = $('task-list');
   root.replaceChildren();
   $('task-count').textContent = tasks.length;
-  if (!tasks.length) return empty(root, '尚无任务。发送消息后在这里观察真实调用。');
+  const appendOlder = () => {
+    const olderCursor = olderTasksCursor === undefined ? state.tasks_older : olderTasksCursor;
+    if (olderCursor === null || olderCursor === undefined) return;
+    const more = node('button', olderTasksBusy ? '正在加载…' : '加载更早的任务', 'secondary-button');
+    more.type = 'button';
+    more.disabled = olderTasksBusy;
+    more.onclick = () => { void loadOlderTasks(); };
+    root.append(more);
+  };
+  if (!tasks.length) {
+    empty(root, '尚无任务。发送消息后在这里观察真实调用。');
+    appendOlder();
+    return;
+  }
   if (inspectPage) {
     const finished = tasks.filter(taskRecordFinished);
     const actions = node('div', undefined, 'form-actions');
@@ -1016,114 +1044,30 @@ function renderTasks() {
         (task.calls || []).length + ' 次 Unit 调用', latency(task.latency_ms)].filter(Boolean).join(' · '),
       error: task.error, open: Boolean(inspectQuery.get('task') === task.id || selectedSource() && (active || task === ordered[0]))}));
   }
+  appendOlder();
 }
 
 function renderUnits() {
-  const units = visibleUnits();
-  const root = $('unit-list');
-  root.replaceChildren();
-  $('unit-count').textContent = units.length;
-  if (!units.length) return empty(root, selectedSource() ? '这个来源当前没有接入能力。已摘除来源的历史结果仍在“来源与分析”页面。' : '能力池为空。分析 Harness 后，以实际接入结果显示 Unit。');
-  root.append(node('p', '源码绑定、实际初始化和逐操作条件分别显示。', 'card-note'));
-  const sourceLists = new Map();
+  const root = $('unit-list'), units = (state.capabilities || []).filter(unit =>
+    (!selectedSource() || unit.source_id === selectedSource()) &&
+    (!inspectQuery.get('unit') || !inspectPage || unit.id === inspectQuery.get('unit')));
+  root.replaceChildren(); $('unit-count').textContent = units.length;
+  if (!units.length) { empty(root, '尚未安装能力。提交完整仓库后，平台会自动准备。'); return; }
   for (const unit of units) {
-    const card = node('article', undefined, 'unit-card');
+    const availability = unit.availability || {}, card = node('article', undefined, 'status-card');
     card.dataset.itemId = unit.id;
-    const head = node('div', undefined, 'card-heading');
-    head.append(node('strong', unit.name || unit.id), pill(unit.status));
-    card.append(head);
-    const sourceId = unit.harness_id || unit.source_id;
-    const source = (state.harnesses || []).find(item => item.id === sourceId);
-    card.append(node('p', [unit.mode || unit.kind, source?.name || sourceId].filter(Boolean).join(' · '), 'card-meta'));
-    if (unit.description) card.append(node('p', unit.description, 'card-note'));
-    if (unit.reason) card.append(node('p', textValue(unit.reason), 'card-note'));
-    const policy = unit.scheduling;
-    card.append(node('p', policy?.visibility === 'transparent' ? '透明能力 · 平台按任务事件激活' :
-      policy?.visibility === 'business' ? '业务可见 · 业务模型可申请' : '激活方式未声明 · 沿用业务可见入口', 'card-meta'));
-    if (inspectPage && !['DETACHED', 'SUPERSEDED'].includes(unit.status)) {
-      const label = node('label', '激活入口', 'unit-policy-control');
-      const selector = node('select'); selector.setAttribute('aria-label', '能力激活入口 ' + (unit.name || unit.id));
-      for (const [value, text] of [['business', '业务可见，由业务模型申请'], ['transparent', '透明能力，由平台事件调度']]) {
-        const option = node('option', text); option.value = value; selector.append(option);
-      }
-      selector.value = policy?.visibility || 'business';
-      selector.onchange = async () => {
-        selector.disabled = true;
-        try {
-          await api('/api/units/policy', {unit_id: unit.id, visibility: selector.value,
-            activation: selector.value === 'transparent' ? 'platform' : 'business'});
-          await refresh();
-        } catch (error) { showNotice(error.message); selector.value = policy?.visibility || 'business'; }
-        finally { selector.disabled = false; }
-      };
-      label.append(selector); card.append(label);
-    }
-    card.append(node('p', '初始化：' + statusLabel(unit.initialization), 'card-meta'));
-    if (unit.runtime_group) card.append(node('p', '执行位置：' + statusLabel(unit.execution) + ' · ' + unit.runtime_group, 'card-meta'), inspectLink('deployments', {harness: sourceId}));
-    if (unit.operations) {
-      const operationList = node('div', undefined, 'operation-list');
-      for (const [name, operation] of Object.entries(unit.operations)) {
-        const item = node('div', undefined, 'operation-row');
-        item.append(node('span', ({export_entry: '独立入口', schedule: '原位排期', parallel: '并行', remote: '远程'})[name] || name),
-          pill(operation?.status));
-        operationList.append(item);
-        if (operation?.formal_proof === false) operationList.append(node('p', '此项未完成完整语义证明。', 'card-meta'));
-        if (operation?.reason) operationList.append(node('p', textValue(operation.reason), 'card-note'));
-      }
-      card.append(operationList);
-      detailValue(card, '逐操作依据', unit.operations);
-    }
-    if (inspectPage && unit.contract_check) {
-      card.append(node('p', unit.contract_check.valid ? '运行契约已核对' : '运行契约需要重新核对', 'card-meta'));
-      if (unit.contract_check.reason) card.append(node('p', unit.contract_check.reason, 'card-note'));
-      detailValue(card, '当前操作资格', unit.operation_checks);
-      detailValue(card, '冻结运行契约', unit.typed_contract);
-    }
-    detailValue(card, '调用输入', unit.input_schema);
-    detailValue(card, '共同能力卡', unit.capability);
-    if (inspectPage) {
-      const editor = node('details'); editor.append(node('summary', '编辑能力卡'));
-      const input = node('textarea'); input.rows = 12; input.value = capabilityDrafts.get(unit.id) ?? JSON.stringify(unit.capability || {}, null, 2);
-      input.setAttribute('aria-label', '共同能力卡 JSON');
-      input.dataset.deploymentField = 'capability/' + unit.id;
-      input.oninput = () => capabilityDrafts.set(unit.id, input.value);
-      const save = node('button', '保存能力卡', 'secondary-button'); save.type = 'button';
-      save.onclick = async () => {
-        try { await api('/api/units/capability', {unit_id: unit.id, card: JSON.parse(input.value)});
-          capabilityDrafts.delete(unit.id);
-          showNotice('能力卡已保存，下次运行冻结新表示。'); await refresh(); }
-        catch (error) { showNotice(error.message); }
-      };
-      editor.append(input, save); card.append(editor);
-    }
-    detailValue(card, unit.result_schema && Object.keys(unit.result_schema).length ? '原结果端口' : '原结果端口 · 类型未解析', unit.result_schema);
-    if (unit.result_type) card.append(node('p', '实际返回类型：' + unit.result_type, 'card-meta'));
-    if (unit.construction) detailValue(card, '原生构造与绑定', unit.construction);
-    else card.append(node('p', unit.kind === 'function' ? '构造：原函数入口。' : '构造说明：见入口绑定依据。', 'card-meta'));
-    if (unit.native_input_schemas && Object.keys(unit.native_input_schemas).length) detailValue(card, '原对象输入端口', unit.native_input_schemas);
-    detailValue(card, '缺失条件', unit.missing);
-    detailValue(card, '入口范围', unit.entry_profile || unit.profile);
-    if (!inspectPage) card.append(inspectLink('units', {harness: sourceId, unit: unit.id}));
-    let target = root;
-    if (inspectPage && !selectedSource()) {
-      if (!sourceLists.has(sourceId)) {
-        const members = units.filter(item => (item.harness_id || item.source_id) === sourceId);
-        const group = disclosure('unit-source/' + sourceId, source?.name || sourceId || '未标记来源', {
-          meta: members.length + ' 个能力 · ' + members.filter(item => item.status === 'READY').length + ' 个源码已绑定',
-          error: members.some(item => item.status === 'FAILED') ? '存在失败能力，展开查看原因' : null});
-        group.classList.add('source-disclosure'); root.append(group); sourceLists.set(sourceId, group);
-      }
-      target = sourceLists.get(sourceId);
-    }
-    target.append(foldCard(card, 'unit/' + unit.id, unit.name || unit.id, {status: unit.status,
-      meta: compactText(unit.description || unit.kind || unit.mode), error: unit.status === 'FAILED' ? unit.reason : null,
-      open: Boolean(inspectQuery.get('unit') === unit.id || selectedSource() && units.length === 1)}));
+    const head = node('div', undefined, 'card-heading'); head.append(node('strong', unit.name || unit.tool_name), pill(availability.status || unit.status));
+    card.append(head, node('p', unit.description, 'card-note'));
+    if (availability.reason || unit.dispatch?.reason) card.append(node('p', availability.reason || unit.dispatch.reason, 'card-note'));
+    card.append(node('p', '来源：' + unit.package + ' · ' + (unit.source_version || '版本未知'), 'card-meta'));
+    detailValue(card, '输入接口', unit.parameters);
+    detailValue(card, '输出与文件', unit.output);
+    detailValue(card, '能力说明与来源依据', unit.capability);
+    const link = inspectLink('deployments', {harness: unit.source_id}); link.textContent = '查看资源与实例'; card.append(link);
+    root.append(foldCard(card, 'capability/' + unit.id, unit.name || unit.tool_name, {
+      status: availability.status || unit.status, meta: unit.description, error: availability.reason}));
   }
 }
-
-const instanceStateNames = {UNDEPLOYED: '未部署', STARTING: '启动中', READY: '就绪', DRAINING: '排空中',
-  STOPPED: '已停止', FAILED: '失败', UNKNOWN: '结果未决'};
-const operationNames = {SUPPORTED: '允许', UNSUPPORTED: '不支持', UNKNOWN: '未知 · 不授予'};
 
 function environmentEditor(initial, key) {
   const environment = deploymentDrafts.get(key) || initial || {};
@@ -1766,208 +1710,107 @@ function renderImages(root) {
 }
 
 function renderDeployments() {
-  const root = $('deployment-list');
-  root.replaceChildren();
-  const groups = (state.runtime_groups || []).filter(group => !selectedSource() || group.source_id === selectedSource())
-    .sort((a, b) => Number(b.host_status === 'HOST_CHECKED') - Number(a.host_status === 'HOST_CHECKED'));
-  root.append(node('p', '同组保持原进程、原对象与原生命周期；组外端口只传编码后的数据。生命周期操作按运行组契约逐项允许，未知不授予；重启不恢复原会话。', 'card-note'));
-  if (inspectPage) renderDeploymentBackend(root);
-  if (inspectPage && state.image_retention) renderImages(root);
+  const root = $('deployment-list'); root.replaceChildren();
+  if (inspectPage) { renderDeploymentBackend(root); if (state.image_retention) renderImages(root); }
   renderServiceGpuAllocations(root);
-  const ungroupedSources = inspectPage ? (state.harnesses || []).filter(source => source.status !== 'DETACHED' &&
-    (!selectedSource() || source.id === selectedSource()) && !groups.some(group => group.source_id === source.id)) : [];
-  for (const source of ungroupedSources) {
-    const target = source.target_runtime || {};
-    const pendingEnvironment = source.environment_pending_recheck || target.status && target.status !== 'READY';
-    const summary = pendingEnvironment ? '待重新核对环境 · 当前无可部署运行组' : '尚无运行组 · 查看来源与分析了解接入进度';
-    const detail = disclosure('deployment-source/' + source.id, source.name || source.id, {
-      meta: summary, error: target.reason || source.error, open: Boolean(selectedSource())});
-    detail.classList.add('source-disclosure');
-    const card = node('article', undefined, 'status-card');
-    card.append(node('p', pendingEnvironment ? '目标环境待准备或重新核对，当前尚未生成可部署运行组。' :
-      '此来源已登记，当前尚未生成运行组。请查看分析记录和入口接入条件。', 'card-note'));
-    if (target.status) card.append(node('p', '目标解释器：' + statusLabel(target.status), 'card-meta'));
-    const link = inspectLink('analyses', {harness: source.id}); link.textContent = '查看来源与分析'; card.append(link);
-    detail.append(card); root.append(detail);
-  }
-  if (!groups.length) { if (!ungroupedSources.length) empty(root, '分析后显示运行组。'); return; }
-  const sourceLists = new Map();
+  const groups = (state.runtime_groups || []).filter(group => !selectedSource() || group.source_id === selectedSource());
+  const packages = state.capability_packages || [];
+  if (!groups.length) { empty(root, '仓库准备完成后显示能力包与运行实例。'); return; }
   for (const group of groups) {
-    const card = node('article', undefined, 'status-card');
-    card.dataset.itemId = group.id;
+    const installed = packages.find(item => item.group_id === group.id);
+    const availability = installed?.availability || {};
+    const card = node('article', undefined, 'status-card'); card.dataset.itemId = group.id;
     const head = node('div', undefined, 'card-heading');
-    const identity = runtimeGroupIdentity(group);
-    head.append(node('strong', identity.title), pill(group.host_status === 'HOST_CHECKED' ? 'HOST_CHECKED' : group.status));
-    const live = (group.instances || []).filter(item => !['STOPPED', 'FAILED'].includes(item.state));
-    card.append(head, node('p', ['宿主：' + (group.contract?.host_profile || '未生成契约'),
-      '执行位置：' + statusLabel(group.execution), '存活实例 ' + live.length,
-      group.contract?.replicas?.replicable ? '可增加副本' : '单实例', group.locked_by_run ? '运行占用中' : null].filter(Boolean).join(' · '), 'card-meta'));
-    card.append(node('p', identity.purpose, 'card-note'), node('p', '运行组 ID：' + group.id, 'card-meta'));
-    if (inspectPage) renderGpuAllocationControls(card, group);
-    if (group.environment_gap) card.append(node('p', group.environment_gap, 'card-note message-error'));
-    card.append(node('p', '成员：' + group.entries.length + ' 个' + (group.entries.length <= 3 ? ' · ' + group.entries.join('、') : '，展开宿主核对查看完整成员。'), 'card-note'));
-    if (group.host) detailValue(card, '宿主核对（逐成员）', group.host.members);
-    if (group.contract) {
-      const list = node('div', undefined, 'operation-list');
-      for (const [name, operation] of Object.entries(group.contract.operations)) {
-        const item = node('div', undefined, 'operation-item');
-        item.append(node('strong', name + ' · ' + (operationNames[operation.status] || operation.status)), node('p', operation.basis, 'card-note'));
-        list.append(item);
-      }
-      const details = node('details'); details.append(node('summary', '运行组契约 · ' + group.contract.digest.slice(0, 12)), list);
-      card.append(details);
-      if (group.contract.lifecycle) detailValue(card, '生命周期分项资格（UNKNOWN 不授予动作）', group.contract.lifecycle);
-      detailValue(card, '契约原文', group.contract);
+    head.append(node('strong', installed?.name || group.name || group.id), pill(availability.status || group.status));
+    card.append(head, node('p', group.id, 'card-meta'));
+    if (availability.reason || group.environment_gap) card.append(node('p', availability.reason || group.environment_gap, 'card-note'));
+    const members = (state.capabilities || []).filter(unit => unit.runtime_group === group.id);
+    card.append(node('p', members.map(unit => unit.name || unit.tool_name).join(' · ') || '等待可用能力', 'card-note'));
+    if (installed?.preparation) detailValue(card, '运行环境准备', installed.preparation);
+    if (installed?.resources?.length) {
+      const resources = node('details'); resources.open = availability.status === 'NEEDS_INPUT';
+      resources.append(node('summary', '资源 · ' + installed.resources.filter(item => item.bound).length + ' / ' + installed.resources.length + ' 已匹配'));
+      for (const resource of installed.resources)
+        resources.append(node('p', resource.description + ' · ' + (resource.bound ? '已绑定' : resource.required ? '需要补充' : '可选'), 'card-note'));
+      if (inspectPage) capabilityResourceForm(resources, installed);
+      card.append(resources);
     }
-    if (group.gaps?.length) detailValue(card, '未覆盖的标量远程条件', [...new Set(group.gaps)]);
-    const artifact = group.artifact;
-    const source = (state.harnesses || []).find(item => item.id === group.source_id);
-    const discovery = group.environment_discovery || source?.environment_discovery;
-    environmentEvidence(card, discovery);
-    if (source?.runtime_environment) card.append(node('p', '来源已选环境：Python ' + source.runtime_environment.python +
-      ' · ' + source.runtime_environment.base_image, 'card-meta'));
-    if (artifact) {
-      card.append(node('p', ['工件 ' + statusLabel(artifact.status), '构建 ' + (artifact.build?.status || 'NOT_RUN'),
-        '镜像可达 ' + (artifact.publish?.status || 'NOT_RUN'), artifact.publish?.reference || artifact.image].join(' · '), 'card-meta'));
-      if (artifact.build?.reason || artifact.publish?.reason) card.append(node('p', textValue(artifact.build?.reason || artifact.publish?.reason), 'card-note'));
-      for (const step of [artifact.build, artifact.publish]) if (step?.manual_commands) detailValue(card, '后端不可用 · 手动命令', step.manual_commands);
-      detailValue(card, '构建工件', artifact);
-      if (artifact.build_reuse) {
-        const reuse = artifact.build?.dependency_reuse;
-        const result = {REUSED: '已复用安装环境', BUILT: '已构建安装环境', FAILED: '依赖环境准备失败',
-          NOT_CHECKED: '尚未核验安装环境', NOT_APPLICABLE: '无独立依赖环境'};
-        card.append(node('p', '依赖环境：' + (result[reuse?.status] || '待构建核验') +
-          (reuse?.dependency_image_id ? ' · ' + reuse.dependency_image_id : '') +
-          '。下载缓存是否命中需查看实际构建日志。', 'card-note'));
-        if (reuse?.reason) card.append(node('p', reuse.reason, 'card-note'));
-        if (artifact.build_reuse.installation) detailValue(card, '依赖安装顺序及原因', artifact.build_reuse.installation);
-      }
-    }
-    card.append(node('p', '真实 worker：' + ((group.instances || []).some(item => item.state === 'READY' && item.accepting) ?
-      '已有就绪且接单的实例' : '尚无就绪且接单的实例') + '。生成工件、构建成功、镜像可达与实例就绪分别记录。', 'card-note'));
-    if (inspectPage && group.contract) {
-      const key = 'group/' + group.id;
-      const environment = artifact?.environment || source?.runtime_environment || discovery?.suggested || {};
-      const {form, fields, read, load} = environmentEditor(environment, key);
-      const editingLocked = Boolean(group.locked_by_run || group.environment_gap) || deploymentSubmitting.has(key) ||
-        deploymentPreparation.get(group.source_id)?.running;
-      for (const field of Object.values(fields)) field.disabled = editingLocked;
-      form.prepend(node('h4', '选择构建环境'), node('p', '基础镜像会实际用于镜像构建；目标 Python 需与镜像内解释器一致。改变环境后须重新核对与构建，已有实例保持原环境。', 'card-note'));
-      if (source?.runtime_environment) {
-        const useSource = node('button', '填写来源已选环境', 'secondary-button'); useSource.type = 'button'; useSource.disabled = editingLocked;
-        useSource.onclick = () => load(source.runtime_environment); form.append(useSource);
-      }
-      const button = node('button', '生成构建工件', 'secondary-button'); button.type = 'submit';
-      button.disabled = !group.actions?.export?.enabled || editingLocked;
-      if (group.actions?.export?.reason || group.locked_by_run) button.title = group.actions?.export?.reason || '研究运行正在使用此组，结束后再修改环境';
-      form.append(button);
-      form.onsubmit = async event => {
-        event.preventDefault();
-        if (editingLocked || deploymentSubmitting.has(key)) return;
-        deploymentSubmitting.add(key); button.disabled = true;
-        for (const field of Object.values(fields)) field.disabled = true;
-        try {
-          const result = await api('/api/deployments/export', {group_id: group.id, environment: read()});
-          deploymentDrafts.delete(key);
-          showNotice('构建工件已生成：' + result.image + '。尚未构建镜像。');
-        } catch (error) { showNotice(error.message); }
-        finally { deploymentSubmitting.delete(key); renderedSections.delete('deployments'); await refresh(); }
-      };
-      card.append(form);
-      if (source) deploymentPreparationControls(card, source, group);
-      if (source) {
-        const environmentLink = node('a', '调整来源环境与目标解释器', 'detail-link');
-        environmentLink.href = '/configuration?section=harnesses'; card.append(environmentLink);
-      }
-      const actions = node('div', undefined, 'model-actions');
-      const release = node('label', undefined, 'checkbox-label');
-      const releaseInput = node('input'); releaseInput.type = 'checkbox';
-      releaseInput.checked = deploymentDrafts.get('release/' + group.id) || false;
-      releaseInput.dataset.deploymentField = 'release/' + group.id;
-      releaseInput.onchange = () => deploymentDrafts.set('release/' + group.id, releaseInput.checked);
-      release.append(releaseInput, node('span', '停止时释放结果未决（UNKNOWN）的实例'));
-      actions.append(
-        deploymentButton(group, 'build', 'build', '构建镜像', () => ({}), '构建已在后台开始。'),
-        deploymentButton(group, 'publish', 'publish', '使镜像对后端可达', () => ({}), '发布已在后台开始。'),
-        deploymentButton(group, 'start', 'start', '启动实例', () => ({}), '实例启动已提交；进程登记后转为就绪。'),
-        deploymentButton(group, 'prewarm', 'prewarm', '预热', () => ({}), '预热已完成，结果见实例事件。'),
-        deploymentButton(group, 'pause_intake', 'pause', '停止接单', () => ({}), '已停止派发新根请求。'),
-        deploymentButton(group, 'drain_stop', 'drain-stop', '排空后停止', () => ({release_unknown: releaseInput.checked}), '已请求排空；收尾后停止。'),
-        deploymentButton(group, 'add_replica', 'add-replica', '增加副本', () => ({}), '新副本启动已提交。'),
-        deploymentButton(group, 'remove_replica', 'remove-replica', '减少副本', () => ({}), '已请求排空一个副本。'),
-        deploymentButton(group, null, 'status', '刷新后端观测', () => ({}), '已刷新实例观测。'));
-      card.append(actions, release);
-      const cleanup = deploymentButton(group, null, 'clear-history', '清理已释放记录', () => ({}),
-        '已清理面板中的已释放记录；原始代次与研究证据保留。');
-      cleanup.disabled ||= !group.history_cleanup?.enabled;
-      if (group.history_cleanup?.reason) cleanup.title = group.history_cleanup.reason;
-      card.append(cleanup);
-      const reported = node('form', undefined, 'model-form');
-      const reportedLabel = node('label', '平台外已构建的镜像引用（操作者报告）');
-      const reportedInput = node('input'); reportedInput.placeholder = 'registry.example/seampact-worker:tag';
-      const reportedKey = 'reported/' + group.id;
-      reportedInput.value = deploymentDrafts.get(reportedKey) || '';
-      reportedInput.dataset.deploymentField = reportedKey;
-      reportedInput.oninput = () => deploymentDrafts.set(reportedKey, reportedInput.value);
-      reportedLabel.append(reportedInput);
-      const reportedButton = node('button', '记录操作者构建的镜像', 'secondary-button'); reportedButton.type = 'submit';
-      reportedButton.disabled = !group.actions?.build?.enabled || Boolean(group.locked_by_run) || deploymentSubmitting.has(reportedKey);
-      reported.append(reportedLabel, reportedButton);
-      reported.onsubmit = async event => {
-        event.preventDefault();
-        if (deploymentSubmitting.has(reportedKey)) return;
-        deploymentSubmitting.add(reportedKey); reportedButton.disabled = true;
-        try { await api('/api/deployments/build', {group_id: group.id, operator_reported_image: reportedInput.value.trim()});
-          deploymentDrafts.delete(reportedKey); showNotice('已记录；平台未核对该构建。'); }
-        catch (error) { showNotice(error.message); }
-        finally { deploymentSubmitting.delete(reportedKey); renderedSections.delete('deployments'); await refresh(); }
-      };
-      card.append(reported);
+    if (inspectPage) {
+      renderGpuAllocationControls(card, group);
+      const advanced = node('details'); advanced.append(node('summary', '运行操作与诊断'));
+      advanced.append(node('p', '通常由请求按需准备实例，空闲实例按调度配置释放。操作前会检查在途调用及资源归属。', 'card-note'));
+      if (installed) advanced.append(generationAction('重新准备运行环境', '/api/capabilities/prepare', {group_id: group.id}));
+      const actions = node('div', undefined, 'form-actions');
+      actions.append(deploymentButton(group, 'start', 'start', '启动实例'),
+        deploymentButton(group, 'prewarm', 'prewarm', '初始化实例'),
+        deploymentButton(group, 'drain_stop', 'drain-stop', '排空后停止'));
+      advanced.append(actions);
+      detailValue(advanced, '能力包与运行契约', group.contract);
+      if (group.artifact) detailValue(advanced, '镜像构建记录', group.artifact);
+      card.append(advanced);
     }
     for (const instance of group.instances || []) renderInstance(card, instance, group.source_id);
     if (!inspectPage) card.append(inspectLink('deployments', {harness: group.source_id}));
-    let target = root;
-    if (inspectPage) {
-      if (!sourceLists.has(group.source_id)) {
-        const members = groups.filter(item => item.source_id === group.source_id);
-        const active = members.filter(runtimeGroupActive).length;
-        const errors = members.filter(runtimeGroupError).length;
-        const sourceGroup = disclosure('deployment-source/' + group.source_id, source?.name || group.source_id, {
-          meta: members.length + ' 个运行组 · ' + active + ' 个有活动实例或操作' + (errors ? ' · ' + errors + ' 个有错误记录' : ''),
-          error: errors ? runtimeGroupError(members.find(runtimeGroupError)) : null, open: Boolean(selectedSource())});
-        sourceGroup.classList.add('source-disclosure'); root.append(sourceGroup); sourceLists.set(group.source_id, sourceGroup);
+    root.append(foldCard(card, 'capability-package/' + group.id, installed?.name || group.name || group.id,
+      {status: availability.status || group.status, meta: members.length + ' 个能力 · ' + (group.instances || []).length + ' 个实例',
+       error: availability.reason, open: Boolean(selectedSource())}));
+  }
+}
+
+function capabilityResourceForm(root, installed) {
+  const form = node('form', undefined, 'resource-form'), readers = [];
+  for (const resource of installed.resources) {
+    const key = 'binding/' + installed.group_id + '/' + resource.id;
+    const label = node('label', resource.description || resource.id);
+    let input, read;
+    if (['weight', 'service', 'credential'].includes(resource.kind)) {
+      input = node('select');
+      const option = node('option', resource.bound ? '保留当前绑定' : '选择已登记资源'); option.value = ''; input.append(option);
+      const choices = resource.kind === 'weight' ? entries(resourceState().weights) :
+        entries(resourceState().connections).filter(item => item.resource_kind !== 'managed');
+      for (const item of choices) {
+        const value = node('option', item.name || item.model || resourceId(item)); value.value = resourceId(item); input.append(value);
       }
-      target = sourceLists.get(group.source_id);
+      input.value = deploymentDrafts.get(key) || '';
+      read = () => {
+        if (!input.value) return undefined;
+        const selected = choices.find(item => resourceId(item) === input.value);
+        if (resource.kind === 'weight') return {form: 'path', resource_id: input.value, path: '/work/resources/' + input.value};
+        const env = 'SEAMPACT_RESOURCE_' + resource.id.toUpperCase();
+        if (resource.kind === 'credential') return {form: 'secret', env, connection_id: input.value};
+        return {form: 'service', connection_id: input.value, base_url: selected.base_url, model: selected.model,
+          parameters: selected.parameters || {}, ...(selected.auth?.mode === 'none' ? {} : {api_key_env: env})};
+      };
+    } else {
+      input = node('textarea'); input.rows = 2;
+      input.placeholder = resource.kind === 'device' ? '设备值（JSON，例如 "cpu"）' : '来源要求的参数值（JSON）';
+      input.value = deploymentDrafts.get(key) ?? (resource.binding ? JSON.stringify(resource.binding.value) : '');
+      read = () => input.value.trim() ? {form: 'value', value: JSON.parse(input.value)} : undefined;
     }
-    const sourceGroups = groups.filter(item => item.source_id === group.source_id);
-    target.append(foldCard(card, 'runtime-group/' + group.id, identity.title, {
-      status: runtimeGroupError(group) ? 'FAILED' : group.locked_by_run ? 'RUNNING' : group.host_status === 'HOST_CHECKED' ? 'HOST_CHECKED' : group.status,
-      meta: [identity.purpose, group.id, '存活实例 ' + live.length,
-        group.artifact?.build?.status ? '构建 ' + statusLabel(group.artifact.build.status) : null,
-        group.locked_by_run ? '运行占用中' : null].filter(Boolean).join(' · '), error: runtimeGroupError(group),
-      open: Boolean(selectedSource() && (sourceGroups.length === 1 || runtimeGroupActive(group)))}));
+    input.dataset.deploymentField = key;
+    input.oninput = () => deploymentDrafts.set(key, input.value);
+    label.append(input); form.append(label); readers.push([resource.id, read, key]);
   }
-  if (inspectPage) {
-    const form = node('form', undefined, 'model-form');
-    const label = node('label', '平台访问运行进程的地址');
-    const input = node('input'); input.type = 'url'; input.required = true; input.placeholder = 'http://127.0.0.1:8890';
-    input.value = deploymentDrafts.get('attach') || ''; input.dataset.deploymentField = 'attach';
-    input.oninput = () => deploymentDrafts.set('attach', input.value);
-    label.append(input);
-    const button = node('button', '登记已启动的运行进程', 'secondary-button'); button.type = 'submit';
-    button.disabled = deploymentSubmitting.has('attach');
-    form.append(label, button);
-    form.onsubmit = async event => {
-      event.preventDefault();
-      if (deploymentSubmitting.has('attach')) return;
-      deploymentSubmitting.add('attach'); button.disabled = true;
-      try { await api('/api/workers/attach', {endpoint: input.value}); deploymentDrafts.delete('attach'); showNotice('已登记为实例；已登记成员的调用将路由到该实例。'); }
-      catch (error) { showNotice(error.message); }
-      finally { deploymentSubmitting.delete('attach'); renderedSections.delete('deployments'); await refresh(); }
-    };
-    const attach = disclosure('deployment-attach', '登记平台外已启动的运行进程', {meta: '已有 worker 地址时使用'});
-    attach.append(form); root.append(attach);
-  }
+  const actions = node('div', undefined, 'form-actions');
+  const save = node('button', '保存并继续准备', 'secondary-button'); save.type = 'submit';
+  const feedback = node('span', '', 'form-status'); feedback.setAttribute('role', 'status');
+  actions.append(save, feedback); form.append(actions);
+  const weights = node('a', '登记权重', 'detail-link'); weights.href = '/configuration?section=weights';
+  const connections = node('a', '登记连接', 'detail-link'); connections.href = '/configuration?section=services';
+  form.append(weights, connections, node('p', '这里只补充当前能力包需要的已有资源；凭据值在连接配置中单独保存。', 'card-note'));
+  form.onsubmit = async event => {
+    event.preventDefault(); save.disabled = true;
+    try {
+      const bindings = {};
+      for (const [identity, read] of readers) { const binding = read(); if (binding !== undefined) bindings[identity] = binding; }
+      if (!Object.keys(bindings).length) throw new Error('先选择或填写需要补充的资源');
+      await api('/api/capabilities/bind', {group_id: installed.group_id, bindings});
+      for (const [, , key] of readers) deploymentDrafts.delete(key);
+      feedback.textContent = '资源已保存，后台继续准备。'; renderedSections.delete('deployments'); await refresh();
+    } catch (error) { feedback.textContent = error.message; }
+    finally { save.disabled = false; }
+  };
+  root.append(form);
 }
 
 function updateAnalysisClocks() {
@@ -2947,191 +2790,60 @@ function sourceIdentity(harness) {
 }
 
 function renderAnalyses() {
-  const harnesses = (state.harnesses || []).filter(source => !selectedSource() || source.id === selectedSource());
-  const analyses = state.analyses || [];
   const root = $('analysis-list');
-  const heading = $('analysis-heading');
-  root.replaceChildren();
-  if (heading) heading.replaceChildren(inspectPage && selectedSource() && harnesses.length === 1 ? sourceIdentity(harnesses[0]) : node('h3', '来源与分析'));
-  $('analysis-count').textContent = analyses.filter(job => harnesses.some(source => source.id === job.harness_id)).length;
-  if (!harnesses.length) return empty(root, '配置 Harness 地址后可开始分析。');
-  for (const harness of harnesses) {
-    const history = analyses.filter(item => item.harness_id === harness.id)
-      .sort((a, b) => String(b.started_at || b.created_at || '').localeCompare(String(a.started_at || a.created_at || '')));
-    const jobs = inspectPage ? history.length ? history : [null] :
-      [analyses.find(item => item.id === harness.analysis_id) || history[0] || null];
-    const steps = new Map([...history].reverse().map((job, index) => [job.id, index + 1]));
-    let target = root;
-    if (inspectPage) {
-      const latest = history.find(job => ['RUNNING', 'QUEUED', 'CANCELLING'].includes(job.status)) ||
-        history.find(job => job.id === harness.analysis_id) || history[0];
-      const running = history.filter(job => ['RUNNING', 'QUEUED', 'CANCELLING'].includes(job.status)).length;
-      const sourceGroup = disclosure('analysis-source/' + harness.id, harness.name || harness.address || harness.id, {
-        status: harness.status === 'DETACHED' ? 'DETACHED' : latest?.status || harness.status,
-        meta: history.length + ' 次操作' + (running ? ' · ' + running + ' 次进行中' : ''),
-        error: latest?.error || (!latest ? harness.error : null), open: Boolean(selectedSource())});
-      sourceGroup.classList.add('source-disclosure'); root.append(sourceGroup); target = sourceGroup;
-    }
-    for (const job of jobs) {
-    const card = node('article', undefined, 'status-card');
-    card.dataset.itemId = harness.id + ':' + (job?.id || 'source');
+  const jobs = (state.generations || []).filter(job => !selectedSource() || job.source_id === selectedSource())
+    .sort((a, b) => String(b.started_at).localeCompare(String(a.started_at)));
+  root.replaceChildren(); $('analysis-count').textContent = jobs.length;
+  if (!jobs.length) { empty(root, '提交完整仓库后自动生成和准备能力。'); return; }
+  for (const job of jobs) {
+    const source = (state.harnesses || []).find(item => item.id === job.source_id);
+    const card = node('article', undefined, 'status-card'); card.dataset.itemId = job.id;
     const head = node('div', undefined, 'card-heading');
-    const title = inspectPage ? (job ? '第' + steps.get(job.id) + '次操作：' + analysisOperationLabel(job) : '尚未分析') :
-      (harness.name || harness.address);
-    head.append(node('strong', title), pill(harness.status === 'DETACHED' ? 'DETACHED' : job?.status || harness.status));
-    card.append(head);
-    if (!inspectPage) {
-      card.append(node('p', harness.address, 'card-meta'));
-      if ((!job || job.id === harness.analysis_id) && harness.root) card.append(node('p', '当前本地源码目录：' + harness.root, 'resource-path'));
-      const files = entryCount(harness.files);
-      if (files !== null) card.append(node('p', files + ' 份可读文件' + (typeof harness.inventory_count === 'number' ? ' · 仓库共 ' + harness.inventory_count + ' 项文件' : ''), 'card-meta'));
+    head.append(node('strong', source?.name || source?.address || job.source_id), pill(job.status));
+    card.append(head, node('p', generationPhase(job.phase), 'card-note'));
+    card.append(node('p', job.started_at || '', 'card-meta'));
+    if (job.error) card.append(node('p', job.error, 'message-error card-note'));
+    if (job.gaps?.length) {
+      const list = node('ul');
+      for (const gap of job.gaps) list.append(node('li', typeof gap === 'string' ? gap : gap.reason || textValue(gap)));
+      card.append(list);
     }
-    if (job?.rounds !== undefined) card.append(node('p', '分析模型响应 ' + job.rounds + ' 轮', 'card-meta'));
-    if (job) { card.append(analysisProgress(job)); const context = contextDetails(job); if (context) card.append(context); }
-    if (job?.kind === 'SOURCE_UPDATE_ANALYSIS' && job.update_installation?.status === 'INSTALLED') {
-      card.append(node('p', '新版本已安装；各入口的检查和运行状态请查看分析结果。', 'card-note'));
-    } else if (job?.kind === 'SOURCE_UPDATE_ANALYSIS' && job.update_installation?.status === 'NOT_INSTALLED') {
-      card.append(node('p', '新版本未安装，原版本保留。原因：' +
-        (job.update_installation.reason || '未满足安装条件'), 'card-note'));
+    if (job.first_call) detailValue(card, '首次实际调用', job.first_call);
+    if (job.coverage_notes?.length) detailValue(card, '本次能力范围', job.coverage_notes);
+    if (job.group_id) {
+      const link = inspectLink('units', {harness: job.source_id}); link.textContent = '查看能力包与补充资源'; card.append(link);
     }
-    const outcome = job?.outcome || job?.submitted?.report?.outcome;
-    const outcomeText = {NEEDS_CANDIDATE_REPAIR: '分析已结束，候选或源码证据还需修正。',
-      AWAITING_EXTERNAL_CONDITIONS: '分析已结束，仍有平台支持、资源或运行条件待补齐。',
-      STATIC_CHECKED_NOT_RUN: '静态检查已通过，尚未实际运行目标。'}[outcome];
-    if (outcomeText) card.append(node('p', outcomeText, 'card-note'));
-    const classification = analysisClassification(job?.submitted?.report?.classification);
-    if (classification) card.append(classification);
-    if (job?.submitted?.report?.execution_contracts) {
-      detailValue(card, '执行约束与剩余条件', job.submitted.report.execution_contracts);
-    }
-    const resultSummary = job && analysisResultSummary(job);
-    if (resultSummary) card.append(resultSummary);
-    if (!resultSummary && Array.isArray(job?.submitted?.report?.entry_readiness)) {
-      for (const readiness of job.submitted.report.entry_readiness) {
-        const entry = node('section'); entry.append(node('h4', '入口 ' + readiness.entry_id), entryReadinessDetails(readiness, job)); card.append(entry);
-      }
-    }
-    const preparation = job && preprocessingSummary(job);
-    if (preparation) card.append(preparation);
-    if (inspectPage) {
-      const sourceVersion = job?.submitted?.report?.source_version || job?.source_version;
-      card.append(node('p', '本记录冻结源码版本：' + (sourceVersion || '未提供；以原分析工件为准'), 'card-meta'));
-      if (!job || job.id === harness.analysis_id) card.append(node('p', '来源 revision：' + (harness.revision || '本地内容版本'), 'card-meta'));
-      if (job) {
-        card.append(analysisTranscript('analysis', job.id, job.model_calls));
-        const originalAnalysis = job.refinement_of || job.resumed_from;
-        if (originalAnalysis) {
-          const link = node('a', '读取原分析记录（本次消息不替代原历史）', 'detail-link');
-          link.href = '/api/analysis/' + encodeURIComponent(originalAnalysis); link.target = '_blank'; card.append(link);
-        }
-        card.append(node('p', '分析 ' + job.id + ' · ' + statusLabel(job.status) +
-          (job.id === harness.analysis_id ? ' · 当前记录' : ' · 历史记录'), 'card-meta'));
-        if (job.started_at) card.append(node('p', '开始：' + job.started_at, 'card-meta'));
-        if (job.refinement_of) card.append(node('p', '沿用分析上下文：' + job.refinement_of, 'card-meta'));
-        if (job.resumed_from) card.append(node('p', '继续分析：' + job.resumed_from +
-          (job.resume_mode === 'checked_candidate' ? ' · 原记录保留此前 ' + job.prior_rounds + ' 轮，本次从候选开启新会话。' :
-            ' · 已保留此前 ' + job.prior_rounds + ' 轮，本记录只统计新增用量。'), 'card-meta'));
-        detailValue(card, '实际模型用量', job.usage);
-        if (job.model_binding) detailValue(card, '本记录冻结的模型与请求参数', job.model_binding);
-      }
-    }
-    if (harness.status === 'DETACHED') card.append(node('p', '来源已退出当前能力池。源码和分析历史保留，可重新接入。', 'card-note'));
-    const error = job?.error || ((!job || job.id === harness.analysis_id) ? harness.error : null);
-    if (error) card.append(node('p', textValue(error), 'card-note message-error'));
-    if (job?.failure_phase === 'model_request' && ['context_length', 'request_too_large'].includes(job.error_kind)) {
-      card.append(node('p', job.resumable ?
-        '请求内容过长。最近检查的候选与完整历史已保存，可从该候选开启新的分析会话继续；不会自动重试。' :
-        '请求内容过长。请检查输出额度并重新分析；已有历史保留，本次没有可恢复的完整候选。', 'card-note'));
-    }
-    if (job?.last_request_size) detailValue(card, '最近一次模型请求规模', job.last_request_size);
-    if (job?.failure_diagnostic) detailValue(card, '模型接口错误类别', job.failure_diagnostic);
-    if (job?.unreported_usage || job?.resumable) card.append(node('p', '中断请求未返回用量，未将其记作零费用。', 'card-note'));
-    const boundaries = job?.submitted?.candidate?.boundaries || job?.boundaries || [];
-    if (boundaries.length) {
-      const detail = node('details');
-      detail.append(node('summary', '拆分结果 · ' + boundaries.length + ' 个边界'), node('pre', textValue(boundaries)));
-      card.append(detail);
-    }
-    const entryList = job?.submitted?.candidate?.entries || [];
-    if (entryList.length) {
-      const detail = node('details');
-      detail.append(node('summary', '接入入口 · ' + entryList.length), node('pre', textValue(entryList)));
-      card.append(detail);
-    }
-    const entryReport = job?.submitted?.report?.entry_bindings;
-    if (entryReport) detailValue(card, '入口绑定与缺失判断', entryReport);
-    if (inspectPage && job?.submitted?.report) detailValue(card, '边界检查完整报告', job.submitted.report);
-    if (inspectPage && (!job || job.id === harness.analysis_id)) {
-      const next = analysisNextSteps(harness, job);
-      if (next) card.append(next);
-      harnessDependencies(card, harness);
-    }
-    const actions = node('div', undefined, 'harness-actions');
-    if (!inspectPage) actions.append(inspectLink('analyses', {harness: harness.id}));
-    if (inspectPage && job?.id === harness.analysis_id && job?.status === 'COMPLETED' && job.submitted?.candidate) {
-      const update = node('button', '检查更新并分析', 'secondary-button');
-      update.title = harness.revision_ref ? '检查引用：' + harness.revision_ref : '检查默认分支';
-      update.disabled = harness.status === 'DETACHED' || analysisSubmitting.has(harness.id) ||
-        (state.analyses || []).some(item => item.harness_id === harness.id && ['RUNNING', 'CANCELLING'].includes(item.status)) ||
-        !isReady(state.models?.analysis);
-      update.onclick = async () => {
-        if (analysisSubmitting.has(harness.id)) return;
-        analysisSubmitting.add(harness.id); update.disabled = true;
-        try {
-          const result = await api('/api/analyze-update', {harness_id: harness.id});
-          showNotice(result.update_status === 'UNCHANGED' ? '来源没有变化，未重复分析。' :
-            '已开始分析新版本；原版本继续保留，检查通过后才会替换。');
-        } catch (error) { showNotice(error.message); }
-        finally { analysisSubmitting.delete(harness.id); await refresh(); }
-      };
-      actions.append(update);
-    }
-    if (job?.id) actions.append(analysisExportButton(job));
-    const cancel = cancelAnalysisButton(harness, job);
-    if (cancel) actions.append(cancel);
-    if (job?.status === 'COMPLETED' && job.submitted?.candidate) actions.append(analysisExportButton(job, true));
-    if (job?.resumable) {
-      const recoverCandidate = ['context_length', 'request_too_large'].includes(job.error_kind);
-      const resume = node('button', recoverCandidate ? (job.last_check ? '从已保存候选继续' : '整理上下文后继续') : '继续这次分析', 'secondary-button');
-      resume.disabled = harness.status === 'DETACHED' || harness.status === 'ANALYZING' || analysisSubmitting.has(harness.id);
-      if (harness.status === 'DETACHED') resume.title = '先重新接入来源，再继续保存的分析；使用当前分析模型配置。';
-      resume.onclick = async () => {
-        if (analysisSubmitting.has(harness.id)) return;
-        analysisSubmitting.add(harness.id); resume.disabled = true;
-        try {
-          await api('/api/analysis/resume', {analysis_id: job.id});
-          showNotice(recoverCandidate ? (job.last_check ? '已用最近候选开启新的分析会话；原历史保留，本次用量单独记录。' :
-            '已从完整工具回复处继续，将先整理上下文；原历史保留，整理用量单独记录。') :
-            '已保留此前的完整上下文，使用当前分析模型继续；本次用量单独记录。');
-        } catch (error) { showNotice(error.message); }
-        finally {
-          analysisSubmitting.delete(harness.id);
-          resume.disabled = harness.status === 'DETACHED' || harness.status === 'ANALYZING';
-          await refresh();
-        }
-      };
-      actions.append(resume);
-    }
-    actions.append(sourceButton(harness), deleteSourceButton(harness));
-    card.append(actions);
-    if (inspectPage && job) renderRevisionWorkspace(card, harness, job);
-    const current = !job || job.id === harness.analysis_id || !harness.analysis_id && job === history[0];
-    const bindings = job?.submitted?.report?.entry_bindings?.entries || [];
-    const active = ['RUNNING', 'QUEUED', 'CANCELLING'].includes(job?.status);
-    const operation = job?.active_operation;
-    const meta = [current ? '当前记录' : '历史记录', job?.started_at || job?.created_at,
-      active ? operation?.tool ? '执行 ' + operation.tool : ({preprocessing: '自动预处理', analysis: '入口与拆分'})[job.pipeline_stage] || '正在核对' : null,
-      bindings.length ? bindings.length + ' 个入口 · ' + bindings.filter(entry => entry.status === 'READY').length + ' 个静态可绑定' : null,
-      job?.resumable ? '可继续此分析，展开操作' : active ? '展开查看进度与取消操作' : null].filter(Boolean).join(' · ');
-    const requestedRevision = inspectQuery.get('revision');
-    const revisionTarget = requestedRevision && (state.analysis_revisions || []).some(item => item.id === requestedRevision && item.base_analysis_id === job?.id);
-    target.append(foldCard(card, 'analysis/' + harness.id + '/' + (job?.id || 'source'), title,
-      {status: harness.status === 'DETACHED' ? 'DETACHED' : job?.status || harness.status, meta, error,
-        open: Boolean(selectedSource() && current || revisionTarget || location.hash === '#analysis-revision-' + job?.id)}));
-    }
+    const actions = node('div', undefined, 'form-actions');
+    if (job.status === 'RUNNING') actions.append(generationAction('取消准备', '/api/generations/cancel', {id: job.id}));
+    else if (job.status !== 'AVAILABLE') actions.append(generationAction('重新准备', '/api/generations', {source_id: job.source_id}));
+    const detail = node('button', '读取完整记录', 'secondary-button'); detail.type = 'button';
+    detail.onclick = async () => {
+      detail.disabled = true;
+      try { detailValue(card, '本次生成与验证记录', await api('/api/generations/' + encodeURIComponent(job.id)), true); }
+      catch (error) { showNotice(error.message); }
+      finally { detail.disabled = false; }
+    };
+    actions.append(detail); card.append(actions); root.append(card);
   }
-  if (state.rules?.theory_pending) root.append(node('p', state.rules.theory_pending === true ?
-    '分析准则待确认。' : textValue(state.rules.theory_pending), 'theory-note'));
+}
+
+function generationPhase(phase) {
+  return ({freezing: '固定仓库版本', generating: '读取源码并生成能力', validating: '检查能力包', matching: '匹配已有资源', binding: '匹配已有资源',
+    installing: '安装能力包', preparing: '准备运行环境', first_call: '执行首次实际调用',
+    verifying: '验证真实调用', releasing: '等待实例释放', ready: '能力已可用', completed: '本次准备已完成',
+    repairing: '修复生成内容', deferred: '等待补充条件', needs_input: '等待补充条件',
+    failed: '本次准备失败', cancelled: '准备已取消', interrupted: '准备已中断'})[phase] || phase || '等待准备';
+}
+
+function generationAction(label, path, body) {
+  const button = node('button', label, 'secondary-button'); button.type = 'button';
+  button.onclick = async () => {
+    button.disabled = true;
+    try { await api(path, body); await refresh(); }
+    catch (error) { showNotice(error.message); }
+    finally { button.disabled = false; }
+  };
+  return button;
 }
 
 function researchState() { return state?.scheduler?.research || {}; }
@@ -3148,193 +2860,6 @@ function shortHash(value) {
 function finiteNumber(value) { return typeof value === 'number' && Number.isFinite(value); }
 function displayNumber(value) { return finiteNumber(value) ? value.toLocaleString('zh-CN', {maximumFractionDigits: 4}) : 'UNKNOWN'; }
 
-function jsonField(id, label, optional = false) {
-  const text = $(id).value.trim();
-  if (!text && optional) return undefined;
-  let result;
-  try { result = JSON.parse(text); }
-  catch (error) { throw new Error(label + '：' + error.message); }
-  if (!result || typeof result !== 'object' || Array.isArray(result)) throw new Error(label + '需要 JSON 对象');
-  return result;
-}
-
-function blankResearchConfig() {
-  return {algorithm: 'double_dqn', parameters: {}, seed: 0, mode: 'train', parent_run_id: null,
-    episodes: 1, split: 'development', tags: [], scene: {id: '', version: '1',
-      adapter: {path: '', symbol: '', dependencies: [], config: {}},
-      observation_schema: [], candidate_schema: [], unit_ids: [], tasks: []},
-    criteria: {id: '', version: '1', prompt: '', evidence_fields: [], dimensions: [],
-      teacher: {role: 'teacher'}, objective: {weights: {}, risk_limits: {}}}};
-}
-
-function loadResearchConfig(config) {
-  researchDraft = structuredClone(config || blankResearchConfig());
-  const algorithms = researchDraft.algorithms || [researchDraft.algorithm || 'double_dqn'];
-  for (const input of document.querySelectorAll('#research-form input[name="algorithm"]')) input.checked = algorithms.includes(input.value);
-  $('research-mode').value = researchDraft.mode || 'train';
-  $('research-seed').value = researchDraft.seed ?? 0;
-  $('research-episodes').value = researchDraft.episodes ?? 1;
-  $('research-split').value = researchDraft.split || 'development';
-  $('research-tags').value = (researchDraft.tags || []).join(', ');
-  $('research-task-ids').value = (researchDraft.task_ids || []).join(', ');
-  $('research-scene').value = JSON.stringify(researchDraft.scene || blankResearchConfig().scene, null, 2);
-  const criteria = researchDraft.criteria || blankResearchConfig().criteria;
-  $('research-criteria').value = JSON.stringify(criteria, null, 2);
-  $('research-prompt').value = criteria.prompt || '';
-  $('research-teacher-role').value = criteria.teacher?.role || 'teacher';
-  $('research-independent').value = researchDraft.evaluation_criteria ? JSON.stringify(researchDraft.evaluation_criteria, null, 2) : '';
-  $('research-parameters').value = JSON.stringify(researchDraft.parameters || {}, null, 2);
-  $('research-scheduling-mode').value = researchDraft.scheduling_mode || 'functional/1';
-  $('research-joint').value = researchDraft.joint ? JSON.stringify(researchDraft.joint, null, 2) : '';
-  hydrateResearchChoices(true);
-  $('research-parent').value = researchDraft.parent_run_id || '';
-  researchDirty = false;
-  researchHydrated = true;
-}
-
-function readResearchConfig() {
-  const algorithms = [...document.querySelectorAll('#research-form input[name="algorithm"]:checked')].map(input => input.value);
-  if (!algorithms.length) throw new Error('至少选择一个学习器或固定参照');
-  const seed = Number($('research-seed').value);
-  const episodes = Number($('research-episodes').value);
-  if (!Number.isInteger(seed) || seed < 0 || !Number.isInteger(episodes) || episodes < 1) throw new Error('种子需为非负整数，任务次数需为正整数');
-  const config = structuredClone(researchDraft);
-  Object.assign(config, {algorithm: algorithms[0], seed, episodes, mode: $('research-mode').value,
-    parent_run_id: $('research-parent').value || null, split: $('research-split').value.trim(),
-    tags: $('research-tags').value.split(/[,，]/).map(value => value.trim()).filter(Boolean),
-    parameters: jsonField('research-parameters', '学习器参数'), scene: jsonField('research-scene', '场景配置'),
-    criteria: readResearchCriteria()});
-  if (algorithms.length > 1) config.algorithms = algorithms;
-  else delete config.algorithms;
-  const taskIds = $('research-task-ids').value.split(/[,，]/).map(value => value.trim()).filter(Boolean);
-  if (taskIds.length) config.task_ids = taskIds;
-  else delete config.task_ids;
-  config.scene.unit_ids = [...document.querySelectorAll('#research-unit-options input:checked')].map(input => input.value);
-  const independent = jsonField('research-independent', '独立评价', true);
-  if (independent) config.evaluation_criteria = independent;
-  else delete config.evaluation_criteria;
-  const referenceFreeze = config.mode === 'freeze' && algorithms.every(algorithm =>
-    ['required_only', 'all_applicable', 'simple'].includes(algorithm));
-  if (config.mode !== 'train' && !config.parent_run_id && !referenceFreeze)
-    throw new Error('学习器冻结评价、继续训练或条件重评需要选择来源运行');
-  if ($('research-scheduling-mode').value === 'joint/1') {
-    config.joint = jsonField('research-joint', '联合配置', true);
-    if (!config.joint) throw new Error('joint/1 需要联合配置');
-    config.scheduling_mode = 'joint/1';
-  } else { delete config.scheduling_mode; delete config.joint; }
-  if (config.joint?.budget_policy) {
-    if (algorithms.length !== 1 || algorithms[0] !== 'ppo')
-      throw new Error('预算条件策略请选择一个 PPO 学习器');
-    if (!['train', 'freeze'].includes(config.mode))
-      throw new Error('预算条件策略支持训练或冻结评价');
-    if (config.mode === 'freeze' && !config.joint.budget_policy.latency_budgets?.includes(config.joint.budget_policy.freeze_budget))
-      throw new Error('冻结预算须选自训练使用的 latency_budgets，并选择对应来源运行');
-  }
-  return config;
-}
-
-function readResearchCriteria() {
-  const criteria = jsonField('research-criteria', '评价资源');
-  criteria.prompt = $('research-prompt').value;
-  criteria.teacher = {...criteria.teacher, role: $('research-teacher-role').value};
-  return criteria;
-}
-
-function hydrateResearchChoices(force = false, selectedOverride = null) {
-  const parent = $('research-parent');
-  const runs = researchState().runs || [];
-  const parentValue = force ? researchDraft.parent_run_id || '' : parent.value;
-  const signature = JSON.stringify(runs.map(run => [runIdentity(run), run.algorithm, run.status]));
-  if (force || parent.dataset.options !== signature) {
-    parent.replaceChildren(node('option', '无'));
-    parent.firstChild.value = '';
-    for (const run of runs) {
-      const identity = runIdentity(run);
-      const option = node('option', (learnerNames[run.algorithm] || run.algorithm || '运行') + ' · ' + identity + ' · ' + statusLabel(run.status));
-      option.value = identity;
-      parent.append(option);
-    }
-    if (parentValue && !runs.some(run => runIdentity(run) === parentValue)) {
-      const option = node('option', parentValue + ' · 来源配置保留'); option.value = parentValue; parent.append(option);
-    }
-    parent.value = parentValue;
-    parent.dataset.options = signature;
-  }
-  const root = $('research-unit-options');
-  const units = (state?.units || []).filter(unit => !['SUPERSEDED', 'DETACHED'].includes(unit.status));
-  const unitSignature = JSON.stringify(units.map(unit => [unit.id, unit.name, unit.status, unit.source_id]));
-  if (force || selectedOverride || root.dataset.options !== unitSignature) {
-    let selected;
-    if (selectedOverride) selected = selectedOverride;
-    else if (force) selected = new Set(researchDraft.scene?.unit_ids || []);
-    else selected = new Set([...root.querySelectorAll('input:checked')].map(input => input.value));
-    root.replaceChildren();
-    for (const unit of units) {
-      const source = (state.harnesses || []).find(item => item.id === unit.source_id);
-      const label = node('label', undefined, 'research-unit-choice');
-      const check = node('input'); check.type = 'checkbox'; check.value = unit.id; check.checked = selected.has(unit.id);
-      const description = node('span');
-      description.append(node('strong', unit.name || unit.id), node('small', (source?.name || unit.source_id || '') + ' · ' + statusLabel(unit.status)));
-      check.disabled = unit.status !== 'READY' && !check.checked;
-      check.onchange = () => {
-        researchDirty = true;
-        try {
-          const scene = jsonField('research-scene', '场景配置');
-          scene.unit_ids = [...root.querySelectorAll('input:checked')].map(input => input.value);
-          $('research-scene').value = JSON.stringify(scene, null, 2);
-        } catch (error) { $('research-form-status').textContent = error.message; }
-      };
-      label.append(check, description); root.append(label);
-    }
-    for (const identity of selected) {
-      if (units.some(unit => unit.id === identity)) continue;
-      const label = node('label', undefined, 'research-unit-choice');
-      const check = node('input'); check.type = 'checkbox'; check.value = identity; check.checked = true;
-      label.append(check, node('span', identity + ' · 当前能力池不可用')); root.append(label);
-    }
-    if (!units.length && !selected.size) empty(root, '当前没有可选 Unit。先分析 Harness 并补齐原资源。');
-    root.dataset.options = unitSignature;
-  }
-  const role = $('research-teacher-role').value;
-  const profile = state?.models?.[role];
-  $('research-teacher-status').textContent = isReady(profile) ? profile.model + ' · ' + (role === 'analysis' ? '复用分析角色' : '独立教师') : '所选角色尚未配置';
-}
-
-function hydrateResearch() {
-  if (!researchHydrated) loadResearchConfig(researchState().config?.config || researchState().config || blankResearchConfig());
-  hydrateResearchChoices();
-}
-
-async function saveResearch(event) {
-  event.preventDefault();
-  const button = event.submitter;
-  if (button) button.disabled = true;
-  const status = $('research-form-status');
-  try {
-    const config = readResearchConfig();
-    const result = await api('/api/scheduler/config', config);
-    researchDraft = structuredClone(config); researchDirty = false;
-    status.textContent = '已保存 · ' + (result.config_digest || result.id || '下次运行使用');
-    await refresh();
-  } catch (error) { status.textContent = error.message; }
-  finally { if (button) button.disabled = false; }
-}
-
-async function startResearch() {
-  const button = $('research-start');
-  const status = $('research-form-status');
-  button.disabled = true; status.textContent = '正在提交…';
-  try {
-    const config = readResearchConfig();
-    const result = await api('/api/scheduler/runs', {config});
-    const ids = result.run_ids || [result.run_id || result.id].filter(Boolean);
-    for (const identity of ids) researchSelected.add(identity);
-    status.textContent = '已提交 ' + ids.length + ' 次独立运行';
-    showNotice('已提交运行：' + ids.join('、') + '。结果按时间与哈希保存。');
-    await refresh();
-  } catch (error) { status.textContent = error.message; }
-  finally { button.disabled = false; }
-}
 
 function downloadJson(value, filename) {
   const url = URL.createObjectURL(new Blob([JSON.stringify(value, null, 2)], {type: 'application/json;charset=utf-8'}));
@@ -3346,7 +2871,6 @@ async function exportResearchRun(identity, button) {
   button.disabled = true;
   try {
     const run = await api('/api/scheduler/runs/' + encodeURIComponent(identity));
-    researchDetails.set(identity, run);
     const value = {schema: 'seampact-research-progress/1', exported_at: new Date().toISOString(),
       run_id: identity, status: run.status, partial: run.status !== 'COMPLETED',
       resumable_artifact: false, visibility: 'private',
@@ -3357,7 +2881,6 @@ async function exportResearchRun(identity, button) {
   finally { button.disabled = false; }
 }
 
-const researchAutoShown = new Set();
 
 function researchProgress(run) {
   const completed = run.episodes_completed ?? run.episodes;
@@ -3371,74 +2894,26 @@ function researchProgress(run) {
   return root;
 }
 
-function researchAction(label, path, body, completed) {
-  const button = node('button', label, 'secondary-button'); button.type = 'button';
-  button.onclick = async () => {
-    button.disabled = true;
-    try { await api(path, body); showNotice(completed); await refresh(); }
-    catch (error) { showNotice(error.message); }
-    finally { button.disabled = false; }
-  };
-  return button;
-}
 
 function renderResearch() {
-  const research = researchState();
-  for (const run of research.runs || []) {
-    const identity = runIdentity(run);
-    if (['RUNNING', 'QUEUED', 'STOPPING'].includes(run.status) && !researchAutoShown.has(identity)) {
-      researchSelected.add(identity); researchAutoShown.add(identity);
-    }
-  }
-  const readyRoot = $('research-readiness'); readyRoot.replaceChildren();
-  if (!state?.scheduler?.research) empty(readyRoot, '当前进程尚未加载研究运行接口。');
-  const readyUnits = (state.units || []).filter(unit => unit.status === 'READY').length;
-  const summary = node('p', '能力池：' + readyUnits + ' 个源码已绑定入口 · 已保存运行：' + (research.runs || []).length, 'card-meta');
-  readyRoot.append(summary);
-  if (research.active_checkpoint) readyRoot.append(node('p', '当前冻结策略：' + textValue(research.active_checkpoint), 'card-note'));
-  if (research.readiness) detailValue(readyRoot, '原环境、资源与入口条件', research.readiness);
-  if (research.options) detailValue(readyRoot, '学习器可用配置', research.options);
-  const filter = $('research-filter').value.trim().toLowerCase();
-  const mode = $('research-mode-filter').value;
-  const root = $('research-run-list'); root.replaceChildren();
-  const runs = (research.runs || []).filter(run => {
-    const sources = (run.source_ids || []).map(id => (state.harnesses || []).find(source => source.id === id)?.name || id);
-    return (!mode || (run.mode || run.config?.mode) === mode) &&
-      (!filter || JSON.stringify([run, sources]).toLowerCase().includes(filter));
-  });
-  if (!runs.length) empty(root, filter || mode ? '没有匹配的运行。可用完整哈希或时间查找。' : '尚无研究运行。配置真实场景及评价后开始。');
+  const research = researchState(), root = $('research-run-list'), ready = $('research-readiness');
+  ready.replaceChildren(node('p', '历史结果按原配置查看和导出。', 'card-note'));
+  const filter = $('research-filter').value.trim().toLowerCase(), mode = $('research-mode-filter').value;
+  const runs = (research.runs || []).filter(run => (!mode || (run.mode || run.config?.mode) === mode) &&
+    (!filter || JSON.stringify(run).toLowerCase().includes(filter)));
+  root.replaceChildren();
+  if (!runs.length) empty(root, '暂无匹配的历史研究记录。');
   for (const run of runs) {
-    const identity = runIdentity(run);
-    const card = node('article', undefined, 'status-card research-run'); card.dataset.itemId = identity;
-    const head = node('div', undefined, 'card-heading');
-    const select = node('label', undefined, 'research-run-select');
-    const check = node('input'); check.type = 'checkbox'; check.checked = researchSelected.has(identity); check.setAttribute('aria-label', '加入对比 ' + identity);
-    check.onchange = () => {
-      if (check.checked) researchSelected.add(identity); else researchSelected.delete(identity);
-      renderResearchComparison(); refreshResearchDetails();
-    };
-    select.append(check, node('strong', learnerNames[run.algorithm] || run.algorithm || '运行')); head.append(select, pill(run.status)); card.append(head);
-    card.append(node('p', identity, 'research-identity'));
-    card.append(node('p', [researchModeNames[run.mode] || run.mode, run.split, run.started_at || run.created_at,
-      run.episodes !== undefined ? '已完成 ' + (run.episodes_completed ?? run.episodes) + ' / ' + (run.budget ?? run.total_episodes ?? '—') : null].filter(Boolean).join(' · '), 'card-meta'));
-    const checkpointId = run.checkpoint_id || run.checkpoint?.checkpoint_id;
-    card.append(node('p', '配置 ' + shortHash(run.config_digest) + (checkpointId ? ' · 策略 ' + shortHash(checkpointId) : ''), 'card-meta'));
-    if (run.eligible_episodes !== undefined) card.append(node('p', '可学习任务 ' + run.eligible_episodes + ' · 缺失而排除 ' + (run.excluded_episodes ?? 0) +
-      ' · 有取舍交互 ' + (run.choice_interactions ?? 0) + ' · 更新 ' + (run.updates ?? 0), 'card-meta'));
-    if (run.tags?.length) card.append(node('p', run.tags.join(' · '), 'card-note'));
-    if (run.error) card.append(node('p', textValue(run.error), 'message-error card-note'));
-    card.append(researchProgress(run));
-    const actions = node('div', undefined, 'harness-actions');
-    const view = node('button', '查看与对比', 'secondary-button'); view.type = 'button';
-    view.onclick = () => { researchSelected.add(identity); check.checked = true; renderResearchComparison(); refreshResearchDetails(); };
-    actions.append(view);
-    const exportButton = node('button', '导出当前结果', 'secondary-button'); exportButton.type = 'button';
-    exportButton.onclick = () => exportResearchRun(identity, exportButton); actions.append(exportButton);
-    if (['QUEUED', 'RUNNING', 'STOPPING'].includes(run.status)) actions.append(researchAction('在任务边界停止', '/api/scheduler/runs/stop', {run_id: identity}, '已请求在当前任务收尾后停止。'));
-    if (checkpointId || run.artifacts?.checkpoint) actions.append(researchAction('启用冻结策略', '/api/scheduler/activate', {run_id: identity}, '已请求启用该运行的兼容冻结策略。'));
-    card.append(actions); root.append(card);
+    const identity = runIdentity(run), card = node('article', undefined, 'status-card');
+    const head = node('div', undefined, 'card-heading'); head.append(node('strong', learnerNames[run.algorithm] || run.algorithm || '历史运行'), pill(run.status));
+    card.append(head, node('p', identity, 'research-identity'), node('p', run.started_at || run.created_at || '', 'card-meta'));
+    const view = node('button', '查看结果', 'secondary-button'); view.type = 'button';
+    view.onclick = () => { researchSelected.add(identity); renderResearchComparison(); void refreshResearchDetails(); };
+    const download = node('button', '导出结果', 'secondary-button'); download.type = 'button';
+    download.onclick = () => exportResearchRun(identity, download);
+    card.append(view, download); root.append(card);
   }
-  renderResearchComparison(); refreshResearchDetails();
+  renderResearchComparison();
 }
 
 async function refreshResearchDetails() {
@@ -3449,7 +2924,28 @@ async function refreshResearchDetails() {
     if (researchLoading.has(identity) || researchDetailVersions.get(identity) === version) return;
     researchLoading.add(identity);
     try {
-      researchDetails.set(identity, await api('/api/scheduler/runs/' + encodeURIComponent(identity)));
+      const cached = researchDetails.get(identity);
+      const historyLength = Array.isArray(cached?.history) ? cached.history.length : 0;
+      const curvesLength = Array.isArray(cached?.curves) ? cached.curves.length : 0;
+      const incremental = Boolean(cached && cached.view === 'summary' && !cached.error &&
+        Number.isFinite(cached.history_total) && Number.isFinite(cached.curves_total) &&
+        cached.history_total === historyLength && cached.curves_total === curvesLength);
+      const historyAfter = incremental ? cached.history_total : 0;
+      const curvesAfter = incremental ? cached.curves_total : 0;
+      const detailPath = (historyOffset, curvesOffset) => '/api/scheduler/runs/' + encodeURIComponent(identity) +
+        '?view=summary&history_after=' + historyOffset + '&curves_after=' + curvesOffset;
+      let result = await api(detailPath(historyAfter, curvesAfter));
+      const mismatch = result.history_after !== historyAfter || result.curves_after !== curvesAfter ||
+        (incremental && (result.history_total < historyLength || result.curves_total < curvesLength));
+      if (mismatch || (incremental && researchDetails.get(identity) !== cached)) {
+        researchDetails.delete(identity);
+        result = await api(detailPath(0, 0));
+        researchDetails.set(identity, result);
+      } else if (incremental) {
+        researchDetails.set(identity, {...result,
+          history: [...cached.history, ...(result.history || [])],
+          curves: [...cached.curves, ...(result.curves || [])]});
+      } else researchDetails.set(identity, result);
       researchDetailVersions.set(identity, version);
     } catch (error) { researchDetails.set(identity, {id: identity, error: error.message}); }
     finally { researchLoading.delete(identity); }
@@ -3536,14 +3032,18 @@ function jointRunSummary(card, run) {
     ' · 资源 ' + (joint.resource_policy ?? '—') + ' · 根调用槽 ' + (joint.capacity?.call_slots ?? '—') +
     ' · 副本上限 ' + (joint.capacity?.replica_cap ?? '—'), 'card-meta'));
   card.append(node('p', '调度范围：' + (joint.dispatch_scope === 'roots_and_boundaries' ? '根请求及已核验内部边界' : '根请求') +
-    ' · 工作集：' + (joint.working_sets ? '按任务准入，允许能力池大于驻留容量' : '历史配置') +
+    ' · 工作集：' + (joint.working_sets?.schema === 'task-working-sets/3'
+      ? '按已选调用及保留状态准入' : '查看本次冻结配置') +
     ' · 资源采样：' + (joint.observation ? '随窗口记录' : '未配置'), 'card-meta'));
   const budget = joint.budget_policy;
   if (budget) {
+    const points = Array.isArray(budget.points) ? budget.points : [];
+    const label = point => point.id + '（优先减少' + (point.objective === 'ram' ? '内存' : '显存') + '）';
     card.append(node('p', '预算条件 PPO · ' + (run.mode === 'freeze'
-      ? '冻结预算 ' + displayNumber(budget.freeze_budget) : '训练预算 ' + budget.latency_budgets.map(displayNumber).join('、')) +
-      ' · 累计任务秒尺度 ' + displayNumber(budget.task_seconds_scale) +
-      ' · 实例秒尺度 ' + displayNumber(budget.instance_seconds_scale), 'card-meta'));
+      ? '冻结点 ' + (budget.freeze_point || '未声明') : '训练点 ' + (points.map(label).join('、') || '查看冻结配置')) +
+      ' · 内存尺度 ' + displayNumber(budget.scales?.ram) + ' GiB·秒' +
+      ' · 显存尺度 ' + displayNumber(budget.scales?.vram) + ' GiB·秒' +
+      ' · 采集块 ' + (budget.blocks?.length ?? '未声明'), 'card-meta'));
     card.append(node('p', '各预算有效选择窗 ' + (run.budget_choice_windows || []).join(' / ') +
       ' · 参数更新 ' + (run.updates ?? '—'), 'card-meta'));
   }
@@ -3584,7 +3084,7 @@ function jointRunSummary(card, run) {
       node('td', displayNumber(item.parallelism?.parallel_fraction)),
       node('td', displayNumber(item.parallelism?.task_seconds)),
       node('td', displayNumber(item.parallelism?.instance_seconds)),
-      node('td', (item.resource_ops || []).length),
+      node('td', item.resource_ops_count ?? item.resource_ops?.length ?? 0),
       node('td', item.eligible ? '有效' : (item.exclusion_reason || '排除')));
     tbody.append(row);
   }
@@ -4124,58 +3624,20 @@ function hydrateModels() {
 }
 
 function renderHarnesses() {
-  const root = $('harness-list');
-  root.replaceChildren();
-  if (!(state.harnesses || []).length) return empty(root, '尚未配置 Harness 来源。');
-  for (const harness of state.harnesses) {
-    const card = node('article', undefined, 'harness-card');
-    card.dataset.itemId = harness.id;
-    const head = node('div', undefined, 'card-heading');
-    head.append(node('strong', harness.name || harness.address), pill(harness.status));
-    card.append(head, node('p', harness.address, 'card-note'));
-    if (harness.root) card.append(node('p', '本地源码目录：' + harness.root, 'resource-path'));
-    if (harness.error) card.append(node('p', textValue(harness.error), 'card-note message-error'));
-    const job = (state.analyses || []).find(item => item.id === harness.analysis_id);
-    const detached = harness.status === 'DETACHED';
-    const activeJob = (state.analyses || []).find(item => item.harness_id === harness.id && ['RUNNING', 'QUEUED', 'CANCELLING'].includes(item.status));
-    const busy = Boolean(activeJob) || analysisSubmitting.has(harness.id) || ['RUNNING', 'QUEUED', 'ANALYZING', 'CANCELLING'].includes(String(job?.status || harness.status).toUpperCase());
-    const action = node('button', busy ? '分析中…' : '分析 Harness', 'secondary-button');
-    const updateOption = document.createElement('input');
-    updateOption.type = 'checkbox';
-    updateOption.checked = sourceUpdateOptions.get(harness.id) || false;
-    updateOption.disabled = detached || busy || sourceUpdating.has(harness.id);
-    updateOption.onchange = () => sourceUpdateOptions.set(harness.id, updateOption.checked);
-    const updateLabel = node('label', undefined, 'form-note');
-    updateLabel.title = harness.revision_ref ? '检查引用：' + harness.revision_ref : '检查默认分支';
-    updateOption.title = updateLabel.title;
-    updateLabel.setAttribute('aria-disabled', String(updateOption.disabled));
-    updateLabel.append(updateOption, document.createTextNode(' 分析前检查上游更新；无变化时不重复分析'));
-    action.type = 'button';
-    action.disabled = detached || busy || harness.target_runtime?.status === 'PREPARING' || deploymentSubmitting.has('source/' + harness.id) ||
-      sourceUpdating.has(harness.id) || !isReady(state.models?.analysis);
-    if (harness.target_runtime?.status === 'PREPARING') action.title = '目标解释器正在准备，完成后再分析';
-    action.onclick = async () => {
-      analysisSubmitting.add(harness.id);
-      action.disabled = true;
-      updateOption.disabled = true;
-      updateLabel.setAttribute('aria-disabled', 'true');
-      action.textContent = '正在提交…';
-      try {
-        const result = await api(updateOption.checked ? '/api/analyze-update' : '/api/analyze', {harness_id: harness.id});
-        showNotice(result.update_status === 'UNCHANGED' ? '来源没有变化，未重复分析。' : 'Harness 分析已开始，来源与分析状态会持续更新。');
-      } catch (error) { showNotice(error.message); }
-      finally { analysisSubmitting.delete(harness.id); await refresh(); }
-    };
-    const actions = node('div', undefined, 'harness-actions');
-    actions.append(action);
-    const cancel = cancelAnalysisButton(harness, activeJob);
-    if (cancel) actions.append(cancel);
-    actions.append(inspectLink('analyses', {harness: harness.id}), sourceButton(harness), deleteSourceButton(harness));
-    if (detached) card.append(node('p', '已摘除；重新接入会使用已有分析，不重复调用分析模型。', 'card-note'));
-    if (!isReady(state.models?.analysis)) actions.append(node('span', '先配置分析模型', 'form-note'));
-    card.append(updateLabel, actions);
-    sourceEnvironment(card, harness);
-    harnessDependencies(card, harness);
+  const root = $('harness-list'); root.replaceChildren();
+  const sources = state.harnesses || [];
+  if (!sources.length) { empty(root, '尚未提交完整仓库。'); return; }
+  for (const source of sources) {
+    const job = (state.generations || []).filter(item => item.source_id === source.id)
+      .sort((a, b) => String(b.started_at).localeCompare(String(a.started_at)))[0];
+    const card = node('article', undefined, 'status-card');
+    const head = node('div', undefined, 'card-heading'); head.append(node('strong', source.name || source.address), pill(job?.status || source.status));
+    card.append(head, node('p', source.address || '', 'card-note'));
+    if (job) card.append(node('p', generationPhase(job.phase), 'card-meta'));
+    if (source.error || job?.error) card.append(node('p', source.error || job.error, 'message-error'));
+    const link = inspectLink('analyses', {harness: source.id}); link.textContent = '查看准备进度与实际结果'; card.append(link);
+    if (source.status !== 'DETACHED' && job?.status !== 'RUNNING' && job?.status !== 'AVAILABLE')
+      card.append(generationAction('准备此仓库能力', '/api/generations', {source_id: source.id}));
     root.append(card);
   }
 }
@@ -4316,48 +3778,18 @@ async function saveWeight(event) {
 
 async function addHarness(event) {
   event.preventDefault();
-  const form = event.currentTarget;
+  const form = event.currentTarget, status = $('harness-form-status');
   const body = {address: form.elements.address.value.trim()};
-  for (const key of ['revision', 'entry']) if (form.elements[key].value.trim()) body[key] = form.elements[key].value.trim();
-  const status = $('harness-form-status');
-  $('add-harness').disabled = true;
-  status.textContent = '正在接入…';
+  if (form.elements.revision.value.trim()) body.revision = form.elements.revision.value.trim();
+  $('add-harness').disabled = true; status.textContent = '正在提交仓库…';
   try {
-    if (form.elements.resources.value.trim()) {
-      body.resources = JSON.parse(form.elements.resources.value);
-      if (!Array.isArray(body.resources)) throw new Error('资源配置需要是 JSON 列表');
-      if (body.resources.some(item => typeof item !== 'string' && (!item || typeof item !== 'object' || Array.isArray(item) || typeof item.path !== 'string'))) {
-        throw new Error('每项资源需要路径字符串，或包含 path 的对象');
-      }
-    }
-    if (form.elements.configuration.value.trim()) {
-      const configuration = JSON.parse(form.elements.configuration.value);
-      const object = value => value && typeof value === 'object' && !Array.isArray(value);
-      if (!object(configuration) || Object.keys(configuration).some(key => key !== 'entries') ||
-          (configuration.entries !== undefined && !object(configuration.entries))) {
-        throw new Error('初始化配置需要 {"entries":{"入口ID":{...}}} 对象');
-      }
-      const rejectApiKey = value => {
-        if (Array.isArray(value)) { value.forEach(rejectApiKey); return; }
-        if (!object(value)) return;
-        for (const [key, item] of Object.entries(value)) {
-          if (key.replace(/[_\-\s]/g, '').toLowerCase() === 'apikey') throw new Error('初始化配置不接受 API Key，请使用模型配置或原项目环境变量');
-          rejectApiKey(item);
-        }
-      };
-      for (const entry of Object.values(configuration.entries || {})) {
-        if (!object(entry) || Object.keys(entry).some(key => !['fixed_arguments', 'constructor_arguments', 'initializers', 'binding_arguments'].includes(key)) ||
-            Object.values(entry).some(value => !object(value)) ||
-            (entry.initializers && Object.values(entry.initializers).some(value => !object(value)))) {
-          throw new Error('入口配置需要参数对象；initializers 按原初始化方法名填写参数对象');
-        }
-      }
-      rejectApiKey(configuration);
-      body.configuration = configuration;
+    const resources = form.elements.resources.value.trim();
+    if (resources) {
+      body.resources = JSON.parse(resources);
+      if (!Array.isArray(body.resources)) throw new Error('已有资源需要 JSON 列表');
     }
     await api('/api/harnesses', body);
-    form.reset();
-    status.textContent = '已接入，可开始分析';
+    form.reset(); status.textContent = '仓库已提交，后台正在自动准备能力。';
     await refresh();
   } catch (error) { status.textContent = error.message; }
   finally { $('add-harness').disabled = false; }
@@ -4367,18 +3799,16 @@ async function refresh() {
   if (refreshing) return;
   refreshing = true;
   try {
+    const previousTasks = state?.tasks || [];
     state = await api('/api/state');
-    await refreshRevisionDetails();
-    await refreshPreparationSummaries();
+    retainDisplacedTasks(previousTasks, state.tasks);
     connected = true;
     $('connection').textContent = '已连接';
     $('version').textContent = state.version ? '核心 ' + state.version : '';
     document.querySelector('.connection-dot').classList.remove('disconnected');
     hydrateModels();
-    hydrateResearch();
-    hydrateSceneTasks();
     updateInspectPage();
-    renderSection('profile', state.entry_profile, renderProfile, ['entry-profile-summary', 'config-entry-profile']);
+    renderSection('profile', state.protocol, renderProfile, ['entry-profile-summary', 'config-entry-profile']);
     managedServiceOptions();
     renderSection('connections', [resourceState().connections, resourceState().managed_services], renderConnections, ['connection-list']);
     renderSection('weights', resourceState().weights, renderWeights, ['weight-list']);
@@ -4386,15 +3816,12 @@ async function refresh() {
     renderSection('scheduler', state.scheduler, renderScheduler, ['scheduler-summary']);
     renderSection('research', [state.scheduler?.research, state.units, state.harnesses], renderResearch,
       ['research-readiness', 'research-run-list', 'research-comparison']);
-    renderSection('tasks', [visibleTasks(), taskDeleteBusy], renderTasks, ['task-list']);
-    renderSection('units', [visibleUnits(), state.harnesses, selectedSource()], renderUnits, ['unit-list']);
-    renderSection('deployments', [state.runtime_groups, resourceState().managed_services, state.gpu_devices, state.deployments, state.deployment_backend, state.image_retention, state.harnesses, state.units, state.analyses,
-      state.runtime_controller, selectedSource(), [...deploymentPreparation]], renderDeployments, ['deployment-list']);
-    renderSection('analyses', [state.analyses, state.harnesses, state.analysis_revisions, state.analysis_revisions_observation_pending, state.models?.analysis,
-      resourceState(), selectedSource(), [...sourceUpdating], [...revisionSelected], [...revisionDetails], [...revisionErrors], [...revisionBusy],
-      [...preparationSummaries], [...preparationErrors]], renderAnalyses, ['analysis-list']);
-    renderSection('harnesses', [state.harnesses, state.analyses, state.models?.analysis, resourceState(), [...analysisSubmitting], [...sourceUpdating],
-      [...deploymentPreparation]], renderHarnesses, ['harness-list']);
+    renderSection('tasks', [visibleTasks(), taskDeleteBusy, olderTasks.length, olderTasksCursor === undefined ? state.tasks_older : olderTasksCursor, olderTasksBusy], renderTasks, ['task-list']);
+    renderSection('units', [state.capabilities, state.harnesses, selectedSource()], renderUnits, ['unit-list']);
+    renderSection('deployments', [state.runtime_groups, state.capability_packages, resourceState(), state.gpu_devices,
+      state.deployment_backend, state.image_retention, selectedSource()], renderDeployments, ['deployment-list']);
+    renderSection('analyses', [state.generations, state.harnesses, selectedSource()], renderAnalyses, ['analysis-list']);
+    renderSection('harnesses', [state.harnesses, state.generations], renderHarnesses, ['harness-list']);
     const requestedJob = pendingRevisionId && (state.analysis_revisions || []).find(item => item.id === pendingRevisionId)?.base_analysis_id;
     const target = pendingSectionHash ? $(pendingSectionHash.slice(1)) : requestedJob ? $('analysis-revision-' + requestedJob) :
       pendingInspectItem ? [...document.querySelectorAll('[data-item-id]')].find(item => item.dataset.itemId === pendingInspectItem) : null;
@@ -4728,6 +4155,15 @@ function observerOpen(open) {
 }
 
 $('chat-form').onsubmit = sendMessage;
+$('stop-message').onclick = async () => {
+  const pending = pendingTask; if (!pending?.id || pending.cancelling) return;
+  pending.cancelling = true; updateComposer();
+  try {
+    await api('/api/chat/cancel', {task_id: pending.id});
+    if (pendingTask === pending) pending.output.meta.textContent = '已请求停止交付 · 远端停算等待实际确认';
+  } catch (error) { pending.cancelling = false; showNotice(error.message); }
+  updateComposer();
+};
 $('new-chat').onclick = () => resetChat();
 $('toggle-chat-history').onclick = () => {
   $('chat-history').hidden = !$('chat-history').hidden;
@@ -4737,7 +4173,6 @@ $('toggle-chat-history').onclick = () => {
 $('chat-history-search').oninput = () => {
   clearTimeout(historySearchTimer); historySearchTimer = setTimeout(loadChatHistory, 180);
 };
-$('scene-task-selector').onchange = updateComposer;
 $('chat-input').oninput = resizeComposer;
 $('chat-input').onkeydown = event => {
   if (event.key === 'Enter' && !event.shiftKey && !event.isComposing) {
@@ -4760,7 +4195,7 @@ for (const button of document.querySelectorAll('.save-role-credential')) button.
   kind.value = 'borrowed'; kindLabel.append(kind);
   const serviceLabel = node('label', '受管服务规格'); serviceLabel.id = 'connection-managed-service-label';
   const service = node('select'); service.name = 'managed_service_id'; serviceLabel.append(service);
-  serviceLabel.append(node('small', '用于符合条件的 Harness 服务依赖；普通对话与分析模型角色请选择云端或借用连接。'));
+  serviceLabel.append(node('small', '普通对话可按需准备和借用受管模型。仓库分析当前需要已可访问的连接。'));
   form.insertBefore(kindLabel, form.querySelector('.form-actions'));
   form.insertBefore(serviceLabel, form.querySelector('.form-actions'));
   kind.onchange = connectionResourceChanged;
@@ -4832,67 +4267,8 @@ $('weight-new').onclick = () => {
   const form = $('weight-form'); form.reset(); form.elements.id.value = '';
   $('weight-form-title').textContent = '新增权重资源'; $('weight-form-status').textContent = '';
 };
-$('research-form').onsubmit = saveResearch;
-$('research-start').onclick = startResearch;
-$('research-form').addEventListener('input', () => { researchDirty = true; });
-$('research-teacher-role').onchange = () => hydrateResearchChoices();
 $('research-filter').oninput = renderResearch;
 $('research-mode-filter').onchange = renderResearch;
-$('research-load-saved').onclick = () => {
-  const saved = researchState().config;
-  loadResearchConfig(saved?.config || saved || blankResearchConfig());
-  $('research-form-status').textContent = saved ? '已加载保存的配置。' : '尚无保存配置，请填写真实环境和评价资源。';
-};
-$('research-criteria').onchange = () => {
-  try {
-    const criteria = jsonField('research-criteria', '评价资源');
-    $('research-prompt').value = criteria.prompt || '';
-    $('research-teacher-role').value = criteria.teacher?.role || 'teacher';
-    hydrateResearchChoices();
-  } catch (error) { $('research-form-status').textContent = error.message; }
-};
-$('research-scene').onchange = () => {
-  try {
-    researchDraft.scene = jsonField('research-scene', '场景配置');
-    $('research-unit-options').dataset.options = '';
-    const selected = new Set(researchDraft.scene.unit_ids || []);
-    hydrateResearchChoices(false, selected);
-  } catch (error) { $('research-form-status').textContent = error.message; }
-};
-$('research-export').onclick = () => {
-  try { downloadJson(readResearchConfig(), 'seampact-run-config.json'); }
-  catch (error) { $('research-form-status').textContent = error.message; }
-};
-$('research-criteria-export').onclick = () => {
-  try { downloadJson(readResearchCriteria(), 'seampact-criterion.json'); }
-  catch (error) { $('research-form-status').textContent = error.message; }
-};
-$('research-import').onchange = async event => {
-  try {
-    const file = event.target.files[0]; if (!file) return;
-    const value = JSON.parse(await file.text());
-    if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('配置文件需要 JSON 对象');
-    loadResearchConfig(value.config || value); researchDirty = true;
-    $('research-form-status').textContent = '已导入到编辑区；保存或开始运行后生效。';
-  } catch (error) { $('research-form-status').textContent = error.message; }
-  finally { event.target.value = ''; }
-};
-$('research-criteria-import').onchange = async event => {
-  try {
-    const file = event.target.files[0]; if (!file) return;
-    const criteria = JSON.parse(await file.text());
-    if (!criteria || typeof criteria !== 'object' || Array.isArray(criteria)) throw new Error('评价文件需要 JSON 对象');
-    $('research-criteria').value = JSON.stringify(criteria, null, 2);
-    $('research-prompt').value = criteria.prompt || '';
-    $('research-teacher-role').value = criteria.teacher?.role || 'teacher';
-    researchDirty = true; hydrateResearchChoices();
-    $('research-form-status').textContent = '已导入完整评价资源；在途运行继续使用原副本。';
-  } catch (error) { $('research-form-status').textContent = error.message; }
-  finally { event.target.value = ''; }
-};
-$('open-research-configuration').onclick = () => {
-  navigatePage('/configuration?section=research');
-};
 $('harness-form').onsubmit = addHarness;
 $('operations-refresh').onclick = () => { operationsRequestVersion++; void refreshOperationalViews(true); };
 for (const id of ['operations-kind', 'operations-source']) $(id).onchange = () => {

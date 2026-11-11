@@ -1,6 +1,7 @@
 """Local research prototype API and standard conversation UI."""
 
 import json
+import shutil
 import socket
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -48,6 +49,12 @@ def make_server(platform, port=8880, host="127.0.0.1", public_port=None):
                     return self.send(200, dict(status="ok", version=__version__))
                 if path == "/api/state":
                     return self.send(200, platform.state())
+                if path == "/api/generations":
+                    return self.send(200, platform.generation.snapshot())
+                if path.startswith("/api/generations/"):
+                    return self.send(200, platform.generation.detail(path.rsplit("/", 1)[1]))
+                if path == "/api/execution":
+                    return self.send(200, platform.execution.status())
                 if path == "/api/operations/preflight":
                     query = parse_qs(urlsplit(self.path).query)
                     return self.send(200, preflight(platform, query.get("operation", ["update"])[0],
@@ -65,13 +72,44 @@ def make_server(platform, port=8880, host="127.0.0.1", public_port=None):
                     return self.send(200, platform.monitor.detail(identity,
                         offset=int(query["offset"][0]) if "offset" in query else None,
                         limit=int(query.get("limit", ["100"])[0])))
+                if path == "/api/tasks":
+                    query = parse_qs(urlsplit(self.path).query)
+                    return self.send(200, platform.tasks(
+                        before=int(query["before"][0]) if "before" in query else None,
+                        limit=int(query.get("limit", ["30"])[0])))
+                if path.startswith("/api/tasks/"):
+                    return self.send(200, platform.task(path.rsplit("/", 1)[1]))
                 if path == "/api/chats":
-                    query = parse_qs(urlsplit(self.path).query).get("q", [""])[0]
-                    return self.send(200, platform.chat.conversations(query))
+                    query = parse_qs(urlsplit(self.path).query)
+                    limit, offset = int(query.get("limit", ["0"])[0]), int(query.get("offset", ["0"])[0])
+                    if limit < 0 or offset < 0:
+                        raise ValueError("limit 与 offset 不能为负数")
+                    return self.send(200, platform.chat.conversations(query.get("q", [""])[0], limit or None, offset))
+                if path.startswith("/api/chat/"):
+                    parts = path.split("/")
+                    if len(parts) == 5 and parts[4] == "events":
+                        query = parse_qs(urlsplit(self.path).query)
+                        after = int(query.get("after", ["0"])[0])
+                        if after < 0:
+                            raise ValueError("事件序号不能为负数")
+                        return self.send(200, platform.chat.stream_events(parts[3], after=after))
+                    if len(parts) == 5 and parts[4] == "task":
+                        task = platform.store.get("task", parts[3])
+                        if not task:
+                            raise ValueError("没有这个任务")
+                        return self.send(200, {key: task.get(key) for key in
+                            ("id", "status", "response", "partial_response", "error", "latency_ms", "context_status", "context_events", "files", "artifacts", "cancel")})
                 if path.startswith("/api/chats/"):
                     return self.send(200, platform.chat.conversation(path.rsplit("/", 1)[1]))
                 if path == "/api/runtime/session":
                     return self.send(200, dict(session=platform.deployments.session))
+                if path.startswith("/api/artifacts/"):
+                    identity = path.rsplit("/", 1)[1]
+                    target = (platform.capabilities.artifacts.path(identity)
+                              if len(identity) == 64 and set(identity) <= set("0123456789abcdef") else None)
+                    if target is None or not target.is_file():
+                        raise ValueError("没有这个交付文件")
+                    return self.send_file(target)
                 if path == "/api/images":
                     return self.send(200, dict(**platform.images.snapshot(), **platform.images.inventory()))
                 if path.startswith("/api/analysis/revisions/"):
@@ -85,6 +123,10 @@ def make_server(platform, port=8880, host="127.0.0.1", public_port=None):
                 if path.startswith("/api/preprocessing/"):
                     return self.send(200, platform.store.get("preprocessing", path.rsplit("/", 1)[1]))
                 if path.startswith("/api/scheduler/runs/"):
+                    query = parse_qs(urlsplit(self.path).query)
+                    if query.get("view", ["full"])[0] == "summary":
+                        return self.send(200, platform.training.progress(path.rsplit("/", 1)[1],
+                            int(query.get("history_after", ["0"])[0]), int(query.get("curves_after", ["0"])[0])))
                     return self.send(200, platform.training.detail(path.rsplit("/", 1)[1]))
                 filename = {"/": "index.html", "/inspect": "index.html", "/configuration": "index.html",
                             "/app.js": "app.js", "/style.css": "style.css"}.get(path)
@@ -96,6 +138,18 @@ def make_server(platform, port=8880, host="127.0.0.1", public_port=None):
                 self.send(400, dict(error=str(error)))
             except Exception as error:
                 self.send(500, dict(error=str(error)))
+
+        def send_file(self, path):
+            try:
+                with path.open("rb") as stream:
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/octet-stream")
+                    self.send_header("Content-Length", str(path.stat().st_size))
+                    self.send_header("Cache-Control", "no-store")
+                    self.end_headers()
+                    shutil.copyfileobj(stream, self.wfile)
+            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                self.close_connection = True
 
         def send_record(self, path, filename):
             # Freeze byte count for active records; future samples remain in the session.
@@ -133,6 +187,16 @@ def make_server(platform, port=8880, host="127.0.0.1", public_port=None):
             try:
                 body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))).decode())
                 path = urlsplit(self.path).path
+                retired = {
+                    "/api/harnesses/bind-dependency", "/api/harnesses/check-dependency",
+                    "/api/harnesses/environment", "/api/units/policy", "/api/units/capability",
+                    "/api/analyze-update", "/api/analysis/resume", "/api/analysis/cancel",
+                    "/api/analysis/revisions", "/api/analysis/revisions/save", "/api/analysis/revisions/check",
+                    "/api/analysis/revisions/refine", "/api/analysis/revisions/install", "/api/analysis/revisions/feedback",
+                    "/api/harnesses/configure", "/api/harnesses/delete", "/api/plans", "/api/analysis/import",
+                    "/api/scheduler/config", "/api/scheduler/runs", "/api/scheduler/runs/stop", "/api/scheduler/activate"}
+                if path in retired:
+                    return self.send(410, dict(error="此旧执行入口已停用；请使用仓库生成、能力包和普通 Agent 入口。历史记录仍可读取。"))
                 if path == "/api/models":
                     platform.profiles.save_role(body["role"], body)
                     result = platform.profiles.public_roles()
@@ -160,13 +224,30 @@ def make_server(platform, port=8880, host="127.0.0.1", public_port=None):
                     result = platform.add_harness(body)
                 elif path == "/api/harnesses/environment":
                     result = platform.configure_environment(body)
+                elif path == "/api/capabilities/install":
+                    result = platform.capabilities.install(body["path"], body.get("bindings"))
+                elif path == "/api/capabilities/bind":
+                    result = platform.capabilities.bind(body["group_id"], body["bindings"])
+                    if result["availability"]["status"] != "NEEDS_INPUT":
+                        result["preparation"] = platform.capabilities.prepare(body["group_id"])
+                elif path == "/api/capabilities/prepare":
+                    result = platform.capabilities.prepare(body["group_id"], body)
+                elif path == "/api/capabilities/invoke":
+                    result = platform.execution.invoke(body["unit_id"], body["input"])
+                elif path == "/api/capabilities/detach":
+                    result = platform.capabilities.detach(body["group_id"])
                 elif path == "/api/units/policy":
                     result = platform.catalog.scheduling_policy(body)
                 elif path == "/api/units/capability":
                     result = platform.catalog.set_capability(body)
                 elif path == "/api/analyze":
-                    result = platform.analyze(body["harness_id"], body.get("preprocessing", "api"),
-                                              body.get("preprocessing_id"))
+                    result = platform.generation.start(body["harness_id"])
+                elif path == "/api/generations":
+                    result = platform.generation.start(body["source_id"])
+                elif path == "/api/generations/cancel":
+                    result = platform.generation.cancel(body["id"])
+                elif path == "/api/execution/config":
+                    result = platform.execution.configure(body)
                 elif path == "/api/analyze-update":
                     result = platform.analyze_update(body["harness_id"])
                 elif path == "/api/analysis/resume":
@@ -196,8 +277,11 @@ def make_server(platform, port=8880, host="127.0.0.1", public_port=None):
                 elif path == "/api/harnesses/configure":
                     result = platform.configure_harness(body)
                 elif path == "/api/chat":
-                    result = (platform.training.start_chat(body) if "scene_task_id" in body
-                              else platform.chat.start(body))
+                    if body.get("scene_task_id"):
+                        raise ValueError("旧场景执行已停用，请直接提交普通 Agent 任务")
+                    result = platform.chat.start(body)
+                elif path == "/api/chat/cancel":
+                    result = platform.chat.cancel(body["task_id"])
                 elif path == "/api/plans":
                     result = platform.chat.start_plan(body)
                 elif path == "/api/monitor/start":
@@ -226,7 +310,8 @@ def make_server(platform, port=8880, host="127.0.0.1", public_port=None):
                 elif path == "/api/scheduler/runs":
                     result = platform.training.start(body)
                 elif path == "/api/scheduler/runs/stop":
-                    result = platform.training.stop(body["run_id"])
+                    result = (platform.training.stop(body["run_id"], after_windows=body["after_windows"])
+                              if "after_windows" in body else platform.training.stop(body["run_id"]))
                 elif path == "/api/scheduler/activate":
                     result = platform.training.activate(body["run_id"])
                 elif path == "/api/analysis/export":
@@ -287,6 +372,8 @@ def make_server(platform, port=8880, host="127.0.0.1", public_port=None):
                     result = platform.deployments.local(body["group_id"])
                 elif path == "/api/runtime/worker":
                     result = platform.deployments.protocol(body)
+                elif path == '/api/runtime/birth':
+                    result = platform.deployments.managed_birth(body)
                 else:
                     return self.send(404, dict(error="没有这个接口"))
                 self.send(200, result)

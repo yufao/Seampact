@@ -7,6 +7,7 @@ import tempfile
 import textwrap
 import unittest
 import zipfile
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -93,6 +94,46 @@ class CompletionTests(unittest.TestCase):
         self.assertIs(type(result), subprocess.CompletedProcess)
         self.assertIs(result.seampact_completion, report)
         return result, report
+
+    def test_exclusive_output_claim_is_atomic_and_never_reused(self):
+        contract = dict(self.contract(), output_scope='fresh-parent/1')
+        arguments = dict(image='image.bin', result='request-a/result.json')
+        def claim(_):
+            try:
+                return before_completion(contract, arguments, self.root)
+            except ValueError:
+                return None
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            snapshots = list(executor.map(claim, range(2)))
+        self.assertEqual(sum(item is not None for item in snapshots), 1)
+        with self.assertRaisesRegex(ValueError, 'already claimed'):
+            before_completion(contract, arguments, self.root)
+
+    def test_exclusive_output_receipt_does_not_grant_lifecycle(self):
+        contract = dict(self.contract(), output_scope='fresh-parent/1')
+        arguments = dict(image='image.bin', result='request-b/result.json')
+        snapshot = before_completion(contract, arguments, self.root)
+        result = subprocess.run([sys.executable, str(self.script), '--input', 'image.bin',
+            '--output', arguments['result']], cwd=self.root, capture_output=True)
+        report = after_completion(snapshot, result)
+        self.assertEqual(report['task_status'], 'COMPLETE')
+        self.assertTrue(report['output_scope']['unchanged_and_single_output'])
+        self.assertEqual(report['output_scope']['lifecycle_permission'], 'NOT_GRANTED')
+        (self.root/'request-b/extra').write_text('unexpected')
+        self.assertEqual(after_completion(snapshot, result)['task_status'], 'INCOMPLETE')
+
+    def test_exclusive_output_rejects_parent_traversal_and_existing_parent(self):
+        contract = dict(self.contract(), output_scope='fresh-parent/1')
+        (self.root/'existing').mkdir()
+        for path in ('existing/result.json', 'unused/../claimed/result.json'):
+            with self.assertRaises(ValueError):
+                before_completion(contract, dict(image='image.bin', result=path), self.root)
+
+    def test_output_scope_must_use_the_checked_protocol(self):
+        inspector, entry = self.proposal()
+        entry['completion']['output_scope'] = 'trust-me'
+        with self.assertRaisesRegex(ValueError, 'unsupported output scope'):
+            check_completion(inspector, entry)
 
     def test_zero_exit_without_result_is_incomplete(self):
         result, report = self.run_cli('missing')

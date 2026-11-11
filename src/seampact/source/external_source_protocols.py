@@ -8,6 +8,7 @@ import ast
 import importlib.util
 
 from seampact.source.inspection import units
+from seampact.source.type_references import TypeReferences
 
 
 TORCH_NO_GRAD = "https://docs.pytorch.org/docs/stable/generated/torch.no_grad"
@@ -19,6 +20,70 @@ class ExternalSourceProtocols:
     def __init__(self, inspector):
         self.inspector = inspector
         self.trees, self.cache = {}, {}
+        self.type_references = TypeReferences(inspector, self.tree)
+        self.type_reference_facts = []
+        self.activation_scope = None
+        self._scope_used = False
+        self._scope_checker = None
+
+    def bind_activation(self, entry, candidate=None, *, checker=None):
+        """Bind one independently collected upper bound before source replay.
+
+        An incomplete collector falls back to the full frozen source domain.
+        Even a complete source bound carries an independent original-worker
+        obligation; it does not turn source non-mutation into runtime permission.
+        """
+        from seampact.source.activation_scope import ActivationScope
+        self.activation_scope = ActivationScope(self.inspector, entry, candidate)
+        self._scope_used, self._scope_checker = False, checker
+        self.cache.clear()
+        self.type_references.bind_activation(self.activation_scope, require_scope=self._require_scope)
+        return self.activation_scope.requirements()
+
+    def _require_scope(self):
+        """Emit a target premise only when a failed full scan is narrowed."""
+        from seampact.source.activation_scope import RULE, GAP
+        from seampact.source.call_value_conditions import digest
+        if self._scope_used or self.activation_scope is None or not self.activation_scope.closed:
+            return
+        self._scope_used = True
+        self.type_references._scope_used = True
+        requirement = self.activation_scope.requirements()
+        checker = self._scope_checker
+        if checker is not None:
+            path = self.activation_scope.entry.get('path')
+            if path in self.inspector.files and path.endswith('.py'):
+                try:
+                    tree = self.tree(path)
+                except (SyntaxError, ValueError, KeyError, OSError):
+                    return requirement
+                if not tree.body:
+                    return requirement
+                node = tree.body[0]
+                checker.protocol(RULE, path, node, target_requirements=requirement,
+                    operation='independent conservative original source activation upper bound')
+                if self.activation_scope.closed:
+                    context = checker.call_context
+                    verified = getattr(context, 'runtime_verified', ()) if context is not None else ()
+                    if (type(verified) is not tuple or any(type(value) is not str for value in verified)
+                            or digest(requirement) not in verified):
+                        checker.negative_gap(path, node, GAP)
+        return requirement
+
+    def source_paths(self):
+        return (self.activation_scope.paths() if self._scope_used else
+                tuple(sorted(path for path in self.inspector.files if path.endswith('.py'))))
+
+    def activation_diagnostic(self):
+        if self.activation_scope is None:
+            return None
+        return dict(self.activation_scope.requirements(), source_domain_restricted=self._scope_used)
+
+    def type_reference(self, path, operation, operand, qualified=None):
+        fact = self.type_references.check(path, operation, operand, qualified)
+        if fact not in self.type_reference_facts:
+            self.type_reference_facts.append(fact)
+        return fact
 
     def tree(self, path):
         if path not in self.trees:
@@ -33,9 +98,27 @@ class ExternalSourceProtocols:
         """
         if qualified in self.cache:
             return self.cache[qualified]
+        paths = tuple(sorted(path for path in self.inspector.files if path.endswith('.py')))
+        valid = self._unmodified(qualified, paths)
+        if (not valid and self.activation_scope is not None and self.activation_scope.closed
+                and self.activation_scope.paths() != paths):
+            valid = self._unmodified(qualified, self.activation_scope.paths())
+            if valid:
+                self._require_scope()
+        self.cache[qualified] = valid
+        return valid
+
+    def _unmodified(self, qualified, paths):
         module, _, attribute = qualified.partition(".")
+        local_bindings = {}
+        parts = qualified.split('.')
+        for end in range(1, len(parts)):
+            for suffix in ('.py', '/__init__.py'):
+                source = '/'.join(parts[:end]) + suffix
+                if source in self.inspector.files:
+                    local_bindings[source] = (parts[end], '.'.join(parts[:end + 1]))
         valid = True
-        for path in sorted(self.inspector.files):
+        for path in paths:
             if not path.endswith(".py"):
                 continue
             try:
@@ -44,6 +127,9 @@ class ExternalSourceProtocols:
                 valid = False
                 break
             aliases = {}
+            if path in local_bindings:
+                local, origin = local_bindings[path]
+                aliases[local] = {origin}
             for node in ast.walk(tree):
                 if isinstance(node, ast.Import):
                     for alias in node.names:
@@ -60,6 +146,12 @@ class ExternalSourceProtocols:
                     return {name + "." + node.attr for name in names(node.value)}
                 return set()
 
+            def type_names(node):
+                direct = names(node)
+                if direct:
+                    return direct
+                return set().union(*(type_names(child) for child in ast.iter_child_nodes(node)))
+
             # Resolve plain aliases to a fixed point within the finite source.
             for _ in range(len(aliases) + 1):
                 changed = False
@@ -75,6 +167,13 @@ class ExternalSourceProtocols:
                     break
             for node in ast.walk(tree):
                 mutated = set()
+                if isinstance(node, ast.ExceptHandler) and node.type is not None:
+                    for target in type_names(node.type):
+                        if target == qualified or target.startswith(qualified + '.'):
+                            self.type_reference(path, node, node.type, target)
+                            # A source-position fact does not close the SDK
+                            # object's runtime identity for this bool guard.
+                            mutated.add(qualified)
                 if isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
                     targets = node.targets if isinstance(node, ast.Assign) else [node.target]
                 elif isinstance(node, ast.Delete):
@@ -104,13 +203,16 @@ class ExternalSourceProtocols:
                     # could mutate it; retain an unsupported binding instead.
                     for argument in [*node.args, *(item.value for item in node.keywords)]:
                         if names(argument) & {module, qualified}:
+                            if len(node.args) == 2 and node.args[1] is argument and qualified in names(argument):
+                                # SOURCE_CHECKED describes one source operand,
+                                # not runtime identity or boolean permission.
+                                self.type_reference(path, node, argument, qualified)
                             mutated.add(qualified)
                 if any(name == qualified or name.startswith(qualified + ".") for name in mutated):
                     valid = False
                     break
             if not valid:
                 break
-        self.cache[qualified] = valid
         return valid
 
     def lazy_guard(self, path, function, name):
@@ -152,7 +254,7 @@ class ExternalSourceProtocols:
                 # Aliasing, returning, configuring, or exposing the singleton
                 # would need another protocol for its possible mutations.
                 return None
-        for source in sorted(self.inspector.files):
+        for source in self.source_paths():
             if not source.endswith(".py"):
                 continue
             source_tree = self.tree(source)

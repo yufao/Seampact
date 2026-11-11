@@ -21,6 +21,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from seampact.hosting.deployment import Deployments
 from seampact.source.inspection import Inspector
 from seampact.scheduling.lifecycle import RULE, build_lifecycle_evidence
+from seampact.source.lifecycle_domains import EXACT_REQUEST_CODEC
 from seampact.runtime import Coordinator, OwnerRuntime, ProtocolError
 from seampact.store import Store
 from seampact.units import UnitCatalog
@@ -122,6 +123,42 @@ class NativeLifecycleTests(unittest.TestCase):
                 reason = lifecycle["source_evidence"]["members"][0]["reason"]
                 self.assertTrue("mutation" in reason or "AugAssign" in reason, reason)
 
+    def with_withheld_root(self, source):
+        source='class Context:\n    def __init__(self):\n        pass\n\n'+source.replace('def withheld(context):','def withheld(context: "Context"):')
+        root,inspector,candidate=self.freeze(source)
+        candidate['entries'].append(dict(id='withheld',path='original.py',symbol='withheld',kind='function',boundary_ids=['withheld-W']))
+        candidate['boundaries'].append(dict(id='withheld-W',path='original.py',symbol='withheld',mode='W'))
+        candidate['runtime_groups']=[dict(entries=['predict','withheld'])]
+        return root,inspector,candidate
+
+    def test_lifecycle_domain_keeps_but_does_not_admit_an_unhosted_root(self):
+        _,inspector,candidate=self.with_withheld_root(SOURCE+'\ndef withheld(context):\n    return context\n')
+        report=self.report(inspector,candidate)
+        group=report['runtime_groups']['groups'][0]
+        self.assertEqual(group['entries'],['predict','withheld'])
+        self.assertEqual(group['host']['host_entries'],['predict'])
+        evidence=group['contract']['lifecycle']['source_evidence']
+        self.assertEqual(evidence['admitted_roots'],['predict'])
+        self.assertEqual(evidence['members'][1]['status'],'WITHHELD')
+        self.assertEqual(group['contract']['lifecycle']['replicate']['status'],'SUPPORTED')
+        changed=json.loads(json.dumps(candidate));changed['entries'][1]['description']='still withheld'
+        other=self.report(inspector,changed)['runtime_groups']['groups'][0]['contract']['lifecycle']['source_evidence']
+        self.assertNotEqual(evidence['binding_digest'],other['binding_digest'])
+
+    def test_unhosted_root_does_not_hide_a_reachable_effect(self):
+        source=SOURCE.replace('return dot(values, self.weights) + self.bias','return withheld(values)')
+        source+='\ndef withheld(context):\n    print(context)\n    return 0.0\n'
+        _,inspector,candidate=self.with_withheld_root(source)
+        group=self.report(inspector,candidate)['runtime_groups']['groups'][0]
+        self.assertEqual(group['contract']['lifecycle']['replicate']['status'],'UNKNOWN')
+        evidence=group['contract']['lifecycle']['source_evidence']
+        self.assertEqual(evidence['members'][0]['status'],'UNKNOWN')
+
+    def test_unhosted_root_does_not_hide_module_initialization_effect(self):
+        _,inspector,candidate=self.with_withheld_root(SOURCE+'\ndef withheld(context):\n    return context\n\nprint("initialization")\n')
+        group=self.report(inspector,candidate)['runtime_groups']['groups'][0]
+        self.assertEqual(group['contract']['lifecycle']['replicate']['status'],'UNKNOWN')
+
     def test_module_initialization_and_transitive_import_effects_are_covered(self):
         for helper, expected in (("import os\n" + textwrap.dedent(HELPER), "external import"),
                                  (textwrap.dedent(HELPER) + "\nprint('effect')\n", "module initialization effect")):
@@ -200,7 +237,7 @@ class NativeLifecycleTests(unittest.TestCase):
                      check=self.report(inspector, candidate)["entries"][0])]
         imported = inspector.snapshots / inspector.files["helper.py"]["sha256"]
         imported.write_bytes(b"print('changed snapshot')\n")
-        rebuilt = build_lifecycle_evidence(inspector, rows, ["predict"])
+        rebuilt = build_lifecycle_evidence(inspector, rows, ["predict"], request_codec=EXACT_REQUEST_CODEC)
         self.assertEqual(rebuilt["checks"]["request_isolation"]["status"], "UNKNOWN")
         self.assertIn("frozen source digest changed", rebuilt["members"][0]["reason"])
 

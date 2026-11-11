@@ -22,6 +22,7 @@ from seampact.runtime import Coordinator, OwnerRuntime, ProtocolError
 from seampact.store import Store
 from seampact.units import UnitCatalog
 from seampact.worker import Worker
+from seampact.source.record_ports import FrozenRecordPorts
 
 
 class CliGroupResultTests(unittest.TestCase):
@@ -52,6 +53,7 @@ class CliGroupResultTests(unittest.TestCase):
                 group = catalog.inspect_candidate(inspector, candidate)['runtime_groups']['groups'][0]
                 self.assertEqual(group['host']['status'], 'HOST_CHECKED')
                 worker = Worker.__new__(Worker)
+                worker.record_ports = FrozenRecordPorts(inspector)
                 worker.catalog, worker.store, worker.runtime = catalog, store, runtime
                 worker.profile, worker.units = GROUP_PROFILE['id'], {unit['id']}
                 worker.session, worker.instance, worker.generation, worker.process_nonce = 'session', 'instance', 0, 'nonce'
@@ -162,7 +164,7 @@ class CliGroupResultTests(unittest.TestCase):
         for args in ('command', ('command', 'argument'), [b'command', b'argument']):
             process = subprocess.CompletedProcess(args, -9, 'text', None)
             self.assertEqual(vars(self.transfer(process)), vars(process))
-        self.assertEqual(PORT_CODEC['id'], 'group-port/2')
+        self.assertEqual(PORT_CODEC['id'], 'group-port/3')
         self.assertEqual(GROUP_PROFILE['codec'], PORT_CODEC['id'])
 
     def test_unknown_attributes_subclasses_and_nonprocess_objects_are_rejected(self):
@@ -217,7 +219,7 @@ class CliGroupResultTests(unittest.TestCase):
                 checked = catalog.inspect_candidate(inspector, candidate)
                 group = checked['runtime_groups']['groups'][0]
                 self.assertEqual(group['host']['status'], 'HOST_CHECKED')
-                self.assertEqual(group['host']['members']['cli']['ports']['codec'], 'group-port/2')
+                self.assertEqual(group['host']['members']['cli']['ports']['codec'], 'group-port/3')
                 process = catalog.invoke(unit['id'], dict(value='actual invocation'))
                 restored = self.transfer(process)
                 self.assertEqual(restored.returncode, 0, restored.stderr)

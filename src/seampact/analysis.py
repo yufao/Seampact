@@ -61,6 +61,7 @@ binding_program格式：{path,unit,scope:"原顶层同步函数",call_line:原re
 完整前缀从原scope首句到原request之前按原序执行，不跳过中间检查，不把每request构造改成共享驻留。entry.path/symbol仍指向原有效入口实现；构造程序path可不同。原分支/循环/try/清理等未被此直线前缀覆盖时保留具体未决。profile只来自用户entry_profile，不能由候选自填通过。
 entry可提供resources:["实际路径"或{"path":"实际路径"}]；缺少运行资源时保留为MISSING，不下载或生成替代数据。
 CLI只提交仓库实际脚本和启动参数。复杂参数或缺依赖明确missing，不写替代算法。
+CLI的kind为cli，另附command字符串数组；symbol只可为__main__、script、<script>或原脚本文件名。command前两项中须恰好一项指向entry.path的原脚本，解释器保持原启动方式，任务占位符各占完整argv项。当前Python参数识别限同文件字面add_argument，console/-m、跨文件parser、optparse及Click/Typer不能据此改写成原脚本调用；不能表达就保留缺口。上述是既有检查器格式，不代替依赖、W/H/R、资源、结果或生命周期证明。
 只有能绑定真实输入/初始化/返回的原生入口可供新任务调用；内部边界仍保留controller/owner，不独立启动内部步骤。
 每个entry可附capability能力卡，描述实际入口而非预言收益：{schema:"capability-card/1",goal:"真实功能",
 roles:["retrieve/check/revise/detect中的实际类别"],modalities:["text/image/tool_text"],
@@ -102,7 +103,7 @@ TOOLS = [
     function("inspect_harness", "按冻结文件分页提取Harness多轴特征、证据及调查配方；功能类别为线索，不授予权限", {
         "path":{"type":"string"},"offset":{"type":"integer"},"count":{"type":"integer"}}, []),
     function("list_source", "分页列出已冻结工件；页大小可自行选择", {"offset":{"type":"integer"},"count":{"type":"integer"}}, []),
-    function("read_file", "读取冻结文件的源码；笔记本只提供源码单元，不发输出", {
+    function("read_file", "读取冻结文件的源码；笔记本只提供源码单元，不发输出。完全重复页在原文仍处于当前上下文时返回精确引用；原文移出后正常重读", {
         "path":{"type":"string"},"unit":{"type":"string"},"start":{"type":"integer"},"count":{"type":"integer"}}, ["path"]),
     function("inspect_symbols", "AST 独立源码事实，保留未知动态闭包", {"path":{"type":"string"}}, ["path"]),
     function("inspect_construction", "原函数逐语句的构造/调用坐标与定义使用事实，不执行源代码", {
@@ -145,6 +146,90 @@ def source_io_error(tool, error):
                 error=type(error).__name__, reason=reason, admission_granted=False,
                 detail="Source evidence is unavailable in the registered/frozen scope. "
                        "Refine the source request or record the dependency as UNKNOWN.")
+
+
+def _read_file_reply(source_version, arguments, result, messages, seen, call_id):
+    """Reference an exact full reply only while it remains in active messages."""
+    if (not isinstance(source_version, str) or not source_version
+            or not isinstance(result, dict) or not isinstance(result.get("lines"), list)
+            or not {"path", "unit", "sha256", "start", "total_lines", "next_line"} <= set(result)):
+        return result
+    content = json.dumps(result, ensure_ascii=False, separators=(',', ':'))
+    response_digest = digest(content.encode("utf-8"))
+    identity = (source_version, content_digest(arguments), response_digest)
+    previous = seen.get(identity)
+    if previous and previous["tool_call_id"] != call_id:
+        current = [message for message in messages if message.get("role") == "tool"
+                   and message.get("tool_call_id") == previous["tool_call_id"]]
+        if len(current) == 1 and current[0].get("content") == content:
+            return dict(schema="source-read-reference/1", source_version=source_version,
+                **{key: result[key] for key in ("path", "unit", "sha256", "start", "total_lines", "next_line")},
+                returned_lines=len(result["lines"]), reference=dict(tool_call_id=previous["tool_call_id"],
+                    arguments=copy.deepcopy(arguments), response_sha256=response_digest,
+                    original_in_current_context=True),
+                detail="该 tool_call_id 的完整 read_file 正文仍在当前上下文；复用其精确源码行，不重复内联。")
+    seen[identity] = dict(tool_call_id=call_id)
+    return result
+
+
+def _restore_read_file_references(messages, references):
+    """Compaction may retain a reference after archiving its original body."""
+    for message in messages:
+        saved = references.get(message.get("tool_call_id")) if message.get("role") == "tool" else None
+        if saved and message.get("content") == saved["reference_content"]:
+            original = [row for row in messages if row.get("role") == "tool"
+                        and row.get("tool_call_id") == saved["original_call_id"]]
+            if len(original) != 1 or original[0].get("content") != saved["full_content"]:
+                message["content"] = saved["full_content"]
+
+
+def _recover_read_file_references(inspector, messages):
+    """Rebuild only references whose exact original evidence is still visible."""
+    recovered = {}
+    for message in messages:
+        if message.get("role") != "tool":
+            continue
+        content = message.get("content")
+        try:
+            reply = json.loads(content)
+        except (ValueError, TypeError):
+            if isinstance(content, str) and "source-read-reference/1" in content:
+                raise ValueError("已有 read_file 引用无法解析，不能宣称原文可见") from None
+            continue
+        if not isinstance(reply, dict) or reply.get("schema") != "source-read-reference/1":
+            continue
+        try:
+            version = inspector.request.get("source_version")
+            if not isinstance(version, str) or not version or reply["source_version"] != version:
+                raise ValueError("source identity")
+            reference = reply["reference"]
+            original_id, current_id = reference["tool_call_id"], message["tool_call_id"]
+            if original_id == current_id or reference["original_in_current_context"] is not True:
+                raise ValueError("reference identity")
+            original = [row for row in messages if row.get("role") == "tool" and row.get("tool_call_id") == original_id]
+            if (len(original) != 1
+                    or sum(row.get("role") == "tool" and row.get("tool_call_id") == current_id for row in messages) != 1):
+                raise ValueError("ambiguous tool reply")
+            full_content = original[0]["content"]
+            full = json.loads(full_content)
+            if (not isinstance(full, dict) or not isinstance(full.get("lines"), list)
+                    or digest(full_content.encode("utf-8")) != reference["response_sha256"]
+                    or any(reply[key] != full[key] for key in ("path", "unit", "sha256", "start", "total_lines", "next_line"))
+                    or reply["returned_lines"] != len(full["lines"])
+                    or inspector.files[full["path"]]["sha256"] != full["sha256"]):
+                raise ValueError("full response identity")
+            arguments = reference["arguments"]
+            if not isinstance(arguments, dict):
+                raise ValueError("read arguments")
+            for identity in (original_id, current_id):
+                calls = [call for row in messages for call in row.get("tool_calls", []) if call.get("id") == identity]
+                if (len(calls) != 1 or calls[0].get("function", {}).get("name") != "read_file"
+                        or content_digest(json.loads(calls[0]["function"]["arguments"])) != content_digest(arguments)):
+                    raise ValueError("original read arguments")
+            recovered[current_id] = dict(original_call_id=original_id, reference_content=content, full_content=full_content)
+        except (ValueError, KeyError, TypeError, AttributeError):
+            raise ValueError("已有 read_file 引用缺少同一冻结源码的唯一精确正文或原调用，停止发送") from None
+    return recovered
 
 
 class AnalysisCancelled(Exception):
@@ -194,9 +279,21 @@ class AnalysisJobs:
     @staticmethod
     def can_resume(job):
         """Only an unanswered model request after complete tool replies can continue."""
-        if (not job or job.get("status") not in {"FAILED", "INTERRUPTED"} or job.get("submitted") is not None
+        if (not job or job.get("status") not in {"FAILED", "INTERRUPTED", "CANCELLED"} or job.get("submitted") is not None
                 or type(job.get("rounds")) is not int or job["rounds"] < 1):
             return False
+        timings = job.get("timings")
+        last = timings[-1] if isinstance(timings, list) and timings and isinstance(timings[-1], dict) else {}
+        unknown = job.get("unreported_usage")
+        cancelled_request = (job.get("status") == "CANCELLED" and job.get("phase") == "model_request"
+            and not job.get("active_operation")
+            and isinstance(job.get("cancel_requested_at"), str) and bool(job["cancel_requested_at"])
+            and isinstance(job.get("cancelled_at"), str) and bool(job["cancelled_at"])
+            and isinstance(unknown, dict) and unknown.get("status") == "UNKNOWN"
+            and unknown.get("reason") == "cancelled_before_model_response"
+            and last.get("phase") == "model_request" and last.get("outcome") == "cancelled"
+            and last.get("stage") == job.get("pipeline_stage", "analysis")
+            and type(last.get("round")) is int and last["round"] == job["rounds"] + 1)
         transport_failure = (job.get("failure_phase") in {"model_request", "context_compaction"}
             and job.get("error_kind") in {"transport", "response_incomplete"})
         legacy_incomplete = (not job.get("failure_phase") and not job.get("error_kind")
@@ -207,8 +304,10 @@ class AnalysisJobs:
             and (bool(job.get('context_scope')) or (bool(job.get("last_check"))
                 and job["last_check"].get("stage") == job.get("pipeline_stage")
                 and job["last_check"].get("report_ref") in job.get("report_refs", []))))
-        if not (transport_failure or legacy_incomplete or interrupted_request or context_recovery):
+        if not (transport_failure or legacy_incomplete or interrupted_request or context_recovery or cancelled_request):
             return False
+        if job.get("status") == "CANCELLED" and not cancelled_request:
+            return False  # A cancelled tool batch/submission is not replayed.
         messages = job.get("messages")
         rules = PREPROCESS_RULES if job.get("pipeline_stage") == "preprocessing" else RULES
         if (not isinstance(messages, list) or not messages
@@ -240,6 +339,12 @@ class AnalysisJobs:
                         return False
                     seen.add(identity)
                     pending.add(identity)
+        if cancelled_request:
+            size = job.get("last_request_size")
+            if (not isinstance(size, dict) or type(size.get("message_characters")) is not int
+                    or type(size.get("request_bytes")) is not int or size["request_bytes"] <= 0
+                    or size["message_characters"] != sum(len(json.dumps(m, ensure_ascii=False)) for m in messages)):
+                return False
         return not pending
 
     @staticmethod
@@ -454,6 +559,17 @@ class AnalysisJobs:
             job.update(resumed_from=resume["id"],
                        prior_rounds=resume.get("prior_rounds", 0) + resume["rounds"],
                        resumed_model_binding=copy.deepcopy(resume.get("model_binding")))
+            # A continuation is a new request, not evidence that the abandoned
+            # prior provider request finished or was free. Keep its uncertainty
+            # explicit and separate from this attempt's usage/cost observations.
+            prior_unknown = copy.deepcopy(resume.get("prior_unreported_usage", []))
+            if resume.get("unreported_usage"):
+                prior_unknown.append(dict(analysis_id=resume["id"],
+                    pipeline_stage=resume.get("pipeline_stage", "analysis"),
+                    usage=copy.deepcopy(resume["unreported_usage"]),
+                    scope="PRIOR_ATTEMPT_ONLY; remote completion and cost are not established"))
+            if prior_unknown:
+                job["prior_unreported_usage"] = prior_unknown
             job['report_refs'] = list(resume.get('report_refs', []))
             if resume.get('context_scope'):
                 job['context_scope'] = resume['context_scope']
@@ -641,6 +757,8 @@ class AnalysisJobs:
         started = stage_started = time.perf_counter()
         memory = ContextMemory(self.store, job.setdefault('context_scope', 'analysis/' + job['id']))
         memory.calibration = copy.deepcopy(job.get('context_calibration'))
+        read_file_replies = {}
+        read_file_references = {}
         def summarize(messages, selected_profile):
             job['phase'] = 'context_compaction'
             job['context_calls'] = job.get('context_calls', 0) + 1
@@ -655,8 +773,12 @@ class AnalysisJobs:
             job.setdefault('context_events', []).append(event)
             job['usage'][-1] = event.get('usage')
             job['usage_by_stage'][job.get('pipeline_stage', 'analysis')][-1] = event.get('usage')
+            if event.get('status') == 'RESPONSE_RECEIVED':
+                job['phase'] = 'context_preparation'
             self._save_job(job, cancellation, 'context_compaction_finished')
         try:
+            job["phase"] = "context_reference_recovery"
+            read_file_references.update(_recover_read_file_references(inspector, job["messages"]))
             if not profile.get("capabilities") and profile.get("provider") == "deepseek":
                 try:
                     job["phase"] = "model_metadata"
@@ -675,8 +797,12 @@ class AnalysisJobs:
                 tools = SOURCE_TOOLS + PREPROCESS_TOOLS if stage == "preprocessing" else TOOLS
                 if job.get("revision_id"):
                     tools = tools + [REVISION_FACT_TOOL]
+                job['phase'] = 'context_preparation'
                 job['messages'], job['context_status'] = memory.prepare(profile, job['messages'], tools, summarize, record,
                     force=job.pop('force_context_compaction', False))
+                _restore_read_file_references(job['messages'], read_file_references)
+                if job['context_status'].get('compacted'):
+                    job['context_status'].update(memory.check_bound(profile, job['messages'], tools))
                 job['context_archives'] = memory.references()
                 job['phase'] = 'model_request'
                 body = completion_body(profile, job["messages"], tools)
@@ -790,6 +916,14 @@ class AnalysisJobs:
                             else:
                                 result = self._await_operation(lambda: getattr(inspector, name)(**args),
                                                                cancellation, job, "source_tools", name)
+                                if name == "read_file":
+                                    reply = _read_file_reply(inspector.request.get("source_version"), args, result,
+                                        job["messages"], read_file_replies, call["id"])
+                                    if reply is not result:
+                                        read_file_references[call["id"]] = dict(
+                                            original_call_id=reply["reference"]["tool_call_id"],
+                                            reference_content=json.dumps(reply, ensure_ascii=False, separators=(',', ':')),
+                                            full_content=json.dumps(result, ensure_ascii=False, separators=(',', ':')))
                         else:
                             raise ValueError("unsupported tool")
                     except OSError as error:

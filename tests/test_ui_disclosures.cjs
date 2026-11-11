@@ -41,6 +41,7 @@ function load() {
     document: {createElement: tag => new Element(tag), createTextNode: text => { const item = new Element('span'); item.textContent = text; return item; }, getElementById: id => roots[id] || Object.values(roots).flatMap(descendants).find(item => item.id === id),
       querySelector: selector => selector === '.observer-scroll' ? roots.scroller : roots.config},
     inspectPage: true, inspectView: 'analyses', inspectQuery: new URLSearchParams(), state: {}, taskDeleteBusy: false,
+    olderTasks: [], olderTasksCursor: undefined, olderTasksBusy: false,
     detailStates: new Map(), renderedSections: new Map(), capabilityDrafts: new Map(),
     deploymentPreparation: new Map(), deploymentDrafts: new Map(), deploymentSubmitting: new Set(), analysisSubmitting: new Set(), sourceUpdating: new Set(), sourceUpdateOptions: new Map(),
     revisionSelected: new Map(), revisionVersions: new Map(), revisionBusy: new Set(), revisionErrors: new Map(),

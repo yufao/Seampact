@@ -11,6 +11,7 @@ import math
 import time
 
 from seampact.providers import Transport, completion_body, completion_parameters, image_evidence, model_request_scope
+from seampact.evidence_metrics import derive, validate_derivation
 
 
 TEACHER_RULES = """You evaluate actual task results using the supplied frozen criteria.
@@ -96,7 +97,11 @@ def validate_criteria(criteria):
         if dimension["level"] == "module" and not isinstance(dimension.get("unit_id"), str):
             raise ValueError(f"metric {identity}: module level requires an actual unit_id")
         if dimension["provider"] == "program":
-            if not isinstance(dimension.get("binding"), str) or not dimension["binding"]:
+            if "derivation" in dimension:
+                validate_derivation(dimension["derivation"])
+            if "binding" in dimension and (not isinstance(dimension["binding"], str) or not dimension["binding"]):
+                raise ValueError(f"metric {identity}: program binding must be a nonempty string")
+            if (not isinstance(dimension.get("binding"), str) or not dimension["binding"]) and "derivation" not in dimension:
                 raise ValueError(f"metric {identity}: specify an existing program metric binding")
         else:
             if dimension.get("kind") == "cost":
@@ -243,14 +248,18 @@ def evaluate(profiles, criteria, evidence, program_metrics, *, transport=None):
         if dimension["provider"] == "teacher":
             pending.append(dimension)
             continue
-        binding = dimension["binding"]
+        binding = dimension.get("binding")
         if binding not in program_metrics:
-            metrics[identity] = _metric(dimension, spec, reason="program binding unavailable: " + binding)
-            continue
-        value = program_metrics[binding]
+            if "derivation" not in dimension:
+                metrics[identity] = _metric(dimension, spec, reason="program binding unavailable: " + str(binding))
+                continue
+            value = derive(dimension["derivation"], evidence)
+            raw.setdefault("program_derivations", {})[identity] = value
+        else:
+            value = program_metrics[binding]
         if isinstance(value, dict):
             status = value.get("status", "KNOWN")
-            reason = value.get("reason", "program binding: " + binding)
+            reason = value.get("reason", "program binding: " + str(binding))
             refs = value.get("evidence", [binding])
             if status != "KNOWN":
                 # Runtime evaluators cannot silently waive an applicable task.

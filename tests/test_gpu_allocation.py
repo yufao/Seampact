@@ -162,7 +162,7 @@ class GPUAllocationTests(unittest.TestCase):
         catalog = SimpleNamespace(snapshot_resources=lambda: {}, require_operation=lambda *args: dict(contract_digest="typed"),
             placement={self.unit["id"]: dict(contract_digest="contract", gpu_devices=[B])})
         profiles = SimpleNamespace(public=lambda: {})
-        with patch.object(jobs, "detail", return_value=source), \
+        with patch.object(jobs, "record", return_value=source), \
                 patch("seampact.scheduling.training.BoundProfiles", return_value=profiles), \
                 patch("seampact.scheduling.training.FrozenCatalog", return_value=catalog):
             with self.assertRaisesRegex(ValueError, "GPU 分配已改变"):

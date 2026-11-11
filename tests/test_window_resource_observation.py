@@ -25,7 +25,7 @@ class WindowResourceChecks(unittest.TestCase):
             observer.start()
             base = time.monotonic()
             def row(instance, generation, stamp, cpu, memory):
-                return dict(instance_id=instance, generation=generation, group_id="service:m",
+                return dict(scope="managed_service_cgroup", instance_id=instance, generation=generation, group_id="service:m",
                     identity=instance + str(generation) if cpu is not None else None,
                     monotonic_s=base + stamp, cpu_seconds=cpu, memory_current_bytes=memory)
             for record in (row("a", 1, 0, 1, 10), row("a", 1, 1, 2, 30),
@@ -41,6 +41,32 @@ class WindowResourceChecks(unittest.TestCase):
             self.assertIsNone(second["cpu_seconds_delta"])
             self.assertIsNone(second["memory_byte_s"])
             self.assertEqual(first["gpu_memory_status"], "UNKNOWN")
+            self.assertEqual(first["scope"], "managed_service_cgroup")
+
+    def test_worker_scope_is_preserved_and_ambiguous_attribution_has_no_totals(self):
+        selected = []
+        with tempfile.TemporaryDirectory() as directory:
+            observer = observation.WindowObserver({"interval_s": 10}, run_id="r", arm="a",
+                runtime_dir=Path(directory) / "runtime", allocation_sampler=lambda: selected)
+            observer.start()
+            base = time.monotonic()
+            for stamp in (0, 1):
+                selected[:] = [dict(instance_id=name, generation=1, group_id="worker:g",
+                    identity=name, monotonic_s=base + stamp, cpu_seconds=stamp + 1,
+                    memory_current_bytes=10 + stamp * 20, **scope)
+                    for name, scope in (("worker", dict(scope="worker_cgroup")),
+                        ("mixed", dict(scope="worker_cgroup" if stamp == 0 else "managed_service_cgroup")),
+                        ("missing", {}))]
+                observer._capture()
+            selected.clear()
+            results = {row["instance_id"]: row for row in observer.finish()["managed_allocations"]}
+            self.assertEqual(results["worker"]["scope"], "worker_cgroup")
+            self.assertEqual(results["worker"]["memory_byte_s"], 20)
+            for name in ("mixed", "missing"):
+                self.assertEqual(results[name]["scope"], "UNKNOWN")
+                self.assertIsNone(results[name]["group_id"])
+                self.assertIsNone(results[name]["cpu_seconds_delta"])
+                self.assertIsNone(results[name]["memory_byte_s"])
 
     def test_configuration_rejects_implicit_selection_and_invalid_values(self):
         self.assertIsNone(observation.ObservationConfig.from_mapping(None))

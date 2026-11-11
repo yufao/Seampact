@@ -13,7 +13,7 @@ import threading
 import time
 import uuid
 from collections import deque
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from seampact.observability.resource_observation import ATTRIBUTION, DEVICE_QUERY, gpu_uuid, number, query, resolve_gpu_devices, utc_now
@@ -222,9 +222,8 @@ class ResourceMonitor:
                 record["devices"].append(value)
         if "workload" in metrics and not cancelled():
             try:
-                snap = self.platform.runtime.snapshot()
+                snap = self.platform.runtime.call("active_view")
                 calls = list(snap["calls"].values())
-                tasks = self.platform.store.list("task") if not cancelled() else []
                 def parse_stamp(value):
                     try:
                         parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
@@ -232,7 +231,15 @@ class ResourceMonitor:
                     except (AttributeError, ValueError, TypeError):
                         return None
                 started = parse_stamp(meta["started_at"])
-                finished = [x for x in tasks if started and (stamp := parse_stamp(x.get("finished_at") or x.get("ended_at"))) and stamp >= started
+                # Read the running count and the tasks that ended near this session, not
+                # all history. The day of slack covers end stamps written with another
+                # UTC offset; the exact comparison follows below.
+                store = self.platform.store
+                counts = store.task_counts() if not cancelled() else dict(total=0, running=0)
+                tasks = (store.tasks_finished_since(
+                    (started.astimezone(timezone.utc) - timedelta(days=1)).date().isoformat())
+                    if started and not cancelled() else [])
+                finished = [x for x in tasks if started and (stamp := parse_stamp(x.get("finished_at"))) and stamp >= started
                             and x.get("status") in {"COMPLETED", "FAILED", "INTERRUPTED", "CANCELLED", "CANCELED", "TIMEOUT", "TIMED_OUT"}]
                 latencies = sorted(x["latency_ms"] for x in finished
                                    if isinstance(x.get("latency_ms"), (int, float)) and not isinstance(x["latency_ms"], bool)
@@ -242,7 +249,7 @@ class ResourceMonitor:
                     return latencies[min(len(latencies) - 1, max(0, int((len(latencies) - 1) * q + 0.5)))]
                 record["workload"] = dict(status="OBSERVED", calls_active=sum(x.get("physical") in {"AUTHORIZED", "STARTED"} for x in calls),
                     calls_waiting=sum(x.get("physical") in {"ENABLED", "RESERVED"} for x in calls),
-                    tasks_running=sum(x.get("status") == "RUNNING" for x in tasks), tasks_total=len(tasks),
+                    tasks_running=counts["running"], tasks_total=counts["total"],
                     slots_used=snap.get("used"), slots_quota=snap.get("quota"),
                     finished_scope="tasks finished since session start; unfinished excluded",
                     tasks_finished=len(finished), tasks_completed=sum(x.get("status") == "COMPLETED" for x in finished),

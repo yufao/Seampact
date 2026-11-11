@@ -353,6 +353,13 @@ class Learner:
             next_values = self._values(*following)
         old_values = torch.tensor([row["value"] for row in rows], dtype=torch.float32, device=self.device)
         old_logs = torch.tensor([row["old_log_prob"] for row in rows], dtype=torch.float32, device=self.device)
+        block_normalizers = {row.get("block_normalizer") for row in rows}
+        if len(block_normalizers) != 1:
+            raise ValueError("PPO rollout must use one frozen block normalizer")
+        normalizer = block_normalizers.pop()
+        objective_scale = 1.0 if normalizer is None else len(rows) / _finite(normalizer, "block_normalizer")
+        if objective_scale <= 0:
+            raise ValueError("block_normalizer must be positive")
         advantages = torch.zeros_like(rewards)
         future = 0.0
         for index in reversed(range(len(rows))):
@@ -381,7 +388,7 @@ class Learner:
                 ratio = (selected_logs - old_logs[selection]).exp()
                 direct = ratio * advantages[selection]
                 clipped = ratio.clamp(1 - self.config["clip_ratio"], 1 + self.config["clip_ratio"]) * advantages[selection]
-                policy_loss = -torch.minimum(direct, clipped).mean()
+                policy_loss = -torch.minimum(direct, clipped).mean() * objective_scale
                 values = self._values(batch_states, batch_candidates, batch_masks)
                 value_loss = torch.nn.functional.mse_loss(values, returns[selection])
                 entropy = -(probabilities * log_probs).sum(dim=1).mean()
@@ -402,14 +409,15 @@ class Learner:
                     policy_version=self.policy_version, replay_size=len(self.replay), rollout_size=len(self.rollout),
                     last_stats=copy.deepcopy(self.last_stats), frozen_action_selection="greedy_legal")
 
-    def save(self, path):
+    def save(self, path, checkpoint_metadata=None):
         destination = Path(path)
         destination.parent.mkdir(parents=True, exist_ok=True)
         payload = dict(format_version=1, **self.snapshot(),
                        networks={name: network.state_dict() for name, network in self.networks.items()},
                        optimizers={name: optimizer.state_dict() for name, optimizer in self.optimizers.items()},
                        replay=list(self.replay) if self.algorithm != "ppo" else [],
-                       random_state=self.random.getstate(), generator_state=self.generator.get_state())
+                       random_state=self.random.getstate(), generator_state=self.generator.get_state(),
+                       checkpoint_metadata=copy.deepcopy(checkpoint_metadata))
         # PPO rollout is deliberately not portable to a newly loaded policy run.
         self.torch.save(payload, destination)
         return str(destination)

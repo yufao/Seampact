@@ -2,15 +2,19 @@
 
 import contextlib
 import copy
+import hashlib
+import json
 from pathlib import Path
 import sys
 import tempfile
 from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from seampact.capabilities import SCALES_2
 from seampact.scenes.scenarios import SceneSession, freeze_scene, route_metric_applicability, route_metric_report, scene_task_criteria, task_route, task_unit_ids
+from seampact.scenes.data_use import load_manifest, task_digest
 
 
 ADAPTER = '''
@@ -44,6 +48,8 @@ class Catalog:
         return dict(id=uid, initialization="BOUND")
     def dispatch_status(self, uid):
         return dict(status="READY_LOCAL")
+    def check_call_conditions(self, uid, arguments, native_arguments=(), deferred_arguments=(), *, instance_identity=None):
+        return dict(status="NOT_REQUIRED", allowed=True)
     def runtime_state(self, units):
         return dict(local=True, ready_instance=True, warm=True, cold_startable=False,
                     accepting=True, busy=False, queue=0, state_age_ms=0)
@@ -63,7 +69,7 @@ class MixedScenes(unittest.TestCase):
             path.write_text(ADAPTER, encoding="utf-8")
             self.adapters.append(path)
         self.spec = dict(id="mixed", version="1", environment_version="fixture/1",
-            representation=dict(version="capability-features/2", scales={k: 1 for k in SCALES_2}),
+            representation=dict(version="capability-features/3", scales={k: 1 for k in SCALES_2}),
             routes={name: dict(unit_ids=["installed-" + name], model_roles=[],
                 adapter=dict(path=str(path), symbol="make_scene", config=dict(unit="installed-" + name)),
                 metric_applicability={"other": False})
@@ -96,6 +102,17 @@ class MixedScenes(unittest.TestCase):
         session.step(0)
         self.assertEqual(self.catalog.calls[-1], ("installed-b", dict(task_id="task-b", seed=43)))
 
+    def test_event_timing_keeps_dispatch_checks_and_total_scope(self):
+        frozen, session = self.session()
+        with patch.object(self.catalog, "dispatch_status", wraps=self.catalog.dispatch_status) as dispatch:
+            event = session.reset(frozen["tasks"][0], 42)
+        self.assertEqual(dispatch.call_count, 1)
+        self.assertTrue(event["candidates"][0]["legal"])
+        self.assertGreaterEqual(event["represent_duration_ms"], 0)
+        self.assertGreaterEqual(event["dispatch_conditions_duration_ms"], 0)
+        self.assertGreaterEqual(event["representation_duration_ms"],
+            event["represent_duration_ms"] + event["dispatch_conditions_duration_ms"])
+
     def test_foreign_candidate_and_invocation_are_rejected(self):
         self.spec["routes"]["a"]["adapter"]["config"]["candidate"] = "installed-b"
         frozen, session = self.session()
@@ -125,6 +142,46 @@ class MixedScenes(unittest.TestCase):
         dependency.write_text("VERSION = 2", encoding="utf-8")
         with self.assertRaises(ValueError):
             session.reset(frozen["tasks"][0], 1)
+
+    def test_research_mixed_scene_binds_normalized_tasks_at_shared_level(self):
+        with self.assertRaisesRegex(ValueError, "unknown research_protocol"):
+            freeze_scene(dict(self.spec, research_protocol="unknown/1"))
+        with self.assertRaisesRegex(ValueError, "research-data-binding/1"):
+            freeze_scene(dict(self.spec, research_protocol="multisource-review/1"))
+        self.spec["tasks"][0]["data_member_id"] = "member-a"
+        self.spec["tasks"][1]["data_member_id"] = "member-b"
+        normalized = freeze_scene(self.spec)["tasks"]
+        records = [dict(id=task["data_member_id"], upstream=dict(dataset="fixture", revision="v1", example_id=task["id"]),
+            group_ids=["fixture:" + task["id"]], derived_from=[], split="train", allowed_use=["train"],
+            expected_task_sha256=task_digest(task)) for task in normalized]
+        source = self.path / "data-manifest.json"
+        payload = json.dumps(dict(schema="research-data-manifest/1", members=records)).encode()
+        source.write_bytes(payload)
+        self.spec["research_protocol"] = "multisource-review/1"
+        self.spec["research_data"] = dict(schema="research-data-binding/1", manifest_path=str(source),
+                                          manifest_sha256=hashlib.sha256(payload).hexdigest())
+        frozen = freeze_scene(self.spec)
+        binding = frozen["research_data"]
+        result = load_manifest(binding["manifest_path"], binding["manifest_sha256"], "train", frozen["tasks"])
+        self.assertEqual(result["selected_count"], 2)
+        self.assertEqual([task["task_class"] for task in frozen["tasks"]], ["a", "b"])
+        self.assertTrue(any(item["path"] == str(source.resolve()) for item in frozen["resource_files"]))
+        frozen["research_task_ids"] = ["task-a"]
+        session = SceneSession(frozen, self.platform, "run", catalog=self.catalog)
+        self.addCleanup(session.close)
+        session.reset(frozen["tasks"][0], 1)
+        with self.assertRaisesRegex(ValueError, "outside the validated"):
+            session.reset(frozen["tasks"][1], 1)
+        changed = dict(frozen["tasks"][0], data_member_id="member-b")
+        with self.assertRaisesRegex(ValueError, "does not match"):
+            session.reset(changed, 1)
+        self.spec["routes"]["a"]["research_data"] = self.spec["research_data"]
+        with self.assertRaisesRegex(ValueError, "shared mixed scene"):
+            freeze_scene(self.spec)
+        del self.spec["routes"]["a"]["research_data"]
+        source.write_bytes(payload + b" ")
+        with self.assertRaisesRegex(ValueError, "sha256 mismatch"):
+            freeze_scene(self.spec)
 
     def test_task_route_mapping_is_immutable(self):
         frozen, session = self.session()

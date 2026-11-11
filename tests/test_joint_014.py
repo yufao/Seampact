@@ -19,7 +19,7 @@ from seampact.capabilities import JOINT_SCALES, SCALES_2
 from seampact.hosting.deployment import Deployments
 from seampact.evaluation import validate_criteria
 from seampact.source.inspection import Inspector
-from seampact.scheduling.joint import Window, configure, run_windows
+from seampact.scheduling.joint import Window, configure, run_windows, window_tasks
 from seampact.runtime import Coordinator, OwnerRuntime
 from seampact.scenes.scenarios import FrozenCatalog, freeze_scene
 from seampact.store import Store
@@ -34,6 +34,11 @@ class Scene:
         self.config, self.context = config, context
     def reset(self, task, seed):
         self.task = task
+        if self.config.get("optional"):
+            return dict(kind="decision", scene_observation=dict(modalities=["text"],
+                scopes=["general_text"], available_inputs=["question"]), required_units=[],
+                candidates=[dict(id="skip", action_type="finish", units=[], legal=True),
+                            dict(id="invoke", action_type="invoke", units=[self.config["unit"]], legal=True)])
         return dict(kind="decision", scene_observation=dict(modalities=["text"],
             scopes=["general_text"], available_inputs=["question"]),
             required_units=[self.config["unit"]], candidates=[dict(id="invoke",
@@ -41,12 +46,51 @@ class Scene:
     def step(self, candidate):
         if self.task.get("fail"):
             raise RuntimeError("fixture failure")
-        result = self.context.invoke(self.config["unit"], dict(value=self.task["value"]))
+        result = (0 if candidate["id"] == "skip" else
+                  self.context.invoke(self.config["unit"], dict(value=self.task["value"])))
         return dict(kind="terminal", terminated=True, truncated=False, response=result,
                     program_metrics=dict(score=result))
 def make_scene(config, context):
     return Scene(config, context)
 '''
+
+
+def budget_fixture(window_count=2, members=None, freeze=False):
+    names = ['ram', 'vram', 'latency', 'unfinished'] + (['quality:score'] if members else [])
+    points = [dict(id=point, objective='ram', limits={n: (limit if n == 'latency' else .1) for n in names if n != 'ram'})
+              for point, limit in [('small', .5), ('large', 2.)]]
+    groups = ([dict(group_id='fixture', stratum='fixture', weight=1., requests=[dict(task_id=t, weight=1 / len(members)) for t in members])]
+              if members else None)
+    blocks = [dict(windows=[i], point=('small' if i % 2 == 0 else 'large'),
+                   cost_weights={n: [1.] for n in ['ram', 'vram', 'latency', 'unfinished']},
+                   quality={'score': copy.deepcopy(groups)} if groups else {}) for i in range(window_count)]
+    result = dict(schema='budget-policy/2', points=points, scales={n: 1. for n in names},
+        initial_multipliers={n: 0. for n in names}, dual_step=.1, normalizer=1.,
+        resource_keys=dict(ram=['ram'], vram=['vram']), resource_units=dict(ram='GiB', vram='GiB'),
+        api=dict(status='NOT_APPLICABLE'), blocks=blocks,
+        quality_budgets=[dict(metric='score', undelivered_loss=1.)] if members else [])
+    if freeze:
+        result['freeze_point'] = 'small'
+    return result
+
+
+def budget_resources():
+    return dict(call_slots=1, resources={'ram': 4., 'vram': 4.}, demands={})
+
+
+def budget_costs():
+    return dict(schema='joint-costs/2', instance_seconds=0, task_seconds=0, resource_seconds={'ram': 0, 'vram': 0})
+
+
+def synthetic_budget_envelope(window):
+    """SYNTHETIC_LEDGER: exercise PPO plumbing without claiming real resource measurement."""
+    result = _original_window_item(window)
+    result['costs']['resource_envelope'] = dict(status='KNOWN', resource_seconds={'ram': 2., 'vram': 1.},
+        instances=[], synthetic=True, semantics='synthetic test proxy; not a local measurement')
+    return result
+
+
+_original_window_item = Window._item
 
 
 class Joint014Integration(unittest.TestCase):
@@ -82,7 +126,7 @@ class Joint014Integration(unittest.TestCase):
             provider="program", binding="score", direction="maximize", unit="count", range=[0, 20],
             definition="returned fixture value")], objective=dict(weights=dict(score=1))))
         self.scene = freeze_scene(dict(id="mixed", version="1", model_roles=[],
-            representation=dict(version="capability-features/2", scales={key: 1 for key in SCALES_2}),
+            representation=dict(version="capability-features/3", scales={key: 1 for key in SCALES_2}),
             routes={name: dict(unit_ids=[uid], model_roles=[], criteria=self.criteria,
                 evaluation_criteria=self.criteria,
                 native_usage={uid: dict(model_free=True, basis="fixture arithmetic source")},
@@ -90,7 +134,7 @@ class Joint014Integration(unittest.TestCase):
                 for name, uid in zip(("a", "b"), self.units)},
             tasks=[dict(id="ta", route="a", value=3), dict(id="tb", route="b", value=5)]))
 
-    def window(self, fail=False, scope="roots_and_boundaries", horizon=False):
+    def window(self, fail=False, scope="roots_and_boundaries", horizon=False, workload=None):
         scene = copy.deepcopy(self.scene)
         scene["tasks"][0]["fail"] = fail
         frozen = FrozenCatalog(self.catalog, self.units)
@@ -99,6 +143,8 @@ class Joint014Integration(unittest.TestCase):
             workload=dict(tasks_per_window=2, arrival=dict(interval_ms=0)),
             costs=dict(task_seconds=0, instance_seconds=0), scales={key: 1 for key in JOINT_SCALES},
             observation=dict(interval_s=0.1, include_current_process=True)))
+        if workload is not None:
+            config["joint"]["workload"] = copy.deepcopy(workload)
         if horizon:
             config["joint"]["workload"].update(horizon_ms=1, unfinished_reward=-1)
         selected = configure(config, scene=scene, tasks=scene["tasks"], task_ids=["ta", "tb"],
@@ -106,7 +152,7 @@ class Joint014Integration(unittest.TestCase):
             deployments=self.platform.deployments, learning=LEARNING, references=REFERENCES,
             mode="freeze", placements=frozen.placement)
         manifest = dict(selected, scene=scene, criteria=self.criteria, evaluation_criteria=self.criteria,
-                        mode="freeze", algorithm="required_only", seed=10)
+                        mode="freeze", algorithm="required_only", seed=10, episodes=2, task_ids=["ta", "tb"])
         jobs = SimpleNamespace(platform=self.platform, directory=self.home,
                                stops={"check": threading.Event()}, closed=False)
         return Window(jobs, "check", manifest, frozen, self.platform.profiles, None, 0, scene["tasks"], {})
@@ -127,6 +173,17 @@ class Joint014Integration(unittest.TestCase):
         self.assertEqual(window.config["working_sets"]["tasks"], dict(ta=[], tb=[]))
         self.assertEqual(window.working.claims, {})
         self.assertEqual({row["route"] for row in result["route_metrics"]}, {"a", "b"})
+        business = [row for row in result["decisions"] if row["kind"] == "business"]
+        self.assertEqual(len(business), 2)
+        for row in business:
+            self.assertGreaterEqual(row["representation_ms"], row["joint_observation_build_ms"] +
+                row["scene_represent_ms"] + row["scene_dispatch_conditions_ms"])
+        online = result["costs"]["online"]
+        self.assertGreater(online["joint_state_snapshot_calls"], 0)
+        self.assertEqual(online["joint_state_snapshot_calls"], window.state_snapshot_calls)
+        self.assertGreaterEqual(online["joint_state_snapshot_ms"], 0)
+        for key in ("joint_observation_build_ms", "scene_represent_ms", "scene_dispatch_conditions_ms"):
+            self.assertEqual(online[key], sum(row.get(key, 0) for row in result["decisions"]))
         self.check_observation(result, "COMPLETED")
 
     def check_observation(self, result, status):
@@ -156,8 +213,20 @@ class Joint014Integration(unittest.TestCase):
         self.assertEqual([task["final_response"] for task in result["tasks"]], [4, 7])
         self.assertFalse(any(row["kind"] == "boundary" for row in result["decisions"]))
 
-    def test_budget_training_and_freeze_share_artifact_and_change_only_budget_input(self):
-        """Two budgets use fresh decisions, a real PPO update and the parent checkpoint."""
+    def test_local_calls_without_declared_integrals_remain_unknown_for_budget(self):
+        window = self.window(scope="roots")
+        window.budget_policy = {"schema": "budget-policy/2"}
+        result = window.run()
+        self.assertTrue(result["tasks"][0]["calls"])
+        envelope = result["costs"]["resource_envelope"]
+        self.assertEqual(envelope["status"], "UNKNOWN")
+        self.assertIsNone(envelope["resource_seconds"])
+
+    def test_synthetic_ledger_training_and_freeze_share_budget_conditioned_artifact(self):
+        """SYNTHETIC_LEDGER: two budgets use real PPO and the parent checkpoint."""
+        proxy = patch.object(Window, '_item', synthetic_budget_envelope)
+        proxy.start()
+        self.addCleanup(proxy.stop)
         import importlib.util
         if importlib.util.find_spec("torch") is None:
             self.skipTest("PPO requires the optional PyTorch dependency")
@@ -172,11 +241,9 @@ class Joint014Integration(unittest.TestCase):
         config = dict(scene=self.scene, algorithm="ppo", scheduling_mode="joint/1", criteria=self.criteria,
             episodes=2, parameters=dict(epochs=1, hidden_sizes=[8]), joint=dict(
                 functional_policy="required_only", dispatch_policy="learned_ready/1", resource_policy="fixed/1",
-                dispatch_scope="roots", capacity=dict(call_slots=1), age_guard_ms=60000,
+                dispatch_scope="roots", capacity=budget_resources(), age_guard_ms=60000,
                 max_consecutive_resource_ops=1, workload=dict(tasks_per_window=2, arrival=dict(interval_ms=0)),
-                costs=dict(instance_seconds=0, task_seconds=0), scales={k: 1 for k in JOINT_SCALES},
-                budget_policy=dict(latency_budgets=[0.5, 2.0], task_seconds_scale=1., instance_seconds_scale=1.,
-                                   max_unfinished_fraction=0., dual_step=0.1)))
+                costs=budget_costs(), scales={k: 1 for k in JOINT_SCALES}, budget_policy=budget_fixture()))
         # Dispatch competition is deterministic once all arrivals have queued their roots.
         original = Window._dispatch_stage
         def paired_dispatch(window):
@@ -201,19 +268,273 @@ class Joint014Integration(unittest.TestCase):
             self.assertTrue(trained["checkpoint"])
             for window in trained["history"]:
                 bill = window["budget_policy"]
-                decisions = [s["transition"] for s in window["transitions"]]
-                for k in range(3):
-                    self.assertAlmostEqual(bill["raw"][k], bill["before_first_choice"][k] +
-                                           sum(d["raw_cost_delta"][k] for d in decisions))
-                self.assertTrue(all(d["state"][-1] == bill["latency_budget"] for d in decisions))
+                decisions = [row["transition"] for row in window["transitions"]]
+                index = 0 if bill["point"] == "small" else 1
+                expected = budget_policy.condition(config["joint"]["budget_policy"], index, bill["multipliers"])
+                self.assertTrue(all(d["state"][-len(expected):] == expected for d in decisions))
             config.update(mode="freeze", parent_run_id=trained["id"], episodes=1)
-            for budget in config["joint"]["budget_policy"]["latency_budgets"]:
-                config["joint"]["budget_policy"]["freeze_budget"] = budget
+            for point in ("small", "large"):
+                policy = config["joint"]["budget_policy"]
+                policy["freeze_point"] = point
+                policy["blocks"] = [dict(windows=[0], point=point, quality={})]
                 frozen = execute()
                 bill = frozen["history"][0]["budget_policy"]
-                self.assertEqual((bill["latency_budget"], frozen["updates"]), (budget, 0))
+                self.assertEqual((bill["point"], frozen["updates"]), (point, 0))
                 self.assertEqual(bill["multipliers_after"], bill["multipliers"])
                 self.assertEqual([t["final_response"] for t in frozen["history"][0]["tasks"]], [4, 7])
+
+    def test_synthetic_ledger_optional_business_and_quality_budget_update_same_ppo(self):
+        """SYNTHETIC_LEDGER: optional choices and a genuine PPO update."""
+        proxy = patch.object(Window, '_item', synthetic_budget_envelope)
+        proxy.start()
+        self.addCleanup(proxy.stop)
+        import importlib.util
+        if importlib.util.find_spec("torch") is None:
+            self.skipTest("PPO requires the optional PyTorch dependency")
+        from seampact.scheduling.training import TrainingJobs
+        self.platform.profiles = SimpleNamespace(lock=threading.RLock(), role_profile=lambda role: {})
+        for uid in self.units:
+            sid = self.store.get("unit", uid)["source_id"]
+            self.store.save("harness", sid, dict(id=sid, revision="fixture"))
+            self.catalog.scheduling_policy(dict(unit_id=uid, visibility="transparent", activation="platform"))
+        scene = copy.deepcopy(self.scene)
+        criterion = copy.deepcopy(self.criteria)
+        criterion["dimensions"][0]["bounds"] = [0, 20]
+        for route in scene["routes"].values():
+            route["adapter"]["config"]["optional"] = True
+            route["criteria"] = route["evaluation_criteria"] = criterion
+        jobs = TrainingJobs(self.platform)
+        self.addCleanup(jobs.close)
+        config = dict(scene=scene, algorithm="ppo", scheduling_mode="joint/1", criteria=criterion,
+            episodes=2, parameters=dict(epochs=1, hidden_sizes=[8]), joint=dict(
+                functional_policy="learned", dispatch_policy="learned_ready/1", resource_policy="learned/1",
+                dispatch_scope="roots", capacity=budget_resources(), age_guard_ms=60000,
+                max_consecutive_resource_ops=1, workload=dict(tasks_per_window=2, arrival=dict(interval_ms=0)),
+                costs=budget_costs(), scales={k: 1 for k in JOINT_SCALES}, budget_policy=budget_fixture(members=["ta", "tb"])))
+        rid = jobs.start(dict(config=config))["run_ids"][0]
+        limit = time.monotonic() + 25
+        while self.store.get("scheduler_run", rid)["status"] in ("RUNNING", "QUEUED"):
+            self.assertLess(time.monotonic(), limit)
+            time.sleep(.02)
+        run = jobs.detail(rid)
+        self.assertEqual(run["status"], "COMPLETED", run["error"])
+        self.assertGreater(run["updates"], 0)
+        for window in run["history"]:
+            bill = window["budget_policy"]
+            self.assertEqual(bill["status"], "EVALUATED")
+            self.assertEqual(len(bill["multipliers_after"]), 5)
+            self.assertGreater(bill["multipliers_after"][4], bill["multipliers"][4])
+            self.assertTrue(any(t["kind"] == "business" for t in window["transitions"]))
+            self.assertEqual(len(bill["quality"]["score"]), 2)
+        # A held-out complete cohort can use the trained policy after the
+        # manifest/checkpoint has made a JSON round trip through the store.
+        heldout = copy.deepcopy(config)
+        heldout.update(mode="freeze", parent_run_id=run["id"], episodes=1)
+        for task in heldout["scene"]["tasks"]:
+            task["id"] += "-heldout"
+        policy = heldout["joint"]["budget_policy"]
+        policy["freeze_point"] = "small"
+        policy["blocks"] = budget_fixture(1, ["ta-heldout", "tb-heldout"])["blocks"]
+        frozen_id = jobs.start(dict(config=heldout))["run_ids"][0]
+        limit = time.monotonic() + 25
+        while self.store.get("scheduler_run", frozen_id)["status"] in ("RUNNING", "QUEUED"):
+            self.assertLess(time.monotonic(), limit)
+            time.sleep(.02)
+        frozen = jobs.detail(frozen_id)
+        self.assertEqual(frozen["status"], "COMPLETED", frozen["error"])
+        self.assertEqual(frozen["updates"], 0)
+        bill = frozen["history"][0]["budget_policy"]
+        self.assertEqual(bill["multipliers"], bill["multipliers_after"])
+        self.assertEqual({t["task_id"] for t in bill["quality"]["score"]}, {"ta-heldout", "tb-heldout"})
+
+    def test_synthetic_ledger_two_window_block_scores_after_release_and_updates_once(self):
+        """SYNTHETIC_LEDGER tests the real TrainingJobs block lifecycle, not resource performance."""
+        import importlib.util
+        if importlib.util.find_spec("torch") is None:
+            self.skipTest("PPO requires the optional PyTorch dependency")
+        from seampact.scheduling.training import TrainingJobs
+        from seampact.scheduling.learners import Learner
+        self.platform.profiles = SimpleNamespace(lock=threading.RLock(), role_profile=lambda role: {})
+        for uid in self.units:
+            sid = self.store.get("unit", uid)["source_id"]
+            self.store.save("harness", sid, dict(id=sid, revision="fixture"))
+            self.catalog.scheduling_policy(dict(unit_id=uid, visibility="transparent", activation="platform"))
+        scene, criterion = copy.deepcopy(self.scene), copy.deepcopy(self.criteria)
+        criterion["dimensions"][0]["bounds"] = [0, 20]
+        for route in scene["routes"].values():
+            route["adapter"]["config"]["optional"] = True
+            route["criteria"] = route["evaluation_criteria"] = criterion
+        policy = budget_fixture(1, ["ta", "tb"])
+        policy["points"] = policy["points"][:1]
+        policy["blocks"][0]["windows"] = [0, 1]
+        policy["blocks"][0]["cost_weights"] = {name: [.5, .5] for name in
+            ["ram", "vram", "latency", "unfinished"]}
+        config = dict(scene=scene, algorithm="ppo", scheduling_mode="joint/1", criteria=criterion, episodes=2,
+            parameters=dict(epochs=1, hidden_sizes=[8]), joint=dict(functional_policy="learned",
+                dispatch_scope="roots", capacity=budget_resources(), age_guard_ms=60000,
+                max_consecutive_resource_ops=1, workload=dict(tasks_per_window=1, arrival=dict(interval_ms=0)),
+                costs=budget_costs(), scales={k: 1 for k in JOINT_SCALES}, budget_policy=policy))
+        jobs = TrainingJobs(self.platform)
+        self.addCleanup(jobs.close)
+        timeline = []
+        run_window, evaluate, update, update_dual = Window.run, Window.evaluate_pending, Learner.update, budget_policy.update_dual
+        def recording_run(window, defer_evaluation=False):
+            result = run_window(window, defer_evaluation=defer_evaluation)
+            self.assertTrue(defer_evaluation)
+            self.assertFalse(result["release"]["left"])
+            self.assertFalse(window.working.claims)
+            timeline.append(('business_released', window.number))
+            return result
+        def recording_score(window):
+            self.assertEqual(timeline[:2], [('business_released', 0), ('business_released', 1)])
+            self.assertTrue(all(not self.platform.deployments.live_instances(group) for group in window.groups))
+            timeline.append(('score', window.number))
+            return evaluate(window)
+        def recording_update(learner, *args, **kwargs):
+            if learner.rollout:
+                timeline.append(('ppo', None))
+            return update(learner, *args, **kwargs)
+        def recording_dual(*args, **kwargs):
+            timeline.append(('dual', None))
+            return update_dual(*args, **kwargs)
+        with patch.object(Window, '_item', synthetic_budget_envelope), patch.object(Window, 'run', recording_run), \
+             patch.object(Window, 'evaluate_pending', recording_score), patch.object(Learner, 'update', recording_update), \
+             patch.object(budget_policy, 'update_dual', recording_dual):
+            rid = jobs.start(dict(config=config))["run_ids"][0]
+            limit = time.monotonic() + 25
+            while self.store.get("scheduler_run", rid)["status"] in ("RUNNING", "QUEUED"):
+                self.assertLess(time.monotonic(), limit)
+                time.sleep(.02)
+            run = jobs.detail(rid)
+        self.assertEqual(run["status"], "COMPLETED", run["error"])
+        self.assertEqual(timeline, [('business_released', 0), ('business_released', 1),
+                                    ('score', 0), ('score', 1), ('ppo', None), ('dual', None)])
+        self.assertEqual(run["budget_choice_windows"], [2])
+        import torch
+        checkpoint = run["checkpoint"]
+        payload = torch.load(checkpoint["path"], map_location="cpu", weights_only=True)
+        self.assertEqual(checkpoint["committed_window_end"], 2)
+        self.assertEqual(checkpoint["config_digest"], run["config_digest"])
+        self.assertEqual(payload["checkpoint_metadata"]["budget_multipliers"], run["budget_multipliers"])
+        self.assertEqual(payload["policy_version"], checkpoint["policy_version"])
+        self.assertTrue(payload["optimizers"])
+        transitions = [entry['transition'] for window in run['history'] for entry in window['transitions']]
+        self.assertEqual({entry['episode_id'] for entry in transitions}, {rid + ':w0', rid + ':w1'})
+        self.assertTrue(all(entry['terminated'] for entry in transitions))
+
+    def test_requested_stop_waits_for_complete_block_and_checkpoint(self):
+        import importlib.util
+        if importlib.util.find_spec("torch") is None:
+            self.skipTest("PPO requires the optional PyTorch dependency")
+        from seampact.scheduling.training import TrainingJobs
+        self.platform.profiles = SimpleNamespace(lock=threading.RLock(), role_profile=lambda role: {})
+        for uid in self.units:
+            sid = self.store.get("unit", uid)["source_id"]
+            self.store.save("harness", sid, dict(id=sid, revision="fixture"))
+            self.catalog.scheduling_policy(dict(unit_id=uid, visibility="transparent", activation="platform"))
+        scene, criterion = copy.deepcopy(self.scene), copy.deepcopy(self.criteria)
+        criterion["dimensions"][0]["bounds"] = [0, 20]
+        for route in scene["routes"].values():
+            route["adapter"]["config"]["optional"] = True
+            route["criteria"] = route["evaluation_criteria"] = criterion
+        policy = budget_fixture(2, ["ta", "tb"])
+        policy["blocks"][0]["windows"] = [0, 1]
+        policy["blocks"][0]["cost_weights"] = {name: [.5, .5] for name in ["ram", "vram", "latency", "unfinished"]}
+        policy["blocks"][1]["windows"] = [2, 3]
+        policy["blocks"][1]["cost_weights"] = copy.deepcopy(policy["blocks"][0]["cost_weights"])
+        config = dict(scene=scene, algorithm="ppo", scheduling_mode="joint/1", criteria=criterion, episodes=4,
+            parameters=dict(epochs=1, hidden_sizes=[8]), joint=dict(functional_policy="learned",
+                dispatch_scope="roots", capacity=budget_resources(), age_guard_ms=60000,
+                max_consecutive_resource_ops=1, workload=dict(tasks_per_window=1, arrival=dict(interval_ms=0)),
+                costs=budget_costs(), scales={k: 1 for k in JOINT_SCALES}, budget_policy=policy))
+        jobs = TrainingJobs(self.platform)
+        self.addCleanup(jobs.close)
+        original = Window.run
+        started = []
+        def requesting_stop(window, defer_evaluation=False):
+            started.append(window.number)
+            if window.number == 0:
+                for invalid in (1, 5, True, None):
+                    with self.assertRaises(ValueError):
+                        jobs.stop(window.rid, invalid)
+                jobs.stop(window.rid, 2)
+            return original(window, defer_evaluation=defer_evaluation)
+        with patch.object(Window, '_item', synthetic_budget_envelope), patch.object(Window, 'run', requesting_stop):
+            rid = jobs.start(dict(config=config))["run_ids"][0]
+            limit = time.monotonic() + 25
+            while self.store.get("scheduler_run", rid)["status"] in ("RUNNING", "QUEUED"):
+                self.assertLess(time.monotonic(), limit)
+                time.sleep(.02)
+            run = jobs.detail(rid)
+        self.assertEqual(run["status"], "STOPPED", run["error"])
+        self.assertEqual(started, [0, 1])
+        self.assertEqual(run["episodes"], 2)
+        self.assertEqual(run["checkpoint"]["committed_window_end"], 2)
+        self.assertEqual(run["stop_request"]["after_windows"], 2)
+
+    def test_failed_tail_keeps_last_committed_budget_checkpoint(self):
+        import importlib.util
+        if importlib.util.find_spec("torch") is None:
+            self.skipTest("PPO requires the optional PyTorch dependency")
+        import torch
+        from seampact.scheduling.training import TrainingJobs
+        self.platform.profiles = SimpleNamespace(lock=threading.RLock(), role_profile=lambda role: {})
+        for uid in self.units:
+            sid = self.store.get("unit", uid)["source_id"]
+            self.store.save("harness", sid, dict(id=sid, revision="fixture"))
+            self.catalog.scheduling_policy(dict(unit_id=uid, visibility="transparent", activation="platform"))
+        scene, criterion = copy.deepcopy(self.scene), copy.deepcopy(self.criteria)
+        criterion["dimensions"][0]["bounds"] = [0, 20]
+        for route in scene["routes"].values():
+            route["adapter"]["config"]["optional"] = True
+            route["criteria"] = route["evaluation_criteria"] = criterion
+        config = dict(scene=scene, algorithm="ppo", scheduling_mode="joint/1", criteria=criterion, episodes=2,
+            parameters=dict(epochs=1, hidden_sizes=[8]), joint=dict(functional_policy="learned",
+                dispatch_scope="roots", capacity=budget_resources(), age_guard_ms=60000,
+                max_consecutive_resource_ops=1, workload=dict(tasks_per_window=2, arrival=dict(interval_ms=0)),
+                costs=budget_costs(), scales={k: 1 for k in JOINT_SCALES},
+                budget_policy=budget_fixture(2, ["ta", "tb"])))
+        jobs = TrainingJobs(self.platform)
+        self.addCleanup(jobs.close)
+        evaluate = Window.evaluate_pending
+        def fail_tail(window):
+            item = evaluate(window)
+            if window.number == 1:
+                item.update(eligible=False, exclusion_reason="provider_http_500",
+                            execution_error=dict(message="provider HTTP 500"))
+            return item
+        with patch.object(Window, '_item', synthetic_budget_envelope), patch.object(Window, 'evaluate_pending', fail_tail):
+            rid = jobs.start(dict(config=config))["run_ids"][0]
+            limit = time.monotonic() + 25
+            while self.store.get("scheduler_run", rid)["status"] in ("RUNNING", "QUEUED"):
+                self.assertLess(time.monotonic(), limit)
+                time.sleep(.02)
+            run = jobs.detail(rid)
+        self.assertEqual(run["status"], "FAILED")
+        self.assertIn("provider HTTP 500", run["error"])
+        self.assertEqual((run["eligible_episodes"], run["excluded_episodes"]), (1, 1))
+        checkpoint = run["checkpoint"]
+        self.assertEqual(checkpoint["committed_window_end"], 1)
+        payload = torch.load(checkpoint["path"], map_location="cpu", weights_only=True)
+        self.assertEqual(payload["checkpoint_metadata"]["checkpoint_id"], checkpoint["checkpoint_id"])
+        self.assertEqual(payload["policy_version"], checkpoint["policy_version"])
+
+    def test_checkpoint_save_failure_keeps_previous_file_and_receipt(self):
+        from seampact.scheduling.training import TrainingJobs
+        jobs = TrainingJobs.__new__(TrainingJobs)
+        jobs.store = SimpleNamespace(save=lambda *args: self.fail("failed save published a receipt"))
+        path = self.home / "policy.pt"
+        path.write_bytes(b"previous checkpoint")
+        previous = dict(checkpoint_id="previous")
+        run = dict(config_digest="fixture", checkpoint=previous, budget_multipliers=[[1.]])
+        def fail_save(*args, **kwargs):
+            raise OSError("checkpoint write failed")
+        learner = SimpleNamespace(policy_version=2, save=fail_save)
+        with self.assertRaisesRegex(OSError, "checkpoint write failed"):
+            jobs._save_checkpoint("check", run, self.home, {}, learner, committed_window_end=2)
+        self.assertEqual(path.read_bytes(), b"previous checkpoint")
+        self.assertEqual(run["checkpoint"], previous)
+        self.assertEqual(list(self.home.glob('.policy-*.tmp')), [])
 
     def test_wake_after_horizon_keeps_already_due_arrivals(self):
         window = self.window(horizon=True)
@@ -272,6 +593,24 @@ class Joint014Integration(unittest.TestCase):
         self.assertEqual((len(saved["history"]), len(saved["curves"])), (2, 2))
         self.assertEqual(self.store.get("scheduler_run", "check")["metrics"], run["metrics"])
 
+    def test_explicit_tail_window_executes_and_records_only_declared_occurrences(self):
+        window = self.window(workload=dict(windows=[
+            dict(task_ids=["ta", "tb"], arrival=dict(offsets_ms=[0, 2])),
+            dict(task_ids=["ta"], arrival=dict(offsets_ms=[4]))]))
+        histories = []
+        jobs = window.jobs
+        jobs.store = self.store
+        jobs._append = lambda folder, name, item: histories.append(copy.deepcopy(item)) if name == "history" else None
+        run = dict(episodes=0, interactions=0, choice_interactions=0, no_choice_episodes=0,
+                   eligible_episodes=0, excluded_episodes=0)
+        run_windows(jobs, "check", run, self.home, window.manifest, window.catalog, window.bound, None)
+        self.assertEqual([item["task_ids"] for item in histories], [["ta", "tb"], ["ta"]])
+        self.assertEqual([[task["arrival_offset_ms"] for task in item["tasks"]] for item in histories], [[0, 2], [4]])
+        self.assertEqual([[task["final_response"] for task in item["tasks"]] for item in histories], [[4, 7], [4]])
+        self.assertEqual(len({task["context"] for item in histories for task in item["tasks"]}), 3)
+        self.assertEqual((run["joint"]["windows"], run["joint"]["tasks"]), (2, 3))
+        self.assertTrue(all(item["eligible"] for item in histories))
+
     def test_preparation_failure_keeps_paid_window_but_never_updates_learner(self):
         from seampact.hosting.images import PreparationFailed
         window = self.window()
@@ -303,38 +642,76 @@ class Joint014Integration(unittest.TestCase):
         self.assertEqual(run["excluded_episodes"], 1)
 
 
-class BudgetLedgerTests(unittest.TestCase):
-    def setUp(self):
-        self.spec = dict(latency_budgets=[2.0], task_seconds_scale=8.0,
-                         instance_seconds_scale=4.0, max_unfinished_fraction=0.0, dual_step=0.1)
-        self.item = dict(service=dict(arrived=4, completed=3), task_ids=["a", "b", "c", "d"],
-                         parallelism=dict(instance_seconds=12.0, charged_task_seconds=24.0),
-                         eligible=True, exclusion_reason=None, window_return=7.0, reward_components={},
-                         transitions=[dict(transition=dict(cost_at_decision=start, reward=0.0))
-                                      for start in ([2.0, 4.0, 0], [6.0, 12.0, 0])])
+class JointWorkloadTests(unittest.TestCase):
+    def manifest(self, workload, episodes, quality=False):
+        tasks = [dict(id=identity) for identity in ("a", "b", "c")]
+        scene = dict(unit_ids=[], tasks=tasks, representation=dict(version="capability-features/3", cards={}))
+        criteria = validate_criteria(dict(id="workload", version="1", dimensions=[dict(id="score",
+            provider="program", binding="score", direction="maximize", unit="ratio", range=[0, 1],
+            bounds=[0, 1], definition="fixture quality")], objective=dict(weights=dict(score=1))))
+        config = dict(episodes=episodes, joint=dict(workload=workload, age_guard_ms=1,
+            max_consecutive_resource_ops=1, costs=dict(task_seconds=0, instance_seconds=0),
+            scales={key: 1 for key in JOINT_SCALES}))
+        if quality:
+            policy = budget_fixture(1, ["a", "b", "c"], freeze=True)
+            policy["blocks"][0]["windows"] = list(range(episodes))
+            config["joint"].update(dispatch_policy="learned_ready/1", capacity=budget_resources(),
+                                   costs=budget_costs(), budget_policy=policy)
+        selected = configure(config, scene=scene, tasks=tasks, task_ids=["a", "b", "c"],
+            algorithm="ppo" if quality else "required_only", criteria=criteria, contracts={}, groups={},
+            deployments=SimpleNamespace(), learning=LEARNING, references=REFERENCES, mode="freeze", placements={})
+        return dict(selected, scene=scene, mode="freeze", seed=1, episodes=episodes)
 
-    def test_whole_window_budget_and_action_credit(self):
-        dual = [0.5, 2.0]
-        self.assertTrue(budget_policy.settle(self.item, self.spec, 0, dual, True))
-        self.assertEqual(self.item["budget_policy"]["normalized"], [3.0, 3.0, 0.25])
-        self.assertEqual([r["transition"]["reward"] for r in self.item["transitions"]], [-1.5, -2.75])
-        self.assertEqual(self.item["reward"], -5.0)
-        self.assertAlmostEqual(dual[0], 0.6)
-        self.assertAlmostEqual(dual[1], 2.025)
-        frozen = [0.5, 2.0]
-        budget_policy.settle(self.item, self.spec, 0, frozen, False)
-        self.assertEqual(frozen, [0.5, 2.0])
+    def test_compact_windows_keep_tail_before_starting_next_epoch(self):
+        manifest = self.manifest(dict(tasks_per_window=2, arrival=dict(offsets_ms=[0, 10])), 4)
+        windows = manifest["joint"]["workload"]["windows"]
+        self.assertEqual([window_tasks(manifest, number) for number in range(4)],
+                         [["a", "b"], ["c"], ["a", "b"], ["c"]])
+        self.assertEqual([window["offsets_ms"] for window in windows], [[0, 10], [0], [0, 10], [0]])
 
-    def test_incomplete_arrivals_exclude_window_without_updating_dual(self):
-        self.item["service"] = dict(arrived=3, completed=3)
-        dual = [0.5, 2.0]
-        self.assertFalse(budget_policy.settle(self.item, self.spec, 0, dual, True))
-        self.assertFalse(self.item["eligible"])
-        self.assertFalse(self.item["budget_policy"]["eligible"])
-        self.assertEqual(self.item["exclusion_reason"], "budget_arrival_coverage")
-        self.assertIsNone(self.item["reward"])
-        self.assertEqual(dual, [0.5, 2.0])
-        self.assertTrue(all(r["transition"]["reward"] == 0.0 for r in self.item["transitions"]))
+    def test_explicit_windows_preserve_members_offsets_and_repeated_occurrences(self):
+        workload = dict(windows=[dict(task_ids=["b", "a"], arrival=dict(offsets_ms=[0, 7])),
+                                 dict(task_ids=["c"], arrival=dict(interval_ms=10)),
+                                 dict(task_ids=["b"], arrival=dict(offsets_ms=[3]))])
+        original = copy.deepcopy(workload)
+        manifest = self.manifest(workload, 3)
+        catalog = SimpleNamespace(remote_groups=lambda: {}, placement={})
+        jobs = SimpleNamespace(platform=SimpleNamespace(runtime=None, deployments=None))
+        occurrences = []
+        for number in range(3):
+            tasks = [{"id": identity} for identity in window_tasks(manifest, number)]
+            window = Window(jobs, "run", manifest, catalog, None, None, number, tasks, {})
+            occurrences.extend(task.task["id"] for task in window.tasks)
+            self.assertEqual([task.offset_ms for task in window.tasks], [[0, 7], [0], [3]][number])
+        self.assertEqual(occurrences, ["b", "a", "c", "b"])
+        self.assertEqual(workload, original)
+        with self.assertRaisesRegex(ValueError, "冻结成员清单"):
+            Window(jobs, "run", manifest, catalog, None, None, 1, [{"id": "a"}], {})
+
+    def test_explicit_windows_reject_incomplete_or_ambiguous_declarations(self):
+        good = dict(task_ids=["a"], arrival=dict(interval_ms=0))
+        invalid = [dict(windows=[]), dict(windows=[good, good]),
+            dict(windows=[dict(task_ids=[], arrival=dict(interval_ms=0))]),
+            dict(windows=[dict(task_ids=["a", "a"], arrival=dict(interval_ms=0))]),
+            dict(windows=[dict(task_ids=["unknown"], arrival=dict(interval_ms=0))]),
+            dict(windows=[dict(task_ids=["a"], arrival=dict(offsets_ms=[0, 1]))]),
+            dict(windows=[dict(task_ids=["a", "b"], arrival=dict(offsets_ms=[2, 1]))]),
+            dict(windows=[good], tasks_per_window=1),
+            dict(windows=[good], arrival=dict(interval_ms=0)),
+            dict(windows=[dict(task_ids=["a"], arrival=dict(offsets_ms=[3]))],
+                 horizon_ms=2, unfinished_reward=-1)]
+        for workload in invalid:
+            with self.subTest(workload=workload), self.assertRaises(ValueError):
+                self.manifest(workload, 1)
+
+    def test_quality_denominator_spans_windows_and_rejects_missing_members(self):
+        workload = dict(windows=[dict(task_ids=["a", "b"], arrival=dict(interval_ms=0)),
+                                 dict(task_ids=["c"], arrival=dict(interval_ms=0))])
+        manifest = self.manifest(workload, 2, quality=True)
+        self.assertEqual(manifest["joint"]["budget_policy"]["blocks"][0]["windows"], [0, 1])
+        workload["windows"][1]["task_ids"] = ["b"]
+        with self.assertRaises(ValueError):
+            self.manifest(workload, 2, quality=True)
 
 
 if __name__ == "__main__":

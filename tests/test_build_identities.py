@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -16,6 +17,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from seampact import target_runtime
 from seampact.hosting.deployment import Deployments, worker_spec
+from seampact.scheduling.joint import Window
+from seampact.store import Store
 from seampact.worker import Worker
 
 
@@ -117,6 +120,67 @@ class BuildIdentityTests(unittest.TestCase):
         os.utime(path, ns=(stat.st_atime_ns, stat.st_mtime_ns))
         self.assertEqual(path.stat().st_size, stat.st_size)
         self.assertNotEqual(self.identities(), before)
+
+    def observation_window(self):
+        store = Store(":memory:")
+        self.addCleanup(store.close)
+        deployments = object.__new__(Deployments)
+        deployments.platform = SimpleNamespace(store=store, source_lock=threading.RLock())
+        deployments.lock = threading.RLock()
+        deployments.instances, deployments.affinity, deployments.run_locks = {}, {}, {}
+        deployments.backend = lambda: dict(kind="docker")
+        implementation = target_runtime.core_identity("worker")
+        groups = {}
+        for identity in ("a", "b"):
+            contract = dict(digest="contract-" + identity, operations=dict(start=dict(status="SUPPORTED")),
+                            prepare={}, replicas=dict(replicable=False),
+                            lifecycle=dict(reclaim=dict(status="UNKNOWN")))
+            store.save("harness", identity, dict(id=identity, installation_id=identity, status="READY"))
+            store.save("runtime_group", identity, dict(id=identity, source_id=identity,
+                installation_id=identity, units=["unit-" + identity], contract=contract))
+            store.save("deployment", identity, dict(contract_digest=contract["digest"],
+                installation_id=identity, platform_core=implementation, image="image-" + identity,
+                build=dict(status="BUILT"), publish=dict(status="NOT_REQUIRED")))
+            groups[identity] = dict(image="image-" + identity)
+        window = object.__new__(Window)
+        window.deployments, window.groups = deployments, groups
+        window.runtime = SimpleNamespace(call=lambda method, identity: [])
+        window.wid = "snapshot"
+        window.state_snapshot_ms, window.state_snapshot_calls = 0.0, 0
+        return window
+
+    def test_joint_snapshot_reads_worker_core_once_for_multiple_groups(self):
+        window = self.observation_window()
+        with patch("seampact.hosting.deployment.core_identity", wraps=target_runtime.core_identity) as read_core:
+            views, roots = window._state()
+            self.assertEqual(read_core.call_count, 1)
+            self.assertEqual(list(views), ["a", "b"])
+            self.assertEqual(roots, [])
+            self.assertTrue(all(view["start_gap"] is None for view in views.values()))
+            self.assertEqual(window.state_snapshot_calls, 1)
+            for group_id, view in views.items():
+                self.assertEqual(view, window.deployments.group_view(group_id, "image-" + group_id))
+            self.assertEqual(read_core.call_count, 3)
+
+    def test_next_snapshot_and_start_recheck_same_size_and_mtime_source_edit(self):
+        self.change("source/verification.py", "\n# content-A\n")
+        window = self.observation_window()
+        with patch("seampact.hosting.deployment.core_identity", wraps=target_runtime.core_identity) as read_core:
+            before, _ = window._state()
+            self.assertTrue(all(view["start_gap"] is None for view in before.values()))
+            path = self.root / "source/verification.py"
+            stat = path.stat()
+            path.write_bytes(path.read_bytes().replace(b"# content-A", b"# content-B"))
+            os.utime(path, ns=(stat.st_atime_ns, stat.st_mtime_ns))
+            self.assertEqual((path.stat().st_size, path.stat().st_mtime_ns), (stat.st_size, stat.st_mtime_ns))
+            with self.assertRaisesRegex(ValueError, "构建工件与当前平台核心代码不同"):
+                window.deployments._start("a", None, False)
+            self.assertEqual(read_core.call_count, 2)
+            after, _ = window._state()
+            self.assertEqual(read_core.call_count, 3)
+            self.assertTrue(all("构建工件与当前平台核心代码不同" in view["start_gap"] for view in after.values()))
+            self.assertTrue(all(view["start_gap"] is None for view in before.values()))
+            self.assertEqual(window.deployments.instances, {})
 
     def test_image_bundle_contains_exactly_the_checked_closure(self):
         implementation = target_runtime.core_identity("worker")

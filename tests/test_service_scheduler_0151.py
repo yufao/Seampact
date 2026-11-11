@@ -2,8 +2,10 @@
 import copy
 import json
 import sys
+import threading
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
@@ -21,6 +23,36 @@ import test_joint_014 as joint_fixture
 
 
 class ServiceSchedulerTests(unittest.TestCase):
+    def test_loading_history_is_run_owned_and_accumulates_across_windows(self):
+        for group, identity_key in (("worker", "contract_digest"), ("service:model", "spec_digest")):
+            with self.subTest(group=group):
+                def record(run_id="arm-a", start=1, ready=3, **extra):
+                    return dict(group_id=group, run_id=run_id, start_wall=start, ready_wall=ready,
+                                **{identity_key: "frozen", **extra})
+                records = dict(first_window=record(), second_window=record(start=5, ready=9),
+                    other_arm=record("arm-b", ready=101), operator=record(None, ready=201),
+                    wrong_identity=record(**{identity_key: "different"}),
+                    failed=record(preparation_failure="failed"), unfinished=record(ready=None))
+                records["unattributed"] = record(ready=301)
+                records["unattributed"].pop("run_id")
+                deployments = SimpleNamespace(lock=threading.RLock(), instances=records)
+                def window(number, run_id):
+                    result = object.__new__(Window)
+                    result.rid, result.number, result.deployments = run_id, number, deployments
+                    result.groups = {group: dict(contract_digest="frozen")}
+                    return result
+                observed = window(2, "arm-a")._load_history(group)
+                self.assertEqual(observed["load_samples"], 2)
+                self.assertEqual(observed["load_ms"], 3000)
+                self.assertAlmostEqual(observed["load_uncertainty"], 2 ** -0.5)
+                self.assertEqual(window(0, "arm-b")._load_history(group)["load_ms"], 100000)
+                self.assertEqual(window(0, "new-arm")._load_history(group),
+                    dict(load_ms=None, load_samples=0, load_uncertainty=1.0))
+                independent = window(2, "arm-a")
+                independent.budget_policy, independent.accounting_start = {"schema": "budget-policy/2"}, 5
+                self.assertEqual(independent._load_history(group)["load_samples"], 1)
+                self.assertEqual(independent._load_history(group)["load_ms"], 4000)
+
     def test_dependency_cost_and_shared_lru_choose_different_legal_retirements(self):
         window = object.__new__(Window)
         window.config = dict(resource_policy="dependency_cost/1", retention=dict(mode="idle_retire/1", idle_ms=100))
@@ -46,18 +78,18 @@ class ServiceSchedulerTests(unittest.TestCase):
             {"memory": 8}, demands, list(demands), "idle_retire/1",
             {"service:m": ["service:t"]})
         working = WorkingSets(spec, {"memory": 8}, demands)
-        self.assertTrue(working.admit("one", "a"))
-        self.assertTrue(working.admit("two", "b"))
+        self.assertTrue(working.admit("one", "a", units=["ua"]))
+        self.assertTrue(working.admit("two", "b", units=["ub"]))
         self.assertEqual(working.used({}), {"memory": 8})
         working.release("two")
         before = copy.deepcopy(working.claims)
-        self.assertFalse(working.admit("two", "b", {"service:m": 2}))
+        self.assertFalse(working.admit("two", "b", {"service:m": 2}, units=["ub"]))
         self.assertEqual(working.claims, before)
 
     def test_versioned_candidate_resource_vector(self):
         scales = {k: 1 for k in JOINT_SCALES}
         spec = freeze_joint(scales, {"gpu_memory_mb": 8})
-        self.assertEqual(spec["version"], "joint-features/3")
+        self.assertEqual(spec["version"], "joint-features/4")
         vector = joint_candidate("prepare", scales, resource_schema=spec["resources"], resource=dict(
             held=0, ready=0, starting=0, draining=0, cap_remaining=1, waiting_roots=2,
             service_target=True, shared_users=2, marginal_resources={"gpu_memory_mb": 0.5}))
@@ -75,7 +107,7 @@ class ServiceSchedulerTests(unittest.TestCase):
         self.assertFalse(cost["instances"][0]["release_confirmed"])
         self.assertEqual(envelope_integral({"instances": [row]}, {}, {"memory": 10})["status"], "UNKNOWN")
 
-    def test_real_window_prepares_one_shared_service_and_holds_through_evaluation(self):
+    def test_real_window_releases_online_service_before_evaluation(self):
         self.real_window("cold")
 
     def test_warm_service_window_accounts_preparation_and_releases(self):
@@ -124,7 +156,9 @@ class ServiceSchedulerTests(unittest.TestCase):
             contracts={g: platform.store.get("runtime_group", g)["contract"] for g in groups},
             groups=groups, deployments=controller, learning=LEARNING, references=REFERENCES,
             mode="freeze", placements=catalog.placement, service_dependencies=catalog.service_dependencies,
-            shared_services=catalog.shared_services)
+            shared_services=catalog.shared_services,
+            online_services=[] if teacher else catalog.shared_services,
+            scoring_services=catalog.shared_services if teacher else [])
         catalog.bind_run("check", selected["resource_control"])
         controller.lock_groups("check", groups, selected["resource_control"])
         manifest = dict(window.manifest, **selected)
@@ -144,15 +178,22 @@ class ServiceSchedulerTests(unittest.TestCase):
         evaluated = []
         teacher_requests = []
         original_evaluate = window._evaluate
+        original_complete = window._complete
+        def complete(task, event, at):
+            if teacher:
+                event["evidence"] = dict(answer=event["response"])
+            return original_complete(task, event, at)
         def evaluate(task, index):
             live = manager.live_instances("model-a")
-            evaluated.append(bool(live) and task.context in manager.group_view("model-a")["leases"].get(live[0]["id"], []))
-            if teacher:
-                task.terminal["evidence"] = dict(answer=task.terminal["response"])
+            self.assertEqual(window.working.claims, {})
+            self.assertTrue(all(task.session_closed for task in window.tasks))
+            evaluated.append(bool(live) and task.context + ":evaluation" in
+                manager.group_view("model-a")["leases"].get(live[0]["id"], []))
             return original_evaluate(task, index)
         def teacher_send(url, key, body):
             owner = _task_context.get()
-            self.assertIn(owner, window.by_context)
+            self.assertTrue(owner.endswith(":evaluation"))
+            self.assertIn(owner[:-len(":evaluation")], window.by_context)
             self.assertIn(owner, manager.leases["service:model-a"])
             self.assertGreater(manager.live_instances("model-a")[0]["in_flight"], 0)
             teacher_requests.append(owner)
@@ -161,7 +202,8 @@ class ServiceSchedulerTests(unittest.TestCase):
             return dict(choices=[dict(message=dict(content=json.dumps(dict(metrics=[dict(id="quality", status="KNOWN",
                 value=1, reason="fixture result", evidence=["answer"])]))))],
                 usage=dict(prompt_tokens=1, completion_tokens=1, total_tokens=2))
-        with patch.object(window, "_evaluate", side_effect=evaluate), \
+        with patch.object(window, "_complete", side_effect=complete), \
+             patch.object(window, "_evaluate", side_effect=evaluate), \
              patch("seampact.evaluation.Transport.send", side_effect=teacher_send):
             result = window.run()
         self.assertIsNone(result["execution_error"], result["execution_error"])
@@ -170,16 +212,20 @@ class ServiceSchedulerTests(unittest.TestCase):
             self.assertTrue(teacher_requests)
             self.assertTrue(manager.leases["service:model-a"])
             self.assertGreater(manager.live_instances("model-a")[0]["unknown_requests"], 0)
-            self.assertTrue(result["release"]["left"])
+            self.assertFalse(result["release"]["left"])
+            self.assertTrue(result["scoring"]["left"])
             self.assertTrue(service.docker.containers)
             return
         self.assertTrue(result["eligible"], result["exclusion_reason"])
         if teacher:
             self.assertEqual(len(teacher_requests), 4)
-        self.assertEqual(sum(c[:2] == ["docker", "run"] for c in service.docker.commands), 1)
-        self.assertEqual(evaluated, [True, True])
+        self.assertEqual(sum(c[:2] == ["docker", "run"] for c in service.docker.commands), 2 if teacher else 1)
+        self.assertEqual(evaluated, [teacher, teacher])
         self.assertEqual([t["final_response"] for t in result["tasks"]], [4, 7])
-        self.assertGreater(result["costs"]["resource_envelope"]["resource_seconds"]["host_memory_mb"], 0)
+        envelope = result["scoring"]["resource_envelope"] if teacher else result["costs"]["resource_envelope"]
+        self.assertGreater(envelope["resource_seconds"]["host_memory_mb"], 0)
+        if teacher:
+            self.assertEqual(result["costs"]["resource_envelope"]["resource_seconds"]["host_memory_mb"], 0)
         self.assertEqual(window.working.claims, {})
         self.assertFalse(service.docker.containers)
         self.assertFalse(result["release"]["left"])

@@ -45,7 +45,11 @@ def _schema_at(schema, path):
         if isinstance(part, str) and schema.get("type") == "object":
             schema = schema.get("properties", {}).get(part, schema.get("additionalProperties", {}))
         elif type(part) is int and schema.get("type") == "array":
-            schema = schema.get("items", {})
+            prefix = schema.get("prefixItems")
+            if prefix is not None:
+                schema = prefix[part] if type(prefix) is list and 0 <= part < len(prefix) else {}
+            else:
+                schema = schema.get("items", {})
         else:
             return {}
     return schema if isinstance(schema, dict) else {}
@@ -56,6 +60,7 @@ def _contains_native(schema):
         return False
     return ("x-native-type" in schema or
         any(_contains_native(item) for item in schema.get("anyOf", [])) or
+        any(_contains_native(item) for item in schema.get("prefixItems", [])) or
         _contains_native(schema.get("items")) or
         _contains_native(schema.get("additionalProperties")) or
         any(_contains_native(item) for item in schema.get("properties", {}).values()))
@@ -91,6 +96,9 @@ def _nonnative_branch_matches(source, target):
         return False
     if "anyOf" in target:
         return any(_nonnative_branch_matches(source, branch) for branch in target["anyOf"])
+    if source.get("type") == target.get("type") == "array":
+        if source.get("x-python-container", "list") != target.get("x-python-container", "list"):
+            return False
     return not _contains_native(target) and source.get("type") == target.get("type") and bool(source.get("type"))
 
 

@@ -11,6 +11,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from seampact.source.inspection import Inspector
 from seampact.source.dependency_closure import dependency_closure
+from seampact.source.frozen_inheritance import FrozenInheritance, InheritanceIssue
 from seampact.runtime import Coordinator, OwnerRuntime
 from seampact.store import Store
 from seampact.units import NativeBindings, UnitCatalog, MissingBinding
@@ -68,6 +69,7 @@ class InheritedNativeBindingTests(unittest.TestCase):
 
     def test_cross_file_original_loop_dispatches_to_original_subclass(self):
         root, inspector, candidate = self.freeze()
+        candidate["boundaries"][0]["native_wiring"] = "Keep the original base wrapper and subclass receiver."
         report = self.report(inspector, candidate)
         self.assertEqual(report["entries"][0]["status"], "READY", report["entries"])
         facts = report["entries"][0]["inheritance_binding"]
@@ -98,6 +100,12 @@ class InheritedNativeBindingTests(unittest.TestCase):
         # Binding an inherited method does not award lifecycle eligibility.
         lifecycle = report["runtime_groups"]["groups"][0]["contract"]["lifecycle"]
         self.assertEqual(lifecycle["replicate"]["status"], "UNKNOWN")
+
+    def test_inherited_whole_method_does_not_accept_structured_wiring(self):
+        _, inspector, candidate = self.freeze()
+        candidate["boundaries"][0]["native_wiring"] = dict(rule="tool-list-before-sdk/1")
+        row = self.report(inspector, candidate)["entries"][0]
+        self.assertEqual(row["status"], "MISSING")
 
     def test_inherited_constructor_and_relative_import_reexport(self):
         child = CHILD.replace("from base import CheckerBase", "from .exports import CheckerBase").replace(
@@ -182,6 +190,36 @@ class InheritedNativeBindingTests(unittest.TestCase):
         self.assertTrue(closure["unresolved_targets"])
         self.assertFalse(closure["call_edges"])
 
+    def test_literal_only_wildcard_does_not_hide_original_receiver(self):
+        child = CHILD.replace("from base import CheckerBase", "from base import CheckerBase\nfrom prompts import *")
+        _, inspector, candidate = self.freeze(child=child, extras={"prompts.py": 'PROMPT = "use the evidence"\n'})
+        chain, method = FrozenInheritance(inspector).resolve("child.py", "NLIChecker.check")
+        self.assertEqual([item.node.name for item in chain], ["NLIChecker", "CheckerBase"])
+        self.assertEqual(method.symbol, "CheckerBase.check")
+        self.assertEqual(dependency_closure(inspector, candidate)["entries"]["check"]["status"], "CHECKED")
+
+    def test_wildcard_that_can_bind_receiver_is_still_rejected(self):
+        child = CHILD.replace("from base import CheckerBase", "from base import CheckerBase\nfrom prompts import *")
+        _, inspector, _ = self.freeze(child=child, extras={"prompts.py": 'NLIChecker = "replacement"\n'})
+        with self.assertRaisesRegex(InheritanceIssue, "ambiguous"):
+            FrozenInheritance(inspector).resolve("child.py", "NLIChecker.check")
+
+    def test_dynamic_wildcard_exports_remain_unresolved(self):
+        child = CHILD.replace("from base import CheckerBase", "from base import CheckerBase\nfrom prompts import *")
+        for source in ('PROMPT = build_prompt()\n', '__all__ = discover_names()\n',
+                       '__all__ = ["missing"]\n', 'if True:\n    NLIChecker = 1\n'):
+            with self.subTest(source=source):
+                _, inspector, _ = self.freeze(child=child, extras={"prompts.py": source})
+                with self.assertRaises(InheritanceIssue):
+                    FrozenInheritance(inspector).resolve("child.py", "NLIChecker.check")
+
+    def test_literal_all_controls_wildcard_exports(self):
+        child = CHILD.replace("from base import CheckerBase", "from base import CheckerBase\nfrom prompts import *")
+        _, inspector, _ = self.freeze(child=child, extras={"prompts.py":
+            'NLIChecker = "not exported"\nPROMPT = "use evidence"\n__all__ = ["PROMPT"]\n'})
+        _, method = FrozenInheritance(inspector).resolve("child.py", "NLIChecker.check")
+        self.assertEqual(method.symbol, "CheckerBase.check")
+
     def test_original_torch_zero_argument_wrapper_preserves_body_reachability(self):
         child = CHILD.replace("from base import CheckerBase", "from base import CheckerBase\nimport torch as tensor_backend").replace(
             "    def _check", "    @tensor_backend.no_grad()\n    def _check")
@@ -193,6 +231,53 @@ class InheritedNativeBindingTests(unittest.TestCase):
         protocol = next(row for row in closure["external_protocols"] if row["target"] == "torch.no_grad")
         self.assertEqual(protocol["rule"], "external-zero-argument-call-wrapper/1")
         self.assertEqual(inspector.data("child.py"), original)
+
+    def test_original_torch_wrapper_on_public_entry_uses_the_same_finite_proof(self):
+        source = '''
+import torch as tensor_backend
+class NLIChecker:
+    def __init__(self):
+        self.prefix = 'original'
+    @tensor_backend.no_grad()
+    def check(self, values: list[str]) -> list[str]:
+        return self._check(values)
+    def _check(self, values: list[str]) -> list[str]:
+        return values
+'''
+        _, inspector, candidate = self.freeze(child=source)
+        original = inspector.data('child.py')
+        with self.assertRaisesRegex(InheritanceIssue, 'descriptor/decorator'):
+            FrozenInheritance(inspector).resolve('child.py', 'NLIChecker.check')
+        closure = dependency_closure(inspector, candidate)['entries']['check']
+        self.assertEqual(closure['status'], 'CHECKED', closure)
+        self.assertTrue(any(edge['target_symbol']=='NLIChecker._check' for edge in closure['call_edges']))
+        protocol = next(row for row in closure['external_protocols'] if row.get('target')=='torch.no_grad')
+        self.assertEqual(protocol['rule'], 'external-zero-argument-call-wrapper/1')
+        self.assertIn('no lifecycle', protocol['scope'])
+        self.assertEqual(inspector.data('child.py'), original)
+
+    def test_public_entry_wrapper_still_rejects_unknown_nonzero_and_mutated_decorators(self):
+        source = '''
+import torch as backend
+class NLIChecker:
+    @backend.no_grad()
+    def check(self, values: list[str]) -> list[str]:
+        return values
+'''
+        cases = [
+            (source.replace('@backend.no_grad()', '@backend.no_grad(True)'), {}),
+            (source.replace('@backend.no_grad()', '@backend.no_grad()\n    @other'), {}),
+            (source.replace('@backend.no_grad()', '@other'), {}),
+            (source+'\nbackend.no_grad = unknown\n', {}),
+            (source, {'patch.py':'import torch\nsetattr(torch, "no_grad", unknown)\n'}),
+            (source, {'torch.py':'def no_grad():\n    return unknown\n'}),
+        ]
+        for child, extras in cases:
+            with self.subTest(source=child, extras=extras):
+                _, inspector, candidate = self.freeze(child=child, extras=extras)
+                closure = dependency_closure(inspector, candidate)['entries']['check']
+                self.assertEqual(closure['status'], 'MISSING', closure)
+                self.assertFalse(any(row.get('target')=='torch.no_grad' for row in closure['external_protocols']))
 
     def test_torch_wrapper_shadow_mutation_and_nonzero_arguments_stay_missing(self):
         child = CHILD.replace("from base import CheckerBase", "from base import CheckerBase\nimport torch").replace(

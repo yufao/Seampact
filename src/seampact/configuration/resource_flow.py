@@ -367,11 +367,20 @@ class ParameterFlow:
         if len(values) > len(parameters) or any(isinstance(a, ast.Starred) for a in args):
             return None
         env = {p.arg: v for p, v in zip(parameters, values)}
+        extra = {}
+        declared = {a.arg for a in parameters + node.args.kwonlyargs}
         for key, item in keywords.items():
-            if key in env or key not in {a.arg for a in parameters + node.args.kwonlyargs}:
+            if key in env:
                 return None
-            env[key] = item
-        for parameter in parameters + node.args.kwonlyargs:
+            if key in declared:
+                env[key] = item
+            elif node.args.kwarg:
+                extra[key] = item
+            else:
+                return None
+        if node.args.kwarg:
+            env[node.args.kwarg.arg] = extra
+        for parameter in parameters + node.args.kwonlyargs + ([node.args.kwarg] if node.args.kwarg else []):
             if _contains(env.get(parameter.arg)) and (not self.require(target.path, parameter, "original_parameter") or
                                                       _writes(list(_scope_nodes(node)), parameter.arg)):
                 return None

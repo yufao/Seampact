@@ -102,6 +102,35 @@ class WorkerImageReuseTests(unittest.TestCase):
         command = next(argv for argv in reversed(docker.commands) if argv[:3] == ["docker", "buildx", "build"])
         return dict(command[i + 1].split("=", 1) for i, item in enumerate(command) if item == "--build-arg")
 
+    def test_worker_uses_python_handled_stop_signal_without_changing_dependency_recipe(self):
+        folder, environment, plan = self.export()
+        dockerfile = (folder / "Dockerfile").read_text(encoding="utf-8")
+        self.assertIn("STOPSIGNAL SIGINT\nENTRYPOINT", dockerfile)
+        self.assertNotIn("STOPSIGNAL", dockerfile.split("AS worker", 1)[0])
+
+    def test_inherited_source_is_cleared_before_each_copy_and_installation(self):
+        for files, requirements in (({"requirements.txt": b"sample==1\n"}, ["requirements.txt"]),
+                                    ({"requirements.txt": b"-e .\n"}, ["requirements.txt"])):
+            with self.subTest(requirements=files["requirements.txt"]):
+                folder, _, plan = self.export(files=files, requirements=requirements, project=".")
+                dependency, worker = (folder / "Dockerfile").read_text(encoding="utf-8").split(
+                    "FROM ${DEPENDENCY_IMAGE} AS worker", 1)
+                cleanup = "WORKDIR /work\nRUN rm -rf /work/source\n"
+                self.assertIn(cleanup, dependency)
+                self.assertLess(dependency.index(cleanup), dependency.index("WORKDIR /work/source"))
+                if "COPY dependency-inputs" in dependency:
+                    self.assertLess(dependency.index(cleanup), dependency.index("COPY dependency-inputs"))
+                    self.assertLess(dependency.index("COPY dependency-inputs"), dependency.index("-r requirements.txt"))
+                self.assertLess(worker.index("RUN rm -rf /work/source"), worker.index("COPY source /work/source"))
+                self.assertLess(worker.index("COPY source /work/source"), worker.index("} ."))
+                # The only cleared location is the fixed image-owned source
+                # directory; package cache, installed packages and mounts stay.
+                self.assertEqual((dependency + worker).count("RUN rm -rf /work/source\n"), 2)
+                self.assertEqual([line for line in (dependency + worker).splitlines() if "rm -rf" in line],
+                                 ["RUN rm -rf /work/source", "RUN rm -rf /work/source"])
+                self.assertIn("RUN rm -rf /work/source\n", dependency)
+                self.assertEqual(plan["scope"].split(";")[0], "verified recipe and resolved base ID select an installed environment")
+
     def test_nondefault_context_uses_its_local_docker_driver_builder(self):
         docker = FakeDocker()
         docker.context = "desktop-linux"
@@ -244,6 +273,40 @@ class WorkerImageReuseTests(unittest.TestCase):
         self.assertEqual(receipt["image_id"], WORKER)
         self.assertEqual(receipt["dependency_reuse"]["status"], "BUILT")
         self.assertEqual(docker.dependency_builds, 1)
+
+    def test_rebuilding_one_mutable_tag_retains_each_actual_manifest_identity(self):
+        class AttestedDocker(FakeDocker):
+            sequence = 0
+            def run(self, argv, timeout, stdin=None):
+                result = super().run(argv, timeout, stdin)
+                if argv[:4] == ['docker', 'buildx', 'build', '--load'] and '--target' not in argv:
+                    self.sequence += 1
+                    tag = argv[argv.index('-t') + 1]
+                    self.images[tag]['Id'] = 'sha256:' + digest(('manifest-' + str(self.sequence)).encode())
+                return result
+        docker = AttestedDocker()
+        artifact = self.export()
+        first = self.build(docker, artifact)
+        second = self.build(docker, artifact)
+        self.assertEqual(first['status'], 'BUILT')
+        self.assertEqual(second['status'], 'BUILT')
+        self.assertNotEqual(first['image_id'], second['image_id'])
+        self.assertNotEqual(first['image_reference'], second['image_reference'])
+        self.assertEqual(docker.images['worker:example']['Id'], second['image_id'])
+        for receipt in (first, second):
+            self.assertEqual(docker.images[receipt['image_reference']]['Id'], receipt['image_id'])
+            self.assertEqual(receipt['image_reference'], backends.content_image_reference(receipt['image_id']))
+
+    def test_failed_final_content_reference_never_reports_success(self):
+        class FailingDocker(FakeDocker):
+            def run(self, argv, timeout, stdin=None):
+                if argv[:3] == ['docker', 'tag', WORKER]:
+                    return dict(argv=argv, returncode=1, stdout='', stderr='cannot retain final image',
+                                output='cannot retain final image', duration_ms=1)
+                return super().run(argv, timeout, stdin)
+        result = self.build(FailingDocker(), self.export())
+        self.assertEqual(result['status'], 'FAILED')
+        self.assertIsNone(result['image_reference'])
 
 
 if __name__ == "__main__":

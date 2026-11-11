@@ -222,6 +222,8 @@ def check_completion(inspector, entry):
         return None
     if not isinstance(contract, dict) or contract.get("schema") != SCHEMA:
         raise ValueError("unsupported completion contract schema")
+    if "output_scope" in contract and contract["output_scope"] != "fresh-parent/1":
+        raise ValueError("unsupported output scope; use an atomically claimed fresh parent directory")
     if entry.get("kind") != "cli" or not entry.get("path", "").endswith(".py"):
         raise ValueError("completion contract covers only original Python CLI single-file output")
     format_ = contract.get("format")
@@ -302,11 +304,29 @@ def before_completion(contract, arguments, root):
     values = [arguments.get(contract[field]) for field in ("input_parameter", "output_parameter")]
     if any(not isinstance(value, str) or not value or any(char in value for char in "*?[]") for value in values):
         raise ValueError("completion requires explicit single-file input and output paths; directory/glob mapping is UNKNOWN")
-    input_path, output_path = [(Path(root) / value).resolve() for value in values]
+    paths = [Path(root) / value for value in values]
+    input_path, output_path = [path.resolve() for path in paths]
     if not input_path.is_file() or input_path == output_path or output_path.suffix != suffix or output_path.is_dir():
         raise ValueError("completion requires an existing single input file and a distinct exact " + suffix + " output path")
-    return dict(contract=contract, input_path=input_path, output_path=output_path,
-                input_before=_fingerprint(input_path), output_before=_fingerprint(output_path))
+    snapshot = dict(contract=contract, input_path=input_path, output_path=output_path,
+                    input_before=_fingerprint(input_path), output_before=_fingerprint(output_path))
+    if contract.get("output_scope") == "fresh-parent/1":
+        # Original argv is unchanged. Atomic mkdir claims the whole per-request
+        # output namespace across processes/replicas sharing this filesystem.
+        # Failed/ambiguous executions keep the directory: never silently replay.
+        if ".." in paths[1].parts or paths[1].parent.name in {"", ".", ".."}:
+            raise ValueError("exclusive output requires a fresh explicit child directory without traversal")
+        namespace = output_path.parent
+        if not namespace.parent.is_dir() or paths[1].parent.is_symlink():
+            raise ValueError("exclusive output requires an existing root and no namespace symlink")
+        try:
+            namespace.mkdir(mode=0o700)
+        except FileExistsError as error:
+            raise ValueError("output namespace was already claimed; no reuse or replay is allowed") from error
+        info = namespace.stat()
+        snapshot["output_scope"] = dict(schema="fresh-parent/1", path=namespace,
+            device=info.st_dev, inode=info.st_ino, scope="DECLARED_OUTPUT_ONLY")
+    return snapshot
 
 
 def _npy(stream):
@@ -394,13 +414,27 @@ def after_completion(snapshot, process):
         validity = _validity(snapshot["output_path"], snapshot["contract"])
         input_after, input_observed = observe_fingerprint("input")
         input_unchanged = input_after == snapshot["input_before"] if input_observed else None
+        scope = snapshot.get("output_scope")
+        scope_valid = None
+        if scope is not None:
+            try:
+                path = scope["path"]
+                info = path.stat()
+                scope_valid = (not path.is_symlink() and (info.st_dev, info.st_ino) ==
+                    (scope["device"], scope["inode"]) and not snapshot["output_path"].is_symlink() and
+                    sorted(member.name for member in path.iterdir()) == [snapshot["output_path"].name])
+            except OSError:
+                scope_valid = False
+            report["output_scope"] = dict(schema="fresh-parent/1", scope="DECLARED_OUTPUT_ONLY",
+                exclusive_claim=True, unchanged_and_single_output=scope_valid,
+                lifecycle_permission="NOT_GRANTED")
         report.update(result=validity, input_unchanged=input_unchanged,
                       output=dict(preexisting=before is not None, changed=changed,
                                   before=before, after=output),
                       expected_items=1, valid_items=None if validity["status"] == "UNKNOWN" else int(validity["status"] == "VALID"),
                       newly_completed_items=0, observation_errors=observation_errors)
-        if process.returncode != 0 or validity["status"] in {"MISSING", "INVALID"} or input_unchanged is False:
-            report.update(task_status="INCOMPLETE", reason="process failure, missing/invalid result, or input changed during execution")
+        if process.returncode != 0 or validity["status"] in {"MISSING", "INVALID"} or input_unchanged is False or scope_valid is False:
+            report.update(task_status="INCOMPLETE", reason="process failure, missing/invalid result, input changed, or exclusive output scope changed")
         elif observation_errors or validity["status"] == "UNKNOWN":
             report.update(task_status="UNKNOWN", reason="input or output could not be observed; original process result is preserved")
         elif not changed:

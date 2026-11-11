@@ -16,6 +16,9 @@ class Store:
     def list(self, kind):
         return list(self.rows.get(kind, {}).values())
 
+    def tasks_with_status(self, *statuses):
+        return [row for row in self.list("task") if row.get("status") in statuses]
+
     def get(self, kind, identity):
         return self.rows.get(kind, {}).get(identity)
 
@@ -34,7 +37,7 @@ class PreflightChecks(unittest.TestCase):
         deployments = SimpleNamespace(lock=lock, instances={}, run_locks={}, controller_error=None)
         services = SimpleNamespace(instances=deployments.instances, leases={})
         catalog = SimpleNamespace(lock=threading.RLock(), source_running=lambda source_id: False)
-        runtime = SimpleNamespace(snapshot=lambda: dict(calls={}, used=0))
+        runtime = SimpleNamespace(call=lambda method: dict(calls={}, used=0))
         self.platform = SimpleNamespace(store=self.store, deployments=deployments,
             managed_services=services, catalog=catalog, runtime=runtime)
 
@@ -89,14 +92,14 @@ class PreflightChecks(unittest.TestCase):
         for state, expected in (("ENABLED", "BLOCKED"), ("ACTIVE", "BLOCKED"),
                                 ("UNKNOWN", "UNKNOWN"), ("RETIRED", "READY")):
             with self.subTest(state=state):
-                self.platform.runtime.snapshot = lambda: dict(calls={}, used=0, roots={
+                self.platform.runtime.call = lambda method: dict(calls={}, used=0, roots={
                     "r": dict(id="r", state=state, task_id="t", run_id="run")})
                 result = preflight(self.platform, "update")
                 self.assertEqual(result["status"], expected)
                 if state != "RETIRED":
                     self.assertEqual(result["items"][0]["kind"], "root")
                     self.assertEqual(result["items"][0]["task_id"], "t")
-        self.platform.runtime.snapshot = lambda: dict(calls={}, used=0, roots={
+        self.platform.runtime.call = lambda method: dict(calls={}, used=0, roots={
             "r": dict(id="r", state="ACTIVE", outcome_unknown=True)})
         self.assertEqual(preflight(self.platform, "update")["status"], "UNKNOWN")
 

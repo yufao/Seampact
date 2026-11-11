@@ -14,7 +14,8 @@ from seampact.store import Store
 
 class Bound:
     def role_profile(self, role):
-        return {"base_url": "http://example.invalid", "model": "test", "parameters": {}}
+        return {"base_url": "http://example.invalid", "model": "test", "parameters": {},
+                "declared_context_window": 1000000}
 
     def role_key(self, role):
         return "frozen-key"
@@ -29,10 +30,20 @@ class Catalog:
     def business_units(self):
         return [{"id": "unit", "tool_name": "unit"}]
 
+    def name_to_id(self, name):
+        return "unit"
+
+    def invoke(self, unit_id, arguments, **kwargs):
+        return dict(output={"evidence": "actual"}, files=[])
+
 
 class Runtime:
-    def snapshot(self):
-        return {"legal_actions": [], "used": 0, "quota": 1, "calls": {}}
+    def call(self, method, *args):
+        if method == "status_view":
+            return {"legal_actions": [], "used": 0, "quota": 1}
+        if method == "task_calls":
+            return []
+        raise AssertionError(method)
 
     def context(self, identity):
         return nullcontext()
@@ -54,6 +65,7 @@ class ChatContextTests(unittest.TestCase):
         self.addCleanup(self.store.close)
         self.jobs = ChatJobs(self.store, None, None, Runtime(), Scheduler())
         self.plan = dict(id="p", units=["unit"], requirements=[], data_edges=[], control_edges=[],
+                         steps=[dict(unit_id="unit",contract_digest="fixture")],
                          placements=[], binding_status="ok", semantic_status="ok")
 
     def task(self, identity="t", conversation="c"):
@@ -64,22 +76,17 @@ class ChatContextTests(unittest.TestCase):
         request_bodies = []
         responses = [
             dict(choices=[dict(finish_reason="tool_calls", message=dict(role="assistant", content=None,
-                tool_calls=[dict(id="call-1", type="function", function=dict(name="execute_harness_plan", arguments="{}"))]))]),
+                tool_calls=[dict(id="call-1", type="function", function=dict(name="unit", arguments="{}"))]))]),
             dict(choices=[dict(finish_reason="stop", message=dict(role="assistant", content="answer"))]),
             dict(choices=[dict(finish_reason="stop", message=dict(role="assistant", content="next answer"))])]
         def send(url, key, body):
             self.assertEqual(key, "frozen-key")
             request_bodies.append(body)
             return responses.pop(0)
-        class Owner:
-            def __init__(self, plan):
-                pass
-            def execute(self, catalog, convert):
-                return dict(execution_status="RETURN", results=[{"evidence": "actual"}]), True
         self.jobs.transport.send = send
+        self.jobs.transport.stream = lambda url, key, body, on_delta: send(url, key, body)
         task = self.task()
-        with patch.object(self.jobs, "_plans", return_value=[self.plan]), patch("seampact.chat.NativePlanOwner", Owner):
-            self.jobs._run(task, task["messages"], Bound(), Catalog())
+        self.jobs._run(task, task["messages"], Bound(), Catalog())
         self.assertEqual(task["status"], "COMPLETED")
         result_message = next(m for m in task["wire_messages"] if m["role"] == "tool")
         ref = json.loads(result_message["content"])["archive_ref"]
@@ -108,6 +115,7 @@ class ChatContextTests(unittest.TestCase):
             return dict(usage={"prompt_tokens": 20}, choices=[dict(finish_reason="stop",
                 message=dict(role="assistant", content="done"))])
         self.jobs.transport.send = send
+        self.jobs.transport.stream = lambda url, key, body, on_delta: send(url, key, body)
         prior = [dict(role="system", content="system"), dict(role="user", content="first"),
                  dict(role="assistant", content="old evidence " * 500),
                  dict(role="user", content="second"), dict(role="assistant", content="second answer"),
@@ -127,6 +135,7 @@ class ChatContextTests(unittest.TestCase):
         sent = []
         self.jobs.transport.send = lambda url, key, body: sent.append(body) or dict(
             choices=[dict(finish_reason="stop", message=dict(role="assistant", content="done"))])
+        self.jobs.transport.stream = lambda url, key, body, on_delta: self.jobs.transport.send(url, key, body)
         prior = [dict(role="system", content="system"), dict(role="user", content="first"),
                  dict(role="assistant", content=None, tool_calls=[dict(id="lost", type="function",
                      function=dict(name="execute_harness_plan", arguments="{}"))])]

@@ -175,6 +175,12 @@ def _inspect_image(reference, timeout):
     return step, info
 
 
+def content_image_reference(image_id):
+    if not isinstance(image_id, str) or not re.fullmatch(r"sha256:[0-9a-f]{64}", image_id):
+        raise ValueError("content image reference requires a complete actual sha256 ID")
+    return "seampact-build-input:sha256-" + image_id.split(":", 1)[1]
+
+
 def build(folder, image, environment, config, dependency_image=None):
     """Resolve actual image content before selecting any installed environment."""
     recipe = None
@@ -187,7 +193,7 @@ def build(folder, image, environment, config, dependency_image=None):
     reuse = dict(status="NOT_CHECKED", candidate_image=dependency_image, recipe_sha256=recipe,
                  requested_base_image=requested_base, resolved_base_id=None,
                  dependency_image=None, dependency_image_id=None, observed_cache_hit="NOT_CHECKED")
-    facts = dict(image=image, image_id=None, dependency_image=None, requested_base_image=requested_base,
+    facts = dict(image=image, image_id=None, image_reference=None, dependency_image=None, requested_base_image=requested_base,
                  resolved_base_id=None, base_resolution=None, dependency_reuse=reuse)
     builder = "default"
 
@@ -233,7 +239,7 @@ def build(folder, image, environment, config, dependency_image=None):
     def build_reference(image_id):
         # BuildKit does not accept a bare Docker config ID in FROM. Bind a
         # content-named local reference to the checked image and verify it.
-        reference = "seampact-build-input:sha256-" + image_id.split(":", 1)[1]
+        reference = content_image_reference(image_id)
         steps.append(run(["docker", "tag", image_id, reference], remaining()))
         if steps[-1]["returncode"] != 0:
             return None
@@ -308,6 +314,13 @@ def build(folder, image, environment, config, dependency_image=None):
     if not built:
         return failure("工作镜像构建后无法核对实际 sha256 ID")
     facts["image_id"] = built["Id"]
+    # Containerd-backed Docker may expose an image-index/manifest identity here.
+    # Its last mutable tag moving can remove that old identity, even when the
+    # runnable config/layers were identical. Retain and recheck this exact full
+    # content identity before returning any successful build receipt.
+    facts["image_reference"] = build_reference(built["Id"])
+    if not facts["image_reference"]:
+        return failure("工作镜像的内容保留引用与已核对 ID 不一致")
     return _result(steps, "BUILT", **facts)
 
 

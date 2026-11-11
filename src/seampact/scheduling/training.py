@@ -10,6 +10,7 @@ import os
 import queue
 import secrets
 import sys
+import tempfile
 import threading
 import time
 from collections import defaultdict
@@ -19,6 +20,8 @@ from pathlib import Path
 from seampact.evaluation import evaluate, validate_criteria, model_binding
 from seampact.scheduling.learners import Learner, default_config, learner_options
 from seampact.scenes.scenarios import SceneSession, FrozenCatalog, arrays, freeze_scene, digest_file, scene_task_criteria, route_metric_applicability
+from seampact.scenes.evaluation_evidence import PassiveEvidenceGap
+from seampact.scenes.data_use import load_manifest
 from seampact.store import now
 from seampact.scheduling.costs import validate_costs, episode_costs, usage_record, summarize_usage
 from seampact.capabilities import JOINT_OBSERVATION_SCHEMA, JOINT_CANDIDATE_SCHEMA
@@ -189,14 +192,39 @@ def task_criteria(criteria, applicability, called_units=None):
     return effective
 
 
+_IMMEDIATE_STOP = object()
+
+
+HISTORY_DETAIL = frozenset((
+    "tasks", "transitions", "decisions", "roots", "resource_ops", "costs", "residency", "setup", "release",
+    "estimates", "on_demand", "scoring", "counters", "task_ids", "unknown_outcomes", "evidence", "calls",
+    "model_calls", "module_feedback", "reward_components", "final_response", "interrupted_event"))
+CURVE_POINT = ("kind", "episode", "step", "reward", "return", "window_return", "eligible", "interactions",
+               "mean_active_roots")
+
+
+def history_summary(item):
+    """One episode or window as a run view lists it; its full record stays in the run file."""
+    value = {key: field for key, field in item.items() if key not in HISTORY_DETAIL}
+    if "resource_ops" in item:
+        value["resource_ops_count"] = len(item["resource_ops"])
+    for key in ("feedback", "independent_feedback"):
+        if isinstance(item.get(key), dict):
+            value[key] = {name: item[key][name] for name in ("reward", "metrics") if name in item[key]}
+    return value
+
+
 class TrainingJobs:
     def __init__(self, platform):
         self.platform, self.store = platform, platform.store
         self.directory = platform.home / "policy" / "runs"
         self.directory.mkdir(parents=True, exist_ok=True)
         self.lock = threading.RLock()
+        self.offsets = {}
         self.pending = queue.Queue()
         self.stops, self.bindings = {}, {}
+        self.stop_after_windows, self.joint_blocks = {}, {}
+        self.retained_owners = {}
         self.closed = False
         self.active = self.store.get("scheduler_active", "current")
         for run in self.store.list("scheduler_run"):
@@ -209,7 +237,7 @@ class TrainingJobs:
     def snapshot(self):
         config = self.store.get("scheduler_config", "current")
         return dict(config=(config or {}).get("config"), config_id=(config or {}).get("digest"),
-                    options=learner_options(), runs=self.store.list("scheduler_run"),
+                    options=learner_options(), runs=self.store.run_summaries(),
                     active_checkpoint=self.active, scene_contract="native-event/1",
                     readiness=dict(ready_units=sum(u["status"] == "READY" for u in self.platform.catalog.public()),
                         note="READY 表示源码入口已绑定；任务数据、模型及场景前提需单独配置"))
@@ -229,11 +257,42 @@ class TrainingJobs:
     def _manifest(self, config, bound, catalog):
         current = {u["id"]: u for u in catalog.public()}
         scene = freeze_scene(config["scene"], {uid: unit.get("capability") for uid, unit in current.items()})
+        algorithm = config.get("algorithm", "double_dqn")
+        if algorithm not in LEARNING | REFERENCES:
+            raise ValueError("未知学习器或参照策略")
+        task_ids = config.get("task_ids") or [t["id"] for t in scene["tasks"]]
+        if not task_ids or set(task_ids) - {t["id"] for t in scene["tasks"]}:
+            raise ValueError("任务清单不在冻结场景内")
+        data_use = dict(status="UNDECLARED")
+        if scene.get("research_protocol") == "multisource-review/1":
+            purpose = config.get("data_purpose")
+            mode = config.get("mode", "train")
+            if mode not in {"train", "warmstart", "rejudge", "freeze"}:
+                raise ValueError("未知运行方式")
+            if algorithm in LEARNING and mode in {"train", "warmstart", "rejudge"} and purpose != "train":
+                raise ValueError("学习训练、warmstart 和 rejudge 仅允许 train 数据用途")
+            tasks_by_id = {task["id"]: task for task in scene["tasks"]}
+            binding = scene["research_data"]
+            data_use = load_manifest(binding["manifest_path"], binding["manifest_sha256"], purpose,
+                                     [tasks_by_id[identity] for identity in task_ids])
+            data_use["status"] = "DECLARATIONS_VERIFIED"
+            scene["research_task_ids"] = list(task_ids)
+            resources = {item["path"]: item["sha256"] for item in scene.get("resource_files", [])}
+            for item in data_use["declared_files"]:
+                if item["path"] in resources and resources[item["path"]] != item["sha256"]:
+                    raise ValueError("research data file conflicts with frozen scene resource")
+                resources[item["path"]] = item["sha256"]
+            scene["resource_files"] = [dict(path=path, sha256=checksum) for path, checksum in resources.items()]
         pool = []
         for uid in scene.get("unit_ids", []):
             unit = catalog.unit(uid)
-            if not unit or unit["status"] != "READY":
+            conditional = (unit and unit.get("status") == "CALL_CONDITION_DEFERRED"
+                           and bool(unit.get("call_condition"))
+                           and catalog.placement.get(uid, {}).get("kind") == "REMOTE")
+            if not unit or (unit["status"] != "READY" and not conditional):
                 raise ValueError("所选 Unit 尚不可执行：" + uid)
+            if conditional:
+                catalog.require_call_condition_structure(uid)
             if current[uid]["scheduling"]["activation"] != "platform":
                 raise ValueError("透明干预场景请先将所选 Unit 配置为平台触发：" + uid)
             source = self.store.get("harness", unit["source_id"])
@@ -267,12 +326,6 @@ class TrainingJobs:
         catalog.add_role_services(bound, roles)
         if catalog.service_placements:
             bound.managed_catalog = catalog
-        algorithm = config.get("algorithm", "double_dqn")
-        if algorithm not in LEARNING | REFERENCES:
-            raise ValueError("未知学习器或参照策略")
-        task_ids = config.get("task_ids") or [t["id"] for t in scene["tasks"]]
-        if not task_ids or set(task_ids) - {t["id"] for t in scene["tasks"]}:
-            raise ValueError("任务清单不在冻结场景内")
         for task in scene["tasks"]:
             applicability = task.get("metric_applicability", {})
             if (not isinstance(applicability, dict) or any(not isinstance(k, str) or not k or type(v) is not bool
@@ -296,7 +349,7 @@ class TrainingJobs:
         dims = ((len(JOINT_OBSERVATION_SCHEMA), len(JOINT_CANDIDATE_SCHEMA) + resource_dimensions) if scheduling == joint.MODE
                 else (len(scene["observation_schema"]), len(scene["candidate_schema"])))
         if (config.get("joint") or {}).get("budget_policy") is not None:
-            dims = (dims[0] + 1, dims[1])
+            dims = (dims[0] + budget_policy.condition_size(config["joint"]["budget_policy"]), dims[1])
         if algorithm in LEARNING:
             resolved = default_config(algorithm)
             unknown = set(parameters) - set(resolved)
@@ -318,7 +371,7 @@ class TrainingJobs:
             harness_resources=catalog.snapshot_resources(), lower_policy="FIFO",
             managed_services=catalog.service_snapshot(),
             missing_rule="exclude_incomplete_episode_keep_budget",
-            costs=validate_costs(config.get("costs")),
+            costs=validate_costs(config.get("costs")), data_use=data_use,
             upstream_costs=config.get("upstream_costs", {}))
         protocol = feedback_protocol(config.get("feedback_protocol"), criteria)
         contracts = {}
@@ -329,11 +382,17 @@ class TrainingJobs:
                 operations={name: item["status"] for name, item in group["contract"]["operations"].items()},
                 image=placement["image"], image_id=placement["image_id"], binding_fingerprint=placement["binding_fingerprint"])
         if scheduling == joint.MODE:
+            online_roles = set(scene.get("model_roles", ["chat"]))
+            scoring_roles = {spec.get("teacher", {}).get("role", "teacher") for spec in [criteria, final, *route_specs]
+                             if spec and any(d["provider"] == "teacher" and d.get("applicable", True)
+                                             for d in spec["dimensions"])}
             manifest.update(runtime_contracts=contracts, **joint.configure(config, scene=scene, tasks=scene["tasks"],
                 task_ids=task_ids, algorithm=algorithm, criteria=criteria, contracts=contracts,
                 groups=catalog.remote_groups(), deployments=self.platform.deployments, learning=LEARNING,
                 references=REFERENCES, mode=manifest["mode"], placements=catalog.placement,
-                service_dependencies=catalog.service_dependencies, shared_services=catalog.shared_services))
+                service_dependencies=catalog.service_dependencies, shared_services=catalog.shared_services,
+                online_services=catalog.services_for_roles(online_roles),
+                scoring_services=catalog.services_for_roles(scoring_roles)))
         else:
             if catalog.service_placements:
                 raise ValueError("受管模型服务的实验请使用 joint/1，以便完整预留容量及记录资源成本")
@@ -384,19 +443,22 @@ class TrainingJobs:
             parent_id = manifest.get("parent_run_id")
             if not parent_id:
                 raise ValueError("该运行方式需要原训练 run_id")
-            parent = self.detail(parent_id)
+            parent = self.record(parent_id)
             budget = manifest.get("joint", {}).get("budget_policy")
             previous_budget = parent["manifest"].get("joint", {}).get("budget_policy")
             if budget_policy.training_semantics(budget) != budget_policy.training_semantics(previous_budget):
                 raise ValueError("父工件的预算网格、尺度或训练约束不同")
             if budget:
+                if (manifest["joint"].get("budget_quality_metrics", {}) !=
+                        parent["manifest"]["joint"].get("budget_quality_metrics", {})):
+                    raise ValueError("父工件的质量预算指标含义不同")
                 def contracts(pool):
                     return {item["id"]: item.get("typed_contract_digest") for item in pool}
                 expected = contracts(parent["manifest"]["pool"])
                 if (not expected or any(not value for value in expected.values())
                         or expected != contracts(manifest["pool"])):
                     raise ValueError("预算冻结评价要求与训练相同的 Unit 操作契约身份")
-                selected = budget["latency_budgets"].index(budget["freeze_budget"])
+                selected = next(i for i, point in enumerate(budget["points"]) if point["id"] == budget["freeze_point"])
                 counts = parent.get("budget_choice_windows", [])
                 if selected >= len(counts) or not counts[selected] or not parent.get("budget_multipliers"):
                     raise ValueError("所选预算没有实际参与训练的选择窗口")
@@ -496,29 +558,114 @@ class TrainingJobs:
                 self.pending.put(rid)
         return dict(run_ids=created)
 
-    def stop(self, rid):
-        run = self.store.get("scheduler_run", rid)
-        if rid not in self.stops or not run or run["status"] not in {"QUEUED", "RUNNING"}:
-            raise ValueError("运行不在当前队列")
-        self.stops[rid].set()
-        return dict(run_id=rid, stop="任务边界停止")
+    def stop(self, rid, after_windows=_IMMEDIATE_STOP):
+        with self.lock:
+            run = self.store.get("scheduler_run", rid)
+            if rid not in self.stops or not run or run["status"] not in {"QUEUED", "RUNNING"}:
+                raise ValueError("运行不在当前队列")
+            if after_windows is _IMMEDIATE_STOP:
+                self.stops[rid].set()
+                return dict(run_id=rid, stop="任务边界停止")
+            if type(after_windows) is not int or after_windows <= 0 or self.stops[rid].is_set():
+                raise ValueError("after_windows 须为未来完整预算块终点的正整数")
+            manifest = json.loads((self.directory / rid / "manifest.json").read_text(encoding="utf-8"))
+            if digest(manifest) != run["config_digest"]:
+                raise ValueError("运行清单内容身份不符")
+            budget = manifest.get("joint", {}).get("budget_policy")
+            ends = {block["windows"][-1] + 1 for block in budget["blocks"]} if budget else set()
+            completed, started_end = self.joint_blocks.get(rid, (0, 0))
+            if (manifest.get("scheduling_mode") != joint.MODE or after_windows not in ends
+                    or after_windows <= completed or after_windows < started_end):
+                raise ValueError("after_windows 须为未来完整预算块终点")
+            request = dict(run_id=rid, after_windows=after_windows, requested_at=now())
+            self.store.save("scheduler_stop_request", rid, request)
+            self.stop_after_windows[rid] = after_windows
+            return dict(run_id=rid, stop="完整预算块边界停止", after_windows=after_windows)
 
-    def detail(self, rid):
+    def begin_joint_block(self, rid, start, end):
+        with self.lock:
+            target = self.stop_after_windows.get(rid)
+            if target is not None and start >= target:
+                self.stops[rid].set()
+                return False
+            self.joint_blocks[rid] = (start, end)
+            return True
+
+    def finish_joint_block(self, rid, end):
+        with self.lock:
+            self.joint_blocks[rid] = (end, end)
+            if self.stop_after_windows.get(rid) == end:
+                self.stops[rid].set()
+
+    def record(self, rid):
+        """A run's document, stop request and frozen manifest, without its episode records."""
         run = self.store.get("scheduler_run", rid)
         if not run:
             raise ValueError("没有这个运行；需要完整 run_id")
-        folder = self.directory / rid
         result = dict(run)
+        result["stop_request"] = self.store.get("scheduler_stop_request", rid)
         with self.lock:
-            result["manifest"] = json.loads((folder / "manifest.json").read_text(encoding="utf-8"))
-            if digest(result["manifest"]) != run["config_digest"]:
-                raise ValueError("运行清单内容身份不符")
-            for key in ("history", "curves"):
-                path = folder / (key + ".jsonl")
-                # An interrupted writer may leave a partial final record. Only
-                # newline-terminated records are complete observation material.
-                lines = path.read_bytes().splitlines(keepends=True) if path.exists() else []
-                result[key] = [json.loads(line.decode("utf-8")) for line in lines if line.endswith(b"\n") and line.strip()]
+            result["manifest"] = json.loads((self.directory / rid / "manifest.json").read_text(encoding="utf-8"))
+        if digest(result["manifest"]) != run["config_digest"]:
+            raise ValueError("运行清单内容身份不符")
+        return result
+
+    def _positions(self, rid, name):
+        """Byte offsets of the complete records in a run file, extended from the last scan."""
+        path = self.directory / rid / (name + ".jsonl")
+        with self.lock:
+            index = self.offsets.setdefault((rid, name), dict(starts=[], end=0))
+            size = path.stat().st_size if path.exists() else 0
+            if size < index["end"]:
+                index.update(starts=[], end=0)
+            if size > index["end"]:
+                with path.open("rb") as stream:
+                    stream.seek(index["end"])
+                    position = index["end"]
+                    for line in stream:
+                        # An interrupted writer may leave a partial final record. Only
+                        # newline-terminated records are complete observation material.
+                        if not line.endswith(b"\n"):
+                            break
+                        if line.strip():
+                            index["starts"].append(position)
+                        position += len(line)
+                    index["end"] = position
+            return path, list(index["starts"])
+
+    def records(self, rid, name, start=0):
+        """Complete records of a run's history or curves from position ``start``."""
+        path, starts = self._positions(rid, name)
+        if start >= len(starts):
+            return
+        with path.open("rb") as stream:
+            for position in starts[start:]:
+                stream.seek(position)
+                yield json.loads(stream.readline().decode("utf-8"))
+
+    def detail(self, rid):
+        """Everything recorded for a run, for export and replay."""
+        result = self.record(rid)
+        for key in ("history", "curves"):
+            result[key] = list(self.records(rid, key))
+        return result
+
+    def progress(self, rid, history_after=0, curves_after=0):
+        """What a run view draws, read incrementally.
+
+        Returns the summaries of records after the given positions. Per-task
+        calls, transitions and evidence stay in the files; detail() has them.
+        """
+        for value in (history_after, curves_after):
+            if type(value) is not int or value < 0:
+                raise ValueError("记录位置须为非负整数")
+        result = self.record(rid)
+        history = [history_summary(item) for item in self.records(rid, "history", history_after)]
+        curves = [{key: item[key] for key in CURVE_POINT if key in item}
+                  for item in self.records(rid, "curves", curves_after)]
+        result.update(view="summary", history=history, curves=curves,
+                      history_after=history_after, history_total=history_after + len(history),
+                      curves_after=curves_after, curves_total=curves_after + len(curves))
         return result
 
     def _append(self, folder, name, value):
@@ -534,7 +681,7 @@ class TrainingJobs:
         if manifest["mode"] in {"warmstart", "freeze", "rejudge"}:
             if not parent_id:
                 raise ValueError("该运行方式需要原训练 run_id")
-            parent = self.detail(parent_id)
+            parent = self.record(parent_id)
             previous = parent["manifest"]
             if any(manifest[k] != previous[k] for k in ("algorithm", "observation_dim", "candidate_dim")):
                 raise ValueError("父工件的学习器或特征维度不兼容")
@@ -556,15 +703,16 @@ class TrainingJobs:
             learner.load(artifact["path"], optimizer=False)
         return learner
 
-    def _choose(self, manifest, learner, event):
+    def _choose(self, manifest, learner, event, session):
+        legal = session.decision_mask(event)
         if learner:
             return learner.act(event["observation"], [c["features"] for c in event["candidates"]],
-                               [c["legal"] for c in event["candidates"]], training=manifest["mode"] != "freeze")
+                               legal, training=manifest["mode"] != "freeze")
         target = event.get("references", {}).get(manifest["algorithm"])
         if target is None:
             raise ValueError("场景未给出满足相同义务的参照动作：" + manifest["algorithm"])
         for index, candidate in enumerate(event["candidates"]):
-            if candidate["id"] == target and candidate["legal"]:
+            if candidate["id"] == target and legal[index]:
                 return dict(index=index)
         raise ValueError("参照动作不在本次合法候选内")
 
@@ -619,11 +767,12 @@ class TrainingJobs:
         window = time.time()
         transitions = []
         event, execution_error = None, None
+        failure_snapshot, evaluation_error = None, None
         try:
             event = session.reset(task, manifest["seed"] + number)
             while event["kind"] == "decision":
                 choice_started = time.perf_counter()
-                decision = self._choose(manifest, learner, event)
+                decision = self._choose(manifest, learner, event, session)
                 decision["duration_ms"] = (time.perf_counter() - choice_started) * 1000
                 old = copy.deepcopy(event)
                 transition = dict(**arrays(old), index=decision["index"],
@@ -643,13 +792,23 @@ class TrainingJobs:
                                   truncated=event["kind"] == "terminal" and event["truncated"])
                 following = event if event["kind"] == "decision" else event.get("bootstrap_decision")
                 if following:
+                    session.decision_mask(following, preview=following is event)
                     data = arrays(following)
                     transition.update(next_state=data["state"], next_candidates=data["candidates"], next_legal=data["legal"])
         except Exception as error:
             execution_error = dict(type=type(error).__name__, message=str(error))
             previous_event = copy.deepcopy(event)
-            event = dict(kind="terminal", terminated=False, truncated=True,
-                         reason="execution_error", evidence={}, interrupted_event=previous_event)
+            try:
+                failure_snapshot = session.context.freeze_failure_evidence(
+                    criteria=[scene_task_criteria(manifest["scene"], task, manifest[scope], scope)
+                              for scope in ("criteria", "evaluation_criteria")],
+                    destination=self.directory / "runtime" / session.context.run_id / "evaluation-evidence" /
+                                ("episode-" + str(number)), interrupted_event=previous_event)
+                event = failure_snapshot["terminal"]
+            except PassiveEvidenceGap:
+                evaluation_error = session.context.evaluation_error
+                event = dict(kind="terminal", terminated=False, truncated=True,
+                    reason="passive_evaluation_evidence_unavailable", evidence={}, interrupted_event=previous_event)
         milliseconds = (time.perf_counter() - started) * 1000
         evidence = event.get("evidence", {})
         program = dict(event.get("program_metrics", {}), latency_ms=milliseconds,
@@ -660,12 +819,22 @@ class TrainingJobs:
         criterion = task_criteria(scene_task_criteria(manifest["scene"], task, manifest["criteria"]), applicability, called_units)
         final_criterion = task_criteria(scene_task_criteria(manifest["scene"], task,
             manifest["evaluation_criteria"], "evaluation_criteria"), applicability, called_units)
-        feedback = evaluate(session.context.profiles, criterion, evidence, program)
+        def feedback_for(spec, metrics):
+            if session.context.evidence_blocked:
+                # Use the existing missing-evidence UNKNOWN result; no teacher
+                # may score while the evidence still depends on a live owner.
+                blocked = copy.deepcopy(spec)
+                unavailable = "passive_evaluation_evidence_unavailable"
+                blocked["evidence_fields"] = list(dict.fromkeys([*blocked.get("evidence_fields", []), unavailable]))
+                for dimension in blocked["dimensions"]:
+                    dimension["required_evidence"] = [unavailable]
+                return evaluate(session.context.profiles, blocked, {}, metrics)
+            return evaluate(session.context.profiles, spec, evidence, metrics)
+        feedback = feedback_for(criterion, program)
         final_program = dict(program)
         final_program.update(event.get("evaluation_metrics", {}))
         final_program.update({key: program[key] for key in ("latency_ms", "module_calls", "module_duration_ms")})
-        independent = evaluate(session.context.profiles, final_criterion, evidence,
-                               final_program) if final_criterion else None
+        independent = feedback_for(final_criterion, final_program) if final_criterion else None
         eligible = feedback["eligible"] and not event["truncated"] and bool(transitions) and not execution_error
         exclusion = None if eligible else ("execution_error" if execution_error else "no_transitions" if not transitions
             else "truncated" if event["truncated"] else "feedback_unknown:" + ",".join(feedback["unknowns"]))
@@ -695,6 +864,10 @@ class TrainingJobs:
             choice_interactions=sum(sum(t["transition"]["legal"]) > 1 for t in transitions),
             final_response=event.get("response"), terminal_reason=event.get("reason"),
             interrupted_event=event.get("interrupted_event"), execution_error=execution_error,
+            evaluation_capture=dict(status="BLOCKED" if session.context.evidence_blocked else
+                "FROZEN" if failure_snapshot is not None else "NOT_AVAILABLE",
+                artifacts=(failure_snapshot or {}).get("artifacts", []),
+                duration_ms=(failure_snapshot or {}).get("capture_duration_ms")), evaluation_error=evaluation_error,
             metric_applicability=applicability,
             effective_applicability={"training": {d["id"]: d["applicable"] for d in criterion["dimensions"]},
                 "independent": {d["id"]: d["applicable"] for d in final_criterion["dimensions"]} if final_criterion else None})
@@ -851,8 +1024,9 @@ class TrainingJobs:
             for candidate in event["candidates"]:
                 row = value["actions"].setdefault(candidate["id"], dict(legal=0, semantic_only=0, selected=0,
                     explored=0, learning_samples=0, module_feedback={}))
-                row["legal"] += candidate["legal"]
-                row["semantic_only"] += bool(candidate.get("semantic_legal", candidate["legal"]) and not candidate["legal"])
+                row["legal"] += candidate.get("decision_legal", candidate["legal"])
+                row["semantic_only"] += bool(candidate.get("semantic_legal", candidate["legal"]) and
+                                             not candidate.get("decision_legal", candidate["legal"]))
             candidate = event["candidates"][decision["index"]]
             row = value["actions"][candidate["id"]]
             row["selected"] += 1
@@ -884,6 +1058,26 @@ class TrainingJobs:
             if rid is None:
                 return
             self._run(rid)
+
+    def _save_checkpoint(self, rid, run, folder, manifest, learner, committed_window_end=None):
+        """Commit weights and their identifying metadata together before publishing the receipt."""
+        metadata = dict(checkpoint_id=identity(), parent_run_id=manifest.get("parent_run_id"),
+            parent_checkpoint_id=(manifest.get("parent_checkpoint") or {}).get("checkpoint_id"),
+            config_digest=run["config_digest"], policy_version=learner.policy_version,
+            committed_window_end=committed_window_end,
+            budget_multipliers=copy.deepcopy(run.get("budget_multipliers")))
+        path = folder / "policy.pt"
+        fd, temporary = tempfile.mkstemp(prefix=".policy-", suffix=".tmp", dir=folder)
+        os.close(fd)
+        try:
+            learner.save(temporary, checkpoint_metadata=metadata)
+            artifact_digest = digest_file(Path(temporary))
+            os.replace(temporary, path)
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
+        run["checkpoint"] = dict(metadata, path=str(path), artifact_digest=artifact_digest)
+        self.store.save("scheduler_run", rid, run)
 
     def _run(self, rid):
         run = self.store.get("scheduler_run", rid)
@@ -1024,7 +1218,8 @@ class TrainingJobs:
                     break
             if run.get("retention_scope_id"):
                 self.platform.images.verify(run["retention_scope_id"])
-            if learner and manifest["mode"] != "freeze" and learner.steps:
+            if (learner and manifest["mode"] != "freeze" and learner.steps and not
+                    (manifest.get("scheduling_mode") == joint.MODE and manifest["joint"].get("budget_policy"))):
                 if manifest["algorithm"] == "ppo":
                     stats = learner.update(force=True)
                     if stats["updated"]:
@@ -1032,11 +1227,7 @@ class TrainingJobs:
                             interactions=run["interactions"], stats=stats, reward=None, metrics=run["metrics"]))
                 run["learning"] = learner.snapshot()
                 run["updates"] = run["learning"]["updates"]
-                path = folder / "policy.pt"
-                learner.save(path)
-                run["checkpoint"] = dict(checkpoint_id=identity(), parent_run_id=manifest.get("parent_run_id"),
-                    parent_checkpoint_id=(manifest.get("parent_checkpoint") or {}).get("checkpoint_id"),
-                    path=str(path), artifact_digest=digest_file(path))
+                self._save_checkpoint(rid, run, folder, manifest, learner)
             run["status"] = "STOPPED" if self.stops[rid].is_set() or self.closed else "COMPLETED"
         except Exception as error:
             failure = (self.platform.images.get(run["retention_scope_id"]).get("failure")
@@ -1045,16 +1236,29 @@ class TrainingJobs:
             if failure:
                 run["preparation_failure"] = failure
         finally:
-            if session:
+            if session and session.context.evidence_blocked:
+                self.retained_owners.setdefault(rid, []).append(session)
+            retained = bool(self.retained_owners.get(rid))
+            if session and not retained:
                 try:
                     session.close()
                 except Exception as error:
                     run.update(status="FAILED", error=(run.get("error") or "") + " 场景关闭失败：" + str(error))
             if window is not None:
-                run["runtime_window"] = self._close_window(rid, window)
+                if retained:
+                    run["runtime_window"] = dict(setup=window["setup"], status="UNKNOWN",
+                        release={group: dict(status="UNKNOWN", reason="passive_evaluation_evidence_unavailable")
+                                 for group in window["groups"]},
+                        left={group: [item["id"] for item in self.platform.deployments.live_instances(group)
+                                      if item.get("run_id") == rid] for group in window["groups"]})
+                else:
+                    run["runtime_window"] = self._close_window(rid, window)
                 if run["runtime_window"]["left"]:
                     run.update(status="FAILED", error=(run.get("error") or "") + " 真实实例尚未确认释放；镜像引用继续保留")
             run["ended_at"] = now()
+            if retained:
+                run["owner_retention"] = dict(status="BLOCKED", release_status="UNKNOWN",
+                                              reason="passive_evaluation_evidence_unavailable")
             if run.get("costs") is not None:
                 run["costs"].update(scene_initialization_ms=run.get("initialization_ms"),
                                     gradient_ms=run.get("gradient_duration_ms", 0))
@@ -1066,15 +1270,17 @@ class TrainingJobs:
                 scope_id = run["retention_scope_id"]
                 images.record_run_end(scope_id, rid, run["status"])
                 scope = images.get(scope_id)
-                if scope.get("owner") == "training" and all(
+                if (not any(self.retained_owners.get(child) for child in scope["run_ids"])
+                        and scope.get("owner") == "training" and all(
                         (self.store.get("scheduler_run", child) or {}).get("status") not in {"QUEUED", "RUNNING"}
-                        for child in scope["run_ids"]):
+                        for child in scope["run_ids"])):
                     images.close(scope_id)
-            self.bindings.pop(rid, None)
+            if not retained:
+                self.bindings.pop(rid, None)
             print("[SeamPact] learning_finished " + rid + " " + run["status"], flush=True)
 
     def activate(self, rid):
-        run = self.detail(rid)
+        run = self.record(rid)
         if (run["status"] != "COMPLETED" or not run.get("checkpoint")
                 or not run["eligible_episodes"] or not run.get("updates")):
             raise ValueError("需要已完成且实际更新过参数的策略工件")
@@ -1082,8 +1288,11 @@ class TrainingJobs:
             raise ValueError("joint/1 策略作用于多任务工作负载窗口；单个场景对话没有派发与资源事件，不能激活")
         if digest_file(run["checkpoint"]["path"]) != run["checkpoint"]["artifact_digest"]:
             raise ValueError("策略工件内容身份不符")
-        self.active = dict(run_id=rid, checkpoint=run["checkpoint"], scene_id=run["manifest"]["scene"]["id"],
-                           task_ids=[task["id"] for task in run["manifest"]["scene"]["tasks"]],
+        scene = run["manifest"]["scene"]
+        task_ids = (run["manifest"]["task_ids"] if scene.get("research_protocol") == "multisource-review/1"
+                    else [task["id"] for task in scene["tasks"]])
+        self.active = dict(run_id=rid, checkpoint=run["checkpoint"], scene_id=scene["id"],
+                           task_ids=task_ids,
                            scope="仅作用于原场景真实事件；普通对话不会伪造安全事件")
         self.store.save("scheduler_active", "current", self.active)
         return self.active
@@ -1096,12 +1305,15 @@ class TrainingJobs:
             active = copy.deepcopy(self.active)
             if body.get("scene_run_id") != active["run_id"]:
                 raise ValueError("激活策略已改变，请刷新并重新选择场景任务")
-            source = self.detail(active["run_id"])
+            source = self.record(active["run_id"])
             manifest = copy.deepcopy(source["manifest"])
             selected = next((task for task in manifest["scene"]["tasks"]
                              if task["id"] == body.get("scene_task_id")), None)
             if selected is None:
                 raise ValueError("请选择激活策略对应的真实场景任务")
+            if (manifest["scene"].get("research_protocol") == "multisource-review/1"
+                    and selected["id"] not in manifest["task_ids"]):
+                raise ValueError("research task is outside the validated run selection")
             if source.get("checkpoint") != active["checkpoint"]:
                 raise ValueError("激活策略的工件身份已改变，请重新激活")
             bound = BoundProfiles(self.platform.profiles)
@@ -1147,7 +1359,7 @@ class TrainingJobs:
 
     def _chat(self, task, manifest, selected, bound, catalog):
         started = time.perf_counter()
-        session = None
+        session, event = None, None
         try:
             learner = self._learner(manifest)
             session = SceneSession(manifest["scene"], self.platform, task["id"], profiles=bound, catalog=catalog)
@@ -1157,7 +1369,7 @@ class TrainingJobs:
                     raise ValueError("平台已关闭，场景任务中断")
                 choice_started = time.perf_counter()
                 choice = learner.act(event["observation"], [c["features"] for c in event["candidates"]],
-                                     [c["legal"] for c in event["candidates"]], training=False)
+                                     session.decision_mask(event), training=False)
                 choice["duration_ms"] = (time.perf_counter() - choice_started) * 1000
                 task["transparent_decisions"].append(dict(event=copy.deepcopy(event),
                     decision=choice,
@@ -1174,6 +1386,20 @@ class TrainingJobs:
             # deployed task uses only the frozen policy and real environment.
         except Exception as error:
             task.update(status="FAILED", error=str(error))
+            if session:
+                try:
+                    snapshot = session.context.freeze_failure_evidence(
+                        criteria=[scene_task_criteria(manifest["scene"], selected, manifest[scope], scope)
+                                  for scope in ("criteria", "evaluation_criteria")],
+                        destination=self.directory / "runtime" / task["id"] / "evaluation-evidence",
+                        interrupted_event=event)
+                    task.update(evidence=snapshot["terminal"]["evidence"],
+                        evaluation_capture=dict(status="FROZEN", artifacts=snapshot["artifacts"],
+                                                duration_ms=snapshot["capture_duration_ms"]))
+                except PassiveEvidenceGap:
+                    task.update(evidence={}, evaluation_capture=dict(status="BLOCKED"),
+                        evaluation_error=session.context.evaluation_error,
+                        owner_retention=dict(status="BLOCKED", release_status="UNKNOWN"))
         finally:
             if session:
                 task["scene_calls"] = copy.deepcopy(session.context.calls)
@@ -1182,12 +1408,14 @@ class TrainingJobs:
                 task["model_call_details"] = copy.deepcopy(session.context.model_calls)
                 task["costs"] = episode_costs(session.context, manifest, (time.perf_counter() - started) * 1000,
                     task["transparent_decisions"], None, None)
-                try:
-                    session.close()
-                except Exception as error:
-                    task.update(status="FAILED", error=(task.get("error") or "") + " 场景关闭失败：" + str(error))
-            task["calls"] = [call for call in self.platform.runtime.snapshot()["calls"].values()
-                             if call.get("task_id") == task["id"]]
+                if session.context.evidence_blocked:
+                    self.retained_owners.setdefault(task["id"], []).append(session)
+                else:
+                    try:
+                        session.close()
+                    except Exception as error:
+                        task.update(status="FAILED", error=(task.get("error") or "") + " 场景关闭失败：" + str(error))
+            task["calls"] = self.platform.runtime.call("task_calls", task["id"])
             task.update(latency_ms=(time.perf_counter() - started) * 1000, ended_at=now())
             self.store.save("task", task["id"], task)
 

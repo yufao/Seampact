@@ -2,10 +2,12 @@
 from pathlib import Path
 import sys
 import unittest
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from seampact.scheduling.joint import TaskRun, Window
+from seampact.scenes.scenarios import SceneContext
 
 
 class TaskCostClock(unittest.TestCase):
@@ -23,6 +25,12 @@ class TaskCostClock(unittest.TestCase):
         window.unattributed = dict(task_time=0.0, instance_time=0.0)
         window._release_task = Mock()
         window.truncated = []
+        window.manifest = dict(scene={}, criteria={}, evaluation_criteria={})
+        window.jobs, window.rid, window.number = SimpleNamespace(directory=Path.cwd()), "clock", 0
+        window.scoring, window.missing_feedback = {}, []
+        for task in window.tasks:
+            context = SceneContext(SimpleNamespace(profiles=object()), "clock", catalog=object())
+            task.session = SimpleNamespace(context=context, close=lambda: None)
         return window
 
     def test_late_completion_corrects_prior_charge(self):

@@ -79,6 +79,7 @@ class ChatRemoteTests(unittest.TestCase):
                 if model_fail: raise ValueError("model unavailable")
                 return replies.pop(0)
             jobs.transport.send = send
+            jobs.transport.stream = lambda url, key, body, on_delta: send(url, key, body)
             save = store.save
             def save_task(kind, identity, value, *args, **kwargs):
                 if final_save_fail and kind == "task" and value.get("finished_at"):

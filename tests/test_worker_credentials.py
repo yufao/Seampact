@@ -19,6 +19,8 @@ from seampact.hosting import backends
 from seampact.hosting.deployment import Deployments
 from seampact.hosting.image_build import worker_dockerfile
 from seampact.source.inspection import Inspector
+from seampact.store import Store
+from seampact.target_runtime import install_catalog
 from seampact.worker import HostProfiles
 
 
@@ -63,6 +65,51 @@ class WorkerCredentialTests(unittest.TestCase):
         self.assertEqual(self.key_reads, [])
         binding.registry = None
         self.assertEqual(binding.worker_environment([]), {})
+
+    def install_target_binding(self, frozen):
+        inspector = frozen.inspector
+        inspector.request["runtime_environment"] = dict(python="3.10", base_image="python:target")
+        inspector.request["dependency_bindings"] = copy.deepcopy(frozen.selected)
+        candidate = dict(entries=list(frozen.entries.values()))
+        rows = [dict(entry, unit=entry.get("unit", "file"), status="READY", operations={})
+                for entry in candidate["entries"]]
+        methods = []
+        def source_tool(method, **kwargs):
+            methods.append(method)
+            if method == "inspect_candidate":
+                return dict(schema="native-entry-report/1", source_version="frozen",
+                            entries=rows, runtime_groups=dict(groups=[]))
+            if method == "check_requirements":
+                return copy.deepcopy(list(frozen.rows.values()))
+            raise AssertionError(method)
+        inspector.target_runtime = SimpleNamespace(call=source_tool)
+        store = Store(":memory:")
+        self.addCleanup(store.close)
+        catalog = SimpleNamespace(store=store, deferred={}, resource_registry=frozen.registry)
+        units = install_catalog(catalog, inspector, candidate, "analysis", "install")
+        self.assertEqual(methods, ["inspect_candidate", "check_requirements"])
+        self.assertEqual(self.key_reads, [], "source checks must not resolve secret bytes")
+        resources = catalog.deferred[units[0]["id"]][0].resource_binding
+        return resources, store
+
+    def test_target_only_install_keeps_private_credential_interface_without_loading_source(self):
+        resources, store = self.install_target_binding(self.bindings())
+        self.assertIsInstance(resources, DependencyBindings)
+        self.assertEqual(resources.worker_environment(["call"]),
+                         {"SEAMPACT_CREDENTIAL_CONNECTION_1": self.key})
+        self.assertNotIn(self.key, json.dumps(resources.snapshot()))
+        self.assertNotIn(self.key, json.dumps(store.list("unit")))
+        self.current["auth"]["credential_version"] = "changed"
+        with self.assertRaisesRegex(ValueError, "select and rebind"):
+            resources.worker_environment(["call"])
+
+    def test_target_only_weight_group_needs_no_service_profile_or_credentials(self):
+        frozen = self.bindings()
+        frozen.rows = {"model": dict(id="model", kind="weight", entry_ids=["call"], mappings=[])}
+        frozen.selected, frozen.registry = {}, None
+        resources, _ = self.install_target_binding(frozen)
+        self.assertEqual(resources.worker_environment(["call"]), {})
+        self.assertEqual(resources.snapshot()["requirements"][0]["kind"], "weight")
 
     def test_missing_or_rotated_credential_cannot_reuse_a_cached_key(self):
         binding = self.bindings()

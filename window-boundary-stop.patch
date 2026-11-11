@@ -1,0 +1,114 @@
+--- a/src/seampact/scheduling/training.py
++++ b/src/seampact/scheduling/training.py
+@@ -192,6 +192,9 @@
+     return effective
+ 
+ 
++_IMMEDIATE_STOP = object()
++
++
+ class TrainingJobs:
+     def __init__(self, platform):
+         self.platform, self.store = platform, platform.store
+@@ -200,6 +203,7 @@
+         self.lock = threading.RLock()
+         self.pending = queue.Queue()
+         self.stops, self.bindings = {}, {}
++        self.stop_after_windows, self.joint_blocks = {}, {}
+         self.retained_owners = {}
+         self.closed = False
+         self.active = self.store.get("scheduler_active", "current")
+@@ -534,12 +538,44 @@
+                 self.pending.put(rid)
+         return dict(run_ids=created)
+ 
+-    def stop(self, rid):
+-        run = self.store.get("scheduler_run", rid)
+-        if rid not in self.stops or not run or run["status"] not in {"QUEUED", "RUNNING"}:
+-            raise ValueError("运行不在当前队列")
+-        self.stops[rid].set()
+-        return dict(run_id=rid, stop="任务边界停止")
++    def stop(self, rid, after_windows=_IMMEDIATE_STOP):
++        with self.lock:
++            run = self.store.get("scheduler_run", rid)
++            if rid not in self.stops or not run or run["status"] not in {"QUEUED", "RUNNING"}:
++                raise ValueError("运行不在当前队列")
++            if after_windows is _IMMEDIATE_STOP:
++                self.stops[rid].set()
++                return dict(run_id=rid, stop="任务边界停止")
++            if type(after_windows) is not int or after_windows <= 0 or self.stops[rid].is_set():
++                raise ValueError("after_windows 须为未来完整预算块终点的正整数")
++            manifest = json.loads((self.directory / rid / "manifest.json").read_text(encoding="utf-8"))
++            if digest(manifest) != run["config_digest"]:
++                raise ValueError("运行清单内容身份不符")
++            budget = manifest.get("joint", {}).get("budget_policy")
++            ends = {block["windows"][-1] + 1 for block in budget["blocks"]} if budget else set()
++            completed, started_end = self.joint_blocks.get(rid, (0, 0))
++            if (manifest.get("scheduling_mode") != joint.MODE or after_windows not in ends
++                    or after_windows <= completed or after_windows < started_end):
++                raise ValueError("after_windows 须为未来完整预算块终点")
++            request = dict(run_id=rid, after_windows=after_windows, requested_at=now())
++            self.store.save("scheduler_stop_request", rid, request)
++            self.stop_after_windows[rid] = after_windows
++            return dict(run_id=rid, stop="完整预算块边界停止", after_windows=after_windows)
++
++    def begin_joint_block(self, rid, start, end):
++        with self.lock:
++            target = self.stop_after_windows.get(rid)
++            if target is not None and start >= target:
++                self.stops[rid].set()
++                return False
++            self.joint_blocks[rid] = (start, end)
++            return True
++
++    def finish_joint_block(self, rid, end):
++        with self.lock:
++            self.joint_blocks[rid] = (end, end)
++            if self.stop_after_windows.get(rid) == end:
++                self.stops[rid].set()
+ 
+     def detail(self, rid):
+         run = self.store.get("scheduler_run", rid)
+@@ -547,6 +583,7 @@
+             raise ValueError("没有这个运行；需要完整 run_id")
+         folder = self.directory / rid
+         result = dict(run)
++        result["stop_request"] = self.store.get("scheduler_stop_request", rid)
+         with self.lock:
+             result["manifest"] = json.loads((folder / "manifest.json").read_text(encoding="utf-8"))
+             if digest(result["manifest"]) != run["config_digest"]:
+--- a/src/seampact/scheduling/joint.py
++++ b/src/seampact/scheduling/joint.py
+@@ -2395,6 +2395,9 @@
+     def collected():
+         blocks = budget["blocks"] if budget else [{"windows": [i]} for i in range(manifest["episodes"])]
+         for block in blocks:
++            begin = getattr(jobs, "begin_joint_block", None)
++            if begin and not begin(rid, block["windows"][0], block["windows"][-1] + 1):
++                break
+             windows, items = [], []
+             index = budget_policy.budget_index(budget, manifest["seed"], block["windows"][0]) if budget else None
+             for number in block["windows"]:
+@@ -2444,6 +2447,10 @@
+                                           committed_window_end=block["windows"][-1] + 1)
+             for item in items:
+                 yield item, stats
++            if len(items) == len(block["windows"]):
++                finish = getattr(jobs, "finish_joint_block", None)
++                if finish:
++                    finish(rid, block["windows"][-1] + 1)
+     for item, stats in collected():
+         run["episodes"] += 1
+         run["interactions"] += len(item["transitions"])
+--- a/src/seampact/server.py
++++ b/src/seampact/server.py
+@@ -226,7 +226,8 @@
+                 elif path == "/api/scheduler/runs":
+                     result = platform.training.start(body)
+                 elif path == "/api/scheduler/runs/stop":
+-                    result = platform.training.stop(body["run_id"])
++                    result = (platform.training.stop(body["run_id"], after_windows=body["after_windows"])
++                              if "after_windows" in body else platform.training.stop(body["run_id"]))
+                 elif path == "/api/scheduler/activate":
+                     result = platform.training.activate(body["run_id"])
+                 elif path == "/api/analysis/export":

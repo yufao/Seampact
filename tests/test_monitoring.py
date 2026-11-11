@@ -14,16 +14,25 @@ from seampact.observability.monitoring import ResourceMonitor
 
 
 class Store:
+    tasks = ()
+
     def list(self, kind):
         if kind == "managed_service":
             return [{"docker": {"gpus": "device=GPU-12345678-1234-1234-1234-123456789abc"}}]
         return []
 
+    def task_counts(self):
+        return dict(total=len(self.tasks), running=sum(task.get("status") == "RUNNING" for task in self.tasks))
+
+    def tasks_finished_since(self, stamp):
+        return [dict(status=task.get("status"), finished_at=task.get("finished_at") or task.get("ended_at"),
+                     latency_ms=task.get("latency_ms")) for task in self.tasks]
+
 
 def platform(tmp_path):
     deployments = SimpleNamespace(backend=lambda: {"gpus": ""}, sample_resources=lambda: [])
     services = SimpleNamespace(groups=lambda: [], sample_resources=lambda ids: [])
-    runtime = SimpleNamespace(snapshot=lambda: {"calls": {}, "used": 0, "quota": 1})
+    runtime = SimpleNamespace(call=lambda method: {"calls": {}, "used": 0, "quota": 1})
     return SimpleNamespace(home=tmp_path, store=Store(), deployments=deployments, managed_services=services, runtime=runtime)
 
 
@@ -109,8 +118,7 @@ class MonitoringTests(unittest.TestCase):
         obj = platform(tmp_path)
         tasks = [{"status": status, "ended_at" if status == "COMPLETED" else "finished_at": "2020-01-02T08:00:00+08:00", "latency_ms": 20}
                  for status in ("COMPLETED", "FAILED", "CANCELLED", "TIMEOUT")]
-        original_list = obj.store.list
-        obj.store.list = lambda kind: tasks if kind == "task" else original_list(kind)
+        obj.store.tasks = tasks
         monitor = ResourceMonitor(obj)
         self.enterContext(patch("seampact.observability.monitoring.shutil.which", return_value="nvidia-smi"))
         with self.assertRaisesRegex(ValueError, "请选择至少一张"):
@@ -118,6 +126,18 @@ class MonitoringTests(unittest.TestCase):
         sample = monitor._capture({"metrics": ["workload"], "started_at": "2020-01-01T23:00:00+00:00", "gpu_uuids": []})
         workload = sample["workload"]
         assert (workload["tasks_finished"], workload["tasks_cancelled"], workload["tasks_timed_out"]) == (4, 1, 1)
+
+    def test_workload_uses_live_calls_without_full_history_snapshot(self):
+        obj = platform(self.tmp_path)
+        calls = {str(i): {"physical": phase} for i, phase in enumerate(
+            ("ENABLED", "RESERVED", "AUTHORIZED", "STARTED", "UNKNOWN"))}
+        with_calls = {"calls": calls, "used": 2, "quota": 3}
+        obj.runtime.call = lambda method: with_calls if method == "active_view" else self.fail(method)
+        monitor = ResourceMonitor(obj)
+        sample = monitor._capture({"metrics": ["workload"], "started_at": "2020-01-01T00:00:00Z", "gpu_uuids": []})
+        self.assertEqual(sample["workload"]["status"], "OBSERVED")
+        self.assertEqual((sample["workload"]["calls_active"], sample["workload"]["calls_waiting"]), (2, 2))
+        self.assertEqual((sample["workload"]["slots_used"], sample["workload"]["slots_quota"]), (2, 3))
 
 
     def test_service_container_is_not_sampled_twice(self):

@@ -1,7 +1,9 @@
 """Finite lifecycle evidence from frozen source, never from candidate flags.
 
 The closed-source subset permits synchronous Python owners with JSON-valued
-construction state and read-only requests. It has no framework API summary:
+construction state and read-only requests. Typed value lists/mappings and finite
+literal-record keyword domains are checked separately from original effects.
+Untyped/native-object arms remain unknown. It has no framework API summary:
 an imported torch/transformers call remains UNKNOWN, including generate/eval.
 The evidence is part of the group contract and is rebuilt in the worker.
 """
@@ -10,9 +12,13 @@ import ast
 import hashlib
 import json
 from pathlib import PurePosixPath
+from seampact.hosting.background import GUARD as PYTHON_WORK_GUARD
+from seampact.source.frozen_inheritance import FrozenInheritance, InheritanceIssue
+from seampact.source.lifecycle_domains import request_domain, TRANSPORT_GUARDS
+from seampact.source.lifecycle_resources import resolve_values, compile_effects
 
 
-RULE = "closed-python-owner-lifecycle/1"
+RULE = "closed-python-owner-lifecycle/3"
 OBLIGATIONS = ("request_isolation", "repeatable_initialization", "owner_end", "cleanup")
 ITERATORS = frozenset({"enumerate", "range", "reversed", "zip"})
 EXCEPTIONS = frozenset({"ValueError", "TypeError", "RuntimeError"})
@@ -48,10 +54,16 @@ def _literal(node, immutable=False):
 class ClosedSource:
     """Check module initialization, reachable calls and unmodified native owners."""
 
-    def __init__(self, inspector):
+    def __init__(self, inspector, request_codec=None, resource_bindings=None):
         self.inspector = inspector
+        self.request_codec = request_codec
+        self.resource_bindings = resource_bindings
+        self.resource_values = []
+        self.resource_observations = []
         self.paths, self.modules, self.coverage, self.calls, self.checked = {}, {}, {}, [], set()
         self.active = set()
+        self.request_domain = None
+        self.root_callable = None
         for path in inspector.files:
             if not path.endswith(".py"):
                 continue
@@ -87,7 +99,7 @@ class ClosedSource:
         self.fail("evaluated annotation needs a lifecycle summary", node)
 
     def definition(self, node):
-        if node.decorator_list or node.args.vararg or node.args.kwarg:
+        if node.decorator_list or node.args.vararg:
             self.fail("decorated/variadic callable needs a lifecycle summary", node)
         if getattr(node, "type_params", None):
             self.fail("type-parameter scope needs a lifecycle summary", node)
@@ -211,6 +223,11 @@ class ClosedSource:
         return None
 
     def function(self, module, node, owner=None, initializing=False, fields=None):
+        closed_keywords = (self.root_callable == (self.modules[module]["path"], node.lineno, node.name)
+            and self.request_domain is not None and self.request_domain["status"] == "CHECKED"
+            and (self.request_domain.get("keyword_domain") or {}).get("status") == "CHECKED")
+        if node.args.kwarg is not None and not closed_keywords:
+            self.fail("reachable variadic keyword callable lacks its own checked finite domain", node)
         key = (module, node.lineno, owner[0] if owner else None, initializing)
         if key in self.checked:
             return
@@ -220,6 +237,8 @@ class ClosedSource:
         parameters = [*node.args.posonlyargs, *node.args.args, *node.args.kwonlyargs]
         receiver = parameters[0].arg if owner else None
         locals_ = {parameter.arg for parameter in parameters}
+        if node.args.kwarg is not None:
+            locals_.add(node.args.kwarg.arg)
         locals_.update(value.id for value in ast.walk(node) if isinstance(value, ast.Name) and isinstance(value.ctx, ast.Store))
         fields = fields if fields is not None else set()
 
@@ -350,27 +369,44 @@ class ClosedSource:
             self.fail("entry kind/source unit needs a lifecycle summary")
         if entry.get("binding_program") or entry.get("environment") or entry.get("resources"):
             self.fail("request construction/environment/resource lifecycle needs its own source summary")
-        def primitive_port(schema):
-            if "x-native-type" in schema:
-                return False
-            if "anyOf" in schema:
-                return bool(schema["anyOf"]) and all(primitive_port(branch) for branch in schema["anyOf"])
-            kind = schema.get("type")
-            if kind in {"null", "boolean", "integer", "number", "string"}:
-                return True
-            if kind == "array":
-                return isinstance(schema.get("items"), dict) and primitive_port(schema["items"])
-            if kind == "object":
-                return (isinstance(schema.get("additionalProperties"), dict)
-                        and primitive_port(schema["additionalProperties"]))
-            return False
         schema = check.get("input_schema") or {}
-        if schema.get("additionalProperties") or any(not primitive_port(port)
-                for port in schema.get("properties", {}).values()):
-            self.fail("request port has no closed primitive-value lifecycle summary")
-        for values in [entry.get("fixed_arguments", {}), (entry.get("constructor") or {}).get("arguments", {}),
-                       *[item.get("arguments", {}) for item in entry.get("initializers", [])]]:
-            _literal(ast.parse(repr(values), mode="eval").body)
+        # Find the exact original signature before importing/module-effect
+        # analysis, so a port gap does not hide the closed fields it did prove.
+        # This is a source read only; it grants neither inherited owner nor SDK
+        # permissions in the subsequent, unchanged effect checker.
+        try:
+            if entry["kind"] == "method":
+                _, definition = FrozenInheritance(self.inspector).resolve(entry["path"], entry["symbol"])
+                node, path = definition.node, definition.path
+            else:
+                tree = ast.parse(self.inspector.data(entry["path"]), filename=entry["path"])
+                nodes = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == entry["symbol"]]
+                if len(nodes) != 1:
+                    self.fail("entry does not identify one original synchronous signature")
+                node, path = nodes[0], entry["path"]
+        except InheritanceIssue as error:
+            self.fail("request signature source is unresolved: " + str(error))
+        self.root_callable = (path, node.lineno, node.name)
+        self.request_domain = request_domain(schema, entry, node, self.request_codec)
+        scopes = [("entry.fixed_arguments", entry.get("fixed_arguments", {})),
+                  ("constructor.arguments", (entry.get("constructor") or {}).get("arguments", {})),
+                  *[("initializers." + item["symbol"], item.get("arguments", {})) for item in entry.get("initializers", [])]]
+        value_gaps = []
+        for location, values in scopes:
+            resolved, proof, observation = resolve_values(values, entry["id"], location, self.resource_bindings)
+            self.resource_values.append(proof)
+            self.resource_observations.append(observation)
+            if proof["status"] != "CHECKED":
+                value_gaps.append("original resource value has no checked binding at " + location)
+            else:
+                try:
+                    _literal(ast.parse(repr(resolved), mode="eval").body)
+                except (ValueError, TypeError, SyntaxError) as error:
+                    value_gaps.append(str(error))
+        if self.request_domain["status"] != "CHECKED":
+            self.fail("request port has no closed value lifecycle summary: " + str(self.request_domain["reason"]))
+        if value_gaps:
+            self.fail("; ".join(value_gaps))
         module = self.entry_module(entry["path"])
         namespace = self.modules[module]["namespace"]
         if entry["kind"] == "function":
@@ -378,6 +414,7 @@ class ClosedSource:
             if not target or target[0] != "function":
                 self.fail("entry is not one frozen top-level synchronous function")
             self.function(module, target[2])
+            self.resource_effects()
             return
         parts = entry["symbol"].split(".")
         if len(parts) != 2 or not entry.get("constructor") or entry["constructor"].get("symbol") != parts[0]:
@@ -394,36 +431,69 @@ class ClosedSource:
                 self.fail("initializer does not identify a checked original owner method")
             self.function(module, owner[1][name], owner, True, fields)
         self.function(module, owner[1][parts[1]], owner, False, fields)
+        self.resource_effects()
+
+    def resource_effects(self):
+        if any(item["values"] for item in self.resource_values):
+            self.fail("original resource loader/SDK effects have no bound lifecycle summary")
 
 
-def build_lifecycle_evidence(inspector, rows, members):
-    """Build bounded evidence for *every* original group member, without imports.
+def build_lifecycle_evidence(inspector, rows, members, admitted_members=None, request_codec=None,
+                             resource_bindings=None, resource_observations=None):
+    """Check admitted host roots and their full reachable original source.
 
     No caller-supplied lifecycle claim is read. Unsupported source gets a
-    concrete missing condition and retains its partial frozen import coverage.
+    concrete missing condition. Withheld roots remain in group/binding identity;
+    their code is still checked if imported at initialization or reached from a
+    host root. Host admission comes from the mechanical port/binding check.
     """
     by_id, reports = {row["entry_id"]: row for row in rows}, []
+    admitted = list(members) if admitted_members is None else list(admitted_members)
+    if len(set(admitted)) != len(admitted) or set(admitted) - set(members):
+        raise ValueError("lifecycle root domain must be a subset of the original group members")
     for identity in members:
-        checker = ClosedSource(inspector)
+        checker = ClosedSource(inspector, request_codec, resource_bindings)
         row = by_id[identity]
         result = dict(entry_id=identity, status="UNKNOWN", rule=RULE, reason=None)
+        if identity not in admitted:
+            result.update(status="WITHHELD", reason="not admitted as a root by the host port/binding check",
+                          source_coverage=[], import_coverage=[], call_coverage=[])
+            reports.append(result)
+            continue
         try:
             checker.entry(row["entry"], row["check"])
-            result.update(status="SUPPORTED", scope="frozen synchronous primitive-valued source owner; request state is read-only")
+            result.update(status="SUPPORTED", scope="frozen synchronous value owner, read-only requests through "
+                          "the exact group-port/3 coordinator transport; not local native-object input permission")
         except (LifecycleGap, ValueError, KeyError, TypeError, SyntaxError) as error:
             result["reason"] = str(error)
+        # Consume bounded SDK facts even when an earlier source/domain gap
+        # prevents a whole-owner proof. Actual host observations stay outside
+        # the frozen contract, just like actual asset availability.
+        effect_evidence, effect_observation = compile_effects(inspector, row["entry"],
+            checker.request_domain, checker.resource_values)
         result.update(source_coverage=sorted(checker.coverage.values(), key=lambda value: value["path"]),
+                      request_domain=checker.request_domain,
+                      resource_values=checker.resource_values,
+                      effect_evidence=effect_evidence,
                       import_coverage=sorted((dict(module=name, path=value["path"], imports=value["imports"])
                                              for name, value in checker.modules.items()), key=lambda value: value["module"]),
                       call_coverage=checker.calls)
         reports.append(result)
-    supported = bool(reports) and all(item["status"] == "SUPPORTED" for item in reports)
-    evidence = dict(schema="source-lifecycle-evidence/1", rule=RULE, source_id=inspector.request["source_id"],
+        if resource_observations is not None:
+            resource_observations.append(dict(entry_id=identity, scopes=checker.resource_observations,
+                                             sdk_effects=effect_observation))
+    supported = bool(admitted) and all(item["status"] == "SUPPORTED" for item in reports if item["entry_id"] in admitted)
+    evidence = dict(schema="source-lifecycle-evidence/2", rule=RULE, source_id=inspector.request["source_id"],
         source_version=inspector.request["source_version"], entries=list(members),
+        admitted_roots=admitted, request_codec=request_codec,
+        scope="host-admitted roots through exact group-port/3 coordinator transport only; "
+              "full reachable code and module initialization remain checked; local native input domain is not proved",
         binding_digest=_digest([by_id[identity]["entry"] for identity in members]), members=reports,
         checks={name: dict(status="SUPPORTED" if supported else "UNKNOWN", basis=RULE if supported else
-            "full frozen source/import/call coverage is missing; see members", guards=["OWNER_LEASE_ENDED", "ROOTS_AND_PERMITS_DRAINED",
-            "NO_UNKNOWN_CALLS", "PROCESS_AND_BACKEND_RELEASE_CONFIRMED"] if name in {"owner_end", "cleanup"} else [])
+            "full frozen source/import/call coverage is missing; see members", guards=list(TRANSPORT_GUARDS) +
+            (["OWNER_LEASE_ENDED", "ROOTS_AND_PERMITS_DRAINED",
+            "NO_UNKNOWN_CALLS", PYTHON_WORK_GUARD, "PROCESS_AND_BACKEND_RELEASE_CONFIRMED"] if name in {"owner_end", "cleanup"} else [])
+            )
                 for name in OBLIGATIONS})
     evidence["digest"] = _digest(evidence)
     return evidence

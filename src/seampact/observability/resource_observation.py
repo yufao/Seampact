@@ -491,11 +491,19 @@ class WindowObserver:
             for instance, generation in sorted(identities):
                 records = [r for sample in self._samples for r in sample.get("managed_allocations", [])
                            if (r["instance_id"], r["generation"]) == (instance, generation)]
+                scopes = {record.get("scope") for record in records}
+                groups = {record.get("group_id") for record in records}
+                attributed = (len(scopes) == 1 and next(iter(scopes)) in
+                    {"worker_cgroup", "managed_service_cgroup"} and len(groups) == 1
+                    and isinstance(next(iter(groups)), str) and bool(next(iter(groups))))
                 result["managed_allocations"].append(dict(instance_id=instance, generation=generation,
-                    group_id=records[0]["group_id"], scope="managed_service_cgroup",
+                    group_id=records[0]["group_id"] if attributed else None,
+                    scope=records[0]["scope"] if attributed else "UNKNOWN",
+                    scope_status="OBSERVED" if attributed else "UNKNOWN",
+                    scope_reason=None if attributed else "MISSING_OR_CHANGED_ALLOCATION_SCOPE_OR_GROUP",
                     gpu_memory_status="UNKNOWN", gpu_memory_reason="container cgroup does not measure GPU memory",
                     probe_overhead_included=True,
-                    **counter_summary(records, elapsed, gap, cgroup=True)))
+                    **counter_summary(records if attributed else [], elapsed, gap, cgroup=True)))
             result["allocation_sampling_gaps"] = sum(sample.get("allocation_sampler_status") ==
                                                        "UNKNOWN_SAMPLING_FAILED" for sample in self._samples)
             self._summary = result

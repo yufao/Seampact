@@ -11,34 +11,60 @@ from seampact.store import Store
 
 
 class ResidencyTests(unittest.TestCase):
-    def spec(self, reclaimable=("a", "b"), retention="idle_retire/1"):
+    def spec(self, reclaimable=("a", "b"), retention="idle_retire/1", initial=()):
         scene = dict(unit_ids=["ua", "ub"])
         tasks = [dict(id="ta", unit_ids=["ua"]), dict(id="tb", unit_ids=["ub"])]
         return freeze_working_sets(scene, tasks,
             {"ua": dict(kind="REMOTE", group_id="a"), "ub": dict(kind="REMOTE", group_id="b")},
-            {"memory": 8}, {"a": {"memory": 6}, "b": {"memory": 6}}, reclaimable, retention)
+            {"memory": 8}, {"a": {"memory": 6}, "b": {"memory": 6}}, reclaimable, retention,
+            initial_allocations=initial)
 
     def test_pool_larger_than_capacity_preserves_waiting_task(self):
         w = WorkingSets(self.spec(), {"memory": 8}, {"a": {"memory": 6}, "b": {"memory": 6}})
-        self.assertTrue(w.admit("1", "ta"))
-        self.assertFalse(w.admit("2", "tb"))
+        self.assertTrue(w.admit("1", "ta", units=["ua"]))
+        self.assertFalse(w.admit("2", "tb", units=["ub"]))
         w.release("1")
-        self.assertTrue(w.admit("2", "tb"))
+        self.assertTrue(w.admit("2", "tb", units=["ub"]))
         self.assertLess(w.after_start("b", {"a": 1, "b": 0}), 0)
         self.assertGreaterEqual(w.after_start("b", {"a": 0, "b": 0}), 0)
 
     def test_shared_working_set_counted_once_and_replicas_counted(self):
         w = WorkingSets(self.spec(), {"memory": 8}, {"a": {"memory": 6}, "b": {"memory": 6}})
-        self.assertTrue(w.admit("1", "ta"))
-        self.assertTrue(w.admit("2", "ta"))
+        self.assertTrue(w.admit("1", "ta", units=["ua"]))
+        self.assertTrue(w.admit("2", "ta", units=["ua"]))
         self.assertEqual(w.used({"a": 1, "b": 0}), {"memory": 6})
         self.assertLess(w.after_start("a", {"a": 1, "b": 0}), 0)
 
-    def test_unreclaimable_work_and_fixed_residency_are_not_waived(self):
-        with self.assertRaisesRegex(ValueError, "工作集"):
-            self.spec(reclaimable=())
-        with self.assertRaisesRegex(ValueError, "工作集"):
-            self.spec(retention="fixed_resident")
+    def test_cold_pool_is_not_pinned_but_actual_unknown_and_fixed_residency_still_count(self):
+        for retention in ("idle_retire/1", "fixed_resident"):
+            with self.subTest(retention=retention):
+                spec = self.spec(reclaimable=(), retention=retention)
+                self.assertEqual(spec["pinned"], [])
+                working = WorkingSets(spec, {"memory": 8}, {"a": {"memory": 6}, "b": {"memory": 6}})
+                self.assertTrue(working.admit("owner", "ta", units=["ua"]))
+                working.release("owner")
+                # Returned logical claims do not release a physical/unknown
+                # allocation: the next cold choice cannot borrow its bytes.
+                self.assertFalse(working.admit("next", "tb", {"a": 1}, units=["ub"]))
+                self.assertEqual(working.used({"a": 1}), {"memory": 6})
+                self.assertEqual(self.spec(reclaimable=(), retention=retention, initial=["a"])["pinned"], ["a"])
+                with self.assertRaisesRegex(ValueError, "工作集"):
+                    self.spec(reclaimable=(), retention=retention, initial=["a", "b"])
+
+    def test_optional_union_does_not_reserve_and_selected_closure_is_complete(self):
+        demands = {g: {"memory": 1} for g in ("a", "b", "dependency")}
+        spec = freeze_working_sets(dict(unit_ids=["ua", "ub"]), [dict(id="t")],
+            {"ua": dict(kind="REMOTE", group_id="a", resource_dependencies=["dependency"]),
+             "ub": dict(kind="REMOTE", group_id="b")}, {"memory": 2}, demands, list(demands), "idle_retire/1")
+        working = WorkingSets(spec, {"memory": 2}, demands)
+        self.assertTrue(working.admit("owner", "t"))
+        self.assertEqual(working.used({}), {"memory": 0})
+        self.assertTrue(working.admit("owner", "t", units=["ua"]))
+        self.assertEqual(working.claims["owner"], {"a", "dependency"})
+        self.assertFalse(working.admit("owner", "t", units=["ub"]))
+        self.assertEqual(working.claims["owner"], {"a", "dependency"})
+        working.release("owner")
+        self.assertEqual(working.used({"a": 1, "dependency": 1}), {"memory": 2})
 
 
 class BoundaryTests(unittest.IsolatedAsyncioTestCase):

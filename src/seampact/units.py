@@ -15,6 +15,7 @@ import importlib.abc
 import importlib.util
 import inspect
 import json
+import math
 import os
 import re
 import shutil
@@ -23,6 +24,7 @@ import symtable
 import sys
 import threading
 import time
+import types
 import uuid
 from pathlib import Path
 
@@ -39,14 +41,284 @@ from seampact.configuration.configuration_files import configuration_arguments, 
 from seampact.store import now
 from seampact.source.verification import check_candidate, source_unit
 from seampact.source.frozen_inheritance import FrozenInheritance, InheritanceIssue
+from seampact.source.keyword_domain import literal_equal, narrow_keywords
+from seampact.source.finite_registration import RULE as REGISTRATION_RULE, RegistrationUnknown
+from seampact.source.registration_targets import (
+    required_worlds as registration_worlds, module_targets as registration_modules,
+    capture_targets as capture_registration_targets, verify_targets as verify_registration_targets,
+)
 
 
 _native_context_lock = threading.RLock()
 _EMPTY = inspect.Parameter.empty
+_NATIVE_TYPE, _NATIVE_FUNCTION, _NATIVE_METHOD = type, types.FunctionType, types.MethodType
+_NATIVE_DICT, _NATIVE_STR = dict, str
+_NATIVE_STATIC, _NATIVE_CLASS, _NATIVE_PROPERTY = staticmethod, classmethod, property
+_NATIVE_OBJECT, _NATIVE_GETSET = object, types.GetSetDescriptorType
+_NATIVE_MODULE = types.ModuleType
+_NATIVE_MODULE_DICT = types.ModuleType.__dict__['__dict__']
+_NATIVE_CLASS_DICT = type.__dict__['__dict__']
+_NATIVE_MRO = type.__dict__['__mro__']
+_NATIVE_QUALNAME = type.__dict__['__qualname__']
+_UNSET_NATIVE_ATTRIBUTE = object()
 
 
 class MissingBinding(ValueError):
     pass
+
+
+def _native_function_chain(callable_):
+    """Follow only exact Python callables, before reading wrapper metadata."""
+    current, functions, seen = callable_, [], set()
+    while True:
+        if _NATIVE_TYPE(current) is _NATIVE_METHOD:
+            current = current.__func__
+        if _NATIVE_TYPE(current) is not _NATIVE_FUNCTION or id(current) in seen:
+            raise MissingBinding('native callable has an unknown or cyclic wrapper protocol')
+        seen.add(id(current))
+        attributes = current.__dict__
+        if _NATIVE_TYPE(attributes) is not _NATIVE_DICT or any(_NATIVE_TYPE(key) is not _NATIVE_STR for key in attributes):
+            raise MissingBinding('native callable metadata has an unknown mapping/key protocol')
+        functions.append(current)
+        if '__wrapped__' not in attributes:
+            return functions
+        current = attributes['__wrapped__']
+
+
+def _native_callable_snapshot(callable_):
+    rows = []
+    for function in _native_function_chain(callable_):
+        closure = function.__closure__
+        try:
+            contents = tuple(cell.cell_contents for cell in closure) if closure else ()
+        except ValueError as error:
+            raise MissingBinding('native callable has an unreadable closure') from error
+        kwdefaults = function.__kwdefaults__
+        if kwdefaults is not None and (_NATIVE_TYPE(kwdefaults) is not _NATIVE_DICT
+                or any(_NATIVE_TYPE(key) is not _NATIVE_STR for key in kwdefaults)):
+            raise MissingBinding('native keyword defaults have an unknown mapping/key protocol')
+        rows.append(dict(function=function, code=function.__code__, globals=function.__globals__,
+                         defaults=function.__defaults__, kwdefaults=kwdefaults,
+                         kwdefault_items=tuple(kwdefaults.items()) if kwdefaults is not None else None,
+                         closure=closure, contents=contents,
+                         wrapped=function.__dict__.get('__wrapped__', _UNSET_NATIVE_ATTRIBUTE),
+                         signature=function.__dict__.get('__signature__', _UNSET_NATIVE_ATTRIBUTE)))
+    return rows
+
+
+def _verify_native_callable_snapshot(callable_, expected):
+    actual = _native_callable_snapshot(callable_)
+    if len(actual) != len(expected):
+        raise MissingBinding('native callable wrapper chain changed after binding')
+    for row, prior in zip(actual, expected):
+        current_kw, previous_kw = row['kwdefault_items'], prior['kwdefault_items']
+        keyword_changed = ((current_kw is None) != (previous_kw is None)
+            or current_kw is not None and (len(current_kw) != len(previous_kw)
+                or any(key != previous_key or value is not previous_value
+                       for (key, value), (previous_key, previous_value) in zip(current_kw, previous_kw))))
+        if (any(row[key] is not prior[key] for key in ('function', 'code', 'globals', 'defaults', 'kwdefaults',
+                                                        'closure', 'wrapped', 'signature'))
+                or keyword_changed
+                or len(row['contents']) != len(prior['contents'])
+                or any(value is not previous for value, previous in zip(row['contents'], prior['contents']))):
+            raise MissingBinding('native callable code, defaults, globals or retained binding changed')
+
+
+def _plain_callable_defaults(callable_):
+    """Snapshot only exact ordinary defaults; never compare unknown objects."""
+    from seampact.source.call_value_conditions import ordinary
+    rows = []
+    for function in _native_function_chain(callable_):
+        positional, keyword = function.__defaults__, function.__kwdefaults__
+        if positional is not None and _NATIVE_TYPE(positional) is not tuple:
+            raise MissingBinding('native defaults have an unknown tuple protocol')
+        if keyword is not None and (_NATIVE_TYPE(keyword) is not _NATIVE_DICT or
+                any(_NATIVE_TYPE(key) is not _NATIVE_STR for key in keyword)):
+            raise MissingBinding('native keyword defaults have unknown key protocols')
+        rows.append(dict(positional=[ordinary(item) for item in positional or ()],
+                         keyword=ordinary(keyword or {})))
+    return json.dumps(rows, sort_keys=True, ensure_ascii=False, allow_nan=False)
+
+
+def _plain_immutable_class_value(value):
+    kind = _NATIVE_TYPE(value)
+    if value is None or kind is str or kind is int or kind is bool:
+        return True
+    if kind is float:
+        return math.isfinite(value)
+    if kind is tuple:
+        return len(value) <= 64 and all(_plain_immutable_class_value(item) for item in value)
+    return False
+
+
+def _checked_module_table():
+    modules = sys.modules
+    if _NATIVE_TYPE(modules) is not _NATIVE_DICT or any(_NATIVE_TYPE(key) is not _NATIVE_STR for key in modules):
+        raise MissingBinding('original module table has unknown key protocols')
+    return modules
+
+
+def _import_only_function_metadata(function):
+    attributes = function.__dict__
+    if (_NATIVE_TYPE(attributes) is not _NATIVE_DICT or
+            any(_NATIVE_TYPE(key) is not _NATIVE_STR for key in attributes)):
+        raise MissingBinding('imported function metadata has unknown mapping/key protocols')
+    return attributes
+
+
+def _capture_import_only_loader_kernel():
+    """Capture the original controlled loader, before any source is loaded.
+
+    This is the finite loading mechanism used by import-only preparation, not a
+    claim about every object or extension in the worker process.
+    """
+    from seampact.source import inspection, verification
+    bootstrap = importlib._bootstrap
+    classes = [_FrozenLoader, _FrozenFinder, NativeBindings, Inspector,
+               contextlib._GeneratorContextManager, contextlib._GeneratorContextManagerBase,
+               importlib.machinery.ModuleSpec, Path]
+    functions = [source_unit, Inspector.data, units, inspection.decode_text,
+                 inspection.digest, inspection.withheld_source, _checked_module_table,
+                 NativeBindings._context, NativeBindings._namespace,
+                 NativeBindings._inject_callsites, NativeBindings._callsite_factory,
+                 _FrozenLoader.__init__, _FrozenLoader.create_module, _FrozenLoader.exec_module,
+                 _FrozenFinder.__init__, _FrozenFinder.find_spec,
+                 importlib.import_module, importlib.util.spec_from_loader,
+                 contextlib._GeneratorContextManagerBase.__init__,
+                 contextlib._GeneratorContextManager.__enter__, contextlib._GeneratorContextManager.__exit__,
+                 Path.read_bytes, Path.open, Path.cwd]
+    # Frozen importlib's helpers and lock/spec classes form the same original
+    # loading mechanism. Pin their loaded Python code as well as exported names.
+    for value in bootstrap.__dict__.values():
+        if _NATIVE_TYPE(value) is _NATIVE_FUNCTION:
+            functions.append(value)
+        elif _NATIVE_TYPE(value) is _NATIVE_TYPE:
+            classes.append(value)
+    class_seen, expanded = set(), []
+    for class_ in classes:
+        for original in (*_NATIVE_MRO.__get__(class_, _NATIVE_TYPE),
+                         *_NATIVE_MRO.__get__(_NATIVE_TYPE(class_), _NATIVE_TYPE)):
+            if id(original) not in class_seen:
+                class_seen.add(id(original))
+                expanded.append(original)
+    classes = expanded
+    for class_ in classes:
+        for value in _NATIVE_CLASS_DICT.__get__(class_, _NATIVE_TYPE).values():
+            if _NATIVE_TYPE(value) is _NATIVE_STATIC or _NATIVE_TYPE(value) is _NATIVE_CLASS:
+                value = value.__func__
+            if _NATIVE_TYPE(value) is _NATIVE_FUNCTION:
+                functions.append(value)
+    rows, seen = [], set()
+    for callable_ in functions:
+        for function in _native_function_chain(callable_):
+            if id(function) in seen:
+                continue
+            seen.add(id(function))
+            namespace = function.__globals__
+            if (_NATIVE_TYPE(namespace) is not _NATIVE_DICT or
+                    any(_NATIVE_TYPE(key) is not _NATIVE_STR for key in namespace)):
+                raise MissingBinding('controlled source loader has unknown global key protocols')
+            names = set(function.__code__.co_names) | {'__builtins__'}
+            rows.append(dict(function=function, snapshot=_native_callable_snapshot(function),
+                globals=namespace, references=tuple((name, namespace.get(name, _UNSET_NATIVE_ATTRIBUTE))
+                                                     for name in names),
+                builtins=function.__builtins__, metadata=tuple(_import_only_function_metadata(function).items())))
+    module_specs = [
+        (sys, 'sys', ('modules', 'exc_info')),
+        (builtins, 'builtins', ('__import__', 'compile', 'exec', '__build_class__')),
+        (types, 'types', ('FunctionType', 'MethodType', 'ModuleType')),
+        (importlib, 'importlib', ('import_module', '_bootstrap', 'util', 'machinery')),
+        (importlib.abc, 'importlib.abc', ('Loader', 'MetaPathFinder')),
+        (importlib.util, 'importlib.util', ('spec_from_loader',)),
+        (importlib.machinery, 'importlib.machinery', ('ModuleSpec',)),
+        (bootstrap, '_frozen_importlib', tuple(name for name in bootstrap.__dict__
+            if name in {'_gcd_import', '_find_and_load', '_find_and_load_unlocked', '_find_spec',
+                        '_load_unlocked', 'module_from_spec', '_init_module_attrs',
+                        '_call_with_frames_removed', '_handle_fromlist', '_resolve_name',
+                        '_ModuleLockManager', '_get_module_lock', 'ModuleSpec'})),
+        (contextlib, 'contextlib', ('_GeneratorContextManager', '_GeneratorContextManagerBase')),
+        (verification, 'seampact.source.verification', ('source_unit', 'units')),
+        (inspection, 'seampact.source.inspection', ('Inspector', 'units', 'decode_text', 'digest', 'withheld_source')),
+        (os, 'os', ('chdir', 'getcwd', 'fspath')),
+        (inspection.io, 'io', ('open', 'text_encoding')),
+        (inspection.hashlib, 'hashlib', ('sha256',)),
+    ]
+    for name in ('_imp', '_thread', '_weakref'):
+        module = bootstrap.__dict__[name]
+        module_specs.append((module, name, tuple(module.__dict__)))
+    modules = []
+    for module, name, names in module_specs:
+        namespace = _NATIVE_MODULE_DICT.__get__(module, _NATIVE_MODULE)
+        modules.append((module, name, namespace, tuple((key, namespace[key]) for key in names)))
+    return dict(functions=rows, classes=tuple((class_, _NATIVE_TYPE(class_),
+        tuple(_NATIVE_MRO.__get__(class_, _NATIVE_TYPE)),
+        tuple(_NATIVE_CLASS_DICT.__get__(class_, _NATIVE_TYPE).items())) for class_ in classes),
+        modules=modules, builtins=tuple(builtins.__dict__.items()),
+        meta_path=tuple(sys.meta_path), binding_class=NativeBindings, inspector_class=Inspector,
+        lock_type=_NATIVE_TYPE(_native_context_lock),
+        protected=('_context', '_namespace', '_inject_callsites', '_callsite_factory',
+                   '_capture_import_only_target', '_capture_imported_helpers', '_entry_anchor',
+                   '_assert_callable', '_assert_inherited_owner', '_source_method_descriptor'))
+
+
+def _check_import_only_loader(binding):
+    """Check actual loaded objects before entering the original import prefix."""
+    kernel = _IMPORT_ONLY_LOADER_KERNEL
+    for class_, meta, mro, expected in kernel['classes']:
+        if _NATIVE_TYPE(class_) is not meta:
+            raise MissingBinding('controlled source loader metaclass changed')
+        actual_mro = _NATIVE_MRO.__get__(class_, _NATIVE_TYPE)
+        values = _NATIVE_CLASS_DICT.__get__(class_, _NATIVE_TYPE)
+        if (len(actual_mro) != len(mro) or any(a is not b for a, b in zip(actual_mro, mro)) or
+                any(_NATIVE_TYPE(key) is not _NATIVE_STR for key in values) or len(values) != len(expected) or
+                any(key not in values or values[key] is not value for key, value in expected)):
+            raise MissingBinding('controlled source loader class protocol changed')
+    if _NATIVE_TYPE(binding) is not kernel['binding_class']:
+        raise MissingBinding('controlled source loader binding has an unknown protocol')
+    attributes = _NATIVE_OBJECT.__getattribute__(binding, '__dict__')
+    if (_NATIVE_TYPE(attributes) is not _NATIVE_DICT or
+            any(_NATIVE_TYPE(key) is not _NATIVE_STR for key in attributes) or
+            any(name in attributes for name in kernel['protected'])):
+        raise MissingBinding('controlled source loader has an instance method shadow')
+    inspector = attributes.get('inspector')
+    if _NATIVE_TYPE(attributes.get('lock')) is not kernel['lock_type']:
+        raise MissingBinding('controlled source loader lock has an unknown protocol')
+    if _NATIVE_TYPE(inspector) is not kernel['inspector_class']:
+        raise MissingBinding('controlled source reader has an unknown protocol')
+    reader_attributes = _NATIVE_OBJECT.__getattribute__(inspector, '__dict__')
+    if (_NATIVE_TYPE(reader_attributes) is not _NATIVE_DICT or
+            any(_NATIVE_TYPE(key) is not _NATIVE_STR for key in reader_attributes) or 'data' in reader_attributes):
+        raise MissingBinding('controlled source reader has an instance method shadow')
+    # Inspect exact module dictionaries before any string-key lookup. A str
+    # subclass stored as a key can run __eq__ even in an otherwise exact dict.
+    for module, name, namespace, references in kernel['modules']:
+        if (_NATIVE_TYPE(module) is not _NATIVE_MODULE or
+                _NATIVE_MODULE_DICT.__get__(module, _NATIVE_MODULE) is not namespace or
+                any(_NATIVE_TYPE(key) is not _NATIVE_STR for key in namespace) or
+                any(namespace.get(key, _UNSET_NATIVE_ATTRIBUTE) is not value for key, value in references)):
+            raise MissingBinding('controlled source loader module binding changed: ' + name)
+    builtin_values = _NATIVE_MODULE_DICT.__get__(builtins, _NATIVE_MODULE)
+    if (len(builtin_values) != len(kernel['builtins']) or
+            any(key not in builtin_values or builtin_values[key] is not value for key, value in kernel['builtins'])):
+        raise MissingBinding('controlled source loader builtin protocol changed')
+    if (_NATIVE_TYPE(sys.meta_path) is not list or len(sys.meta_path) != len(kernel['meta_path']) or
+            any(actual is not expected for actual, expected in zip(sys.meta_path, kernel['meta_path'])) or
+            _NATIVE_TYPE(sys.path) is not list or any(_NATIVE_TYPE(path) is not _NATIVE_STR for path in sys.path)):
+        raise MissingBinding('controlled source loader import search protocol changed')
+    for row in kernel['functions']:
+        function, namespace = row['function'], row['globals']
+        if (any(_NATIVE_TYPE(key) is not _NATIVE_STR for key in namespace) or
+                any(namespace.get(name, _UNSET_NATIVE_ATTRIBUTE) is not value for name, value in row['references']) or
+                function.__builtins__ is not row['builtins']):
+            raise MissingBinding('controlled source loader function globals changed')
+        metadata = _import_only_function_metadata(function)
+        if (len(metadata) != len(row['metadata']) or
+                any(key not in metadata or metadata[key] is not value for key, value in row['metadata'])):
+            raise MissingBinding('controlled source loader function metadata changed')
+        _verify_native_callable_snapshot(function, row['snapshot'])
+    modules = _checked_module_table()
+    if any(modules.get(name) is not module for module, name, _, _ in kernel['modules']):
+        raise MissingBinding('controlled source loader module identity changed')
 
 
 def _anchor(source, symbol):
@@ -113,6 +385,26 @@ def _type_schema(annotation):
     return None
 
 
+def _object_matches(value, schema, matches):
+    """Enforce the same record fields for JSON and original-native leaves."""
+    properties = schema.get("properties", {})
+    required = schema.get("required", [])
+    additional = schema.get("additionalProperties", True)
+    if (type(properties) is not dict or any(type(name) is not str for name in properties)
+            or type(required) is not list or any(type(name) is not str for name in required)
+            or any(name not in value for name in required)):
+        return False
+    for name, item in value.items():
+        if name in properties:
+            if not matches(item, properties[name]):
+                return False
+        elif additional is False:
+            return False
+        elif type(additional) is dict and not matches(item, additional):
+            return False
+    return True
+
+
 def _matches(value, schema):
     if not schema:
         return True
@@ -121,7 +413,7 @@ def _matches(value, schema):
     if "anyOf" in schema:
         return any(_matches(value, branch) for branch in schema["anyOf"])
     if "enum" in schema:
-        return any(type(value) is type(item) and value == item for item in schema["enum"])
+        return any(literal_equal(value, item) for item in schema["enum"])
     kind = schema.get("type")
     valid = {"string": isinstance(value, str), "integer": type(value) is int,
              "number": type(value) in {int, float}, "boolean": type(value) is bool,
@@ -130,9 +422,124 @@ def _matches(value, schema):
         return False
     if kind == "array":
         return all(_matches(item, schema.get("items", {})) for item in value)
-    if kind == "object" and isinstance(schema.get("additionalProperties"), dict):
-        return all(_matches(item, schema["additionalProperties"]) for item in value.values())
+    if kind == "object":
+        return _object_matches(value, schema, _matches)
     return True
+
+
+def _result_number(value):
+    """Comparison-only value for exact finite numeric result scalars.
+
+    The original object is never replaced. Input/fixed-value matching retains
+    its existing exact Python value domain, and group-port/3 keeps the original
+    NumPy scalar dtype in the actual encoded result.
+    """
+    kind = type(value)
+    if kind is int:
+        return value
+    if kind is float:
+        return value if math.isfinite(value) else None
+    numpy = sys.modules.get("numpy")
+    if numpy is None or not any(kind is scalar for scalar in numpy.sctypeDict.values()):
+        return None
+    array = numpy.asarray(value)  # Exact official scalar only; no source hooks.
+    dtype = array.dtype
+    if (dtype.hasobject or dtype.fields is not None or dtype.subdtype is not None
+            or dtype.kind not in {"i", "u", "f"} or dtype.kind == "f" and dtype.char not in {"e", "f", "d"}):
+        return None
+    plain = numpy.ndarray.tolist(array)
+    return plain if type(plain) is int or type(plain) is float and math.isfinite(plain) else None
+
+
+def _result_matches(value, schema):
+    """Check result values without widening request or native-object ports."""
+    if not schema:
+        return True
+    if "x-native-type" in schema:
+        return False  # Original native/CLI rules retain precedence.
+    if "anyOf" in schema:
+        return any(_result_matches(value, branch) for branch in schema["anyOf"])
+    if "enum" in schema:
+        return any(literal_equal(value, item) for item in schema["enum"])
+    kind = schema.get("type")
+    if kind in {"number", "integer"}:
+        number = _result_number(value)
+        return type(number) is int or kind == "number" and type(number) is float
+    if kind == "array":
+        container = schema.get("x-python-container", "list")
+        if type(container) is not str or container not in {"list", "tuple"} or type(value) is not (tuple if container == "tuple" else list):
+            return False
+        prefix = schema.get("prefixItems")
+        if prefix is not None:
+            # Source-proved literals retain their original container and arity.
+            # This result-only rule never turns JSON lists into tuples.
+            return (type(prefix) is list
+                and type(schema.get("minItems")) is int and type(schema.get("maxItems")) is int
+                and schema.get("minItems") == schema.get("maxItems") == len(prefix) == len(value)
+                and all(type(item) is dict for item in prefix)
+                and all(_result_matches(item, item_schema) for item, item_schema in zip(value, prefix)))
+        return container == "list" and all(_result_matches(item, schema.get("items", {})) for item in value)
+    if kind == "object":
+        return type(value) is dict and _object_matches(value, schema, _result_matches)
+    if kind == "string":
+        numpy = sys.modules.get("numpy")
+        # np.str_ already satisfied the old string matcher and is encoded by
+        # group-port/3. Preserve that supported path without consulting an
+        # arbitrary object's __class__ or accepting source string subclasses.
+        return type(value) is str or numpy is not None and type(value) is numpy.str_
+    return (kind is None
+            or kind == "boolean" and type(value) is bool or kind == "null" and value is None)
+
+
+def _result_root_compatible(declared, proved):
+    """Three-valued root comparison; unknown leaves never erase annotations."""
+    if not declared:
+        return True
+    if "anyOf" in declared:
+        answers = [_result_root_compatible(branch, proved) for branch in declared["anyOf"]]
+        return True if True in answers else None if None in answers else False
+    if "enum" in declared or "anyOf" in proved:
+        return None
+    source_kind, declared_kind = proved.get("type"), declared.get("type")
+    if source_kind is None:
+        return None
+    if "x-native-type" in declared:
+        return False if source_kind in {"array", "string", "integer", "number", "boolean", "null"} else None
+    if declared_kind is None:
+        return None
+    if declared_kind == "number" and source_kind == "integer":
+        return True
+    if declared_kind != source_kind:
+        return False
+    if source_kind == "array":
+        if declared.get("x-python-container", "list") != proved.get("x-python-container", "list"):
+            return False
+        expected, actual = declared.get("prefixItems"), proved.get("prefixItems")
+        if type(expected) is list and type(actual) is list and len(expected) != len(actual):
+            return False
+    return True
+
+
+def _select_result_structure(declared, proof):
+    """Use only a checked source root, preserving compatible declared guards.
+
+    A successful-return structure is not a claim about exceptions, owner
+    lifecycle or unknown children. Actual group-port values still need encoding
+    and result checks; this selection never changes an original result object.
+    """
+    proof = copy.deepcopy(proof)
+    effective = copy.deepcopy(declared)
+    proved = proof.get("result_schema")
+    proof.update(declared_schema=copy.deepcopy(declared), selection="DECLARED_ANNOTATION")
+    if proof.get("status") == "CHECKED" and type(proved) is dict and proved:
+        compatible = _result_root_compatible(declared, proved)
+        if not declared or compatible is False:
+            effective = copy.deepcopy(proved)
+            proof["selection"] = "SOURCE_PROVED_STRUCTURE"
+        proof["root_annotation_check"] = ("CONFLICT" if compatible is False else
+                                           "COMPATIBLE_ROOT" if compatible is True else "UNKNOWN")
+    proof["effective_schema"] = copy.deepcopy(effective)
+    return effective, proof
 
 
 def _fixed_annotation_matches(value, annotation):
@@ -368,6 +775,9 @@ class NativeBindings:
     def __init__(self, inspector, candidate, runtime, resource_binding=None):
         request = json.loads(json.dumps(inspector.request))
         self.inspector = Inspector(inspector.root, inspector.snapshots, request)
+        from seampact.source.call_value_conditions import context
+        if context(inspector) is not None:
+            self.inspector._call_value_context = context(inspector)
         self.candidate = json.loads(json.dumps(candidate))
         self.runtime = runtime
         self.resource_binding = resource_binding
@@ -376,14 +786,18 @@ class NativeBindings:
         self.checked = {row["id"]: row for row in self.report["boundaries"]}
         self.patches, self.recipes, self.module_paths = {}, {}, {}
         self.modules, self.notebooks, self.owners, self.entries = {}, {}, {}, {}
+        self.import_only_entries = {}
         self.approved_entries, self.function_owners, self.owner_keys = {}, {}, {}
         self.programs, self.program_helpers = {}, {}
         self.effective_bindings = {}
         self.inheritance = FrozenInheritance(self.inspector)
         self.inherited_entries = {}
+        self.inherited_calls = {}
         self.fixed_value_bindings = {}
         self.execution_contexts = {}
         self.import_contexts = {}
+        self.import_scope_proofs = {}
+        self.result_structures = {}
         self.completion_contracts = {}
         self.dependency_closure = None
         self.callsite_gates, self.entry_owner_ids = {}, {}
@@ -431,7 +845,16 @@ class NativeBindings:
                 lowered = lower_loop(original, boundary["symbol"], boundary.get("loop_index", 0))
                 self.patches[key], self.recipes[boundary["id"]] = lowered["source"], lowered["recipe"]
 
-    def _dependencies(self, path, unit):
+    def _dependencies(self, path, unit, entry=None):
+        exclusions = set()
+        if entry is not None:
+            from seampact.source.dependency_closure import source_import_scope
+            proof = source_import_scope(self.inspector, entry, self.candidate)
+            self.import_scope_proofs[entry["id"]] = proof
+            if proof["status"] == "CHECKED":
+                exclusions = {(site["path"], site["unit"], site["line"], site["module"],
+                    tuple(site["names"]), site["level"], site["kind"])
+                    for site in proof["sites"] if site["status"] == "NOT_REACHED"}
         missing, installed = [], []
         queue, visited = [(path, unit)], set()
         while queue:
@@ -454,6 +877,9 @@ class NativeBindings:
             module = next((name for name, value in self.module_paths.items() if value[0] == current), "")
             package = module if current.endswith("/__init__.py") else module.rpartition(".")[0]
             for imported in facts["imports"]:
+                if (current, imported.get("unit", "file"), imported.get("line"), imported.get("module"),
+                        tuple(imported.get("names", [])), imported.get("level", 0), imported.get("kind")) in exclusions:
+                    continue
                 name = imported.get("module") or ""
                 roots = explicit_import_roots(self.inspector, current, imported.get("line")) if current.endswith(".py") else []
                 for root in roots:
@@ -671,7 +1097,14 @@ class NativeBindings:
         if inherited:
             path, cell = inherited["method"].path, "file"
         arguments = list(node.args.posonlyargs) + list(node.args.args) + list(node.args.kwonlyargs)
-        return {arg.arg: self._port_schema(arg.annotation, path, cell) for arg in arguments}, self._port_schema(node.returns, path, cell)
+        declared = self._port_schema(node.returns, path, cell)
+        if entry["id"] not in self.result_structures:
+            from seampact.source.result_structure import derive_result_structure
+            proof = derive_result_structure(self.inspector, entry, self.candidate)
+            _, proof = _select_result_structure(declared, proof)
+            self.result_structures[entry["id"]] = proof
+        return ({arg.arg: self._port_schema(arg.annotation, path, cell) for arg in arguments},
+                copy.deepcopy(self.result_structures[entry["id"]]["effective_schema"]))
 
     def _entry_anchor(self, entry):
         path, cell, symbol = entry["path"], entry.get("unit", "file"), entry["symbol"]
@@ -731,9 +1164,7 @@ class NativeBindings:
         if schema.get("type") == "array" and isinstance(value, list):
             return all(self.native_matches(item, schema.get("items", {})) for item in value)
         if schema.get("type") == "object" and type(value) is dict:
-            properties, additional = schema.get("properties", {}), schema.get("additionalProperties", {})
-            return all(self.native_matches(item, properties.get(name, additional if isinstance(additional, dict) else {}))
-                       for name, item in value.items())
+            return _object_matches(value, schema, self.native_matches)
         return _matches(value, schema)
 
     @staticmethod
@@ -1071,6 +1502,14 @@ class NativeBindings:
         return False
 
     def _owner_initialization(self, owner, entry, initialization_names, chain=None):
+        from seampact.source.owner_constants import owner_constants, reachable_owner_nodes
+        constant_chain = chain
+        if constant_chain is None:
+            try:
+                constant_chain = self.inheritance.chain(entry["path"], owner.name)
+            except (InheritanceIssue, KeyError):
+                pass  # Unknown class rewrites do not become constant-field facts.
+        constants = owner_constants(owner, entry, constant_chain) if constant_chain else {}
         methods = {node.name: node for node in owner.body if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))}
         if chain:
             methods = {node.name: node for item in reversed(chain) for node in item.node.body
@@ -1085,7 +1524,7 @@ class NativeBindings:
                 visited.add(id(method))
                 positional = list(method.args.posonlyargs) + list(method.args.args)
                 receiver = positional[0].arg if positional else None
-                for node in ast.walk(method):
+                for node in reachable_owner_nodes(method, constants):
                     if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name) and node.value.id == receiver:
                         if node.attr in methods:
                             pending.append(methods[node.attr])
@@ -1147,6 +1586,8 @@ class NativeBindings:
         if path not in self.inspector.files:
             raise MissingBinding("native entry file is outside the frozen source scope")
         if kind == "cli":
+            if "keyword_domain" in entry:
+                raise MissingBinding("keyword_domain applies to an original Python **kwargs callable, not CLI argv")
             self._cli_shape(entry)
             self.execution_contexts[entry["id"]] = process_context(self.inspector, entry)
             try:
@@ -1254,6 +1695,8 @@ class NativeBindings:
                     schema["required"].append(name)
             if any(isinstance(boundary.get("native_wiring"), dict) for boundary in selected):
                 raise MissingBinding("construction prefix SDK registration needs a before-registration construction hook")
+        if "keyword_domain" in entry:
+            schema = narrow_keywords(schema, node, entry["keyword_domain"], entry.get("fixed_arguments", {}))
         if owner is not None and not program and not class_bound:
             constructor = entry.get("constructor")
             if not isinstance(constructor, dict) or constructor.get("symbol") != owner.name:
@@ -1308,14 +1751,17 @@ class NativeBindings:
         elif entry.get("constructor") or entry.get("initializers"):
             raise MissingBinding("function entry cannot invent a native object owner")
         for boundary in selected:
+            wiring = boundary.get("native_wiring")
             if inherited:
                 definition = inherited["method"]
-                if (boundary["mode"] != "W" or boundary.get("rule") or boundary.get("native_wiring")
+                # Prose describes the original wiring; only a structured
+                # adapter changes it and is unavailable for inherited W calls.
+                if (boundary["mode"] != "W" or boundary.get("rule")
+                        or (wiring is not None and not isinstance(wiring, str))
                         or boundary["path"] != definition.path or boundary["symbol"] != definition.symbol
                         or boundary.get("unit", "file") != "file" or len(selected) != 1):
                     raise MissingBinding("inherited native binding supports only its whole original W definition")
                 continue
-            wiring = boundary.get("native_wiring")
             if isinstance(wiring, dict):
                 if owner is None or wiring["controller_path"] != path or wiring["controller_symbol"] != owner.name:
                     raise MissingBinding("native tool-list controller does not match this entry owner")
@@ -1337,7 +1783,7 @@ class NativeBindings:
                         and profile.get("explicit_lifetime") is True):
                     raise MissingBinding("R-INPLACE requires the confirmed finite native entry profile")
         self.check_nested(entry, selected)
-        self._dependencies(path, cell)
+        self._dependencies(path, cell, entry=entry)
         return schema, omitted
 
     def check_nested(self, entry, selected):
@@ -1545,48 +1991,134 @@ class NativeBindings:
                     boundary_id=boundary["id"], source_unit=boundary.get("unit", "file"), mode=boundary["mode"])
 
     def _assert_callable(self, callable_, symbol, path):
-        original = inspect.unwrap(callable_)
-        code = getattr(original, "__code__", None)
-        if (getattr(callable_, "__qualname__", None) != symbol or code is None
+        functions = _native_function_chain(callable_)
+        original, outer = functions[-1], functions[0]
+        code = original.__code__
+        if (_NATIVE_TYPE(outer.__qualname__) is not _NATIVE_STR or outer.__qualname__ != symbol
+            or _NATIVE_TYPE(code.co_filename) is not _NATIVE_STR
             or Path(code.co_filename).resolve() != (self.inspector.root / path).resolve()):
             raise MissingBinding("native callable does not match its frozen source anchor: " + symbol)
 
     def _assert_inherited_owner(self, class_, binding):
         chain = binding["chain"]
-        if not inspect.isclass(class_) or type(class_) is not type:
+        endpoint = chain[-1].external_endpoint
+        expected_meta, tail = _NATIVE_TYPE, [_NATIVE_OBJECT]
+        if endpoint:
+            if endpoint != 'abc.ABC':
+                raise MissingBinding('native inherited external endpoint has no finite target protocol')
+            from seampact.source.abc_kernel import abc_objects, check_abc_source, check_abc_target
+            checked = check_abc_source(self.inspector, chain)
+            if checked['status'] != 'CHECKED':
+                raise MissingBinding('native original ABC source/kernel conditions changed')
+            abc_class, expected_meta = abc_objects()
+            tail = [abc_class, _NATIVE_OBJECT]
+        if _NATIVE_TYPE(class_) is not expected_meta:
             raise MissingBinding("native inherited owner is not an ordinary source class")
-        actual = class_.__mro__
-        if len(actual) != len(chain) + 1 or actual[-1] is not object:
+        actual = _NATIVE_MRO.__get__(class_, _NATIVE_TYPE)
+        if len(actual) != len(chain) + len(tail) or any(value is not expected for value, expected in zip(actual[-len(tail):], tail)):
             raise MissingBinding("native inheritance differs from its frozen single-class chain")
+        local_classes = list(actual[:len(chain)])
+        if endpoint and check_abc_target(class_, local_classes, chain)['status'] != 'CHECKED':
+            raise MissingBinding('native original ABC target class/meta/state conditions changed')
         for original, source in zip(actual, chain):
+            if _NATIVE_TYPE(original) is not expected_meta:
+                raise MissingBinding('native inherited class has an unknown metaclass')
+            self.inspector.data(source.path)  # Fresh original snapshot identity.
             namespace = self._namespace(dict(path=source.path))
-            if (namespace.get(source.node.name) is not original or original.__qualname__ != source.node.name
-                    or original.__module__ != namespace.get("__name__") or type(original) is not type):
+            class_namespace = _NATIVE_CLASS_DICT.__get__(original, _NATIVE_TYPE)
+            if (_NATIVE_TYPE(namespace) is not _NATIVE_DICT or any(_NATIVE_TYPE(key) is not _NATIVE_STR for key in namespace)
+                    or any(_NATIVE_TYPE(key) is not _NATIVE_STR for key in class_namespace)):
+                raise MissingBinding('native inherited source namespace has unknown key protocols')
+            qualname = _NATIVE_QUALNAME.__get__(original, _NATIVE_TYPE)
+            module = class_namespace.get('__module__')
+            if (namespace.get(source.node.name) is not original or _NATIVE_TYPE(qualname) is not _NATIVE_STR
+                    or qualname != source.node.name or _NATIVE_TYPE(module) is not _NATIVE_STR
+                    or module != namespace.get("__name__")):
                 raise MissingBinding("native inherited class differs from its original frozen definition")
             expected_names = {member.name for member in source.node.body
                               if isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef))}
-            actual_names = {name for name, value in original.__dict__.items()
-                            if inspect.isfunction(value) or isinstance(value, (staticmethod, classmethod, property))}
+            actual_names = {name for name, value in class_namespace.items()
+                            if _NATIVE_TYPE(value) is _NATIVE_FUNCTION or _NATIVE_TYPE(value) is _NATIVE_STATIC
+                            or _NATIVE_TYPE(value) is _NATIVE_CLASS or _NATIVE_TYPE(value) is _NATIVE_PROPERTY}
             if actual_names != expected_names:
                 raise MissingBinding("native inherited class method set differs from frozen source")
             for member in source.node.body:
                 if not isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef)):
                     continue
-                descriptor = original.__dict__.get(member.name)
-                if not inspect.isfunction(descriptor):
-                    # Other original builtin descriptors are retained; they
-                    # cannot become the selected inherited instance entry.
-                    if (len(member.decorator_list) == 1 and isinstance(member.decorator_list[0], ast.Name)
-                            and ((member.decorator_list[0].id == "staticmethod" and type(descriptor) is staticmethod)
-                                 or (member.decorator_list[0].id == "classmethod" and type(descriptor) is classmethod))):
-                        descriptor = descriptor.__func__
-                    else:
-                        raise MissingBinding("native inherited method has an unknown runtime descriptor")
-                self._assert_callable(descriptor, source.node.name + "." + member.name, source.path)
-                original_function = inspect.unwrap(descriptor)
+                descriptor = class_namespace.get(member.name)
+                expected_descriptor = _NATIVE_FUNCTION
+                if (len(member.decorator_list) == 1 and isinstance(member.decorator_list[0], ast.Name)
+                        and member.decorator_list[0].id in {'staticmethod', 'classmethod'}):
+                    expected_descriptor = _NATIVE_STATIC if member.decorator_list[0].id == 'staticmethod' else _NATIVE_CLASS
+                if _NATIVE_TYPE(descriptor) is not expected_descriptor:
+                    raise MissingBinding("native inherited method descriptor differs from its original source binding")
+                function = descriptor.__func__ if expected_descriptor is not _NATIVE_FUNCTION else descriptor
+                functions = _native_function_chain(function)
+                if endpoint and len(functions) != 1:
+                    raise MissingBinding('finite original ABC method acquired an unproved wrapper')
+                if endpoint and function.__dict__:
+                    raise MissingBinding('finite original ABC method acquired unproved callable metadata')
+                self._assert_callable(function, source.node.name + "." + member.name, source.path)
+                original_function = functions[-1]
+                if original_function.__globals__ is not namespace:
+                    raise MissingBinding('native inherited method global namespace differs from its original module')
                 first_line = min([member.lineno, *(value.lineno for value in member.decorator_list)])
                 if original_function.__code__.co_firstlineno != first_line:
                     raise MissingBinding("native inherited method was replaced after its source definition")
+
+    @staticmethod
+    def _source_method_descriptor(class_, name):
+        for original in _NATIVE_MRO.__get__(class_, _NATIVE_TYPE):
+            namespace = _NATIVE_CLASS_DICT.__get__(original, _NATIVE_TYPE)
+            if any(_NATIVE_TYPE(key) is not _NATIVE_STR for key in namespace):
+                raise MissingBinding('native class dictionary has unknown key protocols')
+            if name in namespace:
+                return namespace[name]
+        raise MissingBinding('original inherited instance method is absent')
+
+    @staticmethod
+    def _instance_dictionary(owner, class_):
+        for original in _NATIVE_MRO.__get__(class_, _NATIVE_TYPE):
+            namespace = _NATIVE_CLASS_DICT.__get__(original, _NATIVE_TYPE)
+            if any(_NATIVE_TYPE(key) is not _NATIVE_STR for key in namespace):
+                raise MissingBinding('native class dictionary has unknown key protocols')
+            if '__dict__' in namespace:
+                descriptor = namespace['__dict__']
+                if _NATIVE_TYPE(descriptor) is not _NATIVE_GETSET:
+                    raise MissingBinding('native owner dictionary has an unknown descriptor')
+                value = descriptor.__get__(owner, class_)
+                if _NATIVE_TYPE(value) is not _NATIVE_DICT or any(_NATIVE_TYPE(key) is not _NATIVE_STR for key in value):
+                    raise MissingBinding('native owner dictionary has unknown key protocols')
+                return value
+        return {}
+
+    def _verify_inherited_call(self, entry, unit, callable_):
+        if entry['id'] not in self.inherited_entries:
+            return
+        retained = self.inherited_calls.get(unit['id'])
+        if retained is None or retained['callable'] is not callable_:
+            raise MissingBinding('original inherited callable binding is absent or replaced')
+        binding, owner, class_, record = retained['binding'], retained['owner'], retained['class'], retained['record']
+        self._assert_inherited_owner(class_, binding)
+        if _NATIVE_TYPE(owner) is not class_:
+            raise MissingBinding('native inherited owner identity or class changed')
+        fields = self._instance_dictionary(owner, class_)
+        methods = {member.name for item in binding['chain'] for member in item.node.body
+                   if isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef))}
+        proxies = record.get('method_proxies', {})
+        for name in methods & set(fields):
+            if name not in proxies or fields[name] is not proxies[name]['method']:
+                raise MissingBinding('native inherited instance shadows an original method')
+        for name, method in record.get('retained_methods', {}).items():
+            original = method['bound']
+            if (_NATIVE_TYPE(original) is not _NATIVE_METHOD or original.__self__ is not owner
+                    or original.__func__ is not self._source_method_descriptor(class_, name)):
+                raise MissingBinding('retained inherited bound method differs from the current original descriptor')
+            _verify_native_callable_snapshot(original, method['snapshot'])
+        for proxy in proxies.values():
+            _verify_native_callable_snapshot(proxy['method'], proxy['method_snapshot'])
+            _verify_native_callable_snapshot(proxy['proxy'], proxy['proxy_snapshot'])
+        _verify_native_callable_snapshot(callable_, retained['snapshot'])
 
     def _assert_entry_callable(self, callable_, entry):
         inherited = self.inherited_entries.get(entry["id"])
@@ -1595,6 +2127,408 @@ class NativeBindings:
             self._assert_callable(callable_, definition.symbol, definition.path)
         else:
             self._assert_callable(callable_, entry["symbol"], entry["path"])
+
+    def _capture_import_only_target(self, entry, namespace):
+        """Capture only already-defined native functions and class bindings."""
+        if (_NATIVE_TYPE(namespace) is not _NATIVE_DICT or
+                any(_NATIVE_TYPE(key) is not _NATIVE_STR for key in namespace)):
+            raise MissingBinding('original module namespace has unknown key protocols')
+        parts = entry['symbol'].split('.')
+        classes, functions = [], []
+        if entry['kind'] == 'function' and len(parts) == 1:
+            function = namespace.get(parts[0])
+            node, _ = self._entry_anchor(entry)
+            if _NATIVE_TYPE(function) is not _NATIVE_FUNCTION or function.__globals__ is not namespace:
+                raise MissingBinding('imported original function identity is UNKNOWN')
+            metadata = _import_only_function_metadata(function)
+            if node.decorator_list or len(metadata) or function.__code__.co_firstlineno != node.lineno:
+                raise MissingBinding('original function definition or wrapper is outside the import-only subset')
+            self._assert_callable(function, entry['symbol'], entry['path'])
+        elif entry['kind'] == 'method' and len(parts) == 2:
+            class_ = namespace.get(parts[0])
+            inherited = self.inherited_entries.get(entry['id'])
+            if inherited is None:
+                inherited = dict(chain=self.inheritance.chain(entry['path'], parts[0]))
+            # Every original class module must already have been imported by
+            # the selected prefix. This check never imports an extra module.
+            modules = _checked_module_table()
+            for source in inherited['chain']:
+                module = next((name for name, record in self.module_paths.items()
+                               if record[0] == source.path and not name.startswith('src.')), None)
+                if not module or _NATIVE_TYPE(modules.get(module)) is not types.ModuleType:
+                    raise MissingBinding('original class source module is not already imported')
+            self._assert_inherited_owner(class_, inherited)
+            actual = _NATIVE_MRO.__get__(class_, _NATIVE_TYPE)
+            function = self._source_method_descriptor(class_, parts[1])
+            if _NATIVE_TYPE(function) is not _NATIVE_FUNCTION:
+                raise MissingBinding('imported original method is not an exact instance function')
+            definition = self.inheritance.method(inherited['chain'], parts[1])
+            if definition is None:
+                raise MissingBinding('imported original method definition is absent')
+            self._assert_callable(function, definition.symbol, definition.path)
+            for original, source in zip(actual, inherited['chain']):
+                values = _NATIVE_CLASS_DICT.__get__(original, _NATIVE_TYPE)
+                if any(_NATIVE_TYPE(key) is not _NATIVE_STR for key in values):
+                    raise MissingBinding('original class has unknown key protocols')
+                declared = {member.name for member in source.node.body
+                            if isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef))}
+                for name, value in values.items():
+                    if name in declared:
+                        target = value.__func__ if _NATIVE_TYPE(value) is _NATIVE_STATIC or _NATIVE_TYPE(value) is _NATIVE_CLASS else value
+                        if _NATIVE_TYPE(target) is not _NATIVE_FUNCTION:
+                            raise MissingBinding('original class method descriptor is UNKNOWN')
+                        functions.append((target, _native_callable_snapshot(target), _plain_callable_defaults(target)))
+                    elif name not in {'__dict__', '__weakref__', '__abstractmethods__', '_abc_impl'} and not _plain_immutable_class_value(value):
+                        raise MissingBinding('original class contains mutable or unknown class state')
+                classes.append((original, tuple(values.items())))
+        else:
+            raise MissingBinding('import-only original entry is outside the finite source binding')
+        if any('__signature__' in item.__dict__ for item in _native_function_chain(function)):
+            raise MissingBinding('imported original callable has an unproved signature override')
+        return dict(namespace=namespace, function=function, snapshot=_native_callable_snapshot(function),
+                    defaults_state=_plain_callable_defaults(function), classes=classes,
+                    class_mro=tuple(_NATIVE_MRO.__get__(class_, _NATIVE_TYPE)) if classes else None,
+                    class_=class_ if classes else None, inherited=inherited if classes else None,
+                    methods=functions)
+
+    def _verify_import_only_target(self, entry, receipt):
+        namespace, function, class_ = receipt['namespace'], receipt['function'], receipt['class_']
+        if (_NATIVE_TYPE(namespace) is not _NATIVE_DICT or
+                any(_NATIVE_TYPE(key) is not _NATIVE_STR for key in namespace)):
+            raise MissingBinding('imported original namespace has unknown key protocols')
+        if class_ is None:
+            current = namespace.get(entry['symbol'])
+            proxy = receipt.get('approved_proxy')
+            if current is proxy and proxy is not None:
+                _verify_native_callable_snapshot(proxy, receipt['approved_proxy_snapshot'])
+            elif current is not function:
+                raise MissingBinding('imported original function binding changed')
+            if function.__globals__ is not namespace:
+                raise MissingBinding('imported original function binding changed')
+        else:
+            parts = entry['symbol'].split('.')
+            if namespace.get(parts[0]) is not class_:
+                raise MissingBinding('imported original class binding changed')
+            mro = _NATIVE_MRO.__get__(class_, _NATIVE_TYPE)
+            if len(mro) != len(receipt['class_mro']) or any(a is not b for a, b in zip(mro, receipt['class_mro'])):
+                raise MissingBinding('imported original class method order changed')
+            if self._source_method_descriptor(class_, parts[1]) is not function:
+                raise MissingBinding('imported original method descriptor changed')
+            for original, expected in receipt['classes']:
+                values = _NATIVE_CLASS_DICT.__get__(original, _NATIVE_TYPE)
+                if any(_NATIVE_TYPE(key) is not _NATIVE_STR for key in values) or len(values) != len(expected):
+                    raise MissingBinding('imported original class namespace changed')
+                if any(name not in values or values[name] is not value for name, value in expected):
+                    raise MissingBinding('imported original class binding changed')
+            for method, snapshot, defaults in receipt['methods']:
+                _verify_native_callable_snapshot(method, snapshot)
+                if _plain_callable_defaults(method) != defaults:
+                    raise MissingBinding('imported original method defaults changed')
+            if receipt['inherited']['chain'][-1].external_endpoint:
+                from seampact.source.abc_kernel import check_abc_target
+                if check_abc_target(class_, list(mro[:len(receipt['classes'])]), receipt['inherited']['chain'])['status'] != 'CHECKED':
+                    raise MissingBinding('imported original ABC state changed')
+        _verify_native_callable_snapshot(function, receipt['snapshot'])
+        if _plain_callable_defaults(function) != receipt['defaults_state']:
+            raise MissingBinding('imported original defaults changed')
+        return function
+
+    def _capture_imported_helpers(self, plan):
+        """Capture already-imported original module functions, without calling them."""
+        helpers = {}
+        modules = _checked_module_table()
+        for path in plan.get('modules_order', []):
+            module = next((name for name, record in self.module_paths.items()
+                           if record[0] == path and not name.startswith('src.')), None)
+            actual = modules.get(module) if module else None
+            if _NATIVE_TYPE(actual) is not types.ModuleType:
+                raise MissingBinding('original imported helper module is unavailable')
+            namespace = types.ModuleType.__dict__['__dict__'].__get__(actual, types.ModuleType)
+            if any(_NATIVE_TYPE(key) is not _NATIVE_STR for key in namespace):
+                raise MissingBinding('original helper namespace has unknown key protocols')
+            for node in native_ast(source_unit(self.inspector, path, 'file')).body:
+                if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) or node.decorator_list:
+                    continue
+                function = namespace.get(node.name)
+                if _NATIVE_TYPE(function) is not _NATIVE_FUNCTION:
+                    continue
+                metadata = _import_only_function_metadata(function)
+                if (function.__globals__ is not namespace or function.__code__.co_firstlineno != node.lineno or
+                        len(metadata)):
+                    continue
+                try:
+                    self._assert_callable(function, node.name, path)
+                    snapshot = _native_callable_snapshot(function)
+                    defaults = _plain_callable_defaults(function)
+                except (ValueError, TypeError):
+                    continue
+                helpers[(path, node.name)] = dict(namespace=namespace, function=function, snapshot=snapshot,
+                    defaults=defaults, source_sha256=self.inspector.files[path]['sha256'],
+                    definition_ast_sha256=digest(ast.dump(node, include_attributes=False).encode()), node=node)
+        return helpers
+
+    def _check_generator_targets(self, entry, unit, requirements):
+        """Consume finite source generator obligations against actual imported functions."""
+        from seampact.source.call_value_conditions import ordinary, actual_defaults
+        receipt = self.import_only_entries.get(unit['id'])
+        if receipt is None:
+            return False
+        self._verify_import_only_target(entry, receipt)
+        helpers = receipt.get('helpers', {})
+        def same_plain(actual, expected):
+            return json.dumps(ordinary(actual), sort_keys=True, ensure_ascii=False, allow_nan=False) == json.dumps(
+                ordinary(expected), sort_keys=True, ensure_ascii=False, allow_nan=False)
+        for requirement in requirements:
+            if (type(requirement) is not dict or requirement.get('schema') not in {
+                    'source-generator-target-requirements/1', 'source-bounded-value-target-requirements/1'}
+                    or requirement.get('target_status') != 'REQUIRES_NORMAL_WORKER_CHECK'
+                    or requirement.get('execution_permission') is not False or requirement.get('owner_fields')):
+                return False
+            scope = requirement.get('binding_scope')
+            target = requirement.get('target_symbol') if scope == 'module' else requirement.get('parent_symbol') if scope == 'nested' else None
+            if not target or any(item.get('relation') != 'FRESH_PARENT_SAME_CALL' or item.get('target_status') == 'UNKNOWN'
+                                 for item in requirement.get('same_call_captures', [])):
+                return False
+            item = helpers.get((requirement.get('path'), target))
+            if item is None or item['source_sha256'] != requirement.get('source_sha256'):
+                return False
+            if scope == 'module' and item['definition_ast_sha256'] != requirement.get('definition_ast_sha256'):
+                return False
+            namespace, function = item['namespace'], item['function']
+            if any(_NATIVE_TYPE(key) is not _NATIVE_STR for key in namespace):
+                return False
+            current = namespace.get(target)
+            proxy = receipt.get('approved_proxy') if function is receipt['function'] else None
+            if current is proxy and proxy is not None:
+                _verify_native_callable_snapshot(proxy, receipt['approved_proxy_snapshot'])
+            elif current is not function:
+                return False
+            if function.__globals__ is not namespace:
+                return False
+            _verify_native_callable_snapshot(function, item['snapshot'])
+            if _plain_callable_defaults(function) != item['defaults']:
+                return False
+            for fact in requirement.get('source_globals', []):
+                name = fact.get('name')
+                if type(name) is not str or name not in namespace or not same_plain(namespace[name], fact.get('value')):
+                    return False
+            if scope == 'module':
+                node = item['node']
+                names = [parameter.arg for parameter in (*node.args.posonlyargs, *node.args.args)]
+                defaults = actual_defaults(function, names)
+                for fact in requirement.get('omitted_defaults', []):
+                    name = fact.get('name')
+                    if type(name) is not str or name not in defaults or not same_plain(defaults[name], fact.get('value')):
+                        return False
+        return True
+
+    def _verified_runtime_trace(self, entry, unit, ctx, instance_identity):
+        """Read actual targets, then replay the same complete ordinary call.
+
+        This method runs under the normal source lock. Source requirements
+        describe obligations; only independently checked in-process targets
+        can discharge their own fixed gap. Other effects remain blockers.
+        """
+        from dataclasses import replace
+        from seampact.source.call_value_conditions import contextual, runtime_requirements, digest as proof_digest
+        from seampact.source.dependency_closure import resolve_resource_calls
+        from seampact.source.sdk_value_summaries import RULE as SDK_RULE, GAP as SDK_GAP, verify_sdk_targets
+        from seampact.source.configuration_model_flow import GAP as MODEL_GAP
+        from seampact.source.pydantic_models import RULE as MODEL_RULE
+        from seampact.source.pydantic_targets import verify_model_targets
+        from seampact.source.activation_scope import RULE as ACTIVATION_RULE, GAP as ACTIVATION_GAP, verify_activation_targets
+        from seampact.source.sdk_import_summaries import RULE as IMPORT_RULE, FINDER, GAP as IMPORT_GAP
+        from seampact.source.sdk_transformer_protocols import (
+            RULE as TRANSFORMER_RULE, GAP as TRANSFORMER_GAP,
+            profiles_from_fixed_resources, verify_transformer_targets,
+        )
+        if not _native_context_lock._is_owned():
+            raise MissingBinding('actual runtime targets require the original source read/use lock')
+        base = getattr(self, 'call_source_inspector', self.inspector)
+        ctx = replace(ctx, sdk_profiles=profiles_from_fixed_resources(self.resource_binding, entry['id']))
+        shadow = contextual(base, ctx)
+        trace = resolve_resource_calls(shadow, entry, self.candidate)
+        if (trace.get('status') != 'CHECKED' or trace.get('unresolved_targets') or
+                trace.get('activation_prefix', {}).get('status') != 'CHECKED' or
+                any(gap.get('reason') not in {SDK_GAP, MODEL_GAP, TRANSFORMER_GAP, ACTIVATION_GAP, IMPORT_GAP}
+                    for gap in trace.get('negative_scope_gaps', []))):
+            raise MissingBinding('same-call finite source/effect/resource coverage remains UNKNOWN')
+        requirements = runtime_requirements(trace)
+        targets = [row for row in requirements if row['schema'] != REGISTRATION_RULE]
+        if not targets:
+            if trace.get('negative_scope_status') != 'CHECKED':
+                raise MissingBinding('same-call effect coverage remains UNKNOWN')
+            return shadow, trace
+        imported = self.import_only_entries.get(unit['id'])
+        if (imported is None or imported.get('instance_identity') != instance_identity):
+            error = MissingBinding('actual original SDK/helper import occurrence or worker identity is absent')
+            if all(row.get('input_status', 'CHECKED') == 'CHECKED' for row in targets):
+                error.reason_code = ('GENERATOR_BINDING_UNKNOWN' if all(
+                    row['schema'] == 'source-generator-target-requirements/1' for row in targets) else 'SDK_BINDING_UNKNOWN')
+            raise error
+        from seampact.source.import_only import compile_import_only_plan
+        frozen_resources = (self.resource_binding.snapshot(entry_ids={entry['id']})
+                            if self.resource_binding is not None else dict(requirements=[], bindings={}))
+        if self.resource_binding is not None:
+            self.resource_binding.check_entry(entry['id'])
+        plan = compile_import_only_plan(base, entry, self.candidate, frozen_resources)
+        if plan.get('status') != 'CHECKED' or plan.get('plan_digest') != imported.get('plan_digest'):
+            raise MissingBinding('original import prefix/source/resource plan changed before actual target check')
+        self._verify_import_only_target(entry, imported)
+        verified = []
+        imports = [row for row in targets if row['schema'] in {IMPORT_RULE, FINDER}]
+        if imports:
+            evidence = imported.get('sdk_import_evidence') or {}
+            expected = {proof_digest(row) for row in imports}
+            if (evidence.get('status') != 'CHECKED' or evidence.get('allowed') is not True or
+                    evidence.get('plan_digest') != imported['plan_digest'] or
+                    not expected <= set(evidence.get('requirement_digests', []))):
+                raise MissingBinding('original SDK import/finder prerequisites lack this normal before-exec occurrence')
+            verified.extend(proof_digest(row) for row in imports)
+        activation = [row for row in targets if row['schema'] == ACTIVATION_RULE]
+        if activation:
+            checked = verify_activation_targets(shadow, entry, self.candidate, trace, binding=self, receipt=imported)
+            if (checked.get('status') != 'CHECKED' or checked.get('allowed') is not True or
+                    set(checked.get('requirement_digests', [])) != {proof_digest(row) for row in activation}):
+                raise MissingBinding('actual original activation scope/object/no-writer premises remain UNKNOWN')
+            verified.extend(checked['requirement_digests'])
+        sdk = [row for row in targets if row['schema'] == SDK_RULE]
+        if sdk:
+            checked = verify_sdk_targets(sdk, context=imported.get('sdk_context'))
+            if checked.get('status') != 'CHECKED' or checked.get('allowed') is not True:
+                raise MissingBinding('actual original SDK identity/state/assets/effects remain UNKNOWN: ' + str(checked.get('reason')))
+            verified.extend(proof_digest(row) for row in sdk)
+        transformers = [row for row in targets if row['schema'] == TRANSFORMER_RULE]
+        if transformers:
+            checked = verify_transformer_targets(transformers, context=imported.get('sdk_context'), profiles=ctx.sdk_profiles)
+            if checked.get('status') != 'CHECKED' or checked.get('allowed') is not True:
+                raise MissingBinding('actual original transformer/native creation, state, callback or effect premises remain UNKNOWN')
+            verified.extend(proof_digest(row) for row in transformers)
+        bounded = [row for row in targets if row['schema'] in {
+            'source-bounded-value-target-requirements/1', 'source-generator-target-requirements/1'}]
+        if bounded:
+            if not self._check_generator_targets(entry, unit, bounded):
+                raise MissingBinding('actual bounded source helper/owner/default premises remain UNKNOWN')
+            verified.extend(proof_digest(row) for row in bounded)
+        models = [row for row in targets if row['schema'] == MODEL_RULE]
+        if models:
+            # A previously verified independent target removes only its own
+            # gap before the model verifier sees this same call again.
+            shadow = contextual(base, replace(ctx, runtime_verified=tuple(verified)))
+            trace = resolve_resource_calls(shadow, entry, self.candidate)
+            if runtime_requirements(trace) != requirements:
+                raise MissingBinding('same-call runtime requirements changed during independent target checks')
+            modules = {path: self.modules.get(name) for name, (path, _) in self.module_paths.items()
+                       if name in self.modules}
+            checked = verify_model_targets(shadow, entry, self.candidate, trace,
+                imported.get('model_observation'), modules)
+            if (checked.get('status') != 'CHECKED' or
+                    set(checked.get('requirement_digests', [])) != {proof_digest(row) for row in models}):
+                raise MissingBinding('actual original configuration model creation/read-use premises remain UNKNOWN')
+            verified.extend(checked['requirement_digests'])
+        if len(verified) != len(targets):
+            raise MissingBinding('an original runtime target protocol has no actual worker consumer')
+        shadow = contextual(base, replace(ctx, runtime_verified=tuple(verified)))
+        replay = resolve_resource_calls(shadow, entry, self.candidate)
+        if (runtime_requirements(replay) != requirements or replay.get('status') != 'CHECKED' or
+                replay.get('unresolved_targets') or replay.get('negative_scope_status') != 'CHECKED' or
+                replay.get('activation_prefix', {}).get('status') != 'CHECKED'):
+            raise MissingBinding('complete same-call replay is not closed after actual target checks')
+        return shadow, replay
+
+    def _check_import_prerequisites(self, entry, unit, plan, instance_identity):
+        """Recheck original prefix kernels before executing any source import."""
+        from seampact.source.stdlib_definition_prefix import verify_requirements
+        from seampact.source.sdk_import_summaries import RULE, FINDER, verify_before_sdk_import
+        from seampact.source.call_value_conditions import digest as proof_digest
+        if not _native_context_lock._is_owned():
+            raise MissingBinding('original import prerequisites require the source read/use lock')
+        if not verify_requirements(plan.get('stdlib_requirements', [])):
+            raise MissingBinding('original stdlib definition/import kernel changed')
+        requirements = [row for row in plan.get('runtime_protocol_requirements', [])
+                        if row.get('schema') in {RULE, FINDER}]
+        if not requirements:
+            return None
+        evidence = verify_before_sdk_import(requirements, plan.get('sdk_asset_plan'), self,
+            entry=entry, unit=unit, plan=plan, instance_identity=instance_identity)
+        if evidence.get('status') != 'CHECKED' or evidence.get('allowed') is not True:
+            raise MissingBinding('original SDK import prerequisites remain UNKNOWN: ' + '; '.join(evidence.get('remaining', [])))
+        return dict(evidence, plan_digest=plan['plan_digest'],
+                    requirement_digests=[proof_digest(row) for row in requirements])
+
+    def _verify_locked_runtime_call(self, entry, unit, arguments):
+        # Actual ordinary values can expose a helper/target that is absent
+        # from the compiler's shape-only path. Never use an empty frozen
+        # requirements list to skip the actual call's read/use replay.
+        if not unit.get('call_condition'):
+            return
+        from seampact.source.call_value_conditions import call_context
+        ctx, _ = call_context(arguments)
+        imported = self.import_only_entries.get(unit['id']) or {}
+        self._verified_runtime_trace(entry, unit, ctx, imported.get('instance_identity'))
+
+    def _verify_locked_call_defaults(self, entry, unit, arguments, callable_=None):
+        """Recheck omitted literal defaults immediately before original use."""
+        if not unit.get('call_condition'):
+            return
+        if not _native_context_lock._is_owned():
+            raise MissingBinding('original default read/use requires the source context lock')
+        from seampact.source.call_value_conditions import actual_defaults, literal_default
+        node, _ = self._entry_anchor(entry)
+        names = [parameter.arg for parameter in (*node.args.posonlyargs, *node.args.args)]
+        defaults = dict(zip(names[-len(node.args.defaults):], node.args.defaults)) if node.args.defaults else {}
+        defaults.update({parameter.arg: value for parameter, value in zip(node.args.kwonlyargs, node.args.kw_defaults)
+                         if value is not None})
+        omitted = set(defaults) - set(arguments) - set(entry.get('fixed_arguments', {}))
+        if not omitted:
+            return
+        if callable_ is None:
+            callable_ = self.entries.get(unit['id'])
+            if callable_ is None:
+                receipt = self.import_only_entries.get(unit['id'])
+                if receipt is not None:
+                    callable_ = self._verify_import_only_target(entry, receipt)
+        if callable_ is None:
+            raise MissingBinding('omitted defaults have no original current callable')
+        values = actual_defaults(callable_, names)
+        for name in omitted:
+            expected = literal_default(defaults[name])
+            if name not in values or type(values[name]) is not type(expected) or values[name] != expected:
+                raise MissingBinding('original omitted default changed before call: ' + name)
+
+    def _registration_trace(self, entry, arguments=None):
+        from seampact.source.call_value_conditions import call_context, contextual, Context
+        from seampact.source.dependency_closure import resolve_resource_calls
+        base = getattr(self, 'call_source_inspector', self.inspector)
+        ctx = Context(compiling=True) if arguments is None else call_context(arguments)[0]
+        shadow = contextual(base, ctx)
+        return shadow, resolve_resource_calls(shadow, entry, self.candidate)
+
+    def _verify_registration_targets(self, entry, unit, shadow, trace, *, in_context=False):
+        worlds = registration_worlds(shadow, entry, self.candidate, trace, complete_call=True)
+        if not worlds:
+            return
+        imported = self.import_only_entries.get(unit['id'])
+        if imported is None or 'registration_targets' not in imported:
+            raise RegistrationUnknown('actual complete original registration targets are not independently prepared')
+        original = self._verify_import_only_target(entry, imported)
+        modules = registration_modules(self, worlds, in_context=in_context)
+        verify_registration_targets(shadow, entry, self.candidate, trace, imported['registration_targets'], modules,
+                                    entry_function=original)
+
+    def _verify_locked_registration_call(self, entry, unit, arguments):
+        closure = (self.dependency_closure or {}).get('entries', {}).get(entry['id'], {})
+        requirements = (unit.get('call_condition') or {}).get('runtime_protocol_requirements', [])
+        if not (any(row.get('schema') == REGISTRATION_RULE for row in requirements) or
+                any(row.get('rule') == REGISTRATION_RULE for row in closure.get('external_protocols', []))):
+            return
+        if not _native_context_lock._is_owned():
+            raise MissingBinding('registration read/use requires the original native source context lock')
+        shadow, trace = self._registration_trace(entry, arguments)
+        try:
+            self._verify_registration_targets(entry, unit, shadow, trace, in_context=True)
+        except RegistrationUnknown as error:
+            raise MissingBinding(str(error)) from error
 
     def _owner_key(self, entry):
         # A native constructor may mutate a supplied config object. Its owner
@@ -1668,9 +2602,18 @@ class NativeBindings:
     def _load_class_entry(self, entry, unit, selected):
         namespace = self._namespace(entry)
         class_name, _, name = entry["symbol"].partition(".")
+        if _NATIVE_TYPE(namespace) is not _NATIVE_DICT or any(_NATIVE_TYPE(key) is not _NATIVE_STR for key in namespace):
+            raise MissingBinding('native descriptor source namespace has unknown keys')
         owner = namespace.get(class_name)
-        if (not inspect.isclass(owner) or type(owner) is not type or owner.__qualname__ != class_name
-                or owner.__module__ != namespace.get("__name__")):
+        if _NATIVE_TYPE(owner) is not _NATIVE_TYPE:
+            raise MissingBinding("native descriptor owner is not the original direct source class")
+        qualname = _NATIVE_QUALNAME.__get__(owner, _NATIVE_TYPE)
+        owner_namespace = _NATIVE_CLASS_DICT.__get__(owner, _NATIVE_TYPE)
+        if any(_NATIVE_TYPE(key) is not _NATIVE_STR for key in owner_namespace):
+            raise MissingBinding('native descriptor class namespace has unknown keys')
+        module = owner_namespace.get('__module__')
+        if (_NATIVE_TYPE(qualname) is not _NATIVE_STR or qualname != class_name
+                or _NATIVE_TYPE(module) is not _NATIVE_STR or module != namespace.get('__name__')):
             raise MissingBinding("native descriptor owner is not the original direct source class")
         effective = self.effective_bindings[entry["id"]]
         descriptor = inspect.getattr_static(owner, name)
@@ -1695,7 +2638,9 @@ class NativeBindings:
     async def _load(self, entry, unit, construction=None):
         identity = unit["id"]
         if identity in self.entries and not (construction is not None and entry["kind"] == "method"):
-            return self.entries[identity]
+            cached = self.entries[identity]
+            self._verify_inherited_call(entry, unit, cached)
+            return cached
         related = [item for item in self.approved_entries.values() if self._owner_key(item) == self._owner_key(entry)]
         selected_ids = list(dict.fromkeys(name for item in related for name in item.get("boundary_ids", [])))
         selected = [self.boundaries[name] for name in selected_ids]
@@ -1750,11 +2695,14 @@ class NativeBindings:
                       if construction is not None else self.owners.get(key))
             if record is None:
                 class_ = namespace[constructor["symbol"]]
-                if not inspect.isclass(class_) or class_.__qualname__ != constructor["symbol"]:
-                    raise MissingBinding("source constructor did not resolve to the original native class")
                 inherited = self.inherited_entries.get(entry["id"])
                 if inherited:
                     self._assert_inherited_owner(class_, inherited)
+                elif _NATIVE_TYPE(class_) is not _NATIVE_TYPE:
+                    raise MissingBinding('source constructor has an unknown metaclass or object protocol')
+                qualname = _NATIVE_QUALNAME.__get__(class_, _NATIVE_TYPE)
+                if _NATIVE_TYPE(qualname) is not _NATIVE_STR or qualname != constructor['symbol']:
+                    raise MissingBinding("source constructor did not resolve to the original native class")
                 positional, keyword = _actual_arguments(class_, self._original_defaults(entry, "constructor.arguments", constructor.get("arguments", {})))
                 owner = class_(*positional, **keyword)
                 if inspect.isawaitable(owner):
@@ -1765,11 +2713,22 @@ class NativeBindings:
                     self._assert_inherited_owner(class_, inherited)
                     methods = {member.name for item in inherited["chain"] for member in item.node.body
                                if isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef))}
-                    if set(getattr(owner, "__dict__", {})) & methods:
+                    if set(self._instance_dictionary(owner, class_)) & methods:
                         raise MissingBinding("native inherited receiver shadows an original method")
                 record = dict(owner=owner, id="native-owner-" + uuid.uuid4().hex, boundaries=set(), hooks=[], initialized=False)
                 self.owners[key] = record
             owner, owner_id = record["owner"], record["id"]
+            inherited = self.inherited_entries.get(entry['id'])
+            if inherited:
+                class_ = _NATIVE_TYPE(owner)
+                self._assert_inherited_owner(class_, inherited)
+                name = inherited['method'].node.name
+                descriptor = self._source_method_descriptor(class_, name)
+                if _NATIVE_TYPE(descriptor) is not _NATIVE_FUNCTION:
+                    raise MissingBinding('inherited instance entry has no exact original function descriptor')
+                raw = _NATIVE_METHOD(descriptor, owner)
+                record.setdefault('retained_methods', {}).setdefault(name, dict(bound=raw, snapshot=_native_callable_snapshot(raw)))
+                record.setdefault('method_proxies', {})
         else:
             key = self._owner_key(entry)
             record = self.function_owners.setdefault(key,
@@ -1803,7 +2762,11 @@ class NativeBindings:
             self._register(gate, owner_id, self._boundary_unit(boundary, unit))
             proxy = self.runtime.wrap(original, gate, owner_id)
             if owner is not None:
-                install_method_proxy(owner, symbol, proxy)
+                attached = install_method_proxy(owner, symbol, proxy)
+                if entry['id'] in self.inherited_entries:
+                    record['retained_methods'].setdefault(symbol, dict(bound=original, snapshot=_native_callable_snapshot(original)))
+                    record['method_proxies'][symbol] = dict(method=attached, method_snapshot=_native_callable_snapshot(attached),
+                                                           proxy=proxy, proxy_snapshot=_native_callable_snapshot(proxy))
                 if ((boundary["symbol"] == entry["symbol"] or entry["id"] in self.inherited_entries)
                         and boundary["mode"] != "R"):
                     original_entry = proxy
@@ -1853,6 +2816,19 @@ class NativeBindings:
             callable_ = self.runtime.wrap(callable_, gate, owner_id)
         if construction is None or entry["kind"] != "method":
             self.entries[identity] = callable_
+        imported = self.import_only_entries.get(identity)
+        if imported is not None and entry['kind'] == 'function':
+            current = imported['namespace'].get(entry['symbol'])
+            if current is not imported['function']:
+                chain = _native_function_chain(current)
+                if current is not callable_ or chain[-1] is not imported['function']:
+                    raise MissingBinding('imported original function acquired an unknown proxy')
+                imported['approved_proxy'] = current
+                imported['approved_proxy_snapshot'] = _native_callable_snapshot(current)
+        if entry['id'] in self.inherited_entries:
+            self.inherited_calls[identity] = dict(binding=self.inherited_entries[entry['id']], owner=owner,
+                **{'class': _NATIVE_TYPE(owner)}, record=record, callable=callable_, snapshot=_native_callable_snapshot(callable_))
+            self._verify_inherited_call(entry, unit, callable_)
         self.entry_owner_ids[identity] = owner_id
         return callable_
 
@@ -1860,6 +2836,9 @@ class NativeBindings:
         if self.detached:
             raise MissingBinding("Harness source is detached")
         with self._context():
+            self._verify_locked_registration_call(entry, unit, arguments)
+            self._verify_locked_runtime_call(entry, unit, arguments)
+            self._verify_locked_call_defaults(entry, unit, arguments)
             # invoke() serializes this source binding. Capture readiness here,
             # after any earlier queued call has initialized the same owner.
             unit["last_initialization_before"] = self.initialization_state(entry, unit)
@@ -1890,6 +2869,10 @@ class NativeBindings:
                 raise MissingBinding("Harness source is detached")
             active = self.active_owner.set(self.entry_owner_ids.get(unit["id"]))
             try:
+                self._verify_inherited_call(entry, unit, callable_)
+                self._verify_locked_registration_call(entry, unit, arguments)
+                self._verify_locked_runtime_call(entry, unit, arguments)
+                self._verify_locked_call_defaults(entry, unit, arguments, callable_)
                 result = callable_(*positional, **keyword)
                 return await result if inspect.iscoroutinefunction(callable_) else result
             finally:
@@ -1938,6 +2921,9 @@ class UnitCatalog:
         self.bindings, self.entry_specs = {}, {}
         # Structurally checked entries whose package/file/credential facts belong to a group host.
         self.deferred = {}
+        # Structure-only entries retain no callable/dispatch permission. They
+        # are deliberately separate from ready and ordinary deferred hosts.
+        self.structural = {}
         self.lock = threading.RLock()
         self.remote_router = None
         self.resource_registry = None
@@ -1947,6 +2933,7 @@ class UnitCatalog:
         with self.lock:
             installation_id = installation_id or analysis_id
             old_bindings, old_specs, old_deferred = self.bindings.copy(), self.entry_specs.copy(), self.deferred.copy()
+            old_structural = self.structural.copy()
             try:
                 with self.store.transaction():
                     if getattr(inspector, "target_runtime", None):
@@ -1976,7 +2963,8 @@ class UnitCatalog:
                     for raw_entry, unit in zip(candidate["entries"], result):
                         group = self.store.get("runtime_group", unit.get("runtime_group")) if unit.get("runtime_group") else None
                         entry = raw_entry if isinstance(raw_entry, dict) else {}
-                        binding = self.bindings.get(unit["id"]) or (self.deferred.get(unit["id"]) or (None,))[0]
+                        binding = (self.bindings.get(unit["id"]) or (self.deferred.get(unit["id"]) or
+                                   self.structural.get(unit["id"]) or (None,))[0])
                         checked = getattr(binding, "checked", target_checks)
                         unit["typed_evidence"] = dict(evidence, **entry_evidence(inspector, candidate, unit, entry, checked))
                         unit["typed_contract"] = build_contract(unit, group=group)
@@ -1989,6 +2977,7 @@ class UnitCatalog:
                 return result
             except BaseException:
                 self.bindings, self.entry_specs, self.deferred = old_bindings, old_specs, old_deferred
+                self.structural = old_structural
                 raise
 
     def detach(self, source_id):
@@ -1997,7 +2986,8 @@ class UnitCatalog:
             for unit in self.store.list("unit"):
                 if unit.get("source_id") != source_id:
                     continue
-                binding = self.bindings.get(unit["id"]) or (self.deferred.get(unit["id"]) or (None,))[0]
+                binding = (self.bindings.get(unit["id"]) or (self.deferred.get(unit["id"]) or
+                           self.structural.get(unit["id"]) or (None,))[0])
                 if binding:
                     binding.detached = True
                 if unit.get("status") in {"SUPERSEDED", "DETACHED"}:
@@ -2014,7 +3004,7 @@ class UnitCatalog:
                        if binding.inspector.request.get("source_id") == source_id) or
                     any((call.get("unit") or {}).get("source_id") == source_id and
                         call["physical"] in {"AUTHORIZED", "STARTED", "UNKNOWN"}
-                        for call in self.runtime.snapshot()["calls"].values()))
+                        for call in self.runtime.call("active_view")["calls"].values()))
 
     def _candidate_binding(self, inspector, candidate):
         if not isinstance(candidate, dict) or "entries" not in candidate or not isinstance(candidate["entries"], list):
@@ -2039,6 +3029,7 @@ class UnitCatalog:
                       result_schema={}, native_input_schemas={}, construction=None, fixed_value_bindings=[],
                       operations={"export_entry": {"status": "UNKNOWN", "formal_proof": False}})
         result["capability"] = capability_card()
+        structure_prerequisites = False
         try:
             result["capability"] = capability_card(entry.get("capability"))
             if not isinstance(source_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]+", source_id) or source_id in seen or source_id in duplicates:
@@ -2049,6 +3040,7 @@ class UnitCatalog:
             for required in ("path", "symbol", "kind"):
                 if not isinstance(entry.get(required), str) or not entry[required]:
                     raise MissingBinding("native entry field is missing: " + required)
+            structure_prerequisites = True
             gaps = []
             binding.environment_gaps = gaps
             if binding.resource_binding is not None:
@@ -2061,6 +3053,13 @@ class UnitCatalog:
                     binding.resource_binding.environment_gaps = None
             _, result_schema = binding.entry_ports(entry)
             construction = binding.programs.get(entry.get("id"))
+            from seampact.source.call_value_conditions import context, compile_condition
+            closure = (binding.dependency_closure or {}).get('entries', {}).get(entry.get('id'), {})
+            if context(binding.inspector) is None and any(row.get('rule') == REGISTRATION_RULE
+                    for row in closure.get('external_protocols', [])):
+                raise MissingBinding('actual complete original registration targets and read/use conditions are required')
+            if context(binding.inspector) is None and compile_condition(binding.inspector, entry, binding.candidate) is not None:
+                raise MissingBinding('actual call values are required for the finite negative scope')
             result.update(status="READY", parameters=parameters, input_schema=parameters,
                           omitted_object_parameters=omitted, binding="SOURCE_CHECKED_NATIVE_ENTRY",
                           result_schema=result_schema,
@@ -2072,6 +3071,8 @@ class UnitCatalog:
                           inheritance_binding=(binding.inherited_entries.get(entry.get("id")) or {}).get("facts"),
                           execution_context=binding.execution_contexts.get(entry.get("id")),
                           import_context=list(binding.import_contexts.get(entry.get("path"), {}).values()),
+                          dependency_import_scope=binding.import_scope_proofs.get(entry.get("id")),
+                          result_structure=binding.result_structures.get(entry.get("id")),
                           completion_contract=binding.completion_contracts.get(entry.get("id")),
                           dependency_closure=(binding.dependency_closure or {}).get("entries", {}).get(entry.get("id")),
                           operations={"export_entry": {"status": "SOURCE_BOUND", "formal_proof": False,
@@ -2082,6 +3083,35 @@ class UnitCatalog:
                     status="ENVIRONMENT_DEFERRED", gaps=gaps,
                     scope="source, interface and construction rules passed; these execution-environment facts are re-checked by the runtime-group host"))
         except (ValueError, KeyError, TypeError, SyntaxError, OSError) as error:
+            # Compile an enforced conditional binding, never change the
+            # original entry/resource audit to a universal CHECKED result.
+            if binding is not None:
+                from seampact.source.call_value_conditions import compile_condition, contextual, context, Context
+                if context(binding.inspector) is None:
+                    recipe = compile_condition(binding.inspector, entry, binding.candidate)
+                    if recipe is not None:
+                        shadow = contextual(binding.inspector, Context(compiling=True))
+                        resources = (DependencyBindings(binding.resource_binding.registry, shadow, binding.candidate)
+                                     if binding.resource_binding is not None else None)
+                        if resources is not None:
+                            resources.host_check = binding.resource_binding.host_check
+                        conditional = NativeBindings(shadow, binding.candidate, binding.runtime, resource_binding=resources)
+                        conditional.call_source_inspector = binding.inspector
+                        alternative = UnitCatalog._inspect_entry(conditional, None, entry, source_id, set(), set())
+                        if alternative['status'] == 'READY' or alternative.get('host_condition'):
+                            conditional.prepare_transformations()
+                            if not hasattr(binding, 'call_bindings'):
+                                binding.call_bindings = {}
+                            binding.call_bindings[entry['id']] = conditional
+                            alternative.update(status='CALL_CONDITION_DEFERRED', call_condition=recipe,
+                                binding='SOURCE_CONDITIONAL_NATIVE_ENTRY',
+                                reason='actual group-port/3 call values and original runtime bindings must be checked')
+                            alternative['operations']['export_entry']['status'] = 'CONDITIONAL_BOUND'
+                            alternative['dependency_closure'] = (binding.dependency_closure or {}).get('entries', {}).get(entry['id'])
+                            for name in ('dependency_import_scope', 'result_structure'):
+                                if isinstance(alternative.get(name), dict):
+                                    alternative[name] = dict(alternative[name], status='CONDITIONAL', required_call_condition=recipe['digest'])
+                            return alternative
             reason = binding.redact(error) if binding is not None else str(error)
             result["reason"] = reason
             for attribute in ("code", "field_paths", "structured_issues", "candidate_issues"):
@@ -2089,6 +3119,8 @@ class UnitCatalog:
                     result[attribute] = getattr(error, attribute)
             if binding is not None:
                 result["dependency_closure"] = (binding.dependency_closure or {}).get("entries", {}).get(entry.get("id"))
+                result["dependency_import_scope"] = binding.import_scope_proofs.get(entry.get("id"))
+                result["result_structure"] = binding.result_structures.get(entry.get("id"))
             if getattr(error, "initialization_gaps", None):
                 result["code"] = "initialization_incomplete"
                 result["initialization_gaps"] = error.initialization_gaps
@@ -2100,13 +3132,24 @@ class UnitCatalog:
                     result["effective_binding"] = binding.effective_bindings[entry["id"]]
                 if entry.get("id") in binding.inherited_entries:
                     result["inheritance_binding"] = binding.inherited_entries[entry["id"]]["facts"]
+        if result['status'] == 'MISSING' and binding is not None and structure_prerequisites:
+            from seampact.source.value_conditioned_admission import compile_structure_plan
+            structure = compile_structure_plan(binding.inspector, entry, binding.candidate)
+            if structure.get('status') == 'STRUCTURE_CHECKED':
+                result.update(status='STRUCTURE_ONLY', binding='SOURCE_VALUE_CONDITIONED_NATIVE_ENTRY',
+                    structure_admission=structure, parameters=copy.deepcopy(structure['interface']),
+                    input_schema=copy.deepcopy(structure['interface']),
+                    result_schema=copy.deepcopy(structure['declared_result_schema']),
+                    native_input_schemas={}, effective_binding='function',
+                    reason='original structure checked; same-call source and actual worker proofs still required')
+                result['operations']['export_entry'] = dict(status='REQUIRES_SAME_CALL_PROOF', formal_proof=False)
         return result
 
     def inspect_candidate(self, inspector, candidate):
         """Return the same static entry checks as installation, without state writes."""
         if getattr(inspector, "target_runtime", None):
             return inspector.target_runtime.call("inspect_candidate", candidate=candidate)
-        _, _, rows = self._candidate_checks(inspector, candidate)
+        binding, _, rows = self._candidate_checks(inspector, candidate)
         from seampact.hosting.deployment import runtime_groups
         entries = [dict(id=row["entry_id"], path=row["entry"].get("path"),
             unit=row["entry"].get("unit", "file"), symbol=row["entry"].get("symbol"),
@@ -2116,7 +3159,7 @@ class UnitCatalog:
             entries=entries, status="READY" if ready == len(entries) and ready else "PARTIAL" if ready else "MISSING",
             has_bindable_entries=bool(ready), reason=None if ready else "no bindable native entry was discovered",
             initialization="NOT_RUN", parallel=False, remote=False,
-            runtime_groups=runtime_groups(inspector, candidate, rows))
+            runtime_groups=runtime_groups(inspector, candidate, rows, binding.resource_binding if binding else None))
 
     def _candidate_checks(self, inspector, candidate):
         binding, binding_error, duplicates = self._candidate_binding(inspector, candidate)
@@ -2181,8 +3224,14 @@ class UnitCatalog:
             if checked["status"] == "READY":
                 self.bindings[identity], self.entry_specs[identity] = binding, entry
                 binding.approved_entries[identity] = entry
+            elif checked.get('call_condition'):
+                conditional = binding.call_bindings[source_id]
+                conditional.approved_entries[identity] = entry
+                self.deferred[identity] = (conditional, entry)
             elif checked.get("host_condition"):
                 self.deferred[identity] = (binding, entry)
+            elif checked.get('binding') == 'SOURCE_VALUE_CONDITIONED_NATIVE_ENTRY':
+                self.structural[identity] = (binding, entry)
             self.store.save("unit", identity, unit, "unit_installed")
             result.append(unit)
         if binding is not None:
@@ -2196,7 +3245,7 @@ class UnitCatalog:
                         self.entry_specs.pop(unit["id"], None)
                         self.store.save("unit", unit["id"], unit, "unit_binding_missing")
         from seampact.hosting.deployment import runtime_groups
-        group_report = runtime_groups(inspector, candidate, rows)
+        group_report = runtime_groups(inspector, candidate, rows, binding.resource_binding if binding else None)
         for group in group_report["groups"]:
             group.update(installation_id=installation_id, analysis_id=analysis_id,
                 units=[unit["id"] for unit in result if unit["entry_id"] in group["entries"]])
@@ -2224,7 +3273,7 @@ class UnitCatalog:
                 unit["execution"] = "REMOTE" if dispatch and dispatch["status"] == "READY_INSTANCE" else "LOCAL"
                 unit["dispatch"] = dispatch or dict(status="READY_LOCAL" if unit["status"] == "READY" else "UNAVAILABLE",
                                                     reason=unit.get("reason"))
-                if deferred and unit["execution"] == "REMOTE":
+                if deferred and unit["execution"] == "REMOTE" and not unit.get('call_condition'):
                     unit.update(status="READY", reason=None, local_status="ENVIRONMENT_DEFERRED")
                 unit["scheduling"] = self.store.get("unit_policy", unit["id"]) or dict(
                     visibility="business", activation="business", declared=False)
@@ -2233,7 +3282,8 @@ class UnitCatalog:
                     "card", unit.get("capability") or capability_card())
                 from seampact.typed_contract import contract_checks
                 group = self.store.get("runtime_group", unit.get("runtime_group")) if unit.get("runtime_group") else None
-                binding = self.bindings.get(unit["id"]) or (self.deferred.get(unit["id"]) or (None,))[0]
+                binding = (self.bindings.get(unit["id"]) or (self.deferred.get(unit["id"]) or
+                           self.structural.get(unit["id"]) or (None,))[0])
                 evidence = self._binding_evidence(binding, unit) if binding is not None else None
                 unit.update(contract_checks(unit, group=group, evidence=evidence))
                 result.append(unit)
@@ -2279,7 +3329,298 @@ class UnitCatalog:
     def validate_arguments(self, unit_id, arguments, native_arguments=(), deferred_arguments=()):
         """Validate a proposed call before the caller's RL action selection."""
         binding, entry, unit = self._checked_unit(unit_id)
+        if unit.get('call_condition'):
+            self.require_call_conditions(unit_id, arguments, native_arguments, deferred_arguments)
         return self._validate_bound_arguments(binding, entry, unit, arguments, native_arguments, deferred_arguments)
+
+    def check_call_conditions(self, unit_id, arguments, native_arguments=(), deferred_arguments=(), *,
+                              frozen=None, instance_identity=None):
+        """Check actual values; no source import, construction or original call."""
+        from seampact.source.call_value_conditions import (
+            RULE, CallUnknown, ordinary, call_context, contextual, builtin_state, verify_recipe, digest,
+        )
+        result = dict(schema='per-call-condition-evidence/1', status='UNKNOWN', allowed=False,
+                      reason=None, recipe_digest=None, payload_digest=None, supplied=[], omitted=[])
+        unit = self.store.get('unit', unit_id)
+        if not unit:
+            return dict(result, reason='native Unit is missing')
+        if unit.get('binding') == 'SOURCE_VALUE_CONDITIONED_NATIVE_ENTRY':
+            if native_arguments or deferred_arguments or frozen is not None:
+                return dict(result, reason_code='CONDITION_UNKNOWN',
+                    reason='structural admission requires the exact current ordinary call')
+            try:
+                return self.check_structural_call_source(unit_id, arguments)
+            except (ValueError, KeyError, TypeError, SyntaxError, OSError) as error:
+                return dict(result, reason_code='CONDITION_UNKNOWN', reason=str(error))
+        if not unit.get('call_condition'):
+            return dict(result, status='NOT_REQUIRED', allowed=True)
+        try:
+            if instance_identity is None and getattr(self, '_worker_call_identity', None):
+                instance_identity = self._worker_call_identity
+            binding, entry, current = frozen or self._checked_unit(unit_id)
+            if current.get('typed_contract') != unit.get('typed_contract'):
+                raise CallUnknown('call belongs to a different frozen Unit contract')
+            self._verify_operation(binding, unit)
+            if native_arguments or deferred_arguments:
+                raise CallUnknown('native/deferred references have no actual ordinary call proof')
+            values = ordinary(arguments)
+            if type(values) is not dict:
+                raise CallUnknown('actual call arguments are not yet available')
+            # Validate exact types before schema checks or the general codec.
+            self._validate_bound_arguments(binding, entry, unit, values)
+            from seampact.hosting.deployment import encode_port
+            payload = encode_port(values)
+            ctx, payload_digest = call_context(payload)
+            base = getattr(binding, 'call_source_inspector', binding.inspector)
+            recipe = unit['call_condition']
+            if not verify_recipe(base, entry, binding.candidate, recipe):
+                raise CallUnknown('per-call recipe/source/entry/resource definition changed')
+            result.update(recipe_digest=recipe['digest'], payload_digest=payload_digest,
+                supplied=sorted(values), unit_id=unit_id, source_version=unit['source_version'],
+                contract_digest=unit['typed_contract']['digest'])
+            if not getattr(self, '_worker_call_identity', None):
+                if self.remote_router is None:
+                    raise CallUnknown('conditional calls require the actual group-port/3 worker')
+                proposal = dict(result, recipe_digest=recipe['digest'], payload_digest=payload_digest,
+                    supplied=sorted(values), unit_id=unit_id,
+                    contract_digest=unit['typed_contract']['digest'], source_version=unit['source_version'])
+                # Obtain the full target check before the action is legal;
+                # local absence is not cleared or treated as target evidence.
+                return self.remote_router.check_call_conditions(unit, values, proposal, instance_identity)
+            if not builtin_state():
+                raise CallUnknown('original builtin operation or type binding changed')
+            with binding.lock:
+                with binding._context():
+                    shadow, trace = binding._verified_runtime_trace(entry, unit, ctx, instance_identity)
+            resources = (DependencyBindings(binding.resource_binding.registry, shadow, binding.candidate)
+                         if binding.resource_binding is not None else None)
+            if resources is not None:
+                resources.host_check = binding.resource_binding.host_check
+            checked = NativeBindings(shadow, binding.candidate, self.runtime, resource_binding=resources)
+            parameters, _ = checked.describe(entry)
+            if parameters != unit['parameters']:
+                raise CallUnknown('actual call would change the original Unit interface')
+            if any(row.get('rule') == REGISTRATION_RULE for row in trace.get('external_protocols', [])):
+                registration_worlds(shadow, entry, binding.candidate, trace, complete_call=True)
+                receipt = binding.import_only_entries.get(unit_id)
+                if receipt is None or 'registration_targets' not in receipt:
+                    return dict(result, reason_code='REGISTRATION_BINDING_UNKNOWN',
+                                reason='actual complete original registration targets are not independently prepared')
+                plan = self.require_import_only_plan(unit_id, frozen=(binding, entry, current))
+                if (receipt['instance_identity'] != instance_identity or receipt['plan_digest'] != plan['plan_digest']):
+                    raise CallUnknown('original registration import occurrence or actual worker identity changed')
+                binding._verify_registration_targets(entry, unit, shadow, trace)
+            node, _ = checked._entry_anchor(entry)
+            fixed = entry.get('fixed_arguments', {})
+            parameters_ = list(node.args.posonlyargs) + list(node.args.args)
+            defaults = dict(zip([p.arg for p in parameters_[-len(node.args.defaults):]], node.args.defaults)) if node.args.defaults else {}
+            defaults.update({p.arg:d for p,d in zip(node.args.kwonlyargs,node.args.kw_defaults) if d is not None})
+            omitted = sorted(set(defaults) - set(values) - set(fixed))
+            # An existing owner can have changed __defaults__. Inspect only an
+            # already-bound original function; never load it to obtain proof.
+            if omitted:
+                original = getattr(binding, 'entries', {}).get(unit_id)
+                if original is None:
+                    receipt = binding.import_only_entries.get(unit_id)
+                    if receipt is not None:
+                        plan = self.require_import_only_plan(unit_id, frozen=(binding, entry, current))
+                        if (plan.get('plan_digest') != receipt['plan_digest'] or
+                                receipt['instance_identity'] != instance_identity):
+                            raise CallUnknown('import-only original callable identity changed')
+                        original = binding._verify_import_only_target(entry, receipt)
+                if original is None:
+                    return dict(result, reason_code='DEFAULT_BINDING_UNKNOWN',
+                                reason='omitted defaults require an independently prepared original callable')
+                from seampact.source.call_value_conditions import literal_default, actual_defaults
+                actual_values = actual_defaults(original, [p.arg for p in parameters_])
+                for name in omitted:
+                    expected = literal_default(defaults[name])
+                    if name not in actual_values:
+                        raise CallUnknown('original immutable default binding is absent')
+                    actual = actual_values[name]
+                    if type(actual) is not type(expected) or actual != expected:
+                        raise CallUnknown('original immutable default binding changed')
+            result.update(status='CHECKED', allowed=True, recipe_digest=recipe['digest'],
+                payload_digest=payload_digest, supplied=sorted(values), omitted=omitted,
+                unit_id=unit_id, contract_digest=unit['typed_contract']['digest'],
+                instance_identity=copy.deepcopy(instance_identity), source_version=unit['source_version'])
+            if instance_identity != self._worker_call_identity:
+                raise CallUnknown('actual worker instance identity differs')
+            return result
+        except (ValueError, KeyError, TypeError, SyntaxError, OSError) as error:
+            code = getattr(error, 'reason_code', 'CONDITION_UNKNOWN')
+            answer = dict(result, status='UNKNOWN', allowed=False, reason_code=code, reason=str(error))
+            if code == 'SDK_BINDING_UNKNOWN' and getattr(self, '_worker_call_identity', None):
+                try:
+                    plan = self.require_import_only_plan(unit_id, frozen=(binding, entry, current))
+                    with binding.lock:
+                        with binding._context():
+                            binding._check_import_prerequisites(entry, unit, plan, self._worker_call_identity)
+                    answer['import_plan'] = plan
+                except (ValueError, KeyError, TypeError, SyntaxError, OSError) as prerequisite_error:
+                    answer['reason_code'] = 'CONDITION_UNKNOWN'
+                    answer['reason'] = str(prerequisite_error)
+            return answer
+
+    def require_call_condition_structure(self, unit_id, *, frozen=None):
+        """Freeze only a replayed conditional host structure, never a call."""
+        from seampact.source.call_value_conditions import verify_recipe
+        with self.lock:
+            binding, entry, unit = frozen or self._checked_unit(unit_id)
+            current = self.store.get('unit', unit_id)
+            if (not current or current.get('typed_contract') != unit.get('typed_contract')
+                    or current.get('status') != 'CALL_CONDITION_DEFERRED'):
+                raise ValueError('conditional Unit installation is no longer current')
+            self._verify_operation(binding, current, full_source_check=True, operation='prepare')
+            group = self.store.get('runtime_group', current.get('runtime_group'))
+            member = ((group or {}).get('host') or {}).get('members', {}).get(current['entry_id'], {})
+            base = getattr(binding, 'call_source_inspector', binding.inspector)
+            if (member.get('status') != 'HOST_CHECKED' or member.get('call_condition') != current.get('call_condition')
+                    or not verify_recipe(base, entry, binding.candidate, current.get('call_condition'))):
+                raise ValueError('conditional host/source/recipe has not been mechanically closed')
+            return dict(status='STRUCTURE_CHECKED', call_permission='REQUIRES_ACTUAL_CALL',
+                        recipe_digest=current['call_condition']['digest'],
+                        contract_digest=current['typed_contract']['digest'], runtime_group=group['id'])
+
+    def require_import_only_plan(self, unit_id, *, frozen=None):
+        """Replay the frozen original import prefix without granting a call."""
+        from seampact.source.import_only import compile_import_only_plan
+        binding, entry, unit = frozen or self._checked_unit(unit_id)
+        self.require_call_condition_structure(unit_id, frozen=(binding, entry, unit))
+        parts = entry.get('symbol', '').split('.')
+        kind = entry.get('kind')
+        if (entry.get('unit', 'file') != 'file' or not entry.get('path', '').endswith('.py')
+                or entry.get('binding_program') or not all(parts) or
+                not (kind == 'function' and len(parts) == 1 or kind == 'method' and len(parts) == 2
+                     and (entry.get('constructor') or {}).get('symbol') == parts[0])):
+            raise ValueError('import-only original default inspection requires a source function or ordinary method')
+        self._verify_operation(binding, unit, full_source_check=True, operation='prepare')
+        resources = (binding.resource_binding.snapshot(entry_ids={entry['id']}) if binding.resource_binding is not None
+                     else dict(requirements=[], bindings={}))
+        if binding.resource_binding is not None:
+            binding.resource_binding.check_entry(entry['id'])
+        base = getattr(binding, 'call_source_inspector', binding.inspector)
+        plan = compile_import_only_plan(base, entry, binding.candidate, resources)
+        if plan.get('status') != 'CHECKED' or not plan.get('plan_digest'):
+            raise ValueError('original import prefix, external effects or frozen resources are UNKNOWN')
+        return plan
+
+    def validate_worker_import_plan(self, unit_id, proposal, *, frozen=None):
+        """Check a trusted worker proposal against the controller's frozen facts.
+
+        Actual SDK/asset premises belong to that worker. This only checks its
+        plan identity; the existing full claim and worker's independent plan
+        replay remain necessary before any original prefix executes.
+        """
+        from seampact.source.import_only import _metadata
+        from seampact.source.call_value_conditions import digest as proof_digest
+        binding, entry, unit = frozen or self._checked_unit(unit_id)
+        self.require_call_condition_structure(unit_id, frozen=(binding, entry, unit))
+        self._verify_operation(binding, unit, full_source_check=True, operation='prepare')
+        plan = _metadata(proposal)
+        resources = (binding.resource_binding.snapshot(entry_ids={entry['id']}) if binding.resource_binding is not None
+                     else dict(requirements=[], bindings={}))
+        if binding.resource_binding is not None:
+            binding.resource_binding.check_entry(entry['id'])
+        body = {key: value for key, value in plan.items() if key != 'plan_digest'}
+        expected = dict(source_version=binding.inspector.request.get('source_version'), entry_id=entry['id'],
+            path=entry['path'], entry_digest=proof_digest(entry), candidate_digest=proof_digest(binding.candidate),
+            resource_digest=proof_digest(resources))
+        if (plan.get('schema') != 'source-import-only-plan/1' or plan.get('status') != 'CHECKED' or
+                plan.get('activation_prefix', {}).get('status') != 'CHECKED' or
+                plan.get('plan_digest') != proof_digest(body) or
+                any(plan.get(key) != value for key, value in expected.items())):
+            raise ValueError('actual worker import plan differs from the frozen source/entry/resource identity')
+        return plan
+
+    def prepare_import_only(self, unit_id, plan_digest):
+        """Import the original checked module; never construct or invoke an owner."""
+        # _checked_unit and the source replay import their checking modules.
+        # Validate the actual import mechanism before those imports as well.
+        prepared_binding = self.bindings.get(unit_id)
+        if prepared_binding is None:
+            deferred = self.deferred.get(unit_id)
+            prepared_binding = deferred[0] if deferred else None
+        if prepared_binding is None:
+            raise MissingBinding('import-only native source binding is unavailable')
+        _check_import_only_loader(prepared_binding)
+        binding, entry, unit = self._checked_unit(unit_id)
+        if binding is not prepared_binding:
+            raise MissingBinding('import-only native source binding changed')
+        plan = self.require_import_only_plan(unit_id, frozen=(binding, entry, unit))
+        if type(plan_digest) is not str or plan_digest != plan['plan_digest']:
+            raise ValueError('original import prefix plan changed')
+        identity = getattr(self, '_worker_call_identity', None)
+        if type(identity) is not dict:
+            raise ValueError('import-only preparation requires the actual worker identity')
+        prefix_modules = {name for name, record in binding.module_paths.items()
+                          if record[0] in plan.get('modules_order', []) and not name.startswith('src.')}
+        if prefix_modules & set(binding.modules):
+            raise ValueError('original import prefix was already loaded without this checked receipt')
+        _checked_module_table()
+        with binding.lock:
+            _check_import_only_loader(binding)
+            with binding._context():
+                from seampact.source.sdk_value_summaries import RULE as SDK_RULE
+                from seampact.source.sdk_runtime_targets import (
+                    begin_original_import, finish_original_import, abort_original_import,
+                )
+                requirements = (unit.get('call_condition') or {}).get('runtime_protocol_requirements', [])
+                import_evidence = binding._check_import_prerequisites(entry, unit, plan, identity)
+                sdk_token = (begin_original_import(binding, entry, unit, plan, identity,
+                    asset_plan=plan.get('sdk_asset_plan'))
+                    if any(row.get('schema') == SDK_RULE for row in requirements) else None)
+                try:
+                    namespace = binding._namespace(entry)
+                    receipt = binding._capture_import_only_target(entry, namespace)
+                    receipt['helpers'] = binding._capture_imported_helpers(plan)
+                    if any(row.get('schema') == REGISTRATION_RULE for row in requirements):
+                        shadow, trace = binding._registration_trace(entry)
+                        worlds = registration_worlds(shadow, entry, binding.candidate, trace, complete_call=False)
+                        if not worlds:
+                            raise RegistrationUnknown('original registration creation requirements were not reproduced')
+                        modules = registration_modules(binding, worlds, in_context=True)
+                        receipt['registration_targets'] = capture_registration_targets(shadow, entry, binding.candidate,
+                                                                                     trace, modules)
+                    current = self.require_import_only_plan(unit_id, frozen=(binding, entry, unit))
+                    if current.get('plan_digest') != plan_digest:
+                        raise ValueError('original import prefix changed during preparation')
+                    receipt.update(plan_digest=plan_digest, instance_identity=copy.deepcopy(identity))
+                    if import_evidence is not None:
+                        receipt['sdk_import_evidence'] = import_evidence
+                    binding.import_only_entries[unit_id] = receipt
+                    if sdk_token is not None:
+                        receipt['sdk_context'] = finish_original_import(sdk_token)
+                except BaseException:
+                    binding.import_only_entries.pop(unit_id, None)
+                    raise
+                finally:
+                    if sdk_token is not None:
+                        abort_original_import(sdk_token)
+        return dict(status='IMPORTED', plan_digest=plan_digest, owner_construction=False, original_call=False)
+
+    def require_call_conditions(self, unit_id, arguments, native_arguments=(), deferred_arguments=(), **kwargs):
+        result = self.check_call_conditions(unit_id, arguments, native_arguments, deferred_arguments, **kwargs)
+        if not result['allowed']:
+            raise ValueError('actual call condition is UNKNOWN: ' + str(result['reason']))
+        return result
+
+
+    def require_initialization_conditions(self, unit_id):
+        """Check only the independently permitted original preparation prefix."""
+        from seampact.source.call_value_conditions import contextual, Context, verify_recipe
+        binding, entry, unit = self._checked_unit(unit_id)
+        recipe = unit.get('call_condition')
+        if not recipe:
+            return
+        base = getattr(binding, 'call_source_inspector', binding.inspector)
+        if not verify_recipe(base, entry, binding.candidate, recipe) or recipe['initialization']['status'] != 'CHECKED':
+            raise ValueError('original initialization is not independently checked')
+        prefix = contextual(base, Context(compiling=True, initialization_only=True))
+        if binding.resource_binding is not None:
+            resources = DependencyBindings(binding.resource_binding.registry, prefix, binding.candidate)
+            resources.host_check = binding.resource_binding.host_check
+            resources.check_entry(entry['id'])
 
     def _checked_unit(self, unit_id):
         unit = self.store.get("unit", unit_id)
@@ -2297,9 +3638,47 @@ class UnitCatalog:
         from seampact.typed_contract import binding_evidence, installation_evidence
         frozen = getattr(binding, "typed_installation_evidence", {})
         entry = getattr(binding, "typed_entry_evidence", {}).get(unit["id"], {})
-        basis = (installation_evidence(binding.inspector, binding.candidate) if full_source_check else
-                 binding_evidence(binding.inspector, binding.candidate, frozen))
+        if unit.get('binding') == 'SOURCE_VALUE_CONDITIONED_NATIVE_ENTRY':
+            fresh = {**frozen, **entry}
+            if full_source_check:
+                fresh.update(installation_evidence(binding.inspector, binding.candidate))
+            basis = binding_evidence(binding.inspector, binding.candidate, fresh)
+        else:
+            basis = (installation_evidence(binding.inspector, binding.candidate) if full_source_check else
+                     binding_evidence(binding.inspector, binding.candidate, frozen))
         return {**entry, **basis}
+
+    def structure_materialization(self, unit_id):
+        """Return checked source material facts; never a semantic export."""
+        from seampact.typed_contract import require_operation
+        with self.lock:
+            unit = self.store.get('unit', unit_id)
+            frozen = self.structural.get(unit_id)
+            if (not unit or unit.get('status') != 'STRUCTURE_ONLY' or frozen is None or
+                    unit.get('binding') != 'SOURCE_VALUE_CONDITIONED_NATIVE_ENTRY'):
+                raise MissingBinding('entry has no current independently checked structural materialization')
+            binding, entry = frozen
+            if binding.detached:
+                raise MissingBinding('structural source is detached')
+            evidence = self._binding_evidence(binding, unit, full_source_check=True)
+            group = self.store.get('runtime_group', unit.get('runtime_group')) if unit.get('runtime_group') else None
+            require_operation(unit, 'materialize_guarded_entry', group=group, evidence=evidence)
+            return dict(schema='guarded-entry-materialization/1', unit_id=unit_id,
+                structure=copy.deepcopy(unit['structure_admission']),
+                source_version=unit['source_version'], request=copy.deepcopy(binding.inspector.request),
+                candidate=copy.deepcopy(binding.candidate), entry=copy.deepcopy(entry),
+                semantic_export=False, invocation=False, process_start=False)
+
+    def check_structural_call_source(self, unit_id, arguments):
+        """Normal catalog C_x consumer; source facts do not imply NO_WORKER."""
+        from seampact.source.value_conditioned_calls import check_call_source
+        material = self.structure_materialization(unit_id)
+        binding, entry = self.structural[unit_id]
+        proof = check_call_source(binding.inspector, entry, binding.candidate,
+                                  material['structure'], arguments)
+        return dict(proof, source_proof=copy.deepcopy(proof), unit_id=unit_id, allowed=False, can_start=False,
+                    reason_code='NEEDS_ACTUAL_WORKER_AND_RESOURCE_PROOF' if
+                        proof['status'] == 'CONTROLLER_SOURCE_CHECKED' else 'CONDITION_UNKNOWN')
 
     def _verify_operation(self, binding, unit, full_source_check=False, operation="invoke"):
         from seampact.typed_contract import require_operation
@@ -2398,6 +3777,8 @@ class UnitCatalog:
         if current is None or current.get("typed_contract") != unit.get("typed_contract"):
             raise MissingBinding("frozen native Unit contract changed; recheck and freeze the task again")
         self._verify_operation(binding, current)
+        self.require_call_conditions(unit_id, arguments, native_arguments,
+                                     frozen=(binding, entry, unit))
         self._validate_bound_arguments(binding, entry, unit, arguments, native_arguments)
         return self._invoke_bound(binding, entry, unit, arguments)
 
@@ -2412,6 +3793,11 @@ class UnitCatalog:
                     unit.update(result_type=type(result).__module__ + "." + type(result).__qualname__)
                     self.store.save("unit", unit_id, unit)
                 return result
+        if unit.get('call_condition') and getattr(self, '_worker_call_identity', None):
+            binding, entry = self.deferred[unit_id]
+            self.require_call_conditions(unit_id, arguments, native_arguments,
+                                         instance_identity=self._worker_call_identity)
+            return self._invoke_bound(binding, entry, unit, arguments)
         if unit["status"] != "READY" or unit_id not in self.bindings:
             raise MissingBinding("this Unit's execution-environment facts are met only by its runtime-group host; "
                                  "start and register an instance first: " + str(unit.get("reason")))
@@ -2459,3 +3845,8 @@ class UnitCatalog:
                 unit["last_completion"] = completion
             self.store.save("unit", unit_id, unit, "unit_returned")
         return result
+
+
+# Capture after the original classes have been defined, before bindings can
+# import any candidate source. File digests do not establish these identities.
+_IMPORT_ONLY_LOADER_KERNEL = _capture_import_only_loader_kernel()

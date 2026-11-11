@@ -1,5 +1,6 @@
 """Finite host dependency scope checks, with no source execution."""
 
+import ast
 import copy
 import sys
 import tempfile
@@ -8,11 +9,96 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
 
-from seampact.source.dependency_closure import dependency_closure, entry_dependency_issues
+from seampact.source.dependency_closure import _Closure, dependency_closure, entry_dependency_issues, resolve_resource_calls
 from seampact.source.inspection import Inspector
 
 
 class DependencyClosureChecks(unittest.TestCase):
+    def test_replay_tree_preserves_lexical_identity_without_cross_scope_cache(self):
+        self.inspect({'main.py': 'def host(isinstance):\n    return isinstance(None, str)\n'},
+                     [self.function('host')], [])
+        checker = _Closure(self.inspector, self.candidate)
+        tree = checker.tree('main.py')
+        call = next(node for node in ast.walk(tree) if isinstance(node, ast.Call))
+        self.assertIs(tree, checker.tree('main.py'))
+        self.assertIs(tree, checker.sdk_source.tree('main.py'))
+        self.assertIsNone(checker.sdk_source.type_references.resolve('main.py', call.func, call))
+        self.assertEqual(checker.sdk_source.type_references.builtin('main.py', call)['status'], 'UNKNOWN')
+        other = _Closure(self.inspector, self.candidate)
+        self.assertIsNot(tree, other.tree('main.py'))
+
+    def test_public_optional_parameter_is_not_frozen_to_its_none_default(self):
+        for annotation in ('', ': str', ': str | None'):
+            with self.subTest(annotation=annotation):
+                rows = self.inspect({'main.py': 'def host(value' + annotation + '=None):\n'
+                    '    if value is not None:\n        eval(value)\n'}, [self.function('host')], [])
+                self.assertTrue(any(t['target']=='eval' for t in rows['host']['unresolved_targets']))
+
+    def test_public_keyword_only_and_scalar_defaults_remain_overridable(self):
+        for parameter, condition in (('*, value: str = None', 'value is not None'),
+                                     ('value: str = "safe"', 'value == "unsafe"')):
+            with self.subTest(parameter=parameter):
+                rows = self.inspect({'main.py': 'def host(' + parameter + '):\n'
+                    '    if ' + condition + ':\n        eval(value)\n'}, [self.function('host')], [])
+                self.assertTrue(any(t['target']=='eval' for t in rows['host']['unresolved_targets']))
+
+    def test_explicit_fixed_none_is_kept_while_internal_omission_uses_default(self):
+        rows = self.inspect({'main.py': 'def host(value: str=None):\n'
+            '    if value is not None:\n        eval(value)\n'}, [self.function('host',fixed_arguments=dict(value=None))], [])
+        self.assertEqual(rows['host']['unresolved_targets'], [])
+        rows = self.inspect({'main.py': 'def helper(value: str=None):\n'
+            '    if value is not None:\n        eval(value)\ndef host():\n    return helper()\n'},
+            [self.function('host'),self.function('helper')], [])
+        self.assertEqual(rows['host']['unresolved_targets'], [])
+        self.assertTrue(any(t['target']=='eval' for t in rows['helper']['unresolved_targets']))
+
+    def test_open_public_kwargs_cannot_become_omitted_helper_arguments(self):
+        rows = self.inspect({'main.py': 'def helper(value: str=None):\n'
+            '    if value is not None:\n        eval(value)\ndef host(**kwargs):\n    return helper(**kwargs)\n'},
+            [self.function('host')], [])
+        self.assertTrue(any(t['target']=='eval' for t in rows['host']['unresolved_targets']))
+
+    def test_keyword_expansion_preserves_known_internal_none_and_not_unknown_mutation(self):
+        source = ('def helper(value: str=None):\n    if value is not None:\n        eval(value)\n'
+                  'def host():\n    options={"value": None}\n    {mutation}\n    return helper(**options)\n')
+        rows = self.inspect({'main.py':source.replace('{mutation}', 'pass')}, [self.function('host')], [])
+        self.assertEqual(rows['host']['unresolved_targets'], [])
+        rows = self.inspect({'main.py':source.replace('{mutation}', 'external(options)')}, [self.function('host')], [])
+        self.assertTrue(any(t['target']=='eval' for t in rows['host']['unresolved_targets']))
+
+    def test_open_public_positionals_cannot_become_omitted_helper_arguments(self):
+        rows = self.inspect({'main.py': 'def helper(first=None, value: str=None):\n'
+            '    if value is not None:\n        eval(value)\ndef host(*args):\n    return helper(*args)\n'},
+            [self.function('host')], [])
+        self.assertTrue(any(t['target']=='eval' for t in rows['host']['unresolved_targets']))
+
+    def test_unresolved_dependency_reference_is_not_a_literal_dictionary(self):
+        rows = self.inspect({'main.py': 'def host(value: str=None):\n'
+            '    if value is None:\n        eval("dynamic")\n'}, [self.function('host',
+            fixed_arguments=dict(value={'$dependency':dict(id='resource',field='parameters.value')}))], [])
+        self.assertTrue(any(t['target']=='eval' for t in rows['host']['unresolved_targets']))
+
+    def test_literal_none_optional_callback_is_not_a_reachable_call(self):
+        rows = self.inspect({'main.py': 'def helper(callback=None):\n    if callback is not None:\n        callback()\n    return 1\ndef host():\n    return helper()\n'},
+                            [self.function('host')], [])
+        self.assertEqual(rows['host']['unresolved_targets'], [])
+
+    def test_unknown_callback_is_not_confused_with_literal_none(self):
+        rows = self.inspect({'main.py': 'def host(callback):\n    if callback is not None:\n        callback()\n'},
+                            [self.function('host')], [])
+        self.assertTrue(any(t['target'] == 'callback' for t in rows['host']['unresolved_targets']))
+
+    def test_real_optional_callback_keeps_its_dependency(self):
+        rows = self.inspect({'main.py': 'def child():\n    return 2\ndef helper(callback=None):\n    if callback is not None:\n        return callback()\ndef host():\n    return helper(child)\n'},
+                            [self.function('host'), self.function('child')])
+        self.assertEqual(rows['host']['dependency_ids'], ['service'])
+
+    def test_branch_union_with_none_retains_possible_callback(self):
+        rows = self.inspect({'main.py': 'def child():\n    return 2\ndef host(choice):\n    if choice:\n        callback = child\n    else:\n        callback = None\n    if callback is not None:\n        callback()\n'},
+                            [self.function('host'), self.function('child')])
+        # A mixed branch may not be erased merely because one branch is None.
+        self.assertTrue(rows['host']['dependency_ids'] or rows['host']['unresolved_targets'])
+
     def inspect(self, files, entries, dependencies=None):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
@@ -200,8 +286,8 @@ class DependencyClosureChecks(unittest.TestCase):
                 rows = self.inspect({'main.py': source}, [self.function('host')], [])
                 self.assertEqual(rows['host']['status'], 'CHECKED', rows['host'])
                 protocols = rows['host']['external_protocols']
-                self.assertEqual({row['rule'] for row in protocols}, {'module-lazy-external-singleton/1',
-                    'external-callable-factory/1', 'external-factory-result-call/1'})
+                self.assertEqual({row['rule'] for row in protocols} - {'source-known-branch/1'},
+                    {'module-lazy-external-singleton/1', 'external-callable-factory/1', 'external-factory-result-call/1'})
                 factory = next(row for row in protocols if row['rule'] == 'external-callable-factory/1')
                 self.assertEqual(factory['resource']['name'], 'test_pipeline')
                 self.assertEqual(factory['resource']['status'], 'ENVIRONMENT_NOT_CHECKED')
@@ -495,6 +581,121 @@ class DependencyClosureChecks(unittest.TestCase):
                                'def host(raw):\n    configure(raw)\n    ROOT.read_text()\n')
             rows = self.inspect({'main.py': source}, [self.function('host')], [])
             self.assertEqual(bool(rows['host']['unresolved_targets']), unknown)
+
+    def test_known_constructor_branch_retains_original_receiver_and_nested_owner(self):
+        source = ('def child():\n    pass\nclass Engine:\n    def run(self):\n        child()\n'
+                  'class Host:\n    def __init__(self, mode="other"):\n'
+                  '        if mode in ["selected", "alternate"]:\n            self.engine = Engine()\n'
+                  '        else:\n            unavailable()\n'
+                  '    def run(self):\n        if isinstance(self.engine, Engine):\n            self.engine.run()\n'
+                  '        else:\n            unavailable()\n')
+        entry = dict(id='host', path='main.py', symbol='Host.run', kind='method',
+                     constructor=dict(symbol='Host', arguments=dict(mode='selected')))
+        rows = self.inspect({'main.py': source}, [entry, self.function('child')])
+        self.assertEqual(rows['host']['dependency_ids'], ['service'])
+        self.assertEqual(rows['host']['unresolved_targets'], [])
+        self.assertIn('source-exact-local-instance/1', {p['rule'] for p in rows['host']['external_protocols']})
+
+    def test_unknown_field_write_preserves_stable_nested_receiver_and_aliases(self):
+        source = ('def child():\n    pass\nclass Engine:\n    def run(self):\n        child()\n'
+                  'class Host:\n    def __init__(self):\n        self.engine = Engine()\n'
+                  '    def configure(self, choice):\n        alias = self.engine\n'
+                  '        if choice:\n            alias.chunk = 1\n        else:\n            self.engine.chunk = 2\n'
+                  '    def run(self, choice):\n        self.configure(choice)\n        self.engine.run()\n')
+        entry = dict(id='host', path='main.py', symbol='Host.run', kind='method',
+                     constructor=dict(symbol='Host', arguments={}))
+        rows = self.inspect({'main.py': source}, [entry, self.function('child')])
+        self.assertEqual(rows['host']['dependency_ids'], ['service'])
+        self.assertEqual(rows['host']['unresolved_targets'], [])
+
+    def test_distinct_branch_allocations_never_merge_merely_by_class_name(self):
+        source = ('def child():\n    pass\nclass Engine:\n    def __init__(self, callback):\n'
+                  '        self.callback = callback\n    def run(self):\n        self.callback()\n'
+                  'def host(choice):\n    if choice:\n        engine = Engine(child)\n'
+                  '    else:\n        engine = Engine(unknown)\n    engine.run()\n')
+        rows = self.inspect({'main.py': source}, [self.function('host'), self.function('child')])
+        self.assertTrue(rows['host']['unresolved_targets'])
+        self.assertNotEqual(rows['host']['status'], 'CHECKED')
+
+    def test_public_unknown_selector_does_not_prune_constructor_branches(self):
+        source = ('def child():\n    pass\ndef other():\n    pass\n'
+                  'def host(mode):\n    if mode in ["selected"]:\n        child()\n    else:\n        other()\n')
+        rows = self.inspect({'main.py': source}, [self.function('host'), self.function('child'), self.function('other')],
+                            [dict(id='service', entry_ids=['child']), dict(id='other-service', entry_ids=['other'])])
+        self.assertEqual(rows['host']['dependency_ids'], ['service', 'other-service'])
+
+    def test_isinstance_external_base_shadow_and_class_mutation_remain_unknown(self):
+        prefix = ('def child():\n    pass\ndef other():\n    pass\n'
+                  'class Engine{base}:\n    pass\ndef host():\n    engine = Engine()\n'
+                  '    {change}\n    if isinstance(engine, Engine):\n        child()\n    else:\n        other()\n')
+        for base, change in (('(ExternalBase)', 'pass'), ('', 'engine.__class__ = unknown'),
+                             ('', 'external(engine)'), ('', 'isinstance = external')):
+            with self.subTest(base=base, change=change):
+                source = 'from sdk import ExternalBase, external\n' + prefix.format(base=base, change=change)
+                rows = self.inspect({'main.py': source}, [self.function('host'), self.function('child'), self.function('other')],
+                    [dict(id='service', entry_ids=['child']), dict(id='other-service', entry_ids=['other'])])
+                self.assertEqual(rows['host']['dependency_ids'], ['service', 'other-service'])
+                self.assertFalse(any(p['rule'] == 'source-exact-local-instance/1' for p in rows['host']['external_protocols']))
+
+    def test_resource_calls_keep_selected_original_values_none_and_unknown_separate(self):
+        source = ('from sdk import Loader\nclass Host:\n    def __init__(self, mode, cache=None):\n'
+                  '        if mode in ["selected"]:\n            self.model = Loader.from_pretrained("org/selected", cache_dir=cache)\n'
+                  '        else:\n            self.model = Loader.from_pretrained("org/other", cache_dir=cache)\n'
+                  '    def run(self):\n        return 1\n')
+        entry = dict(id='host', path='main.py', symbol='Host.run', kind='method',
+                     constructor=dict(symbol='Host', arguments=dict(mode='selected')))
+        self.inspect({'main.py': source}, [entry], [])
+        result = resolve_resource_calls(self.inspector, entry, self.candidate)
+        calls = [c for c in result['calls'] if c['target'] == 'sdk.Loader.from_pretrained']
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]['args'][0], dict(status='CHECKED', value='org/selected'))
+        self.assertEqual(calls[0]['kwargs']['cache_dir'], dict(status='CHECKED', value=None))
+        self.assertEqual(calls[0]['path_condition_status'], 'CHECKED')
+        entry = copy.deepcopy(entry)
+        entry['constructor']['arguments']['cache'] = {'$dependency': dict(id='cache', field='path')}
+        calls = resolve_resource_calls(self.inspector, entry)['calls']
+        self.assertEqual(calls[0]['kwargs']['cache_dir'], dict(status='UNKNOWN'))
+
+    def test_resource_calls_in_unknown_branches_and_loops_keep_potential_scope(self):
+        source = ('from sdk import Loader\ndef host(choice):\n'
+                  '    if choice:\n        Loader.from_pretrained("org/first")\n'
+                  '    else:\n        Loader.from_pretrained("org/second")\n'
+                  '    for value in choice:\n        Loader.from_pretrained("org/loop")\n')
+        entry = self.function('host')
+        self.inspect({'main.py': source}, [entry], [])
+        calls = resolve_resource_calls(self.inspector, entry)['calls']
+        self.assertEqual(len(calls), 3)
+        self.assertTrue(all(c['path_condition_status'] == 'UNKNOWN' for c in calls))
+
+    def test_class_descriptor_cannot_supply_an_exact_isinstance_proof(self):
+        source = ('def child():\n    pass\ndef other():\n    pass\nclass Expected:\n    pass\n'
+                  'class Actual:\n    @property\n    def __class__(self):\n        return Expected\n'
+                  'def host():\n    value = Actual()\n    if isinstance(value, Expected):\n        child()\n'
+                  '    else:\n        other()\n')
+        rows = self.inspect({'main.py': source}, [self.function('host'), self.function('child'), self.function('other')],
+                            [dict(id='service', entry_ids=['child']), dict(id='other-service', entry_ids=['other'])])
+        self.assertEqual(rows['host']['dependency_ids'], ['service', 'other-service'])
+        self.assertFalse(any(p['rule'] == 'source-exact-local-instance/1' for p in rows['host']['external_protocols']))
+
+    def test_container_receiver_alias_gap_cannot_become_empty_checked_scope(self):
+        source = ('def child():\n    pass\nclass Engine:\n    def run(self):\n        child()\n'
+                  'def host(choice):\n    box = [Engine()]\n    if choice:\n        box.append(Engine())\n'
+                  '    else:\n        box.append(unknown)\n    box[0].run()\n')
+        rows = self.inspect({'main.py': source}, [self.function('host'), self.function('child')])
+        self.assertTrue(rows['host']['dependency_ids'] or rows['host']['unresolved_targets'])
+        self.assertNotEqual(rows['host']['status'], 'CHECKED')
+
+    def test_equal_shaped_bound_receivers_do_not_hide_a_later_alias_write(self):
+        source = ('def child():\n    pass\ndef other():\n    pass\nclass Engine:\n'
+                  '    def __init__(self, callback):\n        self.callback = callback\n'
+                  '    def run(self):\n        self.callback()\n'
+                  'def host(choice):\n    first = Engine(other)\n    second = Engine(other)\n'
+                  '    if choice:\n        callback = first.run\n    else:\n        callback = second.run\n'
+                  '    second.callback = child\n    callback()\n')
+        rows = self.inspect({'main.py': source}, [self.function('host'), self.function('child'), self.function('other')],
+                            [dict(id='service', entry_ids=['child']), dict(id='other-service', entry_ids=['other'])])
+        self.assertTrue('service' in rows['host']['dependency_ids'] or rows['host']['unresolved_targets'])
+        self.assertNotEqual(rows['host']['status'], 'CHECKED')
 
 
 if __name__ == '__main__':

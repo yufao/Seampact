@@ -101,8 +101,18 @@ def dependency_inputs(inspector, requirements):
         files=[dict(path=path, sha256=digest(data)) for path, data in sorted(files.items())])
 
 
-def worker_dockerfile(destination, inspector, environment, check_python):
-    """Emit a reusable dependency stage plus a source-specific worker stage."""
+NATIVE_RUNTIME = dict(
+    copies=["COPY snapshots /work/snapshots", "COPY worker.json /work/worker.json"],
+    entrypoint=["python", "-B", "-m", "seampact.worker", "--spec", "/work/worker.json", "--host", "0.0.0.0", "--port", "8890"])
+
+
+def worker_dockerfile(destination, inspector, environment, check_python, runtime=None):
+    """Emit a reusable dependency stage plus a source-specific worker stage.
+
+    ``runtime`` names what the final stage copies beside the source and the
+    worker entrypoint it starts.
+    """
+    runtime = runtime or NATIVE_RUNTIME
     files, plan = dependency_inputs(inspector, environment["requirements"])
     if files:
         folder = destination / "dependency-inputs"
@@ -139,7 +149,10 @@ def worker_dockerfile(destination, inspector, environment, check_python):
     python_check = "import sys; assert '.'.join(map(str, sys.version_info[:2])) == " + repr(environment["python"])
     dependency_recipe = (
         "ARG PIP_EXTRA_INDEX_URL=\nENV PIP_CACHE_DIR=/root/.cache/pip\n"
-        "WORKDIR /work/source\nRUN python -c " + shlex.quote(python_check) + "\n")
+        # A worker may itself be the selected base. COPY merges directories;
+        # inherited manifests/source must never join this frozen source tree.
+        "WORKDIR /work\nRUN rm -rf /work/source\nWORKDIR /work/source\n"
+        "RUN python -c " + shlex.quote(python_check) + "\n")
     if environment["python"] == "3.10":
         dependency_recipe += cached_run + install + "'tomli>=2,<3'\n"
         installation["early"].insert(0, dict(kind="worker-parser", inputs=["tomli>=2,<3"],
@@ -166,10 +179,13 @@ def worker_dockerfile(destination, inspector, environment, check_python):
         "FROM ${DEPENDENCY_IMAGE} AS worker\nARG PIP_EXTRA_INDEX_URL=\nCOPY core /app\n"
         "ENV PYTHONPATH=/app PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1\nWORKDIR /work\n" +
         "RUN python -c " + shlex.quote(check_python) + "\n"
-        "COPY source /work/source\nWORKDIR /work/source\n" + cached_run + " \\\n && ".join(late) + "\n"
-        "COPY snapshots /work/snapshots\nCOPY worker.json /work/worker.json\nWORKDIR /work\n"
+        "RUN rm -rf /work/source\nCOPY source /work/source\nWORKDIR /work/source\n" + cached_run + " \\\n && ".join(late) + "\n"
+        + "\n".join(runtime["copies"]) + "\nWORKDIR /work\n"
         "ENV SEAMPACT_ENVIRONMENT_LOCK=/work/environment.lock\n"
-        'ENTRYPOINT ["python","-B","-m","seampact.worker","--spec","/work/worker.json","--host","0.0.0.0","--port","8890"]\n')
+        # The Python worker handles KeyboardInterrupt after draining. PID 1
+        # otherwise ignores Docker's default SIGTERM until the kill timeout.
+        "STOPSIGNAL SIGINT\n"
+        "ENTRYPOINT " + json.dumps(runtime["entrypoint"], separators=(",", ":")) + "\n")
     (destination / "Dockerfile").write_text(dockerfile, encoding="utf-8")
     dependency_image = "seampact-environment:recipe-" + recipe_sha256[:24]
     reuse = dict(schema="seampact-build-reuse/2", dependency_stage="dependencies", dependency_image=dependency_image,

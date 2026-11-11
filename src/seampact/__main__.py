@@ -4,13 +4,13 @@ import sys
 from pathlib import Path
 
 def main():
-    # The manual worker entry executes the same scoped runtime as the image.
+    # Manual execution and generated images use the same capability worker.
     if len(sys.argv) > 1 and sys.argv[1] == "worker":
-        from seampact.worker import main as worker_main
+        from seampact.capability_worker import main as worker_main
         return worker_main(sys.argv[2:])
-    parser = argparse.ArgumentParser(description="SeamPact: conversation, Harness intake, Units and RL. Worker options: seampact worker --help")
+    parser = argparse.ArgumentParser(description="SeamPact: repository capabilities and streaming Agents. Worker options: seampact worker --help")
     parser.add_argument("command", choices=["serve"], nargs="?", default="serve")
-    parser.add_argument("--home", default="var/prototype")
+    parser.add_argument("--home", default="var/capability-agent")
     parser.add_argument("--port", type=int, default=8880)
     parser.add_argument("--host", choices=["127.0.0.1", "0.0.0.0"], default="127.0.0.1")
     parser.add_argument("--public-port", type=int)

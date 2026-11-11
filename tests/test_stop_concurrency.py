@@ -1,5 +1,6 @@
 """API/controller stop races cannot overwrite confirmed resource release."""
 import sys
+import tempfile
 import threading
 import unittest
 from pathlib import Path
@@ -9,6 +10,7 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
 from seampact.hosting import backends
 from seampact.hosting.deployment import Deployments
+from seampact.store import Store
 
 
 class StopConcurrencyTests(unittest.TestCase):
@@ -19,7 +21,7 @@ class StopConcurrencyTests(unittest.TestCase):
         deployments.affinity = {}
         deployments.backend = lambda: dict(operation_timeout_s=10)
         deployments.platform = SimpleNamespace(store=SimpleNamespace(get=lambda *args: {}),
-            runtime=SimpleNamespace(snapshot=lambda: dict(calls={}, roots={})))
+            runtime=SimpleNamespace(call=lambda method: dict(calls={}, roots={})))
         record = dict(id='instance', group_id='group', state='DRAINING', in_flight=0,
                       pending_stop=dict(reason='operator'), handle=dict(container='seampact-owned-g1'),
                       released=False)
@@ -29,6 +31,8 @@ class StopConcurrencyTests(unittest.TestCase):
 
     def test_controller_and_api_issue_one_physical_stop(self):
         deployments, record = self.fixture()
+        observed = []
+        deployments._event = lambda item, kind, **facts: observed.append((kind, item.get('pending_stop')))
         entered, finish = threading.Event(), threading.Event()
         errors = []
 
@@ -59,7 +63,33 @@ class StopConcurrencyTests(unittest.TestCase):
         self.assertEqual(record['state'], 'STOPPED')
         self.assertTrue(record['released'])
         self.assertIsNone(record['pending_stop'])
+        self.assertEqual(observed, [('stopped', None)])
         self.assertEqual(deployments.stops_in_progress, set())
+
+    def test_restart_repairs_only_confirmed_released_stops(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = Store(root / 'state.sqlite3')
+            try:
+                for identity, state, released, result in (
+                    ('confirmed', 'STOPPED', True, 'STOPPED'),
+                    ('failed_confirmed', 'FAILED', True, 'STOPPED'),
+                    ('unconfirmed', 'STOPPED', False, 'STOPPED'),
+                    ('pending', 'STOPPED', True, 'STOP_PENDING'),
+                    ('unknown', 'UNKNOWN', True, 'STOPPED')):
+                    store.save('runtime_instance', identity, dict(id=identity, state=state, released=released,
+                        stop_result=dict(status=result), pending_stop=dict(reason='operator')))
+                platform = SimpleNamespace(home=root, store=store, catalog=SimpleNamespace())
+                with patch('threading.Thread.start'):
+                    deployments = Deployments(platform)
+                for identity in ('confirmed', 'failed_confirmed'):
+                    self.assertIsNone(deployments.instances[identity]['pending_stop'])
+                    self.assertIsNone(store.get('runtime_instance', identity)['pending_stop'])
+                for identity in ('unconfirmed', 'pending', 'unknown'):
+                    self.assertIsNotNone(deployments.instances[identity]['pending_stop'])
+                    self.assertIsNotNone(store.get('runtime_instance', identity)['pending_stop'])
+            finally:
+                store.close()
 
     def test_unconfirmed_ended_instance_remains_held_until_backend_confirmation(self):
         deployments, record = self.fixture()

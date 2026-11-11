@@ -227,7 +227,8 @@ class Images:
     def prepare(self, body):
         groups = copy.deepcopy(body.get("groups") or {})
         selected_groups = set(body.get("group_ids") or [])
-        if selected_groups and getattr(self.platform, "catalog", None):
+        if (selected_groups and getattr(self.platform, "catalog", None)
+                and getattr(self.platform, "protocol", None) != "capability-agent/1"):
             from seampact.scenes.scenarios import FrozenCatalog
             units = [u["id"] for u in self.platform.catalog.public() if u.get("runtime_group") in selected_groups]
             if units:

@@ -57,7 +57,7 @@ class ContextMemoryChecks(unittest.TestCase):
         call=dict(role='assistant',content=None,tool_calls=[dict(id='a'),dict(id='b')])
         results=[dict(role='tool',tool_call_id='a',content='A'),dict(role='tool',tool_call_id='b',content='B')]
         messages=self.messages()[:2]+[call]+results+self.messages()[2:]
-        compact,_=self.memory.prepare({},messages,summarize=self.summary,force=True)
+        compact,_=self.memory.prepare(dict(declared_context_window=50000),messages,summarize=self.summary,force=True)
         data=json.loads(self.summary_request[1]['content'])
         self.assertNotIn(call,data)
         index=compact.index(call)
@@ -68,12 +68,12 @@ class ContextMemoryChecks(unittest.TestCase):
     def test_multimodal_bytes_stay_in_original_messages(self):
         image=dict(role='user',content=[dict(type='image_url',image_url=dict(url='data:image/png;base64,fixture'))])
         messages=self.messages()+[image]+self.messages()[2:]
-        compact,status=self.memory.prepare({},messages,summarize=self.summary,force=True)
+        compact,status=self.memory.prepare(dict(declared_context_window=50000),messages,summarize=self.summary,force=True)
         self.assertIn(image,compact)
         self.assertNotIn('data:image',self.summary_request[1]['content'])
         self.assertIsNone(status['estimated_ratio'])
         self.memory.observe(dict(prompt_tokens=900),messages)
-        _,status=self.memory.prepare(dict(declared_context_window=2000),messages,summarize=self.summary)
+        _,status=self.memory.prepare(dict(declared_context_window=50000),messages,summarize=self.summary)
         self.assertEqual(status['last_actual_input_tokens'],900)
         self.assertIsNone(status['estimated_ratio'])
 
@@ -123,10 +123,63 @@ class ContextMemoryChecks(unittest.TestCase):
         def interrupted(*args):
             raise RuntimeError('fixture interruption')
         with self.assertRaises(RuntimeError):
-            self.memory.prepare({},self.messages(),summarize=interrupted,record=events.append,force=True)
+            self.memory.prepare(dict(declared_context_window=50000),self.messages(),summarize=interrupted,record=events.append,force=True)
         self.assertEqual(events[0]['status'],'FAILED')
         self.assertIsNone(events[0]['usage'])
         self.assertTrue(self.memory.read(events[0]['archive_ref'],path='/messages')['total'])
+
+    def test_large_summary_is_planned_as_bounded_complete_tool_groups(self):
+        messages=self.messages()[:2]
+        for index in range(10):
+            messages += [dict(role='assistant',content=None,tool_calls=[dict(id=str(index))]),
+                dict(role='tool',tool_call_id=str(index),content=('source '+str(index)+' ') * 500)]
+        messages += [dict(role='assistant',content='recent exact fact') for _ in range(4)]
+        profile=dict(declared_context_window=8000,declared_max_output_tokens=256)
+        requests,events=[],[]
+        def summarize(request,selected):
+            requests.append(copy.deepcopy(request))
+            status=context_status(selected,request)
+            self.assertLessEqual(status['estimated_ratio'],0.8)
+            return self.summary(request,selected)
+        compact,status=self.memory.prepare(profile,messages,summarize=summarize,record=events.append,force=True)
+        self.assertGreater(len(requests),1)
+        notes=[json.loads(row['content']) for row in compact[2:-6]]
+        archive=self.store.get('context_archive',status['archive_ref'])
+        summarized=[row for request in requests for row in json.loads(request[1]['content'])]
+        self.assertEqual(summarized,archive['messages'])
+        self.assertEqual(sum(event['message_count'] for event in events),len(archive['messages']))
+        self.assertEqual(events[-1]['message_offset']+events[-1]['message_count'],len(archive['messages']))
+        self.assertEqual(status['summary_count'],len(requests))
+        self.assertTrue(all(event['summary_count']==len(requests) for event in events))
+        self.assertEqual(compact[:2],messages[:2])
+        self.assertEqual(compact[-6:],messages[-6:])
+        self.assertTrue(all(note['archive_ref']==status['archive_ref'] for note in notes))
+
+    def test_unknown_summary_window_does_not_send_unbounded_history(self):
+        with self.assertRaisesRegex(ContextError,'窗口未知'):
+            self.memory.prepare({},self.messages(),summarize=lambda *args:self.fail('must not send'),force=True)
+        self.assertTrue(self.memory.references())
+
+    def test_oversized_tool_group_fails_before_any_summary_request(self):
+        messages=self.messages()[:2]
+        for index,size in ((0,30000),(1,10)):
+            messages += [dict(role='assistant',content=None,tool_calls=[dict(id=str(index))]),
+                dict(role='tool',tool_call_id=str(index),content='x'*size)]
+        messages += [dict(role='assistant',content='recent exact fact') for _ in range(4)]
+        with self.assertRaisesRegex(ContextError,'单个完整工具往返'):
+            self.memory.prepare(dict(declared_context_window=5000,declared_max_output_tokens=100),messages,
+                summarize=lambda *args:self.fail('must preflight every group'),force=True)
+        reference=self.memory.references()[0]
+        self.assertEqual(self.store.get('context_archive',reference)['messages'][1]['content'],'x'*30000)
+
+    def test_oversized_current_constraints_fail_before_any_summary_request(self):
+        messages=self.messages()
+        messages[1]['content']='exact current instruction '*2000
+        with self.assertRaisesRegex(ContextError,'当前问题或最近完整工具结果'):
+            self.memory.prepare(dict(declared_context_window=10000,declared_max_output_tokens=100),messages,
+                summarize=lambda *args:self.fail('protected context cannot fit'),force=True)
+        self.assertEqual(messages[1]['content'],'exact current instruction '*2000)
+        self.assertTrue(self.memory.references())
 
 
 if __name__=='__main__':

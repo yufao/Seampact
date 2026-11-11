@@ -17,6 +17,8 @@ from seampact.configuration.configuration_binding import configuration_override_
 from seampact.source.frozen_inheritance import FrozenInheritance
 from seampact.source.process_environment import process_environment_flow
 from seampact.configuration.resource_origins import resource_origin_facts
+from seampact.configuration.hub_cache import validate_hub_cache_spec, check_hub_cache
+from seampact.configuration.resource_call_bindings import resource_scope, prove_hub_cache_binding
 
 DEPENDENCY_RULES = """
 资源配置由用户保存，依赖需求和原参数映射必须由你从原源码提出。预处理工件和最终候选必须提供dependencies数组，逐项枚举已发现的原必需及可选外部服务、权重和配套模型资源；已有用户字面配置、原签名默认值、固定路径或尚未提供资源，均不是省略需求的理由。只在已检查的目标及原初始化范围确实没有发现此类需求时填[]，并在missing说明仍未覆盖的范围；[]本身不证明资源发现完整。
@@ -39,6 +41,9 @@ resource_catalog只提供非敏感连接、权重状态及已有选择；配置�
 CLI environment可沿唯一真实导入/调用追踪原模块单赋值常量、无自定义方法的普通dataclass字段及原对象单写属性；仅真实SDK字段或urllib.request.Request进入urlopen的URL、JSON model字段、Bearer Authorization可作消费者证据。各导入、环境读取、字段、赋值和完整调用均须覆盖。配置工厂或客户端名称本身不证明消费；未调用方法、动态读取、环境覆盖、遮蔽及缺失源文件保留具体MISSING。configuration_flow中的SOURCE_SIGNAL只记录配置来源、合并/条件覆盖次序和原字段加载事实，selected_value:UNRESOLVED不表示YAML/YACS值已求解，不可据此放行或将Hub标识当本地路径。原CLI权重可在entry.fixed_arguments声明whole-placeholder资源引用，mapping另填configuration_key:"原点分字段"及cli_override:{parameter:"原argparse.REMAINDER参数"}；command最后须为该字面字段和{资源参数占位符}，read_time须为process_start。检查器须核对真实YACS导入、原字符串键声明、原工作目录的冻结YAML、最后merge_from_list及该字段到torch.load，无后续覆盖或动态剩余选项。此前YAML值不在平台执行，原CLI保持原加载/合并/推理。
 原CLI若通过命名参数读取冻结YAML并以yaml.safe_load加载嵌套服务字段，可声明entry.configuration={原CLI参数:{原嵌套键:资源引用}}，entry.fixed_arguments中的该参数保留冻结YAML相对原cwd的路径，command以{该参数}整体占位。mapping使用location:"configuration",parameter:"原CLI参数",parameter_path:["原嵌套键",...],configuration_file:"同一YAML相对原cwd的路径",field:"base_url/model/credential/parameters.xxx"，read_time:"process_start"。证据覆盖原argparse选项、open/safe_load、完整冻结YAML及字段到实际服务消费者；原线程池submit的唯一同源callback也须追踪，不能用未调用定义证明消费。仅支持可唯一定位的单行标量和普通块映射；重复键、别名/标签、多行字段、动态键或覆盖未决保留MISSING。引擎运行时仅在私有临时副本替换已证资源叶子，其余原配置及原加载流程保留；不在命令参数暴露凭据，不改原文件。原base_url字段如在消费者前拼接唯一字面路径后缀，检查记录该后缀；所选服务地址已带同一后缀时，临时值去除一次，仍由原代码拼接一次。
 """
+
+
+DEPENDENCY_RULES += "\n已批准的有限 None 恒等回退：仅原构造权重路径参数的一次顶层同名赋值，guard为该参数 is/is not None，非None所选分支仍为同一原参数；需冻结实际资源绑定证明该实参为普通str，再完整核对原参数、赋值和原加载调用。未选资源引用、schema或候选标志不能证明实值；其他改写、比较、嵌套或重复赋值继续UNKNOWN。平台可先在未发布绑定副本上核对已登记且文件身份已验证的资源实值，完整映射通过后才保存选择；失败不发布SELECTED。原默认分支、加载、算法及执行保留，不授予SDK效果、生命周期或拆分许可。\n"
 
 
 class EnvironmentGap(ValueError):
@@ -470,7 +475,51 @@ def _dictionary_field_call(node, parameter, keys, field, evidence, path, cell, t
                and _field_call(call, field, lambda value: matches(value, call)) for call in ast.walk(node))
 
 
-def _constructor_path_call(inspector, node, path, cell, parameter, evidence):
+def _none_identity_assignment(statement, parameter):
+    if isinstance(statement, ast.Assign) and len(statement.targets) == 1:
+        target, value = statement.targets[0], statement.value
+    elif isinstance(statement, ast.AnnAssign) and statement.value is not None:
+        target, value = statement.target, statement.value
+    else:
+        return None
+    if not (isinstance(target, ast.Name) and target.id == parameter and isinstance(value, ast.IfExp)):
+        return None
+    guard = value.test
+    if not (isinstance(guard, ast.Compare) and isinstance(guard.left, ast.Name)
+            and guard.left.id == parameter and len(guard.ops) == len(guard.comparators) == 1
+            and isinstance(guard.comparators[0], ast.Constant) and guard.comparators[0].value is None
+            and isinstance(guard.ops[0], (ast.Is, ast.IsNot))):
+        return None
+    selected = value.orelse if isinstance(guard.ops[0], ast.Is) else value.body
+    return selected if isinstance(selected, ast.Name) and selected.id == parameter else None
+
+
+def _frozen_weight_path(inspector, row, identity):
+    selection = (inspector.request.get('dependency_bindings') or {}).get(identity)
+    if (type(selection) is not dict or selection.get('status') not in {'SELECTED', 'PROPOSED'}
+            or selection.get('definition_digest') != row.get('definition_digest')
+            or selection.get('origin_id') != identity
+            or selection.get('source_id') != inspector.request.get('source_id')
+            or selection.get('source_version') != inspector.request.get('source_version')):
+        return None
+    resource = selection.get('resource')
+    if type(resource) is not dict or not resource.get('id') or selection.get('resource_id') != resource['id']:
+        return None
+    if not _checked_weight_identity(resource):
+        return None
+    value = resource.get('path')
+    return value if type(value) is str else None
+
+
+def _checked_weight_identity(resource):
+    check = resource.get('check') or {}
+    return (check.get('status') == 'present' and check.get('config_digest') == resource.get('config_digest')
+            and check.get('revision') == resource.get('revision')
+            and (check.get('identity') or {}).get('basis') == 'checked_file_sha256'
+            and bool(check.get('files')) and all(file.get('checksum_matches') is True for file in check['files']))
+
+
+def _constructor_path_call(inspector, node, path, cell, parameter, evidence, frozen_value=None, proofs=None):
     """Finite constructor path origins; preserve all original execution logic."""
     def scope_nodes(scope):
         stack = list(getattr(scope, "body", []))
@@ -566,6 +615,9 @@ def _constructor_path_call(inspector, node, path, cell, parameter, evidence):
         and len(statement.value.args) == 1 and not statement.value.keywords
         and isinstance(statement.value.args[0], ast.Name) and statement.value.args[0].id == parameter
         and _covered(evidence, path, cell, statement)]
+    fallbacks = [statement for statement in node.body if _none_identity_assignment(statement, parameter) is not None
+                 and _covered(evidence, path, cell, statement)]
+    normalizations += fallbacks
     if writes.get(parameter_key, 0) and (writes[parameter_key] != 1 or len(normalizations) != 1):
         return False
 
@@ -598,8 +650,18 @@ def _constructor_path_call(inspector, node, path, cell, parameter, evidence):
     # Only direct, ordered assignments establish aliases. Branch assignments and
     # nested definitions cannot supply a definitely created original binding.
     for statement in node.body:
+        if statement in fallbacks:
+            continue  # The selected branch is the unchanged parameter, not a loader.
         if any(_field_call(call, "path", transparent, path_loaders=loaders) and _covered(evidence, path, cell, call)
                for call in _calls(ast.Module(body=[statement], type_ignores=[]))):
+            if fallbacks:
+                if type(frozen_value) is not str:
+                    return 'FROZEN_NON_NONE_VALUE_REQUIRED'
+                if proofs is not None:
+                    proofs.append(dict(rule='source-non-none-identity-fallback/1', status='CHECKED',
+                        value_type='str', value_digest=fingerprint(frozen_value),
+                        evidence=[dict(path=path, unit=cell, start=fallbacks[0].lineno, end=fallbacks[0].end_lineno)],
+                        scope='one actual frozen non-None string; original fallback and native execution retained; no lifecycle permission'))
             return True
         if isinstance(statement, ast.Assign) and len(statement.targets) == 1:
             target, value = statement.targets[0], statement.value
@@ -736,6 +798,9 @@ def _check_mapping(inspector, entries, identity, row, mapping, evidence):
         node, path, cell = _callable(inspector, entry, location)
         args = node.args.posonlyargs + node.args.args + node.args.kwonlyargs
         original = next((arg for arg in args if arg.arg == parameter), None)
+        variadic_keyword = original is None and location == "entry.fixed_arguments" and node.args.kwarg is not None
+        if variadic_keyword:
+            original = node.args.kwarg
         if original is None:
             raise MappingGap("dependency destination is not an original explicit parameter", "candidate_incomplete",
                              "选择原函数确实存在的参数，不生成新参数。", ["mappings.parameter"])
@@ -743,12 +808,31 @@ def _check_mapping(inspector, entries, identity, row, mapping, evidence):
             raise MappingGap("dependency evidence must cover its original parameter definition", "evidence_incomplete",
                              "补充覆盖原参数定义的冻结源码范围。", ["mappings.evidence"],
                              [dict(path=path, unit=cell, start=original.lineno, end=original.end_lineno)])
+        if variadic_keyword:
+            if keys:
+                raise MappingGap("variadic keyword resource requires its own original named value", "parameter_flow_unsupported",
+                                 "使用原 **kwargs 接收的命名参数并核对到 SDK 的完整传递。", ["mappings.parameter_path"])
+            flow = parameter_flow(inspector, node, path, cell, parameter, field, evidence, entry)
+            if not flow.get("proved"):
+                missing = flow.get("missing", [])
+                raise MappingGap("original variadic keyword does not reach a checked SDK resource consumer",
+                    "evidence_incomplete" if missing else "parameter_flow_unsupported",
+                    "补充原 **kwargs 逐层传递及实际 SDK 消费证据；未知更新不放行。",
+                    ["mappings.evidence"] if missing else ["mappings"], missing)
+            return dict(flow, rule="original-named-keyword-forwarding/1")
         matches = lambda value: isinstance(value, ast.Name) and value.id == parameter
         direct = (_dictionary_field_call(node, parameter, keys, field, evidence, path, cell,
                     ast.parse(_source(inspector, path, cell))) if keys else
                   any(_field_call(call, field, matches) and _covered(evidence, path, cell, call) for call in _calls(node)))
+        path_proofs = []
         path_flow = (field == "path" and location == "constructor.arguments" and
-                     _constructor_path_call(inspector, node, path, cell, parameter, evidence))
+                     _constructor_path_call(inspector, node, path, cell, parameter, evidence,
+                         frozen_value=_frozen_weight_path(inspector, row, identity), proofs=path_proofs))
+        if path_flow == 'FROZEN_NON_NONE_VALUE_REQUIRED':
+            raise MappingGap('original None fallback requires the actual frozen non-None ordinary string resource value',
+                'frozen_non_none_value_required',
+                '选择已核对文件身份的原资源；在未发布绑定副本中完整核对原 None 恒等分支和加载映射后才保存选择。',
+                ['mappings'], [dict(path=path, unit=cell, start=node.lineno, end=node.end_lineno)])
         reassigned = any(
             isinstance(n, ast.Name) and n.id == parameter and isinstance(n.ctx, (ast.Store, ast.Del))
             or isinstance(n, (ast.Import, ast.ImportFrom)) and any(
@@ -768,7 +852,52 @@ def _check_mapping(inspector, entries, identity, row, mapping, evidence):
                     "原参数尚未连接到受支持的资源使用点；保留原入口并核对调用目标、配置分支或 SDK。",
                     ["mappings.evidence"] if missing else ["mappings"], missing)
             return flow
-        return dict(proved=True, trace=[], rule="direct_or_constructor_path")
+        return dict(proved=True, trace=path_proofs, rule="direct_or_constructor_path")
+
+
+def _check_original_fixed_path(inspector, row, placement, texts, evidence):
+    expression = placement.get("expression")
+    if not isinstance(expression, str) or not expression.strip():
+        raise ValueError("fixed weight dependency needs placement.expression from its original source")
+    found = []
+    for item, text in texts:
+        for node in ast.walk(ast.parse(text)):
+            if isinstance(node, ast.expr) and hasattr(node, "lineno") and item["start"] <= node.lineno <= item["end"] and ast.unparse(node) == expression:
+                found.append((item, node))
+    if not found:
+        raise ValueError("fixed path expression is not present in the cited original source")
+    item, node = found[0]
+    tree = ast.parse(_source(inspector, item["path"], item.get("unit", "file")))
+    aliases = set()
+    for statement in ast.walk(tree):
+        if isinstance(statement, (ast.Assign, ast.AnnAssign)) and statement.value is not None and ast.dump(statement.value) == ast.dump(node):
+            targets = statement.targets if isinstance(statement, ast.Assign) else [statement.target]
+            if _covered(evidence, item["path"], item.get("unit", "file"), statement):
+                aliases.update(target.id for target in targets if isinstance(target, ast.Name))
+    aliases = {name for name in aliases if sum(isinstance(n, ast.Name) and n.id == name and isinstance(n.ctx, (ast.Store, ast.Del))
+                                             for n in ast.walk(tree)) == 1}
+    matches = lambda value: ast.dump(value) == ast.dump(node) or isinstance(value, ast.Name) and value.id in aliases
+    for fact in row.get("resource_origins", []):
+        if (fact.get("source_kind") in {"hub_or_local", "hub_id", "cache_directory"} and
+                (fact.get("expression") == expression or fact.get("expression") in aliases)):
+            raise MappingGap("Hub identifiers and cache directories are not verified fixed model paths",
+                "resource_locator_unsupported", "核对原模型标识、版本、配置分支和缓存位置；不能把标识或缓存当权重文件路径。",
+                ["placement"], [fact])
+    if not any(isinstance(call, ast.Call) and _field_call(call, "path", matches) and
+               _covered(evidence, item["path"], item.get("unit", "file"), call) for call in ast.walk(tree)):
+        if any(fact.get("accepted_origins") in {"hub_id", "hub_or_local"} for fact in row.get("resource_origins", [])):
+            raise MappingGap("fixed placement does not resolve the original Hub/local model loader or configuration branch",
+                "resource_locator_unsupported", "保留原加载器及选择分支，核对模型标识与本地缓存；扩大证据范围不能把分支变量变成固定路径。",
+                ["placement"], row["resource_origins"])
+        raise ValueError("fixed placement evidence must cover its original model-loader call")
+    required = placement.get("required_files", [])
+    if not isinstance(required, list) or any(not isinstance(name, str) or not name or Path(name).is_absolute()
+        or ".." in Path(name).parts for name in required):
+        raise ValueError("fixed placement requires original relative necessary-file names")
+    path = Path(_path_expression(node, inspector.root, inspector.root / item["path"]))
+    path = (inspector.root / path).resolve() if not path.is_absolute() else path.resolve()
+    return dict(placement, resolved_path=str(path), execution_environment="platform_process",
+        original_cwd=str(inspector.root), contents="NOT_LOADED")
 
 
 def check_requirements(inspector, candidate):
@@ -787,8 +916,10 @@ def check_requirements(inspector, candidate):
             row["id"] = "invalid-dependency-" + str(index)
         row.update(status="MISSING", reason=None, execution="NOT_RUN", entry_checks={},
                    selection_allowed=False, selection_reason="original dependency mapping is unresolved")
+        row['definition_digest'] = fingerprint(requirement)
         scope_checked = False
         affected = []
+        inactive = {}
         failure_code, failure_action = "candidate_incomplete", "补齐候选中缺失或格式错误的原字段，再完整重检。"
         try:
             identity = requirement.get("id")
@@ -836,6 +967,17 @@ def check_requirements(inspector, candidate):
             if row["kind"] == "weight":
                 origin_evidence = evidence + [item for mapping in mappings for item in mapping.get("evidence", [])]
                 row["resource_origins"] = resource_origin_facts(inspector, origin_evidence)
+            # Preserve the proposed declaration. Only a complete source trace,
+            # never a candidate permission flag, can discharge an unused branch.
+            inactive = {}
+            if row["kind"] == "weight" and not row["configurable"] and not mappings:
+                row["declared_entry_ids"] = list(affected)
+                row["scope_checks"] = {entry_id: resource_scope(inspector, entries[entry_id], row, candidate)
+                                       for entry_id in affected}
+                inactive = {entry_id: proof for entry_id, proof in row["scope_checks"].items()
+                            if proof["status"] == "NOT_USED"}
+                affected = [entry_id for entry_id in affected if entry_id not in inactive]
+                row["entry_ids"] = list(affected)
             errors, proofs = {}, {}
             for mapping_index, mapping in enumerate(mappings):
                 try:
@@ -858,49 +1000,30 @@ def check_requirements(inspector, candidate):
                 if row["kind"] != "weight" or mappings:
                     raise ValueError("fixed placement supports original weight locations without parameter overrides")
                 placement = row.get("placement") or {}
-                expression = placement.get("expression")
-                if not isinstance(expression, str) or not expression.strip():
-                    raise ValueError("fixed weight dependency needs placement.expression from its original source")
-                failure_code, failure_action = "evidence_incomplete", "补查固定路径的原表达式与完整加载调用。"
-                found = []
-                for item, text in texts:
-                    for node in ast.walk(ast.parse(text)):
-                        if isinstance(node, ast.expr) and hasattr(node, "lineno") and item["start"] <= node.lineno <= item["end"] and ast.unparse(node) == expression:
-                            found.append((item, node))
-                if not found:
-                    raise ValueError("fixed path expression is not present in the cited original source")
-                item, node = found[0]
-                tree = ast.parse(_source(inspector, item["path"], item.get("unit", "file")))
-                aliases = set()
-                for statement in ast.walk(tree):
-                    if isinstance(statement, (ast.Assign, ast.AnnAssign)) and statement.value is not None and ast.dump(statement.value) == ast.dump(node):
-                        targets = statement.targets if isinstance(statement, ast.Assign) else [statement.target]
-                        if _covered(evidence, item["path"], item.get("unit", "file"), statement):
-                            aliases.update(target.id for target in targets if isinstance(target, ast.Name))
-                aliases = {name for name in aliases if sum(isinstance(n, ast.Name) and n.id == name and isinstance(n.ctx, (ast.Store, ast.Del))
-                                                         for n in ast.walk(tree)) == 1}
-                matches = lambda value: ast.dump(value) == ast.dump(node) or isinstance(value, ast.Name) and value.id in aliases
-                for fact in row.get("resource_origins", []):
-                    if (fact.get("source_kind") in {"hub_or_local", "hub_id", "cache_directory"} and
-                            (fact.get("expression") == expression or fact.get("expression") in aliases)):
-                        raise MappingGap("Hub identifiers and cache directories are not verified fixed model paths",
-                            "resource_locator_unsupported", "核对原模型标识、版本、配置分支和缓存位置；不能把标识或缓存当权重文件路径。",
-                            ["placement"], [fact])
-                if not any(isinstance(call, ast.Call) and _field_call(call, "path", matches) and
-                           _covered(evidence, item["path"], item.get("unit", "file"), call) for call in ast.walk(tree)):
-                    if any(fact.get("accepted_origins") in {"hub_id", "hub_or_local"} for fact in row.get("resource_origins", [])):
-                        raise MappingGap("fixed placement does not resolve the original Hub/local model loader or configuration branch",
-                            "resource_locator_unsupported", "保留原加载器及选择分支，核对模型标识与本地缓存；扩大证据范围不能把分支变量变成固定路径。",
-                            ["placement"], row["resource_origins"])
-                    raise ValueError("fixed placement evidence must cover its original model-loader call")
-                required = placement.get("required_files", [])
-                if not isinstance(required, list) or any(not isinstance(name, str) or not name or Path(name).is_absolute()
-                    or ".." in Path(name).parts for name in required):
-                    raise ValueError("fixed placement requires original relative necessary-file names")
-                path = Path(_path_expression(node, inspector.root, inspector.root / item["path"]))
-                path = (inspector.root / path).resolve() if not path.is_absolute() else path.resolve()
-                row["placement"] = dict(placement, resolved_path=str(path), execution_environment="platform_process",
-                    original_cwd=str(inspector.root), contents="NOT_LOADED")
+                if not affected:
+                    # The original declaration remains in the candidate and in
+                    # this report; no location is needed for an unreachable use.
+                    row["placement"] = dict(placement, contents="NOT_LOADED", applicability="SOURCE_PROVED_NOT_USED")
+                elif "hub_cache" in placement:
+                    spec = validate_hub_cache_spec(placement["hub_cache"])
+                    source_proofs = {entry_id: prove_hub_cache_binding(inspector, entries[entry_id], row, candidate)
+                                     for entry_id in affected}
+                    failed = [proof["reason"] for proof in source_proofs.values() if proof["status"] != "CHECKED"]
+                    if failed:
+                        raise MappingGap("; ".join(dict.fromkeys(failed)), "resource_locator_unsupported",
+                            "核对完整原加载调用、固定构造分支、模型版本及缓存参数；不覆盖原Hub实参。",
+                            ["placement"], list(source_proofs.values()))
+                    cache_root = Path(spec["cache_dir"])
+                    snapshot = cache_root / ("models--" + spec["repo_id"].replace("/", "--")) / "snapshots" / spec["revision"]
+                    row["placement"] = dict(placement, hub_cache=spec, resolved_path=str(snapshot),
+                        backing_kind="FIXED_HUB_CACHE", original_argument="PRESERVED", source_proofs=source_proofs,
+                        execution_environment="platform_process", contents="NOT_LOADED")
+                else:
+                    failure_code, failure_action = "evidence_incomplete", "补查固定路径的原表达式与完整加载调用。"
+                    row["placement"] = _check_original_fixed_path(inspector, row, placement, texts, evidence)
+            for entry_id, scope in inactive.items():
+                row["entry_checks"][entry_id] = dict(status="MAPPING_CHECKED", reason=None,
+                    mapping_count=0, issues=[], mapping_proofs=[], applicability="SOURCE_PROVED_NOT_USED", scope=scope)
             for entry_id in affected:
                 count = sum(mapping["entry_id"] == entry_id for mapping in mappings)
                 issues = errors.get(entry_id, [])
@@ -941,6 +1064,9 @@ def check_requirements(inspector, candidate):
                 mapping_count=sum(isinstance(mapping, dict) and mapping.get("entry_id") == entry_id
                                   for mapping in invalid_mappings))
                 for entry_id in affected}
+            row["entry_checks"].update({entry_id: dict(status="MAPPING_CHECKED", reason=None,
+                mapping_count=0, issues=[], mapping_proofs=[], applicability="SOURCE_PROVED_NOT_USED", scope=proof)
+                for entry_id, proof in inactive.items()})
             row["selection_reason"] = row["reason"]
         row["definition_digest"] = fingerprint(requirement)
         result.append(row)
@@ -964,6 +1090,7 @@ class DependencyBindings:
     """An installation's frozen nonsecret configuration and private key resolver."""
     def __init__(self, registry, inspector, candidate):
         self.registry, self.inspector = registry, inspector
+        self.candidate = candidate
         self.entries = {e.get("id"): e for e in candidate.get("entries", []) if isinstance(e, dict)}
         self.rows = {row["id"]: row for row in check_requirements(inspector, candidate)}
         for row in self.rows.values():
@@ -987,6 +1114,17 @@ class DependencyBindings:
 
     def snapshot(self, entry_ids=None):
         rows = {k:v for k,v in self.rows.items() if entry_ids is None or set(v.get("entry_ids", [])) & set(entry_ids)}
+        from seampact.source.call_value_conditions import context, contextual
+        current = context(self.inspector)
+        if current is not None and current.compiling:
+            # Compiler assumptions are never published as global resource
+            # mappings or NOT_USED declarations. Keep that audit unchanged.
+            actual = check_requirements(contextual(self.inspector, None), self.candidate)
+            actual = [row for row in actual if entry_ids is None or set(row.get('entry_ids', [])) & set(entry_ids)]
+            return copy.deepcopy(dict(requirements=actual,
+                bindings={k:v for k,v in self.selected.items() if any(r['id']==k for r in actual)},
+                call_condition_plan=dict(status='REQUIRES_ACTUAL_CALL',
+                    dependency_ids=list(rows), permission='NOT_GRANTED')))
         return copy.deepcopy(dict(requirements=list(rows.values()),
                                   bindings={k:v for k,v in self.selected.items() if k in rows}))
 
@@ -1001,7 +1139,7 @@ class DependencyBindings:
             raise ValueError("resource dependency is unselected or its original mapping has changed")
         return row, selection
 
-    def value(self, value, entry_id, location, parameter, runtime=False, parameter_path=()):
+    def value(self, value, entry_id, location, parameter, runtime=False, parameter_path=(), observation=None):
         ref = reference(value)
         if ref is None:
             return value
@@ -1013,6 +1151,8 @@ class DependencyBindings:
         if row["kind"] == "weight":
             check = (self.host_check(selection["resource"]) if self.host_check
                      else selection["resource"].get("check", {}))
+            if observation is not None:
+                observation.update(copy.deepcopy(check))
             if str(check.get("status", "")).lower() not in {"files_present", "identity_verified", "ready", "present", "verified"}:
                 self._environment("weight resource required files have not been checked or are missing in this execution environment")
             elif check.get("necessary_files") == "not_declared":
@@ -1069,6 +1209,12 @@ class DependencyBindings:
                                parameter_path=mapping.get("parameter_path", []))
             else:
                 placement = row["placement"]
+                if placement.get("backing_kind") == "FIXED_HUB_CACHE":
+                    proof = placement["source_proofs"][entry_id]
+                    observation = check_hub_cache(placement["hub_cache"], require_offline=proof["require_offline"])
+                    if observation["status"] != "IDENTITY_VERIFIED":
+                        self._environment("required original Hub cache, revision, declared files or offline execution condition is unavailable")
+                    continue
                 target = Path(placement["resolved_path"])
                 required = placement.get("required_files", [])
                 if target.is_dir() and not required:
@@ -1245,15 +1391,30 @@ class Dependencies:
                 self.store.save("dependency_binding", selected["dependency_id"], selected)
         return outcome
 
-    def select(self, body):
+    def select(self, body, validate_selection=None):
         row = self.store.get("resource_dependency", body["dependency_id"])
-        if (not row or not row.get("active", True) or row["source_id"] != body["harness_id"]
-                or not _selection_allowed(row)):
+        if not row or not row.get("active", True) or row["source_id"] != body["harness_id"]:
             raise ValueError("dependency has no current checked original source requirement")
+        issues = [issue for check in row.get('entry_checks', {}).values() for issue in check.get('issues', [])]
+        def has_none_proof(value):
+            if isinstance(value, dict):
+                return (value.get('rule') == 'source-non-none-identity-fallback/1'
+                        or any(has_none_proof(child) for child in value.values()))
+            return isinstance(value, list) and any(has_none_proof(child) for child in value)
+        provisional = (any(issue.get('issue_code') == 'frozen_non_none_value_required' for issue in issues)
+                       or has_none_proof(row.get('entry_checks', {})))
+        if not _selection_allowed(row) and not provisional:
+            raise ValueError('dependency has no current checked original source requirement')
+        if provisional:
+            if (row.get('kind') != 'weight' or not callable(validate_selection)
+                    or any(issue.get('issue_code') != 'frozen_non_none_value_required' for issue in issues)):
+                raise ValueError('dependency has no current checked original source requirement')
         if not row["configurable"]:
             raise ValueError("original fixed resource location must be prepared in place")
         item = dict(dependency_id=row["id"], origin_id=row["origin_id"], source_id=row["source_id"],
-            definition_digest=row["definition_digest"], bound_at=now(), status="SELECTED", execution="NOT_RUN")
+            source_version=row.get('source_version'),
+            definition_digest=row["definition_digest"], bound_at=now(),
+            status='PROPOSED' if provisional else 'SELECTED', execution="NOT_RUN")
         if row["kind"] == "service":
             connection = next((c for c in self.profiles.public_connections() if c["id"] == body["connection_id"]), None)
             if connection is None:
@@ -1267,8 +1428,43 @@ class Dependencies:
             if inside_platform_checkout(self.resources.home / "sources", resource.get("path")):
                 raise ValueError("这份权重的路径在平台来源克隆里，不能绑定到当前来源。请改登记到独立目录。")
             item.update(resource_id=resource["id"], resource=resource)
+        if provisional:
+            if not _checked_weight_identity(resource):
+                raise ValueError('None fallback selection requires registered files with current checked SHA-256 identity')
+            # Observe the actual files again at selection time. This is still
+            # an as-of-check identity observation, not a later SDK guarantee.
+            resource = self.resources.check_weight(resource['id'])
+            if (type(resource.get('path')) is not str or not resource['path']
+                    or not _checked_weight_identity(resource)):
+                raise ValueError('None fallback selected resource identity no longer matches its declared files')
+            item['resource'] = resource
+            checked = validate_selection(copy.deepcopy(item))
+            if (not isinstance(checked, dict) or checked.get('id') != row['origin_id']
+                    or checked.get('source_version') != row.get('source_version')
+                    or checked.get('definition_digest') != row['definition_digest']
+                    or checked.get('status') != 'MAPPING_CHECKED'
+                    or not checked.get('entry_checks') or any(value.get('status') != 'MAPPING_CHECKED'
+                        for value in checked['entry_checks'].values())):
+                raise ValueError('proposed resource did not pass complete original mapping and None fallback checks')
+            item.update(status='SELECTED', selection_proof=dict(rule='source-non-none-identity-fallback/1',
+                definition_digest=row['definition_digest'], source_version=checked.get('source_version'),
+                mapping_proofs=copy.deepcopy(checked['entry_checks'])))
         item["revision_digest"] = fingerprint(item)
-        self.store.save("dependency_binding", row["id"], item)
+        with self.store.transaction():
+            current = self.store.get('resource_dependency', row['id'])
+            if (not current or current.get('definition_digest') != row['definition_digest']
+                    or current.get('source_version') != row.get('source_version')):
+                raise ValueError('original dependency changed during selection')
+            if provisional:
+                current_resource = self.store.get('weight_resource', item['resource_id'])
+                if (not current_resource or not _checked_weight_identity(current_resource)
+                        or any(current_resource.get(key) != resource.get(key)
+                        for key in ('id', 'config_digest', 'revision'))):
+                    raise ValueError('selected weight configuration changed during source mapping checks')
+                published = dict(row, **copy.deepcopy(checked))
+                published.update(id=row['id'], origin_id=row['origin_id'], source_id=row['source_id'])
+                self.store.save('resource_dependency', row['id'], published)
+            self.store.save("dependency_binding", row["id"], item)
         return item
 
     def check_fixed(self, body):
@@ -1279,6 +1475,18 @@ class Dependencies:
         if row.get("configurable"):
             raise ValueError("check its selected weight or connection resource")
         placement = row.get("placement") or {}
+        if placement.get("applicability") == "SOURCE_PROVED_NOT_USED":
+            row["check"] = dict(status="NOT_APPLICABLE", checked_at=now(), target_execution="NOT_RUN",
+                                basis="SOURCE_PROVED_NOT_USED", permission="NOT_GRANTED")
+            self.store.save("resource_dependency", row["id"], row)
+            return row
+        if placement.get("backing_kind") == "FIXED_HUB_CACHE":
+            proofs = placement.get("source_proofs", {})
+            require_offline = not proofs or any(proof.get("require_offline", True) for proof in proofs.values())
+            row["check"] = dict(check_hub_cache(placement["hub_cache"], require_offline=require_offline),
+                checked_at=now(), target_execution="NOT_RUN", permission="NOT_GRANTED")
+            self.store.save("resource_dependency", row["id"], row)
+            return row
         target = Path(placement["resolved_path"])
         missing = [n for n in placement.get("required_files", []) if not (target / n).is_file()]
         if not target.exists():

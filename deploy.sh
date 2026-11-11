@@ -25,10 +25,10 @@ import uuid
 SCRIPT = Path(sys.argv.pop(1)).resolve()
 PARSER = argparse.ArgumentParser(
     prog="bash deploy.sh",
-    description="Install/update the Linux Docker platform, preserving /data and other mounts.",
+    description="Install/update the Linux Docker platform, or configure the current image while preserving its state mounts.",
     epilog="Examples: bash deploy.sh install --repo <GIT_URL>; bash deploy.sh update; "
            "bash deploy.sh update --container OLD_NAME --adopt-compose")
-PARSER.add_argument("action", choices=("install", "update", "status", "cleanup"))
+PARSER.add_argument("action", choices=("install", "update", "configure", "status", "cleanup"))
 PARSER.add_argument("--root", default="~/seampact-workspace", help="private workspace (default: ~/seampact-workspace)")
 PARSER.add_argument("--repo", help="Git URL, needed only when the code clone does not exist")
 PARSER.add_argument("--code-dir", help="existing Git clone; default: <root>/Seampact")
@@ -55,6 +55,7 @@ DEPENDENCIES = PARSER.add_mutually_exclusive_group()
 DEPENDENCIES.add_argument("--dependency-lock", help="exact platform package lock file; imported and persisted privately")
 DEPENDENCIES.add_argument("--refresh-dependencies", action="store_true", help="explicitly resolve new platform dependency versions")
 PARSER.add_argument("--docker-cli-image", help="official Docker CLI image; persisted, default docker:29-cli")
+PARSER.add_argument("--gpu-observe", help="NVIDIA utility-only observation: all or comma-separated full GPU UUIDs; persisted")
 PARSER.add_argument("--ready-timeout", type=int, default=120, help="startup wait in seconds (default: 120)")
 ARGS = PARSER.parse_args()
 if sys.platform != "linux":
@@ -399,6 +400,68 @@ def add_tools(spec):
     return added
 
 
+def gpu_observation(value):
+    if not value:
+        return ""
+    if not isinstance(value, str):
+        fail("GPU observation selection must be a string.")
+    value = value.strip()
+    if value == "all":
+        return value
+    devices = list(dict.fromkeys(item.strip() for item in value.split(",")))
+    pattern = r"GPU-[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}"
+    if not devices or any(not re.fullmatch(pattern, item) for item in devices):
+        fail("--gpu-observe requires all or full GPU UUIDs, not device indexes/counts.")
+    return ",".join(devices)
+
+
+def add_gpu_observation(spec):
+    selected = gpu_observation(CONFIG.get("gpu_observe"))
+    if not selected:
+        return
+    host = spec["HostConfig"]
+    for request in host.get("DeviceRequests") or []:
+        capabilities = {item for group in request.get("Capabilities", []) for item in group}
+        if request.get("Driver", "") not in ("", "nvidia") or not capabilities <= {"gpu", "utility"}:
+            fail("Existing compute/other accelerator requests cannot be replaced by utility-only observation.")
+    request = dict(Driver="nvidia", Capabilities=[["gpu", "utility"]])
+    if selected == "all":
+        request["Count"] = -1
+    else:
+        request["DeviceIDs"] = selected.split(",")
+    host["DeviceRequests"] = [request]
+    env = inspect_environment(spec.get("Env"))
+    env.update(NVIDIA_DRIVER_CAPABILITIES="utility", NVIDIA_VISIBLE_DEVICES=selected)
+    spec["Env"] = [key + "=" + value for key, value in env.items()]
+
+
+def probe_gpu_observation(spec, image, container=None):
+    selected = gpu_observation(CONFIG.get("gpu_observe"))
+    if not selected:
+        return
+    query = ["--query-gpu=uuid", "--format=csv,noheader"]
+    if container:
+        args = ["exec", container, "nvidia-smi", *query]
+    else:
+        # No state/socket mounts or ports; use the already-local platform image.
+        selector = "all" if selected == "all" else '"device=' + selected + '"'
+        args = ["run", "--rm", "--pull=never", "--network", "none", "--gpus", selector + ",capabilities=utility",
+                "--env", "NVIDIA_DRIVER_CAPABILITIES=utility", "--env", "NVIDIA_VISIBLE_DEVICES=" + selected]
+        if spec.get("User"):
+            args += ["--user", spec["User"]]
+        for group in spec["HostConfig"].get("GroupAdd") or []:
+            args += ["--group-add", str(group)]
+        args += ["--entrypoint", "nvidia-smi", image, *query]
+    result = docker(*args, check=False)
+    devices = {line.strip().lower() for line in (result.stdout or "").splitlines() if line.strip()}
+    expected = {item.lower() for item in selected.split(",")}
+    valid = devices and all(re.fullmatch(r"gpu-[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", item) for item in devices)
+    if result.returncode or not valid or (selected != "all" and devices != expected):
+        details = private_error("GPU observation probe", result.stdout, result.stderr)
+        fail("GPU observation could not be verified. Check NVIDIA Container Toolkit and the selected UUIDs. "
+             "Private probe details: " + details)
+
+
 def fresh_spec(image):
     data = install_data_path()
     harness = Path(ARGS.harness_dir or ROOT / "harnesses").expanduser().resolve()
@@ -541,6 +604,8 @@ def show_status():
     print("Last ready version: " + CONFIG.get("version", "unknown"))
     print("Runtime network: " + str(CONFIG.get("runtime_network") or "preserved host/multiple networks; inspect locally"))
     print("Tools image: " + ("enabled" if CONFIG.get("tools") else "disabled"))
+    if CONFIG.get("gpu_observe"):
+        print("GPU observation (utility only): " + CONFIG["gpu_observe"])
     print("Latest state backup: " + CONFIG.get("latest_backup", "none"))
     if CONFIG.get("pending"):
         print("Interrupted replacement; retained containers: " + CONFIG["pending"]["old_name"] + ", " + CONFIG["pending"]["candidate_name"])
@@ -565,7 +630,7 @@ def main():
     except BlockingIOError:
         fail("Another deployment command is already running in this workspace.")
     CONFIG = json.loads(CONFIG_PATH.read_text(encoding="utf-8")) if CONFIG_PATH.exists() else {}
-    if ARGS.action in ("status", "cleanup") and not CONFIG:
+    if ARGS.action in ("status", "cleanup", "configure") and not CONFIG:
         fail("No deployment.json exists at --root. Select the workspace used for installation/adoption.")
     if CONFIG and CONFIG.get("schema") != "seampact-deploy/1":
         fail("Unsupported deployment record schema.")
@@ -589,6 +654,10 @@ def main():
     if CONFIG.get("pending"):
         fail("A prior replacement is incomplete. Run status, inspect retained containers and the backup, then resolve it manually. "
              "No old container is automatically restarted against possibly migrated data.")
+    if ARGS.action == "configure" and (ARGS.local or ARGS.refresh_dependencies or any(getattr(ARGS, name) is not None for name in
+            ("repo", "code_dir", "extras", "base_image", "pip_index_url", "pip_extra_index_url", "torch_version",
+             "torch_index_url", "dependency_lock", "docker_cli_image"))):
+        fail("configure reuses the current image; code/dependency/build options belong to update.")
     if ARGS.action == "install" and CONFIG.get("current_image") and not ARGS.reuse_data:
         fail("This workspace is already deployed. Use update.")
     if CONFIG.get("container") and ARGS.container and CONFIG["container"] != ARGS.container:
@@ -598,7 +667,7 @@ def main():
     planned_code = Path(ARGS.code_dir or CONFIG.get("code_dir") or ROOT / "Seampact").expanduser().resolve()
     if child_of(ROOT, planned_code):
         fail("--root must be outside the Git checkout so deployment settings/backups remain private.")
-    OLD = inspect_container(CONFIG["container"], required=ARGS.action == "update")
+    OLD = inspect_container(CONFIG["container"], required=ARGS.action in ("update", "configure"))
     if ARGS.action == "install" and OLD:
         fail("The requested container already exists. Adopt it with update --container NAME.")
     if not OLD:
@@ -618,6 +687,8 @@ def main():
         has_tools = docker("exec", OLD["Id"], "docker", "--version", check=False).returncode == 0 if OLD["State"].get("Running") else any(row["Destination"] == "/var/run/docker.sock" for row in OLD.get("Mounts", []))
         CONFIG.setdefault("tools", has_tools)
     CONFIG["tools"] = ARGS.tools if ARGS.tools is not None else CONFIG.get("tools", True)
+    if ARGS.gpu_observe is not None:
+        CONFIG["gpu_observe"] = gpu_observation(ARGS.gpu_observe)
     CONFIG["extras"] = ARGS.extras if ARGS.extras is not None else CONFIG.get("extras", "")
     CONFIG["base_image"] = ARGS.base_image or CONFIG.get("base_image") or "python:3.11-slim"
     for option in ("pip_index_url", "pip_extra_index_url", "torch_version", "torch_index_url"):
@@ -634,42 +705,52 @@ def main():
         CONFIG.pop("dependency_lock", None)
     CONFIG["docker_cli_image"] = ARGS.docker_cli_image or CONFIG.get("docker_cli_image") or "docker:29-cli"
     save()
-    code = prepare_code()
-    text = (code / "pyproject.toml").read_text(encoding="utf-8")
-    version = re.search(r'^version\s*=\s*"([^"\n]+)"', text, re.M).group(1)
-    revision = run(["git", "rev-parse", "HEAD"], cwd=code).stdout.strip()
     stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    tag = version + "-" + revision[:12] + "-" + stamp + "-" + uuid.uuid4().hex[:4]
-    core = "seampact-core-" + CONFIG["id"][:8] + ":" + tag
-    runtime = "seampact-tools-" + CONFIG["id"][:8] + ":" + tag if CONFIG["tools"] else core
-    build = dict(tags=list(dict.fromkeys((core, runtime))), runtime=runtime, version=version, status="building")
-    CONFIG.setdefault("images", []).append(build)
-    save()
-    print("Building platform " + version + " before stopping the old container.", flush=True)
-    receipt_path = ROOT / "platform-build.json"
-    command = [sys.executable, str(code / "deploy/build_platform.py"), "--code-dir", str(code),
-        "--state-dir", str(ROOT / "platform-environments"), "--docker-host", ENDPOINT,
-        "--base-image", CONFIG["base_image"], "--extras", CONFIG["extras"],
-        "--image", core, "--revision", revision, "--owner", CONFIG["id"], "--receipt", str(receipt_path)]
-    for option in ("pip_index_url", "pip_extra_index_url", "torch_version", "torch_index_url", "dependency_lock"):
-        if CONFIG.get(option):
-            command += ["--" + option.replace("_", "-"), CONFIG[option]]
-    if ARGS.refresh_dependencies:
-        command.append("--refresh-dependencies")
-    run(command, visible=True)
-    environment_receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
-    build["dependency_environment"] = dict(image=environment_receipt["image"], image_id=environment_receipt["image_id"],
-        key=environment_receipt["key"], lock_sha256=environment_receipt["lock_sha256"], status=environment_receipt["status"])
-    save()
-    if CONFIG["tools"]:
-        docker("buildx", "build", "--load", "--builder", "default", "--label", "io.seampact.deployment=" + CONFIG["id"], "--build-arg", "PLATFORM_IMAGE=" + core,
-               "--build-arg", "DOCKER_CLI_IMAGE=" + CONFIG["docker_cli_image"], "-t", runtime,
-               "-f", str(code / "deploy/Dockerfile.tools"), str(code), visible=True)
+    build = None
+    if ARGS.action == "configure":
+        runtime = OLD["Image"]
+        version = (image_info(runtime)["Config"].get("Labels") or {}).get("org.opencontainers.image.version")
+        if not version or version != CONFIG.get("version"):
+            fail("The running image version differs from the completed deployment record; resolve it before configure.")
+        print("Reusing current platform " + version + " image; no Git pull or image build.", flush=True)
+    else:
+        code = prepare_code()
+        text = (code / "pyproject.toml").read_text(encoding="utf-8")
+        version = re.search(r'^version\s*=\s*"([^"\n]+)"', text, re.M).group(1)
+        revision = run(["git", "rev-parse", "HEAD"], cwd=code).stdout.strip()
+        tag = version + "-" + revision[:12] + "-" + stamp + "-" + uuid.uuid4().hex[:4]
+        core = "seampact-core-" + CONFIG["id"][:8] + ":" + tag
+        runtime = "seampact-tools-" + CONFIG["id"][:8] + ":" + tag if CONFIG["tools"] else core
+        build = dict(tags=list(dict.fromkeys((core, runtime))), runtime=runtime, version=version, status="building")
+        CONFIG.setdefault("images", []).append(build)
+        save()
+        print("Building platform " + version + " before stopping the old container.", flush=True)
+        receipt_path = ROOT / "platform-build.json"
+        command = [sys.executable, str(code / "deploy/build_platform.py"), "--code-dir", str(code),
+            "--state-dir", str(ROOT / "platform-environments"), "--docker-host", ENDPOINT,
+            "--base-image", CONFIG["base_image"], "--extras", CONFIG["extras"],
+            "--image", core, "--revision", revision, "--owner", CONFIG["id"], "--receipt", str(receipt_path)]
+        for option in ("pip_index_url", "pip_extra_index_url", "torch_version", "torch_index_url", "dependency_lock"):
+            if CONFIG.get(option):
+                command += ["--" + option.replace("_", "-"), CONFIG[option]]
+        if ARGS.refresh_dependencies:
+            command.append("--refresh-dependencies")
+        run(command, visible=True)
+        environment_receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+        build["dependency_environment"] = dict(image=environment_receipt["image"], image_id=environment_receipt["image_id"],
+            key=environment_receipt["key"], lock_sha256=environment_receipt["lock_sha256"], status=environment_receipt["status"])
+        save()
+        if CONFIG["tools"]:
+            docker("buildx", "build", "--load", "--builder", "default", "--label", "io.seampact.deployment=" + CONFIG["id"], "--build-arg", "PLATFORM_IMAGE=" + core,
+                   "--build-arg", "DOCKER_CLI_IMAGE=" + CONFIG["docker_cli_image"], "-t", runtime,
+                   "-f", str(code / "deploy/Dockerfile.tools"), str(code), visible=True)
     spec = replacement_spec(OLD, runtime) if OLD else fresh_spec(runtime)
     added_tool_mounts = set()
     if CONFIG["tools"] and (not OLD or ARGS.tools is True):
         added_tool_mounts = add_tools(spec)
+    add_gpu_observation(spec)
     check_idle()
+    probe_gpu_observation(spec, runtime)
     candidate = CONFIG["container"] + "-next-" + uuid.uuid4().hex[:8]
     # Creation validates Docker options while the old platform is still running.
     created = api("POST", "/containers/create?name=" + quote(candidate, safe=""), spec)
@@ -742,6 +823,11 @@ def main():
             api("POST", "/containers/" + candidate_id + "/stop?t=30", allowed=(204, 304))
             fail("The platform starts, but its Docker socket/client/buildx check failed. The new container is stopped; "
                  "the old container and data backup remain for manual diagnosis.")
+    try:
+        probe_gpu_observation(spec, runtime, container=candidate_id)
+    except RuntimeError:
+        api("POST", "/containers/" + candidate_id + "/stop?t=30", allowed=(204, 304))
+        raise
     if OLD:
         api("DELETE", "/containers/" + OLD["Id"] + "?v=0")
     ready = inspect_container(candidate_id)
@@ -749,7 +835,8 @@ def main():
     CONFIG.update(data_mount=mount_signature(data), version=version, current_image=runtime,
                   previous_image=OLD["Image"] if OLD else None)
     CONFIG.pop("pending", None)
-    build["status"] = "ready"
+    if build is not None:
+        build["status"] = "ready"
     save()
     cleanup()
     print("Platform " + version + " is ready. Existing state, source/weight mounts and worker images are preserved.")

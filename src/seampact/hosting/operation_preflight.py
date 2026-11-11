@@ -28,6 +28,10 @@ def preflight(platform, operation, source_id=None):
     if source and source.get("status") == "DETACHED":
         add("source", "BLOCKED", "来源已摘除", "先重新接入来源", source_id=source_id)
     sources = platform.store.list("harness") if operation == "update" else [source]
+    if getattr(platform, "generation", None) is not None:
+        for job in platform.generation.snapshot(source_id):
+            if job.get("status") in {"RUNNING", "CANCELLING"}:
+                add("analysis", "BLOCKED", "能力包正在生成或准备", "等待生成完成", id=job["id"])
     groups = platform.store.list("runtime_group")
     if operation == "source_environment":
         groups = [g for g in groups if g.get("source_id") == source_id]
@@ -50,9 +54,8 @@ def preflight(platform, operation, source_id=None):
         if operation == "update" or owner == source_id:
             add("analysis", "BLOCKED", "分析或修订正在进行", "等待分析或修订结束", id=job.get("id"), source_id=owner)
     if operation == "update":
-        for task in platform.store.list("task"):
-            if task.get("status") in {"RUNNING", "CANCELLING"}:
-                add("task", "BLOCKED", "任务正在运行或结束中", "等待任务结束", task_id=task.get("id"))
+        for task in platform.store.tasks_with_status("RUNNING", "CANCELLING"):
+            add("task", "BLOCKED", "任务正在运行或结束中", "等待任务结束", task_id=task.get("id"))
     if operation == "update" and getattr(platform, "monitor", None) is not None:
         try:
             current = platform.monitor.status().get("current") or {}
@@ -112,12 +115,14 @@ def preflight(platform, operation, source_id=None):
             add("source_calls", "UNKNOWN", "来源调用状态正在变化", "稍后刷新")
         else:
             try:
-                if platform.catalog.source_running(source_id):
+                if (any(platform.deployments.live_instances(g["id"]) for g in groups)
+                        if getattr(platform, "protocol", None) == "capability-agent/1"
+                        else platform.catalog.source_running(source_id)):
                     add("source_calls", "BLOCKED", "来源仍有调用执行或状态未知", "等待调用结束并确认状态", source_id=source_id)
             finally:
                 platform.catalog.lock.release()
     else:
-        snapshot = platform.runtime.snapshot()
+        snapshot = platform.runtime.call("active_view")
         for root in snapshot.get("roots", {}).values():
             state = root.get("state")
             if state in {"ENABLED", "ACTIVE", "UNKNOWN"}:

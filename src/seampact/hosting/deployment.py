@@ -28,7 +28,7 @@ from urllib.error import HTTPError
 from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
 
-from seampact.hosting import backends
+from seampact.hosting import backends, capability_hosting
 from seampact.source.inspection import digest, safe_path
 from seampact.runtime import ProtocolError, _task_context
 from seampact.store import now
@@ -38,22 +38,25 @@ from seampact.hosting.image_build import worker_dockerfile
 from seampact.target_runtime import core_identity, copy_core, environment_selection
 from seampact.scheduling.lifecycle import build_lifecycle_evidence
 from seampact.observability.resource_observation import resolve_gpu_devices
+from seampact.source.record_ports import RecordSnapshot, RecordPortGap
+from seampact.hosting.background import GUARD as PYTHON_WORK_GUARD, required as python_work_required, quiescent as python_work_quiescent
 
 REMOTE_PROFILE = dict(id="python-native-scalar-worker/2", confirmed=True, python_versions=["3.10", "3.11", "3.12", "3.13"],
     process_per_group=1, replicas=1, preserve_original_lifetimes=True,
     session_recovery=False, codec="JSON_SCALARS", parallel=False,
     source="用户确认：按原对象/共享状态/控制依赖分组，远程条件独立核对，未覆盖继续本地")
 GROUP_PROFILE = dict(id="python-native-group-worker/2", process_per_instance=1, python_versions=["3.10", "3.11", "3.12", "3.13"],
-    preserve_original_lifetimes=True, session_recovery=False, codec="group-port/2", parallel=False,
+    preserve_original_lifetimes=True, session_recovery=False, codec="group-port/3", parallel=False,
     environment="RECHECKED_IN_HOST",
     source="部署前建设方案 P2：整组冻结原源码与核对后的绑定在同一工作进程；原 owner、构造、controller 与内部许可留在组内")
 CONTRACT = "runtime-group-contract/1"
 IDENTITY_PROTOCOL = "process-identity/1"
-PORT_CODEC = dict(id="group-port/2", transport="inline JSON body of one call", visibility="caller of that call",
+PORT_CODEC = dict(id="group-port/3", transport="inline JSON body of one call", visibility="caller of that call",
     validity="that call only", identity="sha256 over byte/array payloads",
     types=["None", "bool", "int", "finite float", "str", "bytes", "list", "tuple", "dict with str keys",
            "numpy.ndarray / numpy scalar without object dtype (npy, allow_pickle=False)",
-           "original CLI subprocess.CompletedProcess: args, returncode, stdout, stderr, optional seampact_completion"],
+           "original CLI subprocess.CompletedProcess: args, returncode, stdout, stderr, optional seampact_completion",
+           "source-checked passive record value snapshot; fields only, no original object identity or reconstruction"],
     rejected="any other type is reported by name; no str()/JSON conversion and no pickle")
 LIVE = {"UNDEPLOYED", "STARTING", "READY", "DRAINING", "UNKNOWN"}
 
@@ -89,7 +92,7 @@ def json_request(url, body=None, timeout=None):
     return value
 
 
-def encode_port(value):
+def encode_port(value, record_ports=None):
     numpy = sys.modules.get("numpy")
     def walk(item):
         kind = type(item)
@@ -97,10 +100,13 @@ def encode_port(value):
             return item
         if kind is float:
             if not math.isfinite(item):
-                raise PortGap("group-port/2 carries finite floats only")
+                raise PortGap("group-port/3 carries finite floats only")
             return item
         if kind is bytes:
             return {"$bytes": base64.b64encode(item).decode("ascii")}
+        if kind is RecordSnapshot:
+            return {"$record_snapshot": dict(module=item.module, symbol=item.symbol,
+                source_sha256=item.source_sha256, fields=walk(item.fields))}
         if kind is subprocess.CompletedProcess:
             fields = {"args", "returncode", "stdout", "stderr"}
             if set(vars(item)) - fields - {"seampact_completion"}:
@@ -118,18 +124,27 @@ def encode_port(value):
             return {"$tuple": [walk(member) for member in item]}
         if kind is dict:
             if any(type(key) is not str or key.startswith("$") for key in item):
-                raise PortGap("group-port/2 dictionaries need str keys without a leading $")
+                raise PortGap("group-port/3 dictionaries need str keys without a leading $")
             return {key: walk(member) for key, member in item.items()}
-        if numpy is not None and (kind is numpy.ndarray or (isinstance(item, numpy.generic) and kind.__module__ == "numpy")):
+        # isinstance(value, numpy.generic) may consult an arbitrary value's
+        # __class__ hook. Accept exact official scalar types, never a spoofed
+        # module name or a source subclass with custom array conversion.
+        numpy_scalar = numpy is not None and any(kind is scalar for scalar in numpy.sctypeDict.values())
+        if numpy is not None and (kind is numpy.ndarray or numpy_scalar):
             array = numpy.asarray(item)
             if array.dtype.hasobject:
-                raise PortGap("group-port/2 does not carry object arrays")
+                raise PortGap("group-port/3 does not carry object arrays")
             buffer = io.BytesIO()
             numpy.save(buffer, array, allow_pickle=False)
             data = buffer.getvalue()
             return {"$ndarray": dict(dtype=array.dtype.str, shape=list(array.shape), scalar=kind is not numpy.ndarray,
                                      sha256=hashlib.sha256(data).hexdigest(), npy=base64.b64encode(data).decode("ascii"))}
-        raise PortGap("group-port/2 has no encoding for " + kind.__module__ + "." + kind.__qualname__)
+        if record_ports is not None:
+            try:
+                return walk(record_ports.snapshot(item))
+            except RecordPortGap as error:
+                raise PortGap(str(error)) from error
+        raise PortGap("group-port/3 has no encoding for " + kind.__module__ + "." + kind.__qualname__)
     return walk(value)
 
 
@@ -141,8 +156,18 @@ def decode_port(value):
     if not any(key.startswith("$") for key in value):
         return {key: decode_port(member) for key, member in value.items()}
     if len(value) != 1:
-        raise PortGap("unknown group-port/2 marker")
+        raise PortGap("unknown group-port/3 marker")
     key, payload = next(iter(value.items()))
+    if key == "$record_snapshot":
+        if (type(payload) is not dict or set(payload) != {"module", "symbol", "source_sha256", "fields"}
+                or any(type(payload[name]) is not str or not payload[name] for name in ("module", "symbol"))
+                or not isinstance(payload["source_sha256"], str)
+                or not re.fullmatch("[0-9a-f]{64}", payload["source_sha256"])
+                or type(payload["fields"]) is not dict
+                or any(type(k) is not str or k.startswith("$") for k in payload["fields"])):
+            raise PortGap("invalid passive record snapshot")
+        return RecordSnapshot(payload["module"], payload["symbol"], payload["source_sha256"],
+                              decode_port(payload["fields"]))
     if key == "$bytes":
         return base64.b64decode(payload, validate=True)
     if key == "$tuple":
@@ -172,15 +197,25 @@ def decode_port(value):
         if array.dtype.str != payload["dtype"] or list(array.shape) != payload["shape"]:
             raise PortGap("array payload dtype/shape differs from its declaration")
         return array[()] if payload.get("scalar") else array
-    raise PortGap("unknown group-port/2 marker: " + key)
+    raise PortGap("unknown group-port/3 marker: " + key)
 
 
 def worker_spec(binding, group, unit):
     candidate = binding.candidate
     entries = [item for item in candidate["entries"] if item["id"] in group["entries"]]
     selected = {identity for entry in entries for identity in entry.get("boundary_ids", [])}
-    candidate = dict(candidate, entries=entries,
-        boundaries=[item for item in candidate.get("boundaries", []) if item["id"] in selected], runtime_groups=[])
+    conditional_group = any(member.get('call_condition') for member in
+                            (group.get('host') or {}).get('members', {}).values())
+    structural_group = bool((group.get('host') or {}).get('structure_entries'))
+    if conditional_group or structural_group:
+        if len(entries) != len(candidate['entries']):
+            raise ValueError('conditional host requires the complete frozen candidate identity in this group')
+        # Keep the complete original grouping and candidate, including absent
+        # versus explicitly empty fields. Never normalize away identity input.
+        candidate = copy.deepcopy(candidate)
+    else:
+        candidate = dict(candidate, entries=entries,
+            boundaries=[item for item in candidate.get("boundaries", []) if item["id"] in selected], runtime_groups=[])
     contract = group.get("contract") or {}
     return dict(schema="native-worker/1", profile=contract.get("host_profile", REMOTE_PROFILE["id"]),
                 contract_digest=contract.get("digest"), group=group, request=binding.inspector.request,
@@ -486,7 +521,19 @@ def check_group_host(rows, members, scalar):
         native_inputs = sorted(name for name, port in schema.get("properties", {}).items()
                                if "x-native-type" in port and name in schema.get("required", []))
         result_schema = check.get("result_schema") or {}
-        if check["status"] != "READY" and not check.get("host_condition"):
+        if (check.get("status") == "STRUCTURE_ONLY" and
+                check.get("binding") == "SOURCE_VALUE_CONDITIONED_NATIVE_ENTRY"):
+            # This is a material recipe, not a checked callable or host.
+            member.update(status="STRUCTURE_ONLY", reason="same-call and actual worker proofs remain required",
+                          prepare=dict(status="UNKNOWN", scope="UNKNOWN", basis="no import or preparation permission"))
+            member["ports"].update(inputs=sorted(schema.get("properties", {})), result="DECLARATION_ONLY")
+            result[identity] = member
+            continue
+        if check.get('call_condition'):
+            member['call_condition'] = copy.deepcopy(check['call_condition'])
+            if check['call_condition']['initialization']['status'] != 'CHECKED':
+                member['prepare'] = dict(status='UNKNOWN', scope='UNKNOWN', basis='original initialization prefix is not independently closed')
+        if check["status"] not in {"READY", 'CALL_CONDITION_DEFERRED'} and not check.get("host_condition"):
             member.update(status="MISSING", reason="native entry binding is missing: " + str(check.get("reason")))
         elif native_inputs:
             member.update(status="MISSING", reason="组外端口没有原对象输入的编码，该成员保留本地组合：" + ", ".join(native_inputs))
@@ -501,9 +548,13 @@ def check_group_host(rows, members, scalar):
                 gaps[identity] = check["host_condition"]["gaps"]
         result[identity] = member
     hosted = [identity for identity in members if result[identity]["status"] == "HOST_CHECKED"]
-    return dict(profile=REMOTE_PROFILE["id"] if scalar else GROUP_PROFILE["id"],
-                status="HOST_CHECKED" if hosted else "MISSING", members=result, host_entries=hosted,
-                environment_gaps=gaps)
+    structural = [identity for identity in members if result[identity]["status"] == "STRUCTURE_ONLY"]
+    value = dict(profile=REMOTE_PROFILE["id"] if scalar else GROUP_PROFILE["id"],
+                status="HOST_CHECKED" if hosted else "STRUCTURE_ONLY" if structural else "MISSING",
+                members=result, host_entries=hosted, environment_gaps=gaps)
+    if structural:
+        value["structure_entries"] = structural
+    return value
 
 
 def lifecycle_conditions(group, source_evidence=None):
@@ -522,6 +573,9 @@ def lifecycle_conditions(group, source_evidence=None):
         basis="scalar-independent-entry/1：原导入闭包及逐调用标量状态已由有限规则核对" if scalar else
               "native group：当前没有覆盖该项的通用源码规则，宿主可调用不能替代生命周期依据")
         for name, requirement in obligations.items()}
+    if scalar:
+        for name in ("owner_end", "cleanup"):
+            checked[name]["guards"] = [PYTHON_WORK_GUARD]
     if not scalar and source_evidence is not None:
         for name, item in checked.items():
             evidence = source_evidence["checks"][name]
@@ -567,11 +621,18 @@ def group_contract(group, host, source_evidence=None):
             remove_replica=operation(hosted and reclaimable, replica_basis if hosted else missing, unknown=hosted),
             live_restore=operation(False, "不实现保留 GPU 内存、调用栈和会话的休眠恢复")),
         replicas=dict(default=1, replicable=hosted and replicable))
+    if host.get("structure_entries"):
+        value["structure_entries"] = list(host["structure_entries"])
+        value["structure_materialization"] = dict(status="REQUIRES_CURRENT_SOURCE_REPLAY",
+            semantic_export=False, invocation=False, process_start=False,
+            basis="Material recipe only; each export replays the installed structural evidence.")
+        if not hosted:
+            value["operations"]["start"] = operation(False, "同次调用证明与完整资源预约尚未消费", unknown=True)
     value["digest"] = digest(json.dumps(value, sort_keys=True, ensure_ascii=False).encode())
     return value
 
 
-def runtime_groups(inspector, candidate, rows):
+def runtime_groups(inspector, candidate, rows, resource_bindings=None):
     boundaries = {item["id"]: item for item in candidate.get("boundaries", [])}
     remote = {row["entry_id"]: check_remote(inspector, row["entry"], row["check"], boundaries) for row in rows}
     unsafe = {identity for identity, result in remote.items() if result["status"] != "REMOTE_CHECKED"}
@@ -614,8 +675,12 @@ def runtime_groups(inspector, candidate, rows):
         if proposal:
             groups[-1]["api_proposal"] = {key: proposal.get(key) for key in ("id", "rationale")}
         host = check_group_host(rows, members, can_remote)
-        evidence = None if can_remote else build_lifecycle_evidence(inspector, rows, members)
-        groups[-1].update(host=host, host_status=host["status"], contract=group_contract(groups[-1], host, evidence))
+        resource_observations = []
+        evidence = None if can_remote else build_lifecycle_evidence(inspector, rows, members, host["host_entries"],
+            request_codec=PORT_CODEC["id"] if host["profile"] == GROUP_PROFILE["id"] else None,
+            resource_bindings=resource_bindings, resource_observations=resource_observations)
+        groups[-1].update(host=host, host_status=host["status"], resource_observations=resource_observations,
+                         contract=group_contract(groups[-1], host, evidence))
     return dict(schema="runtime-group-report/1", profile=REMOTE_PROFILE, profiles=[REMOTE_PROFILE, GROUP_PROFILE],
                 groups=groups, proposal_gaps=gaps, proposal_status="REPAIRED_CONSERVATIVELY" if gaps else "CHECKED")
 
@@ -628,6 +693,7 @@ class Deployments:
         self.session = uuid.uuid4().hex
         self.lock = threading.RLock()
         self.instances, self.affinity, self.unit_state = {}, {}, {}
+        self.capability_calls = {}  # in-flight capability call -> instance
         self.run_locks, self.environment_changes = {}, {}
         self.stops_in_progress = set()
         self.event_log, self.controller_error, self.listeners = [], None, []
@@ -641,16 +707,43 @@ class Deployments:
                 record.update(state="UNKNOWN", accepting=False, stale=True, observed_at=now(),
                     reason="平台会话已重启：原实例会话不恢复；请停止并释放后启动新实例")
                 platform.store.save("runtime_instance", record["id"], record)
+            elif (record["state"] in {"STOPPED", "FAILED"} and record.get("released") is True
+                  and (record.get("stop_result") or {}).get("status") == "STOPPED"
+                  and record.get("pending_stop")):
+                # Older versions saved the completion event before clearing this flag.
+                record["pending_stop"] = None
+                platform.store.save("runtime_instance", record["id"], record)
             self.instances[record["id"]] = record
+        # Image work is owned by daemon threads in this coordinator process.
+        # A new coordinator cannot resume those threads or infer their result.
+        # Preserve the interrupted attempt and require an explicit new build;
+        # never turn a possibly produced image into a verified build here.
+        for artifact in platform.store.list("deployment"):
+            changed = False
+            for field in ("build", "publish"):
+                attempt = artifact.get(field) or {}
+                if attempt.get("status") != "RUNNING":
+                    continue
+                stamp = now()
+                artifact.setdefault("interrupted_operations", []).append(dict(
+                    operation=field, previous=copy.deepcopy(attempt), interrupted_at=stamp,
+                    image=artifact.get("image"), installation_id=artifact.get("installation_id")))
+                artifact[field] = dict(attempt, status="INTERRUPTED", finished_at=stamp,
+                    execution_outcome="UNKNOWN",
+                    reason="平台进程已重启；原后台操作不恢复，结果未知；核对后使用新操作身份重新提交")
+                changed = True
+            if changed:
+                platform.store.save("deployment", artifact["id"], artifact)
         self.thread = threading.Thread(target=self._controller, daemon=True, name="seampact-runtime-controller")
         self.thread.start()
 
-    def sample_resources(self):
+    def sample_resources(self, instance_ids=None):
         """Sample only Docker workers launched in this platform session."""
         import subprocess
         with self.lock:
             targets = [copy.deepcopy(item) for item in self.instances.values()
                        if item.get("session") == self.session and item.get("released") is not True
+                       and (instance_ids is None or item["id"] in instance_ids)
                        and item.get("target_kind") != "model-service"
                        and (item.get("handle") or {}).get("kind") in {"docker", "kubernetes"}]
         rows = []
@@ -796,6 +889,12 @@ class Deployments:
         for group in self.platform.store.list("runtime_group"):
             if group.get("target_kind") == "model-service":
                 continue
+            if group.get("kind") == capability_hosting.GROUP_KIND:
+                if not group.get("detached"):
+                    yield group
+                continue
+            if getattr(self.platform, "protocol", None) == "capability-agent/1":
+                continue
             source = sources.get(group["source_id"])
             if source and source.get("status") != "DETACHED" and group.get("installation_id") == source.get("installation_id"):
                 yield group
@@ -819,11 +918,15 @@ class Deployments:
             pair = (catalog.bindings.get(unit_id), catalog.entry_specs.get(unit_id))
             if pair[0] is None:
                 pair = catalog.deferred.get(unit_id, (None, None))
+            if pair[0] is None and group.get("host", {}).get("structure_entries"):
+                pair = catalog.structural.get(unit_id, (None, None))
             if pair[0] is not None:
                 return pair[0], pair[1], self.platform.store.get("unit", unit_id)
         raise ValueError("运行组成员在本进程没有已核对的绑定")
 
     def _entry(self, unit_id):
+        if getattr(self.platform, "protocol", None) == "capability-agent/1":
+            return self.platform.capabilities.unit(unit_id)
         catalog = self.platform.catalog
         return catalog.entry_specs.get(unit_id) or (catalog.deferred.get(unit_id) or (None, {}))[1]
 
@@ -870,7 +973,7 @@ class Deployments:
                     records = [item for item in records if item["id"] == instance_id]
                     if not records:
                         raise ValueError("该运行组没有这个实例")
-                snapshot = self.platform.runtime.snapshot()
+                snapshot = self.platform.runtime.call("active_view")
                 hidden, skipped = [], []
                 for record in records:
                     if record.get("history_hidden"):
@@ -891,7 +994,7 @@ class Deployments:
         artifacts = {item["id"]: item for item in self.platform.store.list("deployment")}
         result = []
         with self.lock:
-            snapshot = self.platform.runtime.snapshot()
+            snapshot = self.platform.runtime.call("active_view")
             groups = {group["id"]: group for group in self._current_groups()}
             # Keep older backend objects visible for release after an
             # environment edit, source detachment or platform-code update.
@@ -935,17 +1038,24 @@ class Deployments:
         return result
 
     def _artifact_gap(self, group, artifact):
+        return self._artifact_gap_for_core(group, artifact, lambda: core_identity("worker"))
+
+    def _artifact_gap_for_core(self, group, artifact, read_core):
         if not artifact:
             return "先生成构建工件并构建镜像"
         if (artifact.get("contract_digest") != group["contract"]["digest"]
                 or artifact.get("installation_id") != group.get("installation_id")):
             return "构建工件与当前运行组契约/接入版本不一致，请重新生成"
-        if artifact.get("platform_core") != core_identity("worker"):
+        current_core = capability_hosting.core() if group.get("kind") == capability_hosting.GROUP_KIND else read_core()
+        if artifact.get("platform_core") != current_core:
             return "构建工件与当前平台核心代码不同，请重新生成并构建 worker"
         return None
 
     def _start_gap(self, group, artifact):
-        artifact_gap = self._artifact_gap(group, artifact)
+        return self._start_gap_for_core(group, artifact, lambda: core_identity("worker"))
+
+    def _start_gap_for_core(self, group, artifact, read_core):
+        artifact_gap = self._artifact_gap_for_core(group, artifact, read_core)
         if artifact_gap:
             return artifact_gap
         if any(artifact.get(field, {}).get("status") == "RUNNING" for field in ("build", "publish")):
@@ -979,9 +1089,10 @@ class Deployments:
                    "已有实例或待释放对象，请先排空停止" if held else
                    "该运行组正在构建或发布镜像" if any((artifact or {}).get(field, {}).get("status") == "RUNNING"
                                                            for field in ("build", "publish")) else None)
+        exportable = group.get("kind") == capability_hosting.GROUP_KIND or group.get("host_status") == "HOST_CHECKED"
         return dict(
-            export=dict(enabled=not editing and group.get("host_status") == "HOST_CHECKED",
-                        reason=editing or (None if group.get("host_status") == "HOST_CHECKED" else "没有通过宿主核对的成员")),
+            export=dict(enabled=not editing and exportable,
+                        reason=editing or (None if exportable else "没有通过宿主核对的成员")),
             build=dict(enabled=not editing and artifact_gap is None, reason=editing or artifact_gap),
             publish=dict(enabled=not editing and artifact_gap is None and built,
                          reason=editing or artifact_gap or (None if built else "镜像尚未构建成功")),
@@ -1010,17 +1121,19 @@ class Deployments:
         return dict(status="COLD_STARTABLE", group_id=group_id) if gap is None else dict(status="UNAVAILABLE", group_id=group_id, reason=gap)
 
     def queue(self, group_id):
-        return sum(1 for call in self.platform.runtime.snapshot()["calls"].values()
-                   if (call.get("unit") or {}).get("runtime_group") == group_id and call["physical"] in {"ENABLED", "RESERVED"})
+        return self.platform.runtime.call("group_call_counts").get(group_id, 0)
 
     def start_gap(self, group_id, expected_image=None):
+        return self._start_gap_for_image(group_id, expected_image, lambda: core_identity("worker"))
+
+    def _start_gap_for_image(self, group_id, expected_image, read_core):
         if group_id.startswith("service:"):
             return self.platform.managed_services.start_gap(group_id, expected_image)
         group = self.platform.store.get("runtime_group", group_id)
         if not group or not group.get("contract"):
             return "运行组不存在或缺少宿主契约"
         artifact = self.platform.store.get("deployment", group_id)
-        gap = self._start_gap(group, artifact)
+        gap = self._start_gap_for_core(group, artifact, read_core)
         reference = ((artifact or {}).get("publish") or {}).get("reference") or (artifact or {}).get("image")
         if gap is None and expected_image and reference != expected_image:
             gap = "当前镜像与本次运行冻结的镜像不一致"
@@ -1099,6 +1212,22 @@ class Deployments:
 
     def group_view(self, group_id, expected_image=None):
         """Contract facts and held instances a joint decision may read."""
+        return self.group_views({group_id: expected_image})[group_id]
+
+    def group_views(self, expected_images):
+        """Read several groups with one exact core observation, never retained."""
+        observed_core = None
+
+        def read_core():
+            nonlocal observed_core
+            if observed_core is None:
+                observed_core = core_identity("worker")
+            return observed_core
+
+        return {group_id: self._group_view(group_id, image, read_core)
+                for group_id, image in expected_images.items()}
+
+    def _group_view(self, group_id, expected_image, read_core):
         if group_id.startswith("service:"):
             return self.platform.managed_services.group_view(group_id, expected_image)
         fields = ("id", "state", "accepting", "in_flight", "units", "initialization", "generation", "run_id",
@@ -1116,7 +1245,8 @@ class Deployments:
                         operations={name: item["status"] for name, item in contract["operations"].items()},
                         prepare={entry: rule["status"] for entry, rule in contract["prepare"].items()},
                         replicable=contract["replicas"]["replicable"] is True, reclaim=self._idle_rebuild_allowed(group),
-                        start_gap=self.start_gap(group_id, expected_image), instances=instances, leases=leases)
+                        start_gap=self._start_gap_for_image(group_id, expected_image, read_core),
+                        instances=instances, leases=leases)
 
     def bound(self, task_id, group_id):
         with self.lock:
@@ -1180,6 +1310,9 @@ class Deployments:
         self.platform.store.save("runtime_instance", record["id"], record)
         with self.events_path.open("a", encoding="utf-8") as stream:
             stream.write(json.dumps(event, ensure_ascii=False, allow_nan=False) + "\n")
+        execution = getattr(self.platform, "execution", None)
+        if execution is not None and hasattr(execution, "instance_event"):
+            execution.instance_event(dict(event, run_id=record.get("run_id"), profile=record.get("profile")))
         for listener in list(self.listeners):
             listener(event)
         return event
@@ -1228,15 +1361,33 @@ class Deployments:
     def _export(self, identity, body):
         self._artifact_guard(identity)
         group = self._group(identity)
-        if group["host"]["status"] != "HOST_CHECKED":
+        if group.get("kind") == capability_hosting.GROUP_KIND:
+            return capability_hosting.export_artifact(self, group, body)
+        structural = group["host"]["status"] == "STRUCTURE_ONLY"
+        if group["host"]["status"] != "HOST_CHECKED" and not structural:
             raise ValueError("运行组没有通过宿主核对的成员，继续本地执行；请查看缺口")
         from seampact.typed_contract import build_contract, verify_contract
         members = [self.platform.store.get("unit", uid) for uid in group["units"]]
-        for member in members:
-            checked = verify_contract(member, group=group)
-            if not checked["valid"]:
-                raise ValueError(checked["reason"])
+        material = None
+        if structural:
+            if (len(members) != 1 or len(group["entries"]) != 1 or
+                    group["host"].get("host_entries") or
+                    group["host"].get("structure_entries") != group["entries"] or
+                    group["contract"].get("structure_entries") != group["entries"] or
+                    group["host"].get("members", {}).get(group["entries"][0], {}).get("status") != "STRUCTURE_ONLY" or
+                    not members[0] or members[0].get("entry_id") != group["entries"][0]):
+                raise ValueError("结构物料只支持单个独立原入口")
+            material = self.platform.catalog.structure_materialization(members[0]["id"])
+        else:
+            for member in members:
+                checked = verify_contract(member, group=group)
+                if not checked["valid"]:
+                    raise ValueError(checked["reason"])
         binding, _, unit = self._binding(group)
+        if structural and (material["unit_id"] != unit["id"] or material["candidate"] != binding.candidate or
+                material["request"] != binding.inspector.request or material["semantic_export"] is not False or
+                material["invocation"] is not False or material["process_start"] is not False):
+            raise ValueError("结构物料与当前原绑定不一致")
         environment = self._environment(body.get("environment"), binding)
         group["runtime_environment"] = environment_selection(environment)
         destination = self.folder / (identity + "-" + uuid.uuid4().hex[:8])
@@ -1272,6 +1423,11 @@ class Deployments:
             platform_core=spec["platform_core"], build_reuse=reuse,
             created_at=now(), source_version=group["source_version"], build=dict(status="NOT_RUN"),
             publish=dict(status="NOT_RUN"), deployment="NOT_APPLIED", copies_original_code=True, resource_downloads=0)
+        if structural:
+            record.update(materialization="STRUCTURE_ONLY", semantic_export=False, invocation=False, process_start=False)
+        previous = self.platform.store.get("deployment", identity) or {}
+        if previous.get("interrupted_operations"):
+            record["interrupted_operations"] = copy.deepcopy(previous["interrupted_operations"])
         # The checked deployment environment is part of contract support.
         # Publish it and the resulting Unit identities as one transaction.
         with self.platform.store.transaction():
@@ -1280,9 +1436,13 @@ class Deployments:
                 latest = self.platform.store.get("unit", member["id"])
                 if not latest or latest.get("typed_contract") != member["typed_contract"]:
                     raise ValueError("构建期间 Unit 操作契约已改变，请重新生成工件")
-                checked = verify_contract(latest, group=current)
-                if not checked["valid"]:
-                    raise ValueError(checked["reason"])
+                if structural:
+                    if self.platform.catalog.structure_materialization(latest["id"]) != material:
+                        raise ValueError("构建期间结构物料已改变，请重新生成工件")
+                else:
+                    checked = verify_contract(latest, group=current)
+                    if not checked["valid"]:
+                        raise ValueError(checked["reason"])
                 latest["typed_contract"] = build_contract(latest, group=group)
                 self.platform.store.save("unit", latest["id"], latest)
             self.platform.store.save("runtime_group", identity, group)
@@ -1305,7 +1465,7 @@ class Deployments:
         images = getattr(self.platform, "images", None)
         operation = images.image_operation(field) if images else nullcontext()
         operation.__enter__()
-        artifact[field] = dict(status="RUNNING", started_at=now())
+        artifact[field] = dict(status="RUNNING", started_at=now(), platform_session=self.session)
         self.platform.store.save("deployment", identity, artifact)
         def run():
             try:
@@ -1431,10 +1591,24 @@ class Deployments:
                     if locked["placement"].get("gpu_devices", allocation["devices"]) != allocation["devices"]:
                         raise ValueError("启动 GPU 与冻结研究运行不一致")
             credentials = {}
-            if config["kind"] == "docker":
+            if config["kind"] == "docker" and group.get("kind") == capability_hosting.GROUP_KIND:
+                config = capability_hosting.resource_backend(self.platform, group, config)
+                credentials = capability_hosting.credentials(self.platform, group)
+            elif config["kind"] == "docker":
+                credential_entries = group["entries"]
+                if group.get("host", {}).get("status") == "HOST_CHECKED":
+                    host_entries = group["host"].get("host_entries")
+                    if (not isinstance(host_entries, list) or not host_entries or
+                            host_entries != contract.get("root_entries") or
+                            any(entry_id not in group["entries"] for entry_id in host_entries)):
+                        raise ValueError("宿主可执行入口与冻结运行组契约不一致")
+                    credential_entries = host_entries
                 binding, _, _ = self._binding(group)
                 if binding.resource_binding is not None:
-                    credentials = binding.resource_binding.worker_environment(group["entries"])
+                    # The complete candidate stays in the worker for rechecking;
+                    # only checked host roots can execute. Their original
+                    # transitive resource mappings remain required.
+                    credentials = binding.resource_binding.worker_environment(credential_entries)
             if update_gpu_default:
                 self.platform.store.save("runtime_group_gpu", identity, allocation)
             generation = self._next_generation(identity)
@@ -1450,8 +1624,15 @@ class Deployments:
                 record.update(**frozen, startup_kind="COLD_START", model_load_ms=None)
             self.instances[record["id"]] = record
             self._event(record, "start_requested", replica=replica)
+        birth_token = None
+        if group.get('host', {}).get('structure_entries'):
+            from seampact.hosting.value_conditioned_birth import before_start
+            birth_token = before_start(self, record, artifact, config, reference)
         result = (backends.start(record, reference, artifact["folder"], config, credential_env=credentials) if credentials else
                   backends.start(record, reference, artifact["folder"], config))
+        if birth_token is not None:
+            from seampact.hosting.value_conditioned_birth import confirm_start
+            confirm_start(self, birth_token, result)
         with self.lock:
             record["apply"] = {key: item for key, item in result.items() if key != "handle"}
             # A manual apply can create the same object later. Retain its identity
@@ -1492,16 +1673,31 @@ class Deployments:
             raise ValueError("运行进程缺少同版身份协议、有效代次或进程身份；请重建同版 worker")
         group = self._group(health.get("group_id"))
         contract = group["contract"]
-        binding, _, unit = self._binding(group)
-        expected = worker_spec(binding, self.platform.store.get("runtime_group", group["id"]), unit)
+        if group.get("kind") == capability_hosting.GROUP_KIND:
+            # The instance reports the digest of the spec it verified its package against.
+            fingerprint = capability_hosting.digest(capability_hosting.worker_spec(group))
+            if health.get("package_digest") != group["package_digest"]:
+                raise ValueError("运行进程加载的能力包与当前安装不一致")
+        else:
+            binding, _, unit = self._binding(group)
+            fingerprint = binding_fingerprint(worker_spec(binding, self.platform.store.get("runtime_group", group["id"]), unit))
         if (health.get("session") != self.session or health.get("profile") != contract["host_profile"]
                 or health.get("source_version") != group["source_version"]
                 or health.get("installation_id") != group["installation_id"]
-                or health.get("binding_fingerprint") != binding_fingerprint(expected)
-                or (contract["host_profile"] == GROUP_PROFILE["id"] and health.get("contract_digest") != contract["digest"])):
+                or health.get("binding_fingerprint") != fingerprint
+                or (contract["host_profile"] != REMOTE_PROFILE["id"] and health.get("contract_digest") != contract["digest"])):
             raise ValueError("运行进程与当前源码/接入版本/宿主/契约/平台会话不一致")
         units = list(health.get("units", []))
-        if not units or set(units) - set(group["units"]):
+        guarded_units = list(health.get('guarded_units', []))
+        structural = set(group.get('host', {}).get('structure_entries', []))
+        expected_guarded = {uid for uid in group['units'] if
+            (self.platform.store.get('unit', uid) or {}).get('entry_id') in structural}
+        if guarded_units:
+            if units or len(guarded_units) != 1 or set(guarded_units) != expected_guarded or len(group['units']) != 1:
+                raise ValueError('guarded process registration is outside its separate structural root')
+        elif expected_guarded:
+            raise ValueError('structural material cannot register as an executable member')
+        elif not units or set(units) - set(group["units"]):
             raise ValueError("实例登记的可执行成员不属于该运行组")
         unknown = False
         with self.lock:
@@ -1535,15 +1731,25 @@ class Deployments:
             if not unknown:
                 record.update(endpoint=endpoint, process_nonce=health.get("process_nonce"), state="READY", accepting=True,
                     units=units, missing=health.get("missing", {}), initialization=dict(health.get("initialization", {})),
+                    guarded_units=guarded_units,
                     environment=health.get("environment"), resources=health.get("resources"), ready_wall=time.time(),
                     observed_wall=time.time(), last_activity_wall=time.time(), registered_at=now(), health_failures=0, reason=None)
                 self._event(record, "registered", start_to_ready_ms=(record["ready_wall"] - record["start_wall"]) * 1000
                             if record.get("start_wall") else None)
+                if guarded_units:
+                    from seampact.hosting.value_conditioned_birth import bind_registration
+                    bind_registration(self, record, health)
         if unknown:
             self.platform.runtime.call("remote_unknown", record["group_id"], record["id"])
             raise ValueError(record["reason"])
         print("[SeamPact] worker_attached " + group["id"] + " " + record["id"], flush=True)
         return self._view(record)
+
+    def managed_birth(self, identity):
+        """Read internal normal-start provenance, without accepting permissions."""
+        from seampact.hosting.value_conditioned_birth import read_birth
+        with self.lock:
+            return read_birth(self, identity)
 
     @staticmethod
     def _identity(record):
@@ -1636,6 +1842,48 @@ class Deployments:
                 ready, key=lambda item: (item["in_flight"], -item["generation"]))
         return self.drain_stop(identity, dict(body, instance_id=chosen["id"]), reason="remove_replica")
 
+    def import_only(self, identity, body, *, run_id, claim_check):
+        """Controller-only prefix work, under the active full task claim.
+
+        The worker control channel has the same trusted-controller boundary as
+        prewarm. The callback reads the actual Window ledger, not request data.
+        """
+        if not callable(claim_check) or not claim_check():
+            raise ValueError('original import prefix requires the selected full working-set claim')
+        unit_id, instance_id = body.get('unit'), body.get('instance_id')
+        with self.lock:
+            self._guard(identity, run_id)
+            group = self._group(identity)
+            if unit_id not in group['units']:
+                raise ValueError('import prefix Unit is outside the frozen group')
+            records = [r for r in self._instances(identity, {'READY'}) if r['id'] == instance_id
+                       and r.get('accepting') and not r.get('pending_stop') and unit_id in r.get('units', [])]
+            if len(records) != 1 or not claim_check():
+                raise ValueError('selected import worker or full claim is no longer current')
+            record = records[0]
+            if self._identity(record) != body.get('instance_identity'):
+                raise ValueError('selected import worker identity has changed')
+            record['in_flight'] += 1
+            record['last_activity_wall'] = time.time()
+            worker_identity = self._identity(record)
+        started = time.perf_counter()
+        try:
+            answer = json_request(record['endpoint'] + '/import_only',
+                dict(worker_identity, unit=unit_id, plan_digest=body.get('plan_digest'),
+                     task_id=body.get('task_id'), run_id=run_id))
+            self._check_identity(record, answer)
+            if answer.get('status') not in {'IMPORTED', 'FAILED'}:
+                return dict(status='UNKNOWN', reason='original import prefix response is incomplete')
+            return answer
+        except (OSError, ValueError, ProtocolError) as error:
+            return dict(status='UNKNOWN', reason=str(error))
+        finally:
+            with self.lock:
+                record['in_flight'] -= 1
+                record['last_activity_wall'] = time.time()
+                self._event(record, 'import_only', duration_ms=(time.perf_counter() - started) * 1000,
+                            unit=unit_id)
+
     def prewarm(self, identity, body, run_id=None):
         if identity.startswith("service:"):
             return self.platform.managed_services.prewarm(identity, body, run_id)
@@ -1647,8 +1895,11 @@ class Deployments:
                 if operation["status"] != "SUPPORTED":
                     raise ValueError(operation["status"] + "：" + operation["basis"])
                 allowed = {entry for entry, rule in group["contract"]["prepare"].items() if rule["status"] == "SUPPORTED"}
-                units = [unit_id for unit_id in group["units"]
-                         if (self.platform.store.get("unit", unit_id) or {}).get("entry_id") in allowed]
+                if group.get("kind") == capability_hosting.GROUP_KIND:
+                    units = [unit_id for unit_id, entry in zip(group["units"], group["entries"]) if entry in allowed]
+                else:
+                    units = [unit_id for unit_id in group["units"]
+                             if (self.platform.store.get("unit", unit_id) or {}).get("entry_id") in allowed]
                 requested = body.get("units", units)
                 if not isinstance(requested, list) or not requested or set(requested) - set(units):
                     raise ValueError("预热成员须为契约允许提前准备的非空成员列表")
@@ -1730,7 +1981,7 @@ class Deployments:
         if any(task_id and instance_id == record["id"] for (task_id, _), instance_id in self.affinity.items()):
             record["drain_blocked"] = "原任务/owner lease 尚未结束；Unit 返回不能代替 owner 结束"
             return False
-        snapshot = self.platform.runtime.snapshot()
+        snapshot = self.platform.runtime.call("active_view")
         if any(root["host"] == record["id"] and root["state"] in {"ACTIVE", "UNKNOWN"} for root in snapshot["roots"].values()):
             return False
         calls = [call for call in snapshot["calls"].values()
@@ -1748,6 +1999,12 @@ class Deployments:
                 return bool(record["pending_stop"].get("release_unknown"))
             if health.get("in_flight"):
                 return False
+            record["python_threads"] = health.get("python_threads")
+            group = self.platform.store.get("runtime_group", record["group_id"]) or {}
+            if python_work_required(group.get("contract") or {}) and not python_work_quiescent(health.get("python_threads")):
+                record["drain_blocked"] = "已获资格的结束操作尚缺 Python 后台线程排空回执；不以 Unit 返回代替"
+                return False
+        record.pop("drain_blocked", None)
         return True
 
     def _advance_stops(self):
@@ -1798,9 +2055,10 @@ class Deployments:
                 if self._idle_rebuild_allowed(self.platform.store.get("runtime_group", item["group_id"]) or {}):
                     for key in [key for key, value in self.affinity.items() if value == item["id"]]:
                         del self.affinity[key]
-                self._event(item, "stopped", reason=item["pending_stop"]["reason"],
-                            duration_ms=(time.perf_counter() - started) * 1000)
+                stop_reason = item["pending_stop"]["reason"]
                 item["pending_stop"] = None
+                self._event(item, "stopped", reason=stop_reason,
+                            duration_ms=(time.perf_counter() - started) * 1000)
             else:
                 item.update(desired="STOPPED", released=False)
                 item["pending_stop"]["blocked"] = result.get("reason") or result["status"]
@@ -1909,7 +2167,7 @@ class Deployments:
     # Calls: routing with owner affinity, encoded ports, no replay.
 
     def group_busy(self, identity):
-        return any((call.get("unit") or {}).get("runtime_group") == identity and call["physical"] in {"ENABLED", "RESERVED", "AUTHORIZED", "STARTED", "UNKNOWN"} for call in self.platform.runtime.snapshot()["calls"].values())
+        return any((call.get("unit") or {}).get("runtime_group") == identity and call["physical"] in {"ENABLED", "RESERVED", "AUTHORIZED", "STARTED", "UNKNOWN"} for call in self.platform.runtime.call("active_view")["calls"].values())
 
     @staticmethod
     def _idle_rebuild_allowed(group):
@@ -1949,7 +2207,67 @@ class Deployments:
             return False, None
         return True, self._call(record, unit, arguments, native_arguments)[0]
 
-    def invoke_placed(self, placement, unit, arguments, native_arguments=()):
+    def check_call_conditions(self, unit, arguments, proposal, instance_identity=None):
+        """Ask an existing worker; never start one or run an original method."""
+        from seampact.source.call_value_conditions import ordinary
+        values = ordinary(arguments)
+        with self.lock:
+            held = [copy.deepcopy(r) for r in self._instances(unit.get('runtime_group')) if self._held(r)]
+            records = [r for r in held if r['state'] == 'READY'
+                       if r.get('accepting') and unit['id'] in r.get('units', [])
+                       and (instance_identity is None or self._identity(r) == instance_identity)]
+        if not records:
+            if instance_identity is not None:
+                code = 'IDENTITY_MISMATCH'
+            elif not held:
+                code = 'NO_WORKER'
+            elif any(r['state'] in {'UNDEPLOYED', 'STARTING'} for r in held):
+                code = 'STARTING'
+            elif any(r['state'] != 'READY' for r in held):
+                code = 'WORKER_UNAVAILABLE'
+            elif all(unit['id'] not in r.get('units', []) for r in held):
+                code = 'MEMBER_MISSING'
+            else:
+                code = 'WORKER_NONACCEPTING'
+            return dict(proposal, status='UNKNOWN', allowed=False, reason_code=code,
+                        reason='no matching READY worker for the actual call check')
+        last = 'actual worker call condition remains UNKNOWN'
+        code = 'WORKER_UNAVAILABLE'
+        last_identity = None
+        last_plan = None
+        for record in records:
+            try:
+                answer = json_request(record['endpoint'] + '/check_call',
+                    dict(unit=unit['id'], arguments=values, **self._identity(record)), timeout=60)
+                self._check_identity(record, answer)
+                if answer.get('allowed') is not True or answer.get('status') != 'CHECKED':
+                    last = answer.get('reason') or last
+                    code = answer.get('reason_code') or 'CONDITION_UNKNOWN'
+                    last_identity = self._identity(record)
+                    last_plan = None
+                    if code == 'SDK_BINDING_UNKNOWN':
+                        keys = ('recipe_digest', 'payload_digest', 'unit_id', 'contract_digest', 'source_version', 'supplied')
+                        if any(answer.get(key) != proposal.get(key) for key in keys):
+                            code, last = 'IDENTITY_MISMATCH', 'worker SDK preparation plan belongs to a different frozen call'
+                        elif type(answer.get('import_plan')) is dict:
+                            last_plan = copy.deepcopy(answer['import_plan'])
+                    continue
+                mismatched = [key for key in ('recipe_digest', 'payload_digest', 'unit_id', 'contract_digest', 'source_version', 'supplied')
+                              if answer.get(key) != proposal.get(key)]
+                if mismatched:
+                    last = 'worker call evidence differs from the actual frozen payload or contract: ' + ', '.join(mismatched)
+                    code = 'IDENTITY_MISMATCH'
+                    continue
+                return answer
+            except (OSError, ValueError, ProtocolError) as error:
+                last = str(error)
+        result = dict(proposal, status='UNKNOWN', allowed=False, reason_code=code, reason=last,
+                      instance_identity=last_identity)
+        if code == 'SDK_BINDING_UNKNOWN' and last_plan is not None:
+            result['import_plan'] = last_plan
+        return result
+
+    def invoke_placed(self, placement, unit, arguments, native_arguments=(), on_event=None):
         """Functional mode: a fixed controller prepares an instance, then the call is dispatched."""
         waited = None
         with self.lock:
@@ -1962,7 +2280,12 @@ class Deployments:
             started = time.perf_counter()
             record = self._ensure(placement, unit["id"])
             waited = (time.perf_counter() - started) * 1000
-        result, facts = self._call(record, unit, arguments, native_arguments)
+        try:
+            result, facts = (self._call(record, unit, arguments, native_arguments, on_event) if on_event is not None
+                             else self._call(record, unit, arguments, native_arguments))
+        except capability_hosting.CapabilityError as error:
+            error.facts.update(start_wait_ms=waited, cold_instance=waited is not None)
+            raise
         facts.update(start_wait_ms=waited, cold_instance=waited is not None)
         return result, facts
 
@@ -2011,9 +2334,16 @@ class Deployments:
         raise ProtocolError("实例在 " + str(placement["start_timeout_s"]) + " 秒内未就绪：" +
                             (str(record.get("reason") or record["state"]) if record else "原实例仍在排空"))
 
-    def _call(self, record, unit, arguments, native_arguments):
+    def _call(self, record, unit, arguments, native_arguments, on_event=None):
+        if record["profile"] == capability_hosting.WORKER_PROFILE:
+            return capability_hosting.call(self, record, unit, arguments, on_event)
         if native_arguments:
             raise ValueError("组外端口不传递原对象引用；需要原对象输入的组合留在本地")
+        if unit.get('call_condition'):
+            from seampact.source.call_value_conditions import ordinary
+            arguments = ordinary(arguments)
+            self.platform.catalog.require_call_conditions(unit['id'], arguments,
+                native_arguments, instance_identity=self._identity(record))
         if record["profile"] == REMOTE_PROFILE["id"]:
             if any(type(value) not in {str, int, bool, type(None)} for value in arguments.values()):
                 raise ValueError("远程输入须为原类型的内建不可变标量，不转换原对象或子类")
@@ -2133,7 +2463,6 @@ class Deployments:
         method, args, kwargs = body.get("method"), body.get("args", []), body.get("kwargs", {})
         if method not in {"register", "enable", "wait", "consume", "finish", "cancel", "label"}:
             raise ProtocolError("未支持的运行进程协议操作")
-        snapshot = self.platform.runtime.snapshot()
         if method == "register":
             unit = kwargs.get("unit") or {}
             group = self.platform.store.get("runtime_group", record["group_id"])
@@ -2147,7 +2476,7 @@ class Deployments:
                 raise ProtocolError("运行边界不属于核对后的组成员")
             kwargs["unit"] = dict(unit, runtime_group=record["group_id"], execution="REMOTE", **self._identity(record))
         else:
-            item = snapshot["gates"].get(args[0]) if method in {"enable", "label"} else snapshot["calls"].get(args[0])
+            item = self.platform.runtime.call("gate_view" if method in {"enable", "label"} else "call_view", args[0])
             if not item or any((item.get("unit") or {}).get(key) != value for key, value in self._identity(record).items()):
                 raise ProtocolError("边界/调用不属于当前运行进程")
             if method == "label":

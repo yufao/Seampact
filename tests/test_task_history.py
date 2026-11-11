@@ -77,19 +77,19 @@ class TaskHistoryTests(unittest.TestCase):
         self.task("done", "FAILED")
         for physical in ["ENABLED", "RESERVED", "AUTHORIZED", "STARTED", "UNKNOWN"]:
             snapshot = dict(calls=dict(call=dict(task_id="done", physical=physical)), roots={})
-            with self.subTest(physical=physical), patch.object(self.platform.runtime, "snapshot", return_value=snapshot):
+            with self.subTest(physical=physical), patch.object(self.platform.runtime, "call", return_value=snapshot):
                 with self.assertRaisesRegex(ValueError, "调用"):
                     self.platform.delete_tasks(dict(task_ids=["done"]))
             self.assertIsNone(self.store.get("task_deleted", "done"))
         snapshot["calls"]["call"]["physical"] = "RETIRED"
-        with patch.object(self.platform.runtime, "snapshot", return_value=snapshot):
+        with patch.object(self.platform.runtime, "call", return_value=snapshot):
             self.platform.delete_tasks(dict(task_ids=["done"]))
 
     def test_unended_roots_and_owner_leases_block_cleanup(self):
         self.task("done")
         for state in ["ENABLED", "ACTIVE", "UNKNOWN"]:
             snapshot = dict(calls={}, roots=dict(root=dict(task_id="done", state=state)))
-            with self.subTest(state=state), patch.object(self.platform.runtime, "snapshot", return_value=snapshot):
+            with self.subTest(state=state), patch.object(self.platform.runtime, "call", return_value=snapshot):
                 with self.assertRaisesRegex(ValueError, "根请求"):
                     self.platform.delete_tasks(dict(task_ids=["done"]))
         self.platform.deployments.affinity[("done", "group")] = "instance"
@@ -116,15 +116,40 @@ class TaskHistoryTests(unittest.TestCase):
 
     def test_state_is_rechecked_after_runtime_observation(self):
         task = self.task("done")
-        def observe():
+        def observe(method):
+            self.assertEqual(method, "active_view")
             changed = copy.deepcopy(task)
             changed["status"] = "RUNNING"
             self.store.save("task", "done", changed)
             return dict(calls={}, roots={})
-        with patch.object(self.platform.runtime, "snapshot", side_effect=observe):
+        with patch.object(self.platform.runtime, "call", side_effect=observe):
             with self.assertRaisesRegex(ValueError, "已结束"):
                 self.platform.delete_tasks(dict(task_ids=["done"]))
         self.assertIsNone(self.store.get("task_deleted", "done"))
+
+    def test_state_keeps_full_retired_calls_and_saved_task_fallback(self):
+        self.task("done", calls=[{"id": "stale"}])
+        self.task("running", "RUNNING", calls=[{"id": "stale"}])
+        saved = [{"id": "saved", "unit": {"name": "previous"}}]
+        self.task("old", calls=saved)
+        retained = {"id": "retired", "task_id": "done", "physical": "RETIRED",
+                    "unit": {"source_id": "s", "name": "original", "nested": {"proof": "preserved"}}}
+        active = {"calls": {}, "roots": {}, "used": 0, "quota": 1}
+        calls = []
+        def query(method, *args):
+            calls.append(method)
+            if method == "active_view":
+                return active
+            if method == "task_calls_by_tasks":
+                return {task_id: [retained] if task_id == "done" else [] for task_id in args[0]}
+            self.fail("unexpected query: " + method)
+        with patch.object(self.platform.runtime, "call", side_effect=query), \
+             patch.object(self.platform.runtime, "snapshot", side_effect=AssertionError("full snapshot")):
+            tasks = {task["id"]: task for task in self.platform.state()["tasks"]}
+        self.assertEqual(tasks["done"]["calls"], [retained])
+        self.assertEqual(tasks["running"]["calls"], [])
+        self.assertEqual(tasks["old"]["calls"], saved)
+        self.assertEqual(calls.count("task_calls_by_tasks"), 1)
 
 
 if __name__ == "__main__":
