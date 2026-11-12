@@ -125,6 +125,9 @@ cite its configurable model/API endpoint or typed LLM input. The selected connec
 its declared capability, protocol and parameters must match. A specific model or NLI/embedding
 implementation cannot use this override to substitute an unrelated text model. Cite the original
 parameter/model usage; an operator override is not a default copied from the source.
+Keep transport settings (timeouts, retries and connection limits) separate from model-generation
+parameters. Injecting an HTTP client must preserve configured or source-default transport behavior;
+do not silently replace it with the HTTP library's defaults. Close owned clients at their actual lifecycle boundary.
 For data use {area:'data'|'indexes',provenance}, citing the original file/index path usage.
 Platform uses configuration.project_id and generates the mount path and package index namespace;
 never supply a host path, a project ID or a namespace in resource_matches. Project data is read-only;

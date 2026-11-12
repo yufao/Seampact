@@ -14,7 +14,7 @@ import re
 import time
 import uuid
 
-from seampact.agent_runtime import AgentHook
+from seampact.agent_runtime import AgentHook, SYSTEM_PROMPT
 from seampact.project_spaces import _checked
 
 SCHEMA = "seampact.office-spreadsheet-runtime/1"
@@ -275,9 +275,12 @@ def start_spreadsheet_task(platform, body, *, internal_task_id=None, pilot_confi
     identity = internal_task_id or uuid.uuid4().hex
     namespace = "spreadsheetbench/" + identity
     environment = SpreadsheetTask(platform, identity, body["project_id"], case, inputs, namespace)
-    prompt = ("Complete this original SpreadsheetBench office workbook task.\nInstruction: " + case["instruction"] +
-        "\nInstruction type: " + case["instruction_type"] + "\nAnswer position: " + str(case["answer_position"]) +
-        "\nThe only visible original input is /data/" + namespace + "/" + inputs[0]["name"] +
+    prompt = ("Instruction: " + case["instruction"] +
+        "\nInstruction type: " + case["instruction_type"] + "\nAnswer position: " + str(case["answer_position"]))
+    # Host execution rules are trusted system context. Keep the original task
+    # in user context so input guards still inspect every supplied instruction.
+    system_prompt = (SYSTEM_PROMPT + "\n\nComplete this original SpreadsheetBench office workbook task.\n"
+        "The only visible original input is /data/" + namespace + "/" + inputs[0]["name"] +
         ". Inspect it using run_python in the ordinary isolated execution environment. "
         "Write /workspace/solution.py as a self-contained reusable Python program. It must read input_path=sys.argv[1], "
         "write output_path=sys.argv[2], and implement the requested manipulation for arbitrary values and row counts. "
@@ -289,7 +292,7 @@ def start_spreadsheet_task(platform, body, *, internal_task_id=None, pilot_confi
     hooks = (AgentHook("spreadsheet_frozen_submission", "before_tool", environment.gate),
              AgentHook("spreadsheet_replay_delivery", "before_delivery", environment.deliver, mode="complete"))
     options = dict(code_execution=environment, external_tools=environment.tools(), external_execute=environment.submit,
-                   hooks=hooks, allowed_capabilities=[],
+                   hooks=hooks, allowed_capabilities=[], system_prompt=system_prompt,
                    allowed_workspace_tools=["list_files", "read_file", "write_file", "run_python"],
                    max_model_turns=15, evaluator=environment.evaluate)
     if pilot_config is not None:

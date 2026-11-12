@@ -1,5 +1,6 @@
 """Contract checks for Python executor isolation and retained leases."""
 import io
+import json
 import sys
 import threading
 import unittest
@@ -9,7 +10,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from seampact.agent_runtime import RunControl
-from seampact.isolated_execution import DockerPythonExecutor
+from seampact.isolated_execution import DockerPythonExecutor, _daemon_path
 from seampact.providers import RequestCancelled
 from seampact.workspace_tools import WorkspaceTools
 
@@ -89,6 +90,60 @@ class IsolatedExecutionTests(unittest.TestCase):
                     control=control, task=task, emit=lambda *a, **k: None)
         start.assert_not_called()
         self.assertTrue(task["python_calls"][0]["stopped"])
+
+    def test_platform_bind_maps_project_and_replay_paths_without_broadening(self):
+        mounts = [dict(Type="bind", Source="/srv/pilot/data", Destination="/data", RW=True)]
+        self.assertEqual(_daemon_path("/data/projects/p/data", mounts, writable=False),
+                         "/srv/pilot/data/projects/p/data")
+        self.assertEqual(_daemon_path("/data/projects/p/tasks/t/scratch/replay/solution.py", mounts, writable=False),
+                         "/srv/pilot/data/projects/p/tasks/t/scratch/replay/solution.py")
+        self.assertEqual(_daemon_path("/data/projects/p/sessions/c/workspace", mounts, writable=True),
+                         "/srv/pilot/data/projects/p/sessions/c/workspace")
+        with self.assertRaises(ValueError):
+            _daemon_path("/outside/project", mounts, writable=True)
+        nested = mounts + [dict(Type="tmpfs", Source="", Destination="/data/projects/p", RW=True)]
+        with self.assertRaises(ValueError):
+            _daemon_path("/data/projects/p/data", nested, writable=False)
+        mounts[0]["RW"] = False
+        with self.assertRaises(ValueError):
+            _daemon_path("/data/projects/p/workspace", mounts, writable=True)
+
+    def test_container_uses_its_inspected_mounts_for_sources(self):
+        observed = []
+        def command(*args, **kwargs):
+            observed.append(args)
+            return SimpleNamespace(returncode=0, stdout=json.dumps([
+                dict(Type="bind", Source="/srv/pilot/data", Destination="/data", RW=True)
+            ]).encode(), stderr=b"")
+        def path(value):
+            if value == "/.dockerenv":
+                return SimpleNamespace(exists=lambda: True)
+            return SimpleNamespace(resolve=lambda strict: value)
+        self.executor._command = command
+        with patch("seampact.isolated_execution.Path", side_effect=path), patch.dict(
+                "os.environ", {"SEAMPACT_CONTAINER_NAME": "platform"}):
+            mapped = self.executor._mount_sources([
+                dict(source="/data/projects/p/data", target="/data", read_only=True),
+                dict(source="/data/projects/p/sessions/c/workspace", target="/workspace", read_only=False)])
+        self.assertEqual(observed, [("inspect", "--format", "{{json .Mounts}}", "platform")])
+        self.assertEqual([x["source"] for x in mapped],
+                         ["/srv/pilot/data/projects/p/data", "/srv/pilot/data/projects/p/sessions/c/workspace"])
+
+    def test_create_error_records_safe_docker_reason_without_stderr(self):
+        task = {}
+        def command(*args, **kwargs):
+            if args[0] == "create":
+                return SimpleNamespace(returncode=1, stdout=b"", stderr=(
+                    b'invalid mount config for type "bind": bind source path does not exist: /private/token'))
+            return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+        self.executor._command = command
+        with patch.object(self.executor, "_mount_sources", side_effect=lambda rows: rows):
+            with self.assertRaisesRegex(ValueError, "无法创建隔离"):
+                self.executor.run(Projects(), self.scope, "print(1)", 5,
+                    control=RunControl(), task=task, emit=lambda *a, **k: None)
+        self.assertEqual(task["python_calls"][0]["create_error"],
+                         dict(exit_code=1, reason="Docker bind source path does not exist"))
+        self.assertNotIn("/private/token", str(task))
 
 
 if __name__ == "__main__":

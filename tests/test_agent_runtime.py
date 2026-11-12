@@ -9,6 +9,7 @@ from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from seampact.agent_runtime import AgentHook, AgentRuntime, RunControl, model_connection
+from seampact.api_accounting import summarize as summarize_api_usage
 from seampact.providers import ProviderError
 from seampact.store import Store
 
@@ -135,6 +136,52 @@ class AgentRuntimeTests(unittest.TestCase):
         self.assertNotIn("usage text", json.dumps(self.task))
         self.assertEqual(self.task["capability_usage"][0]["model_usage"][0]["data"]["usage"],
                          dict(prompt_tokens=3, completion_tokens=2))
+
+    def test_private_flat_usage_survives_a_block_without_exposing_other_fields(self):
+        def dispatch(unit, args, **options):
+            options["on_event"](dict(kind="model_usage", call_id="c", data=dict(
+                usage_received=True, input_tokens=190, output_tokens=94, total_tokens=284,
+                request_id="request", private="secret")))
+            return dict(output="blocked")
+        def check(payload, context):
+            context.invoke("guard", {}, private_events=True)
+            return False
+        self.run_host(lambda *args: self.fail("blocked before model"),
+                      hooks=[AgentHook("guard", "input_received", check)], dispatch=dispatch)
+        self.assertEqual(self.task["status"], "BLOCKED")
+        self.assertEqual(self.task["api_usage"]["tokens"], 284)
+        self.assertNotIn("secret", json.dumps(self.task))
+
+    def test_private_usage_is_retained_when_the_capability_fails(self):
+        def dispatch(unit, args, **options):
+            options["on_event"](dict(kind="model_usage", call_id="c", data=dict(
+                usage_received=True, total_tokens=12)))
+            raise RuntimeError("capability failed after its model response")
+        def check(payload, context):
+            context.invoke("guard", {}, private_events=True)
+        self.run_host(lambda *args: self.fail("failed before model"),
+                      hooks=[AgentHook("guard", "input_received", check)], dispatch=dispatch)
+        self.assertEqual(self.task["status"], "FAILED")
+        self.assertEqual(self.task["api_usage"]["tokens"], 12)
+
+    def test_api_accounting_formats_duplicates_and_unknown_timeout(self):
+        events = [dict(call_id="c", data=dict(usage_received=True, input_tokens=190,
+                     output_tokens=94, total_tokens=284, request_id="one")),
+                  dict(call_id="c", data=dict(usage_received=True, total_tokens=284, request_id="one")),
+                  dict(call_id="c", data=dict(usage_returned=True, request_count=1,
+                     usage=dict(prompt_tokens=3, completion_tokens=2), request_id="two")),
+                  dict(call_id="c", data=dict(usage_received=False, total_tokens=999, request_id="timeout"))]
+        result = summarize_api_usage([dict(total_tokens=7)], [dict(uses_model_service=True, model_usage=events)])
+        self.assertEqual(result["observed_tokens"], 296)
+        self.assertEqual(result["unknown_requests"], 1)
+        self.assertEqual(result["capability_requests"], 3)
+        self.assertIsNone(result["tokens"])
+        events.pop()
+        self.assertEqual(summarize_api_usage([dict(total_tokens=7)],
+                         [dict(uses_model_service=True, model_usage=events)])["tokens"], 296)
+        events.append(dict(call_id="c", data=dict(usage_returned=True, request_count=2,
+                                                 usage=dict(total_tokens=20))))
+        self.assertIsNone(summarize_api_usage([], [dict(model_usage=events)])["tokens"])
 
     def test_buffered_partial_response_cannot_fallback_or_become_delivered(self):
         count = []

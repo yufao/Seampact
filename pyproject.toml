@@ -7,7 +7,7 @@ dependencies = []
 
 [project.optional-dependencies]
 rl = ["torch>=2.2", "numpy>=1.26"]
-office = ["agentdojo==0.1.35", "hatchling"]
+office = ["agentdojo==0.1.35", "hatchling", "editables"]
 
 [build-system]
 requires = ["setuptools>=68"]

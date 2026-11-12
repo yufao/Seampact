@@ -6,7 +6,6 @@ an optional-hook selector can only omit hooks explicitly marked optional.
 """
 
 import copy
-import hashlib
 import inspect
 import json
 import math
@@ -15,7 +14,7 @@ import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 
-from seampact.api_accounting import summarize as summarize_api_usage
+from seampact.api_accounting import private_receipt, summarize as summarize_api_usage
 from seampact.context_memory import ContextMemory
 from seampact.pi_runtime import PiHost
 from seampact.providers import RequestCancelled, RequestControl, Transport, completion_body
@@ -294,18 +293,7 @@ class AgentRuntime:
                 if value.get("kind") == "model_usage":
                     if private_events:
                         data = value.get("data") if isinstance(value.get("data"), dict) else {}
-                        usage = data.get("usage") if isinstance(data.get("usage"), dict) else {}
-                        safe_usage = {k: v for k, v in usage.items() if k in {
-                            "total_tokens", "prompt_tokens", "completion_tokens", "input_tokens", "output_tokens"}
-                            and type(v) is int and v >= 0}
-                        request_id = data.get("request_id")
-                        safe_data = dict(usage=safe_usage, usage_returned=data.get("usage_returned") is True)
-                        if "request_count" in data:
-                            safe_data["request_count"] = (data["request_count"]
-                                if type(data["request_count"]) is int and data["request_count"] > 0 else None)
-                        if isinstance(request_id, str):
-                            safe_data["request_id"] = hashlib.sha256(request_id.encode()).hexdigest()
-                        usage_record["model_usage"].append(dict(call_id=identity, data=safe_data))
+                        usage_record["model_usage"].append(dict(call_id=identity, data=private_receipt(data)))
                     else:
                         usage_record["model_usage"].append(copy.deepcopy(value))
                 public_event = ({k: value[k] for k in ("kind", "call_id", "unit_id", "instance_id", "generation")

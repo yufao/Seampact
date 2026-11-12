@@ -1,6 +1,31 @@
 """Provider-reported token accounting; absent receipts never imply zero cost."""
 
 
+def receipt_usage(data):
+    """Read the two per-request event formats without inferring missing usage."""
+    if isinstance(data.get("usage"), dict) or "usage_returned" in data:
+        return data.get("usage"), data.get("usage_returned", True) is True
+    return data, data.get("usage_received") is True
+
+
+def private_receipt(data):
+    """Retain only accounting fields from a possibly private usage event."""
+    import hashlib
+
+    usage, returned = receipt_usage(data)
+    usage = usage if isinstance(usage, dict) else {}
+    fields = ("total_tokens", "prompt_tokens", "completion_tokens", "input_tokens", "output_tokens")
+    result = dict(usage={key: usage[key] for key in fields
+                         if type(usage.get(key)) is int and usage[key] >= 0},
+                  usage_returned=returned)
+    if "request_count" in data:
+        count = data["request_count"]
+        result["request_count"] = count if type(count) is int and count > 0 else None
+    if isinstance(data.get("request_id"), str):
+        result["request_id"] = hashlib.sha256(data["request_id"].encode()).hexdigest()
+    return result
+
+
 def token_count(usage):
     if not isinstance(usage, dict):
         return None
@@ -32,8 +57,10 @@ def summarize(business_usage, capability_calls):
                 seen.add(key)
             # A batch/last-attempt receipt cannot establish the total cost of
             # several provider requests. Emit one usage event per request.
-            receipts.append(token_count(data.get("usage"))
-                            if data.get("usage_returned", True) and data.get("request_count", 1) == 1 else None)
+            usage, returned = receipt_usage(data)
+            count = data.get("request_count", 1)
+            receipts.append(token_count(usage)
+                            if returned and type(count) is int and count == 1 else None)
         if call.get("uses_model_service") and not receipts:
             unknown_calls += 1
         capability.extend(receipts)

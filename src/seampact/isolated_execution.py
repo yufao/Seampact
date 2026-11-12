@@ -1,5 +1,8 @@
 """Bounded Python execution in a locally registered immutable Docker image."""
 
+import json
+import os
+from pathlib import Path, PurePosixPath
 import re
 import subprocess
 import threading
@@ -10,6 +13,49 @@ from .providers import RequestCancelled
 
 _IMAGE = re.compile(r"(?:sha256:[0-9a-f]{64}|[^\s@]+@sha256:[0-9a-f]{64})\Z")
 _MAX_OUTPUT = 65536
+
+
+def _create_failure(result):
+    """Retain actionable Docker failure categories without exposing daemon output."""
+    text = (result.stderr or b"").decode("utf-8", "replace").lower()
+    if "bind source path does not exist" in text:
+        reason = "Docker bind source path does not exist"
+    elif "invalid mount config" in text:
+        reason = "Docker rejected the bind mount configuration"
+    elif "permission denied" in text:
+        reason = "Docker denied access to a required resource"
+    elif "no such image" in text:
+        reason = "Docker image does not exist on the selected daemon"
+    else:
+        reason = "Docker create failed; inspect the daemon locally"
+    return dict(exit_code=result.returncode, reason=reason)
+
+
+def _daemon_path(source, mounts, *, writable):
+    """Translate a platform-container path through its verified Docker mount."""
+    source = PurePosixPath(source)
+    if not source.is_absolute() or ".." in source.parts:
+        raise ValueError("隔离执行的源路径必须是绝对路径")
+    candidates = []
+    for mount in mounts:
+        target = mount.get("Destination")
+        if not isinstance(target, str):
+            continue
+        target = PurePosixPath(target)
+        if target.is_absolute() and source.is_relative_to(target):
+            candidates.append((len(target.parts), target, mount))
+    if not candidates:
+        raise ValueError("隔离执行源路径没有平台容器的 Docker 宿主挂载")
+    candidates.sort(key=lambda row: row[0], reverse=True)
+    if len(candidates) > 1 and candidates[0][0] == candidates[1][0]:
+        raise ValueError("隔离执行源路径的 Docker 挂载不唯一")
+    _, target, mapping = candidates[0]
+    host = mapping.get("Source")
+    if (mapping.get("Type") not in ("bind", "volume") or not isinstance(host, str)
+            or not PurePosixPath(host).is_absolute() or ".." in PurePosixPath(host).parts
+            or (writable and not mapping.get("RW"))):
+        raise ValueError("隔离执行源路径的 Docker 宿主挂载不可用")
+    return str(PurePosixPath(host) / source.relative_to(target))
 
 
 class DockerPythonExecutor:
@@ -37,6 +83,24 @@ class DockerPythonExecutor:
             return None
         state = result.stdout.strip()
         return True if state == b"true" else False if state == b"false" else None
+
+    def _mount_sources(self, mounts):
+        if not Path("/.dockerenv").exists():
+            return mounts
+        identity = os.environ.get("SEAMPACT_CONTAINER_NAME") or os.environ.get("HOSTNAME")
+        if not identity:
+            raise ValueError("无法确定平台容器，不能安全映射隔离执行路径")
+        result = self._command("inspect", "--format", "{{json .Mounts}}", identity)
+        if result.returncode:
+            raise ValueError("无法核实平台容器的 Docker 宿主挂载")
+        try:
+            own_mounts = json.loads(result.stdout)
+            if not isinstance(own_mounts, list) or not all(isinstance(row, dict) for row in own_mounts):
+                raise ValueError("invalid mount list")
+            return [dict(mount, source=_daemon_path(str(Path(mount["source"]).resolve(strict=True)),
+                         own_mounts, writable=not mount["read_only"])) for mount in mounts]
+        except (KeyError, TypeError, OSError, json.JSONDecodeError) as exc:
+            raise ValueError("无法核实隔离执行的 Docker 宿主路径") from exc
 
     def is_drained(self, task):
         for call in task.get("python_calls", []):
@@ -98,7 +162,7 @@ class DockerPythonExecutor:
                     "--cap-drop", "ALL", "--security-opt", "no-new-privileges", "--cpus", "1",
                     "--memory", "512m", "--pids-limit", "64", "--log-driver", "none",
                     "--tmpfs", "/tmp:rw,nosuid,nodev,noexec,size=64m", "--workdir", "/workspace"]
-            for mount in mounts:
+            for mount in self._mount_sources(mounts):
                 args += ["--mount", "type=bind,src=" + mount["source"] + ",dst=" + mount["target"] +
                          (",readonly" if mount["read_only"] else "")]
             args += [self.image, "python", "-I", "-"]
@@ -107,6 +171,7 @@ class DockerPythonExecutor:
             created = self._command(*args)
             record["create_uncertain"] = False
             if created.returncode:
+                record["create_error"] = _create_failure(created)
                 raise ValueError("无法创建隔离 Python 容器")
             control.check()
             proc = subprocess.Popen([self.docker, "start", "--attach", "--interactive", name],
