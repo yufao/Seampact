@@ -69,6 +69,29 @@ function node(tag, text, className) {
   return item;
 }
 
+test('privacy demo requires a selected task and explicitly opens its recorded conversation', async () => {
+  const controls = new Map();
+  const control = id => { if (!controls.has(id)) controls.set(id, element('div')); return controls.get(id); };
+  control('project-demo-case').value = '';
+  const calls = [], opened = [];
+  const context = load(['startPrivacyDemo'], {
+    $: control, activeProjectId: 'project-one', projectDemoBusy: false, pendingTask: null,
+    chatRestoring: false, projectFileBusy: false, projectApplicationBusy: false,
+    connected: true, state: {models: {chat: {}}}, isReady: () => true, updateComposer() {},
+    api: async (url, body) => { calls.push({url, body}); return {task_id: 'task-one', conversation_id: 'conversation-one'}; },
+    loadConversation: async (...args) => opened.push(args), refresh: async () => {},
+  });
+  await context.startPrivacyDemo();
+  assert.equal(calls.length, 0);
+  control('project-demo-case').value = 'office-privacy:meeting:normal';
+  await context.startPrivacyDemo();
+  assert.deepEqual(JSON.parse(JSON.stringify(calls)), [{url: '/api/experiments/office/privacy',
+    body: {project_id: 'project-one', case_id: 'office-privacy:meeting:normal', demo: true}}]);
+  assert.deepEqual(opened, [['conversation-one', true]]);
+  assert.equal(context.projectDemoBusy, false);
+  assert.equal(context.chatRestoring, false);
+});
+
 function taskHarness() {
   const root = element('div');
   const count = element('span');
@@ -305,7 +328,7 @@ test('chat history loads fifty at a time and a new search replaces the list', as
   const paths = [];
   const all = Array.from({length: 60}, (_, index) => ({id: 'c' + index, title: '会话' + index, status: 'COMPLETED', turns: 1}));
   const context = load(['loadChatHistory'], {
-    historySearchVersion: 0, activeChatId: null, pendingTask: null, chatRestoring: false,
+    historySearchVersion: 0, activeChatId: null, activeProjectId: 'project A', pendingTask: null, chatRestoring: false,
     $: id => id === 'chat-history-list' ? root : search,
     node, empty(target, text) { target.append(node('p', text, 'empty-note')); },
     statusLabel: status => status, loadConversation() {}, deleteConversation() {},
@@ -317,20 +340,21 @@ test('chat history loads fifty at a time and a new search replaces the list', as
   });
   const rows = () => root.children.filter(child => (child.className || '').includes('chat-history-row'));
   await context.loadChatHistory();
-  assert.equal(paths[0], '/api/chats?q=' + encodeURIComponent('图像') + '&limit=50&offset=0');
+  assert.equal(paths[0], '/api/chats?q=' + encodeURIComponent('图像') + '&project_id=project%20A&limit=50&offset=0');
+  assert.equal(new URL(paths[0], 'http://local').searchParams.get('project_id'), 'project A');
   assert.equal(rows().length, 50);
   const more = root.querySelector('.chat-history-more');
   assert.equal(more.textContent, '更多会话');
   assert.equal(more.className.includes('secondary-button'), true);
   await more.onclick();
-  assert.equal(paths[1], '/api/chats?q=' + encodeURIComponent('图像') + '&limit=50&offset=50');
+  assert.equal(paths[1], '/api/chats?q=' + encodeURIComponent('图像') + '&project_id=project%20A&limit=50&offset=50');
   assert.equal(rows().length, 60);
   assert.equal(rows()[0].textContent.includes('会话0'), true);
   assert.equal(rows()[50].textContent.includes('会话50'), true);
   assert.equal(root.querySelector('.chat-history-more'), null);
   search.value = '';
   await context.loadChatHistory();
-  assert.equal(paths[2], '/api/chats?q=&limit=50&offset=0');
+  assert.equal(paths[2], '/api/chats?q=&project_id=project%20A&limit=50&offset=0');
   assert.equal(rows().length, 50);
   assert.equal(root.querySelector('.chat-history-more').textContent, '更多会话');
 });

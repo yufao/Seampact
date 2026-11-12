@@ -30,6 +30,21 @@
         <div class="chat-heading"><div class="eyebrow">SEAMPACT</div><h1 id="chat-title">对话</h1></div>
         <div class="header-actions"><button id="new-chat" class="secondary-button" type="button">新对话</button><button id="toggle-chat-history" class="secondary-button" type="button" aria-controls="chat-history" aria-expanded="false">历史会话</button><span id="chat-model-name" class="status-pill pending">对话模型未配置</span></div>
       </header>
+      <div class="project-bar"><label for="project-select">项目</label><select id="project-select" aria-label="选择项目"><option value="default">默认项目</option></select><button id="create-project" class="secondary-button" type="button">新建项目</button></div>
+      <details id="project-application" class="project-files"><summary>本项目使用的库 <span id="project-application-summary"></span></summary><div class="project-files-body">
+        <p class="card-note">选择适用于后续任务的库。每项任务保留开始时的配置；保存选择不会启停实例。</p>
+        <div id="project-library-list" class="project-library-list" aria-live="polite"></div>
+        <div class="project-file-actions"><button id="project-office-preset" class="secondary-button" type="button" disabled>复用办公检查绑定</button><button id="project-libraries-none" class="secondary-button" type="button">全部停用</button><button id="project-libraries-refresh" class="secondary-button" type="button">刷新</button></div>
+        <p id="project-application-bindings" class="card-note"></p><p id="project-application-feedback" class="card-note" role="status" aria-live="polite"></p>
+        <div class="project-file-actions"><label for="project-demo-case">模拟办公任务</label><select id="project-demo-case"><option value="">请选择一种虚构任务</option></select><button id="project-demo-start" class="secondary-button" type="button" disabled>开始模拟任务</button></div>
+        <p class="card-note">手动发起后使用当前项目与模型，在新会话中运行。所有收件目标和资料均虚构，交付仅记为本项目的模拟回执；透明检查继续由调度器选择。</p><p id="project-demo-feedback" class="card-note" role="status" aria-live="polite"></p>
+      </div></details>
+      <details id="project-files" class="project-files"><summary>项目资料</summary><div class="project-files-body">
+        <p class="card-note">项目资料可供同一项目中的对话使用。工作区属于当前会话。</p>
+        <div class="project-file-actions"><label for="project-file-area">查看</label><select id="project-file-area"><option value="data">项目资料</option><option value="workspace">当前会话工作区</option></select><button id="project-file-up" class="secondary-button" type="button">上一级</button><button id="project-file-refresh" class="secondary-button" type="button">刷新</button></div>
+        <p id="project-file-path" class="card-note"></p><div id="project-file-list" class="project-file-list" aria-live="polite"></div>
+        <div class="project-file-actions"><input id="project-file-upload" type="file" aria-label="选择要上传的文件"><button id="project-file-upload-button" class="secondary-button" type="button">上传到当前位置</button><button id="project-scratch-clear" class="secondary-button" type="button">清理临时文件</button><button id="project-workspace-clear" class="secondary-button" type="button">清空当前会话工作区</button></div><p id="project-file-feedback" class="card-note" role="status" aria-live="polite"></p>
+      </div></details>
       <section id="chat-history" class="chat-history" aria-label="历史会话" hidden>
         <label for="chat-history-search">搜索历史会话</label><input id="chat-history-search" type="search" placeholder="搜索问题或回答" autocomplete="off">
         <p class="card-note">普通对话保存在当前平台。旧记录若未保存问题，仅展示已有回答。删除会话只从历史移除，可撤销；执行记录保留在任务详情。</p>

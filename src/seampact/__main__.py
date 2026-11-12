@@ -18,6 +18,10 @@ def main():
     args = parser.parse_args()
     os.umask(0o077)
     sys.stdout.reconfigure(encoding="utf-8")
+    import faulthandler
+    import signal
+    if hasattr(signal, "SIGUSR1"):
+        faulthandler.register(signal.SIGUSR1, all_threads=True)
     from seampact.service import Platform
     from seampact.server import make_server
     legacy = args.legacy_config

@@ -40,7 +40,7 @@ OUTPUT_KINDS = {"json", "text", "files"}
 STATE_SCOPES = {"call", "instance"}
 EFFECT_KINDS = {"filesystem", "network", "external"}
 EFFECT_ACCESS = {"read", "write"}
-RESOURCE_KINDS = {"weight", "service", "credential", "device", "parameter"}
+RESOURCE_KINDS = {"weight", "service", "credential", "device", "parameter", "data"}
 CANCEL_MODES = {"none", "cooperative"}
 
 _TYPES = {"object": dict, "array": list, "string": str, "integer": int,
@@ -343,8 +343,31 @@ def load_package(root, source_root=None):
 # Secrets are named by environment variable and never stored in a binding.
 
 BINDING_FORMS = {"weight": "path", "service": "service", "credential": "secret",
-                 "device": "value", "parameter": "value"}
+                 "device": "value", "parameter": "value", "data": "project"}
 ENVIRONMENT_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+PROJECT_ID = re.compile(r"[A-Za-z0-9_-]{1,128}\Z")
+PROJECT_RESERVED = re.compile(r"(?:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])\Z", re.I)
+INDEX_NAMESPACE = re.compile(r"[0-9a-f]{24}\Z")
+
+
+def project_binding_path(binding):
+    """Derive the only worker path admitted for a managed project resource."""
+    _require(isinstance(binding, dict) and binding.get("form") == "project"
+             and set(binding) <= {"form", "project_id", "area", "read_only", "namespace"},
+             "项目资料绑定只接受项目身份、区域与访问模式")
+    project = binding.get("project_id")
+    _require(isinstance(project, str) and PROJECT_ID.fullmatch(project)
+             and not PROJECT_RESERVED.fullmatch(project), "项目资料绑定需要有效的 project_id")
+    area = binding.get("area")
+    _require(area in {"data", "indexes"} and type(binding.get("read_only")) is bool,
+             "项目资料绑定需要 data/indexes 区域与 read_only")
+    if area == "data":
+        _require(binding["read_only"] and "namespace" not in binding, "项目共用资料必须只读且不能指定索引命名空间")
+        return "/work/projects/" + project + "/data"
+    namespace = binding.get("namespace")
+    _require(isinstance(namespace, str) and INDEX_NAMESPACE.fullmatch(namespace),
+             "项目索引绑定需要平台生成的 namespace")
+    return "/work/projects/" + project + "/indexes/" + namespace
 
 
 def check_binding(resource, binding):
@@ -354,6 +377,8 @@ def check_binding(resource, binding):
     if form == "path":
         _require(set(binding) <= {"form", "path", "resource_id", "sha256"} and isinstance(binding.get("path"), str)
                  and binding["path"], label + "需要实例内可见的 path")
+    elif form == "project":
+        project_binding_path(binding)
     elif form == "service":
         _require(set(binding) <= {"form", "base_url", "model", "api_key_env", "connection_id", "parameters"}
                  and isinstance(binding.get("base_url"), str) and binding["base_url"], label + "需要 base_url")
@@ -376,6 +401,11 @@ def check_bindings(manifest, bindings):
     _require(not unknown, "绑定了包内未声明的资源：" + ", ".join(unknown))
     for identity, binding in bindings.items():
         check_binding(resources[identity], binding)
+        if binding["form"] == "project" and binding["area"] == "indexes":
+            _require(binding["namespace"] == package_digest(manifest)[:24],
+                     "索引命名空间必须来自本能力包身份")
+    projects = {binding["project_id"] for binding in bindings.values() if binding["form"] == "project"}
+    _require(len(projects) <= 1, "一个能力实例只能绑定一个项目")
     return [identity for identity, resource in resources.items() if resource["required"] and identity not in bindings]
 
 

@@ -54,6 +54,7 @@ PARSER.add_argument("--torch-index-url", help="explicit torch wheel channel; per
 DEPENDENCIES = PARSER.add_mutually_exclusive_group()
 DEPENDENCIES.add_argument("--dependency-lock", help="exact platform package lock file; imported and persisted privately")
 DEPENDENCIES.add_argument("--refresh-dependencies", action="store_true", help="explicitly resolve new platform dependency versions")
+PARSER.add_argument("--agentdojo-bundle", help="optional Git bundle containing the fixed office source; imported privately")
 PARSER.add_argument("--docker-cli-image", help="official Docker CLI image; persisted, default docker:29-cli")
 PARSER.add_argument("--gpu-observe", help="NVIDIA utility-only observation: all or comma-separated full GPU UUIDs; persisted")
 PARSER.add_argument("--ready-timeout", type=int, default=120, help="startup wait in seconds (default: 120)")
@@ -311,6 +312,12 @@ def replacement_spec(old, new_image):
                  if key not in old_defaults or old_defaults[key] != value}
     for key in ("SEAMPACT_REVISION", "SEAMPACT_EXTRAS"):
         overrides.pop(key, None)
+    # The office pilot's old image used a custom lock path. The new image
+    # records its complete environment at its own declared default path.
+    if overrides.get("SEAMPACT_RUNTIME_LOCK") == "/opt/office-dependencies.lock":
+        if "office" not in {x.strip() for x in CONFIG.get("extras", "").split(",")}:
+            fail("The adopted office pilot requires --extras office (and any other required extras); no container was stopped.")
+        overrides.pop("SEAMPACT_RUNTIME_LOCK")
     spec["Env"] = [key + "=" + value for key, value in dict(new_defaults, **overrides).items()]
     spec["Image"] = new_image
     old_labels = old_image.get("Labels") or {}
@@ -433,6 +440,20 @@ def add_gpu_observation(spec):
     env = inspect_environment(spec.get("Env"))
     env.update(NVIDIA_DRIVER_CAPABILITIES="utility", NVIDIA_VISIBLE_DEVICES=selected)
     spec["Env"] = [key + "=" + value for key, value in env.items()]
+
+
+def check_build_inputs(spec, image):
+    """Check pilot-specific inputs before stopping the current platform."""
+    env = inspect_environment(spec.get("Env"))
+    python_image = env.get("SEAMPACT_PYTHON_IMAGE")
+    if python_image and docker("image", "inspect", python_image, check=False).returncode:
+        fail("The configured Python tool image is unavailable on the selected daemon; no container was stopped.")
+    if "office" in {x.strip() for x in CONFIG.get("extras", "").split(",")}:
+        code = ("from pathlib import Path; from seampact.office_experiment import source_identity; "
+                "assert Path('/app/runtime-lock.txt').is_file(); source_identity()")
+        if docker("run", "--rm", "--pull=never", "--network", "none", "--entrypoint", "python",
+                  image, "-c", code, check=False).returncode:
+            fail("The new office image failed its fixed source or runtime lock check; no container was stopped.")
 
 
 def probe_gpu_observation(spec, image, container=None):
@@ -654,9 +675,9 @@ def main():
     if CONFIG.get("pending"):
         fail("A prior replacement is incomplete. Run status, inspect retained containers and the backup, then resolve it manually. "
              "No old container is automatically restarted against possibly migrated data.")
-    if ARGS.action == "configure" and (ARGS.local or ARGS.refresh_dependencies or any(getattr(ARGS, name) is not None for name in
+    if ARGS.action == "configure" and (ARGS.local or ARGS.refresh_dependencies or any(getattr(ARGS, name, None) is not None for name in
             ("repo", "code_dir", "extras", "base_image", "pip_index_url", "pip_extra_index_url", "torch_version",
-             "torch_index_url", "dependency_lock", "docker_cli_image"))):
+             "torch_index_url", "dependency_lock", "docker_cli_image", "agentdojo_bundle"))):
         fail("configure reuses the current image; code/dependency/build options belong to update.")
     if ARGS.action == "install" and CONFIG.get("current_image") and not ARGS.reuse_data:
         fail("This workspace is already deployed. Use update.")
@@ -703,6 +724,15 @@ def main():
         CONFIG["dependency_lock"] = str(target_lock)
     elif ARGS.refresh_dependencies:
         CONFIG.pop("dependency_lock", None)
+    if getattr(ARGS, "agentdojo_bundle", None):
+        if "office" not in {x.strip() for x in CONFIG["extras"].split(",")}:
+            fail("--agentdojo-bundle requires the office extra.")
+        source = Path(ARGS.agentdojo_bundle).expanduser().resolve(strict=True)
+        target = ROOT / "agentdojo.bundle"
+        if source != target:
+            shutil.copyfile(source, target)
+        os.chmod(target, 0o600)
+        CONFIG["agentdojo_bundle"] = str(target)
     CONFIG["docker_cli_image"] = ARGS.docker_cli_image or CONFIG.get("docker_cli_image") or "docker:29-cli"
     save()
     stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
@@ -733,6 +763,8 @@ def main():
         for option in ("pip_index_url", "pip_extra_index_url", "torch_version", "torch_index_url", "dependency_lock"):
             if CONFIG.get(option):
                 command += ["--" + option.replace("_", "-"), CONFIG[option]]
+        if "office" in {x.strip() for x in CONFIG["extras"].split(",")} and CONFIG.get("agentdojo_bundle"):
+            command += ["--agentdojo-bundle", CONFIG["agentdojo_bundle"]]
         if ARGS.refresh_dependencies:
             command.append("--refresh-dependencies")
         run(command, visible=True)
@@ -749,6 +781,8 @@ def main():
     if CONFIG["tools"] and (not OLD or ARGS.tools is True):
         added_tool_mounts = add_tools(spec)
     add_gpu_observation(spec)
+    if ARGS.action != "configure":
+        check_build_inputs(spec, runtime)
     check_idle()
     probe_gpu_observation(spec, runtime)
     candidate = CONFIG["container"] + "-next-" + uuid.uuid4().hex[:8]
@@ -764,6 +798,16 @@ def main():
             after = [row for row in after if row["Destination"] not in added_tool_mounts]
             if before != after:
                 fail("The candidate's persistent mounts differ from the original. No old container was stopped; use the original deployment command.")
+            for key in ("PidMode", "DeviceRequests", "PortBindings", "NetworkMode"):
+                # Explicit --gpu-observe is the only requested device change.
+                if key == "DeviceRequests" and ARGS.gpu_observe is not None:
+                    continue
+                if OLD["HostConfig"].get(key) != candidate_info["HostConfig"].get(key):
+                    fail("The candidate changed " + key + ". No old container was stopped; inspect the original configuration.")
+            old_env = inspect_environment(OLD["Config"].get("Env"))
+            candidate_env = inspect_environment(candidate_info["Config"].get("Env"))
+            if old_env.get("SEAMPACT_PYTHON_IMAGE") != candidate_env.get("SEAMPACT_PYTHON_IMAGE"):
+                fail("The candidate changed the Python tool image. No old container was stopped.")
         backup_dir.mkdir(parents=True, mode=0o700)
         private_json(backup_dir / "container.json", OLD or spec)
         if OLD:

@@ -46,6 +46,22 @@ button, input, select, textarea { -webkit-tap-highlight-color: transparent; }
 .header-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; align-items: center; gap: 6px; min-width: 0; max-width: 75%; }
 .chat-heading { min-width: 0; }
 #chat-title { overflow-wrap: anywhere; }
+.project-bar, .project-file-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; }
+.project-bar { padding: 8px 24px; border-bottom: 1px solid var(--line); }
+.project-bar label, .project-file-actions label { font-weight: 600; font-size: 12px; }
+.project-bar select, .project-file-actions select { max-width: 240px; padding: 5px 8px; border: 1px solid var(--line); border-radius: 7px; background: white; }
+.project-files { padding: 8px 24px; border-bottom: 1px solid var(--line); background: var(--soft); }
+.project-files summary { cursor: pointer; color: var(--accent); font-weight: 600; }
+.project-files-body { max-height: 280px; overflow-y: auto; padding: 8px 0; }
+.project-file-actions { margin-top: 8px; }
+.project-file-actions input[type="file"] { max-width: 260px; font-size: 12px; }
+.project-file-list { display: grid; gap: 4px; margin: 8px 0; }
+.project-file-entry { overflow-wrap: anywhere; }
+.project-library-list { display: grid; gap: 8px; margin: 10px 0; }
+.project-library-row { display: flex; align-items: start; gap: 9px; font-size: 13px; }
+.project-library-row input { margin-top: 3px; }
+.project-library-row span { min-width: 0; overflow-wrap: anywhere; }
+.project-library-row small { display: block; margin-top: 3px; color: var(--muted); }
 .chat-history { padding: 14px 24px; border-bottom: 1px solid var(--line); background: var(--soft); }
 .chat-history > label { font-size: 12px; font-weight: 600; }
 .chat-history > input { width: 100%; padding: 8px 10px; margin: 6px 0; border: 1px solid var(--line); border-radius: 7px; }

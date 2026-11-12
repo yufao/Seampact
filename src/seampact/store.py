@@ -165,6 +165,8 @@ class Store:
                 ON documents(json_extract(data,'$.status')) WHERE kind='task'""")
             self.db.execute("""CREATE INDEX IF NOT EXISTS task_conversation
                 ON documents(COALESCE(json_extract(data,'$.conversation_id'), id)) WHERE kind='task'""")
+            self.db.execute("""CREATE INDEX IF NOT EXISTS task_project
+                ON documents(COALESCE(json_extract(data,'$.project_id'), 'default')) WHERE kind='task'""")
             self.db.execute("""CREATE INDEX IF NOT EXISTS task_finished
                 ON documents(COALESCE(json_extract(data,'$.finished_at'), json_extract(data,'$.ended_at')))
                 WHERE kind='task'""")
@@ -225,18 +227,22 @@ class Store:
             if row:
                 yield json.loads(row[0])
 
-    def conversation_heads(self):
+    def conversation_heads(self, project_id=None):
         """Per task, latest first: the few fields a conversation list and its search read."""
         self._task_indexes()
         before = None
         while True:
             older, values = ("", ()) if before is None else (" AND task.rowid < ?", (before,))
+            if project_id is not None:
+                older += " AND COALESCE(json_extract(task.data,'$.project_id'), 'default')=?"
+                values += (project_id,)
             with self.lock:
                 rows = self.db.execute("SELECT task.rowid, task.id, " + self._TASK_CONVERSATION + """,
                     json_extract(task.data,'$.origin'), json_extract(task.data,'$.phase'),
                     json_extract(task.data,'$.conversation_id') IS NOT NULL, json_extract(task.data,'$.status'),
                     json_extract(task.data,'$.started_at'), json_extract(task.data,'$.finished_at'),
-                    json_extract(task.data,'$.messages'), json_extract(task.data,'$.response')
+                    json_extract(task.data,'$.messages'), json_extract(task.data,'$.response'),
+                    COALESCE(json_extract(task.data,'$.project_id'), 'default')
                     FROM documents AS task WHERE task.kind='task'""" + older + """
                     ORDER BY task.rowid DESC LIMIT 64""", values).fetchall()
             if not rows:
@@ -244,7 +250,8 @@ class Store:
             before = rows[-1][0]
             for row in rows:
                 yield dict(id=row[1], conversation=row[2], origin=row[3], phase=row[4], threaded=bool(row[5]),
-                           status=row[6], started_at=row[7], finished_at=row[8], messages=row[9], response=row[10])
+                           status=row[6], started_at=row[7], finished_at=row[8], messages=row[9], response=row[10],
+                           project_id=row[11])
 
     def run_summaries(self):
         """Scheduler runs as polled: totals stay, per-window series are read with the run's detail."""

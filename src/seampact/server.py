@@ -1,5 +1,7 @@
 """Local research prototype API and standard conversation UI."""
 
+import base64
+import binascii
 import json
 import shutil
 import socket
@@ -49,6 +51,33 @@ def make_server(platform, port=8880, host="127.0.0.1", public_port=None):
                     return self.send(200, dict(status="ok", version=__version__))
                 if path == "/api/state":
                     return self.send(200, platform.state())
+                if path == "/api/projects":
+                    projects = [dict(item, status="ARCHIVED" if item.get("archived") else "ACTIVE")
+                                for item in platform.projects.list()]
+                    return self.send(200, dict(projects=projects, default_project_id="default"))
+                if path == "/api/projects/application":
+                    query = parse_qs(urlsplit(self.path).query)
+                    return self.send(200, platform.project_applications.view(query.get("project_id", ["default"])[0]))
+                if path == "/api/experiments/office/privacy":
+                    from seampact.office_privacy import privacy_cases
+                    return self.send(200, dict(cases=[{key: case[key] for key in
+                        ("id", "family_id", "variant", "title")} for case in privacy_cases()],
+                        transport="simulated_only", enabled_by_default=False))
+                if path in {"/api/project-files", "/api/project-file"}:
+                    query = parse_qs(urlsplit(self.path).query)
+                    project_id = query.get("project_id", ["default"])[0]
+                    conversation_id = query.get("conversation_id", [None])[0]
+                    area = query.get("area", ["data"])[0]
+                    relative = query.get("path", [""])[0]
+                    if area not in {"data", "workspace"}:
+                        raise ValueError("请选择项目资料或会话文件")
+                    if path == "/api/project-files":
+                        return self.send(200, platform.projects.list_files(project_id, conversation_id,
+                                                                          area, relative))
+                    # Keep managed cleanup from removing the file while it is sent.
+                    with platform.projects.lock:
+                        return self.send_file(platform.projects.file_path(project_id, conversation_id,
+                                                                          area, relative))
                 if path == "/api/generations":
                     return self.send(200, platform.generation.snapshot())
                 if path.startswith("/api/generations/"):
@@ -77,6 +106,8 @@ def make_server(platform, port=8880, host="127.0.0.1", public_port=None):
                     return self.send(200, platform.tasks(
                         before=int(query["before"][0]) if "before" in query else None,
                         limit=int(query.get("limit", ["30"])[0])))
+                if path.startswith("/api/tasks/") and path.endswith("/activity"):
+                    return self.send(200, platform.task_activity(path.split("/")[-2]))
                 if path.startswith("/api/tasks/"):
                     return self.send(200, platform.task(path.rsplit("/", 1)[1]))
                 if path == "/api/chats":
@@ -84,7 +115,8 @@ def make_server(platform, port=8880, host="127.0.0.1", public_port=None):
                     limit, offset = int(query.get("limit", ["0"])[0]), int(query.get("offset", ["0"])[0])
                     if limit < 0 or offset < 0:
                         raise ValueError("limit 与 offset 不能为负数")
-                    return self.send(200, platform.chat.conversations(query.get("q", [""])[0], limit or None, offset))
+                    return self.send(200, platform.chat.conversations(query.get("q", [""])[0], limit or None,
+                        offset, project_id=query.get("project_id", [None])[0]))
                 if path.startswith("/api/chat/"):
                     parts = path.split("/")
                     if len(parts) == 5 and parts[4] == "events":
@@ -134,6 +166,8 @@ def make_server(platform, port=8880, host="127.0.0.1", public_port=None):
                     return self.send(404, dict(error="没有这个接口"))
                 mime = {"index.html": "text/html", "app.js": "text/javascript", "style.css": "text/css"}[filename]
                 self.send(200, (ui / filename).read_bytes(), mime + "; charset=utf-8")
+            except FileNotFoundError:
+                self.send(404, dict(error="没有这个项目或文件"))
             except ValueError as error:
                 self.send(400, dict(error=str(error)))
             except Exception as error:
@@ -185,8 +219,14 @@ def make_server(platform, port=8880, host="127.0.0.1", public_port=None):
 
         def do_POST(self):
             try:
-                body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))).decode())
                 path = urlsplit(self.path).path
+                length = int(self.headers.get("Content-Length", 0))
+                if length < 0 or path == "/api/project-files" and length > 23 * 1024 * 1024:
+                    self.close_connection = True
+                    return self.send(413, dict(error="单次文件上传最多16 MiB"))
+                body = json.loads(self.rfile.read(length).decode())
+                if not isinstance(body, dict):
+                    raise ValueError("请求内容需要对象")
                 retired = {
                     "/api/harnesses/bind-dependency", "/api/harnesses/check-dependency",
                     "/api/harnesses/environment", "/api/units/policy", "/api/units/capability",
@@ -197,7 +237,40 @@ def make_server(platform, port=8880, host="127.0.0.1", public_port=None):
                     "/api/scheduler/config", "/api/scheduler/runs", "/api/scheduler/runs/stop", "/api/scheduler/activate"}
                 if path in retired:
                     return self.send(410, dict(error="此旧执行入口已停用；请使用仓库生成、能力包和普通 Agent 入口。历史记录仍可读取。"))
-                if path == "/api/models":
+                if path == "/api/projects":
+                    result = platform.projects.create(body)
+                elif path == "/api/projects/application":
+                    result = platform.project_applications.configure(body.get("project_id", "default"), body)
+                elif path == "/api/projects/cleanup":
+                    result = platform.cleanup_project(body)
+                elif path == "/api/projects/archive":
+                    result = platform.projects.archive(body.get("project_id", "default"))
+                elif path == "/api/project-files/delete":
+                    area = body.get("area", "data")
+                    if area not in {"data", "workspace"}:
+                        raise ValueError("请选择项目资料或会话文件")
+                    result = platform.projects.delete_file(body.get("project_id", "default"),
+                        body.get("conversation_id"), area, body.get("path", ""))
+                elif path == "/api/project-files":
+                    area = body.get("area", "data")
+                    if area not in {"data", "workspace"}:
+                        raise ValueError("请选择项目资料或会话文件")
+                    encoded = body.get("content_base64")
+                    if not isinstance(encoded, str):
+                        raise ValueError("请选择要上传的文件")
+                    try:
+                        data = base64.b64decode(encoded, validate=True)
+                    except (ValueError, binascii.Error):
+                        raise ValueError("文件内容编码无效") from None
+                    if len(data) > 16 * 1024 * 1024:
+                        raise ValueError("单次文件上传最多16 MiB")
+                    with platform.projects.lock:
+                        # A browser upload must not race a model editing the same files.
+                        project_id = body.get("project_id", "default")
+                        platform.projects.require_idle(project_id, body.get("conversation_id") if area == "workspace" else None)
+                        result = platform.projects.put_file(project_id, body.get("conversation_id"), area,
+                                                            body.get("path", ""), data)
+                elif path == "/api/models":
                     platform.profiles.save_role(body["role"], body)
                     result = platform.profiles.public_roles()
                 elif path == "/api/models/select":
@@ -233,7 +306,8 @@ def make_server(platform, port=8880, host="127.0.0.1", public_port=None):
                 elif path == "/api/capabilities/prepare":
                     result = platform.capabilities.prepare(body["group_id"], body)
                 elif path == "/api/capabilities/invoke":
-                    result = platform.execution.invoke(body["unit_id"], body["input"])
+                    from seampact.capability_diagnostics import invoke
+                    result = invoke(platform, body)
                 elif path == "/api/capabilities/detach":
                     result = platform.capabilities.detach(body["group_id"])
                 elif path == "/api/units/policy":
@@ -243,7 +317,8 @@ def make_server(platform, port=8880, host="127.0.0.1", public_port=None):
                 elif path == "/api/analyze":
                     result = platform.generation.start(body["harness_id"])
                 elif path == "/api/generations":
-                    result = platform.generation.start(body["source_id"])
+                    result = platform.generation.start(body["source_id"],
+                        improve_from=body.get("improve_from"), configuration=body.get("configuration"))
                 elif path == "/api/generations/cancel":
                     result = platform.generation.cancel(body["id"])
                 elif path == "/api/execution/config":
@@ -282,6 +357,21 @@ def make_server(platform, port=8880, host="127.0.0.1", public_port=None):
                     result = platform.chat.start(body)
                 elif path == "/api/chat/cancel":
                     result = platform.chat.cancel(body["task_id"])
+                elif path == "/api/experiments/office/native":
+                    from seampact.office_experiment import start_native_task
+                    result = start_native_task(platform, body)
+                elif path == "/api/experiments/office/spreadsheet":
+                    from seampact.office_spreadsheet import start_spreadsheet_task
+                    result = start_spreadsheet_task(platform, body)
+                elif path == "/api/experiments/office/spreadsheet/score":
+                    from seampact.office_spreadsheet import apply_native_score
+                    result = apply_native_score(platform, body)
+                elif path == "/api/experiments/office/privacy":
+                    from seampact.office_privacy import start_privacy_task
+                    result = start_privacy_task(platform, body)
+                elif path == "/api/experiments/office/pilot":
+                    from seampact.office_pilot import handle
+                    result = handle(platform, body)
                 elif path == "/api/plans":
                     result = platform.chat.start_plan(body)
                 elif path == "/api/monitor/start":
@@ -377,6 +467,8 @@ def make_server(platform, port=8880, host="127.0.0.1", public_port=None):
                 else:
                     return self.send(404, dict(error="没有这个接口"))
                 self.send(200, result)
+            except FileNotFoundError:
+                self.send(404, dict(error="没有这个项目或文件"))
             except Exception as error:
                 self.send(400, dict(error=str(error)))
 

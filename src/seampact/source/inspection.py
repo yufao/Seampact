@@ -8,6 +8,7 @@ import io
 import json
 import os
 import re
+import stat
 import sys
 import tokenize
 from pathlib import Path, PurePosixPath
@@ -133,14 +134,41 @@ def withheld_source(path, data):
             positions.append(dict(path=path, unit=unit, line=line, status="WITHHELD",
                                   reason="explicit authentication field contains a non-placeholder string literal"))
     def inspect(unit, source, python=False):
+        pattern_literals, pattern_targets = set(), set()
         if python:
             try:
                 tree = ast.parse(source)
             except SyntaxError:
                 tree = None
             if tree:
+                # A detector may name a regex fragment `password` or `api_key`.
+                # Only exempt a literal that is demonstrably used as a regex
+                # parameter in the same scope and contains a quantified
+                # character class. Raw strings alone can hold real credentials.
+                scopes = {}
+                def assign_scope(node, scope):
+                    if isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+                        scope = node
+                    scopes[id(node)] = id(scope)
+                    for child in ast.iter_child_nodes(node):
+                        assign_scope(child, scope)
+                assign_scope(tree, tree)
+                regex_names = {(scopes[id(node)], node.value.id) for node in ast.walk(tree)
+                               if isinstance(node, ast.keyword) and node.arg and node.arg.endswith("_regex")
+                               and isinstance(node.value, ast.Name)}
+                for node in ast.walk(tree):
+                    if not isinstance(node, (ast.Assign, ast.AnnAssign)) or not isinstance(node.value, ast.Constant):
+                        continue
+                    value = node.value.value
+                    targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+                    if isinstance(value, str) and re.search(r"\[[^\]\r\n]+\]\{\d+(?:,\d*)?\}", value):
+                        matched = [target for target in targets if isinstance(target, ast.Name)
+                                   and (scopes[id(node)], target.id) in regex_names]
+                        if matched:
+                            pattern_literals.add((node.value.lineno, node.value.col_offset))
+                            pattern_targets.update((target.lineno, target.col_offset, target.id) for target in matched)
                 def literal(field, node):
-                    if isinstance(node, ast.Constant):
+                    if isinstance(node, ast.Constant) and (node.lineno, node.col_offset) not in pattern_literals:
                         record(unit, node.lineno, field, node.value)
                 for node in ast.walk(tree):
                     if isinstance(node, (ast.Assign, ast.AnnAssign)):
@@ -169,9 +197,16 @@ def withheld_source(path, data):
             if not _authentication_field(match["field"]):
                 continue
             value = match["double"] if match["double"] is not None else match["single"]
+            line_number = source.count("\n", 0, match.start()) + 1
+            line_start = source.rfind("\n", 0, match.start()) + 1
+            prefix = source[line_start:match.start()]
+            example_comment = (python and re.fullmatch(r"\s*#\s*(?:e\.g\.|example:)\s*", prefix, re.I)
+                               and value.strip().lower() in {"foo", "bar", "baz", "abc"})
+            if (line_number, match.start() - line_start, match["field"]) in pattern_targets or example_comment:
+                continue
             if _placeholder(value) or dynamic_tail.match(source, match.end()):
                 continue
-            record(unit, source.count("\n", 0, match.start()) + 1, match["field"],
+            record(unit, line_number, match["field"],
                    value)
     inspect("file", text, str(path).lower().endswith((".py", ".pyi")))
     if str(path).lower().endswith(".ipynb"):
@@ -373,8 +408,10 @@ def source_facts(path, data):
     return dict(imports=imports, entry_candidates=entries, unknown=unknown, dependency_closure="UNKNOWN")
 
 
-def inventory_repository(root, excluded_roots=()):
+def inventory_repository(root, excluded_roots=(), *, discover_entries=True):
     """Inventory every non-excluded path; only decodable text enters files."""
+    if type(discover_entries) is not bool:
+        raise ValueError("discover_entries must be a boolean")
     root = Path(root).resolve()
     excluded_roots = {Path(path).resolve() for path in excluded_roots if Path(path).resolve() != root}
     inventory, files, resources, entries = [], [], [], []
@@ -383,13 +420,14 @@ def inventory_repository(root, excluded_roots=()):
     for directory, children, names in os.walk(root, onerror=unreadable):
         base = Path(directory)
         children[:] = sorted(name for name in children
-            if not excluded((name,)) and (base / name).resolve() not in excluded_roots)
+            if not excluded((name,)) and base / name not in excluded_roots)
         for name in list(children):
             path = base / name
             relative = path.relative_to(root).as_posix()
-            if path.is_symlink() or not path.resolve().is_relative_to(root):
+            info = path.lstat()
+            if stat.S_ISLNK(info.st_mode) or getattr(info, "st_file_attributes", 0) & 0x400:
                 children.remove(name)
-                inventory.append(dict(path=relative, kind="symlink", readable=False, bytes=path.lstat().st_size))
+                inventory.append(dict(path=relative, kind="symlink", readable=False, bytes=info.st_size))
             else:
                 inventory.append(dict(path=relative, kind="directory", readable=False, bytes=None))
         for name in sorted(names):
@@ -397,11 +435,13 @@ def inventory_repository(root, excluded_roots=()):
                 continue
             path = base / name
             relative = path.relative_to(root).as_posix()
-            if path.is_symlink() or not path.resolve().is_relative_to(root) or not path.is_file():
-                inventory.append(dict(path=relative, kind="symlink" if path.is_symlink() else "special",
-                                      readable=False, bytes=path.lstat().st_size))
+            info = path.lstat()
+            linked = stat.S_ISLNK(info.st_mode) or getattr(info, "st_file_attributes", 0) & 0x400
+            if linked or not stat.S_ISREG(info.st_mode):
+                inventory.append(dict(path=relative, kind="symlink" if linked else "special",
+                                      readable=False, bytes=info.st_size))
                 continue
-            record = dict(path=relative, kind=file_kind(relative), bytes=path.stat().st_size, readable=False)
+            record = dict(path=relative, kind=file_kind(relative), bytes=info.st_size, readable=False)
             if path.suffix.lower() not in BINARY_SUFFIXES:
                 data = path.read_bytes()
                 try:
@@ -416,10 +456,11 @@ def inventory_repository(root, excluded_roots=()):
                     else:
                         record.update(readable=True, encoding=encoding)
                         files.append(relative)
-                        try:
-                            entries.extend(source_facts(relative, data)["entry_candidates"])
-                        except (ValueError, TypeError, AttributeError):
-                            record["structure"] = "PARSE_UNSUPPORTED"
+                        if discover_entries:
+                            try:
+                                entries.extend(source_facts(relative, data)["entry_candidates"])
+                            except (ValueError, TypeError, AttributeError):
+                                record["structure"] = "PARSE_UNSUPPORTED"
             inventory.append(record)
             if not record["readable"]:
                 resources.append({key: record[key] for key in ("path", "kind", "bytes", "status", "positions", "reason")

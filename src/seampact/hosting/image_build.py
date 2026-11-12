@@ -126,7 +126,9 @@ def worker_dockerfile(destination, inspector, environment, check_python, runtime
     # eviction never changes the requested installation or the frozen lock.
     cached_run = "RUN --mount=type=cache,id=seampact-pip-v1,target=/root/.cache/pip,sharing=locked "
     index = '${PIP_EXTRA_INDEX_URL:+--extra-index-url "$PIP_EXTRA_INDEX_URL"} '
-    install = "python -m pip install " + index
+    # Ignore ambient pip environment and user configuration inherited from the base image.
+    # The explicitly selected extra index is still supplied as a command-line option.
+    install = "python -m pip --isolated install " + index
     independent = plan["status"] == "DEPENDENCY_ONLY"
     early = [install + "-r " + shlex.quote(path) for path in environment["requirements"]] if independent else []
     late = [] if independent else [install + "-r " + shlex.quote(path) for path in environment["requirements"]]

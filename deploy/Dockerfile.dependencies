@@ -3,7 +3,7 @@ ARG BASE_IMAGE
 FROM ${BASE_IMAGE}
 WORKDIR /opt/seampact-environment
 RUN python -c "import sys; assert sys.version_info[:2] == (3, 11), 'platform requires Python 3.11'" \
-    && apt-get update && apt-get install -y --no-install-recommends git ca-certificates \
+    && apt-get update && apt-get install -y --no-install-recommends git ca-certificates libstdc++6 libatomic1 \
     && rm -rf /var/lib/apt/lists/*
 COPY request.json input.lock install_environment.py ./
 ENV PIP_CACHE_DIR=/root/.cache/pip

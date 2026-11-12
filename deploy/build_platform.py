@@ -213,13 +213,14 @@ def prepare(code, state_dir, docker, *, base_image="python:3.11-slim", refresh=F
     return dict(record, status="REUSED" if reused else "BUILT", version=project["project"]["version"])
 
 
-def build_platform(docker, code, environment, image, revision="UNKNOWN", owner=None):
+def build_platform(docker, code, environment, image, revision="UNKNOWN", owner=None, agentdojo_input=None):
     reference = build_reference(docker, environment["image_id"], environment["image"])
     args = ["buildx", "build", "--load", "--builder", "default", "-f", str(Path(code) / "deploy/Dockerfile"),
         "--build-arg", "DEPENDENCY_IMAGE=" + reference,
         "--build-arg", "SEAMPACT_EXTRAS=" + ",".join(environment["request"]["extras"]),
         "--build-arg", "SEAMPACT_VERSION=" + environment["version"],
-        "--build-arg", "SEAMPACT_REVISION=" + revision, "-t", image]
+        "--build-arg", "SEAMPACT_REVISION=" + revision,
+        "--build-context", "agentdojo_input=" + str(agentdojo_input or Path(code) / "deploy"), "-t", image]
     if owner:
         args += ["--label", "io.seampact.deployment=" + owner]
     docker.run(args + [str(code)], visible=True)
@@ -237,6 +238,7 @@ def main(argv=None):
     parser.add_argument("--torch-version", default="")
     parser.add_argument("--torch-index-url", default="")
     parser.add_argument("--dependency-lock", type=Path)
+    parser.add_argument("--agentdojo-bundle", type=Path, help="optional local Git bundle for the pinned office source")
     parser.add_argument("--refresh-dependencies", action="store_true")
     parser.add_argument("--image", help="also build the final platform image")
     parser.add_argument("--revision", default="UNKNOWN")
@@ -246,6 +248,8 @@ def main(argv=None):
     args = parser.parse_args(argv)
     if args.refresh_dependencies and args.dependency_lock:
         parser.error("refresh-dependencies and an explicit dependency-lock are mutually exclusive")
+    if args.agentdojo_bundle and "office" not in {x.strip() for x in args.extras.split(",")}:
+        parser.error("--agentdojo-bundle requires the office extra")
     os.umask(0o077)
     docker = Docker(args.docker_host)
     result = prepare(args.code_dir.resolve(), args.state_dir.resolve(), docker, base_image=args.base_image,
@@ -253,8 +257,20 @@ def main(argv=None):
         lock=args.dependency_lock.read_text(encoding="utf-8") if args.dependency_lock else "",
         extras=args.extras, pip_index_url=args.pip_index_url, pip_extra_index_url=args.pip_extra_index_url,
         torch_version=args.torch_version, torch_index_url=args.torch_index_url)
+    # A separate private context avoids adding offline inputs to the source checkout.
+    # Recreate it each time, so removing the option cannot silently reuse a bundle.
+    agentdojo_input = args.state_dir.resolve() / "agentdojo-input"
+    agentdojo_input.mkdir(parents=True, exist_ok=True)
+    target_bundle = agentdojo_input / "agentdojo.bundle"
+    if args.agentdojo_bundle:
+        source_bundle = args.agentdojo_bundle.resolve(strict=True)
+        if source_bundle == target_bundle:
+            raise ValueError("agentdojo bundle input must be outside the generated context")
+        shutil.copyfile(source_bundle, target_bundle)
+    elif target_bundle.exists():
+        target_bundle.unlink()
     if args.image:
-        build_platform(docker, args.code_dir, result, args.image, args.revision, args.owner)
+        build_platform(docker, args.code_dir, result, args.image, args.revision, args.owner, agentdojo_input)
     if args.receipt:
         save(args.receipt, result)
     if args.compose_env:
@@ -263,7 +279,8 @@ def main(argv=None):
         args.compose_env.write_text("\n".join([
             "SEAMPACT_DEPENDENCY_IMAGE=" + reference,
             "SEAMPACT_EXTRAS=" + ",".join(result["request"]["extras"]),
-            "SEAMPACT_VERSION=" + result["version"], "SEAMPACT_REVISION=" + args.revision]) + "\n", encoding="utf-8")
+            "SEAMPACT_VERSION=" + result["version"], "SEAMPACT_REVISION=" + args.revision,
+            "SEAMPACT_AGENTDOJO_INPUT=" + str(agentdojo_input)]) + "\n", encoding="utf-8")
         os.chmod(args.compose_env, 0o600)
     print("Platform dependency environment: " + result["status"] + "; lock " + result["lock_sha256"][:16])
     if result["installed"].get("torch"):

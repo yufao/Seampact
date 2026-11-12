@@ -18,6 +18,7 @@
 | [Bandit](https://github.com/PyCQA/bandit) | Python代码安全AST检查 | CPU；与Semgrep部分重叠，作为替代或补充需明确任务 |
 | [detect-secrets](https://github.com/Yelp/detect-secrets) | 代码／文件中的密钥痕迹扫描 | CPU规则与熵；检测结果由应用决定阻断或提示，不能自动宣称识别所有秘密 |
 | [TruFor](https://github.com/grip-unina/TruFor) | 有图像任务的篡改定位和完整性分析 | 本地权重CPU／GPU；不用于纯文本请求，不等于所有图像真实性判断 |
+| [Haystack](https://github.com/deepset-ai/haystack) | 业务RAG：关键词／向量检索及本地重排，按需读取授权知识资料 | CPU索引、embedding／reranker；接入检索组件，不增加Agent宿主，明确计作业务增强来源 |
 
 [REX-RAG](https://github.com/MiliLab/REX-RAG)可作业务检索来源，不默认计入防护库。[JailbreakEval](https://github.com/CryptoAILab/JailbreakEval)是响应评价器集合，默认属于评分研究；不能未经任务定义便当在线防护或AgentDojo原判分。来源的模型API、权重许可和依赖按实际固定版本登记，表中资源类型不是本机测量结果。
 
@@ -26,6 +27,8 @@
 办公优先考虑文本注入、隐私、外发／操作、内容与证据检查；软件加入Semgrep、Bandit和detect-secrets；资料场景增加RefChecker／SelfCheckGPT，有真实图像任务时才加入TruFor。NeMo和Guardrails只选择需要的具体方法，不复制其完整宿主。
 
 每场目标七至十个来源库。平台先为每个候选列出真实用途、适用任务、输入输出、原实现、资源所有者、可用干预及效果评价。根据任务覆盖和资源异质性选择组合；一个源库多个scanner不算多个来源，同一底层检测器不同框架包装不能伪装成不同防护。候选尚需去重和实际接入，当前不宣称任何场景已经满足数量目标。
+
+办公首批方案现为七个防护来源加一个RAG来源，共八库，见[办公协作方案](办公协作场景方案.md)。基础宿主、业务增强、防护和评分角色分开记录；不将RAG计成额外防护算法，也不排除它参与能力和实例调度。
 
 ## 两种评价
 

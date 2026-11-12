@@ -2,10 +2,12 @@
 
 import copy
 import json
+import math
 import subprocess
 import threading
 import uuid
 from collections import deque
+from contextlib import nullcontext
 
 from seampact.providers import FrozenProfiles, Transport
 from seampact.store import now
@@ -56,12 +58,18 @@ def public_result(value, active=None):
 
 class ChatJobs:
     def __init__(self, store, profiles, catalog, runtime=None, scheduler=None, *, dispatch=None,
-                 model_connection=None, hooks=(), optional_hooks=None):
+                 model_connection=None, hooks=(), optional_hooks=None, projects=None, code_execution=None,
+                 applications=None):
         self.store, self.profiles, self.catalog = store, profiles, catalog
         self.runtime, self.scheduler = runtime, scheduler
         self.transport = Transport()
         self.dispatch, self.model_connection = dispatch, model_connection
         self.hooks, self.optional_hooks = tuple(hooks), optional_hooks
+        self.projects = projects
+        self.applications = applications
+        self.code_execution = code_execution
+        self._start_lock = projects.lock if projects is not None else threading.RLock()
+        self._workspace_controller = uuid.uuid4().hex
         self._controls, self._threads = {}, {}
         self._stream_condition = threading.Condition()
         self._streams = {}
@@ -115,12 +123,15 @@ class ChatJobs:
         """The newest task of one conversation, without reading other history."""
         return next((task for task in self.store.conversation_tasks(identity) if self._conversational(task)), None)
 
-    def conversations(self, query="", limit=None, offset=0):
+    def conversations(self, query="", limit=None, offset=0, project_id=None):
         """Conversation list from per-task heads; tool traces and model context are not read."""
+        if self.projects is not None:
+            project_id = self.projects.get(project_id)["id"] if project_id is not None else self.projects.default()["id"]
         deleted = {row["id"] for row in self.store.list("chat_deleted")}
         needle = query.casefold() if query else ""
         groups = {}
-        for head in self.store.conversation_heads():
+        heads = self.store.conversation_heads(project_id=project_id) if self.projects is not None else self.store.conversation_heads()
+        for head in heads:
             if (head["origin"] == "EXPLICIT_TASK_PLAN" or head["conversation"] in deleted
                     or not (head["threaded"] or head["phase"] in {"conversation", "harness_execution"})):
                 continue
@@ -140,6 +151,8 @@ class ChatJobs:
                 continue
             result.append(dict(id=identity, title=title, updated_at=latest["finished_at"] or latest["started_at"],
                                status=latest["status"], turns=group["turns"], legacy=not bool(messages)))
+            if self.projects is not None:
+                result[-1]["project_id"] = latest.get("project_id") or project_id
         page = result[offset:offset + limit] if limit else result[offset:]
         return dict(conversations=page, total=len(result))
 
@@ -153,8 +166,21 @@ class ChatJobs:
         # Only user-visible messages are restored; tool traces remain task details.
         if latest.get("status") == "COMPLETED" and latest.get("response"):
             messages.append(dict(role="assistant", content=latest["response"]))
-        return dict(id=identity, messages=messages, legacy=not bool(latest.get("messages")),
+        result = dict(id=identity, messages=messages, legacy=not bool(latest.get("messages")),
                     task={key: latest.get(key) for key in ("id", "status", "response", "partial_response", "error", "latency_ms", "context_status", "context_events", "files", "cancel")})
+        if self.projects is not None:
+            with self.projects.lock:
+                session = self.projects.session(identity)
+                project_id = (session or {}).get("project_id") or latest.get("project_id") or self.projects.default()["id"]
+                if latest.get("project_id") not in (None, project_id):
+                    raise ValueError("会话的项目归属与任务记录不一致")
+                if session or not self.projects.get(project_id).get("archived"):
+                    self.projects.ensure_session(project_id, identity)
+            result["project_id"] = project_id
+            result["task"]["project_id"] = project_id
+            result["task"].update({key: latest[key] for key in
+                ("workspace_status", "workspace_retention_reason", "workspace_error") if key in latest})
+        return result
 
     def delete_conversation(self, identity):
         if self.store.get("chat_deleted", identity):
@@ -170,7 +196,24 @@ class ChatJobs:
         self.store.delete("chat_deleted", identity)
         return dict(restored=self.conversation(identity)["id"])
 
-    def start(self, body):
+    def start(self, body, *, runtime_options=None, on_event=None, metadata=None, internal_task_id=None,
+              capability_snapshot=None, apply_project_application=False):
+        # Dynamic availability may wait for the coordinator, whose journal
+        # uses the store lock. Read it before entering project admission.
+        capability_snapshot = (self.catalog.public() if capability_snapshot is None else capability_snapshot)
+        # Reserving the session and recording RUNNING are one admission step;
+        # cleanup and simultaneous HTTP submissions use this same project lock.
+        # Capability snapshots inspect deployment state. Match the controller's
+        # deployment -> project/store order before entering admission.
+        router = getattr(self.catalog, "router", None) or getattr(self.catalog, "remote_router", None)
+        deployment_lock = getattr(router, "lock", None)
+        with deployment_lock if deployment_lock is not None else nullcontext(), self._start_lock:
+            return self._start(body, runtime_options=runtime_options, on_event=on_event, metadata=metadata,
+                               internal_task_id=internal_task_id, capability_snapshot=capability_snapshot,
+                               apply_project_application=apply_project_application)
+
+    def _start(self, body, *, runtime_options=None, on_event=None, metadata=None, internal_task_id=None,
+               capability_snapshot, apply_project_application=False):
         messages = body.get("messages")
         if not isinstance(messages, list) or not messages:
             raise ValueError("请提交完整对话消息")
@@ -181,6 +224,10 @@ class ChatJobs:
                 raise ValueError("消息内容需要文字或模型支持的多模态内容")
         if self.closed:
             raise ValueError("平台已停止")
+        deadline = body.get("deadline_s")
+        if deadline is not None and (type(deadline) not in (int, float) or
+                not math.isfinite(deadline) or deadline <= 0):
+            raise ValueError("任务时限需要有限正数")
         bound = FrozenProfiles(self.profiles)
         profile = bound.role_profile("chat")
         if not profile.get("base_url") or not profile.get("model"):
@@ -196,6 +243,18 @@ class ChatJobs:
                 raise ValueError("旧对话没有保存完整问题，请新建会话")
             if previous["task"]["status"] == "RUNNING":
                 raise ValueError("这段会话还有任务正在运行")
+        project_id = None
+        if self.projects is not None:
+            requested = body.get("project_id")
+            if requested is not None:
+                requested = self.projects.get(requested)["id"]
+            if body.get("conversation_id"):
+                project_id = previous["project_id"]
+                if requested not in (None, project_id):
+                    raise ValueError("续聊不能更改会话所属项目")
+            else:
+                project_id = requested or self.projects.default()["id"]
+            self.projects.ensure_session(project_id, conversation_id)
         prior_wire = None
         prior_context = None
         prior_calibration = None
@@ -208,33 +267,82 @@ class ChatJobs:
             prior_context = latest.get("context_messages")
             if (latest.get("models") or {}).get("chat") == bound.public().get("chat"):
                 prior_calibration = latest.get("context_calibration")
-        identity = uuid.uuid4().hex
+        if internal_task_id is not None:
+            if (not isinstance(internal_task_id, str) or len(internal_task_id) != 32
+                    or any(c not in "0123456789abcdef" for c in internal_task_id)
+                    or self.store.get("task", internal_task_id) is not None):
+                raise ValueError("内部任务身份无效或已被使用")
+        identity = internal_task_id or uuid.uuid4().hex
         task = dict(id=identity, status="RUNNING", started_at=now(), response=None,
             error=None, partial_response="", calls=[], model_calls=0, usage=[], latency_ms=None, phase="conversation",
             conversation_id=conversation_id, messages=copy.deepcopy(messages),
             context_calibration=copy.deepcopy(prior_calibration), models=bound.public(), role_resources=bound.resources(),
-            capability_pool=copy.deepcopy(catalog.public()))
-        self.store.save("task", identity, task)
-        self._stream_event(identity, "reset")
-        self._controls[identity] = RunControl()
-        thread = threading.Thread(target=self._run, args=(task, messages, bound, catalog, prior_wire, prior_context),
-                                  daemon=True, name="seampact-agent-" + identity[:8])
-        self._threads[identity] = thread
-        thread.start()
-        return dict(task_id=identity, conversation_id=conversation_id)
+            capability_pool=copy.deepcopy(capability_snapshot))
+        if self.applications is not None and self.projects is not None and (runtime_options is None or apply_project_application):
+            from seampact.project_applications import TaskCapabilityCatalog
+            application, eligible = self.applications.snapshot(project_id, capability_snapshot)
+            task["application"] = application
+            task["capability_pool"] = copy.deepcopy(eligible)
+            transparent = set(application["effective_bindings"].values())
+            catalog = TaskCapabilityCatalog(self.catalog, [u for u in eligible if u["id"] not in transparent])
+            application_options = self.applications.runtime_options(identity, application)
+            runtime_options = dict(runtime_options or {})
+            if application_options.get("hooks"):
+                runtime_options["hooks"] = self.hooks + tuple(runtime_options.get("hooks", ())) + application_options["hooks"]
+            runtime_options.update({key: value for key, value in application_options.items() if key != "hooks"})
+        if metadata is not None:
+            # Research labels stay in the task record, never in model context.
+            task["experiment"] = copy.deepcopy(metadata)
+        if deadline is not None:
+            task["deadline_s"] = float(deadline)
+        if self.projects is not None:
+            task["project_id"] = project_id
+            task["workspace_controller"] = self._workspace_controller
+            scope = self.projects.begin_task(project_id, conversation_id, identity)
+            task["workspace"] = {key: scope[key] for key in ("project_id", "conversation_id", "task_id")}
+        try:
+            self.store.save("task", identity, task)
+            self._stream_event(identity, "reset")
+            self._controls[identity] = RunControl()
+            thread = threading.Thread(target=self._run, args=(task, messages, bound, catalog, prior_wire, prior_context),
+                                      kwargs=dict(runtime_options=runtime_options, on_event=on_event),
+                                      daemon=True, name="seampact-agent-" + identity[:8])
+            self._threads[identity] = thread
+            thread.start()
+        except Exception:
+            self._controls.pop(identity, None)
+            self._threads.pop(identity, None)
+            if self.projects is not None:
+                self.projects.finish_task(identity, drained=True)
+            task.update(status="FAILED", error="对话任务未能启动", finished_at=now())
+            self.store.save("task", identity, task)
+            raise
+        result = dict(task_id=identity, conversation_id=conversation_id)
+        if self.projects is not None:
+            result["project_id"] = project_id
+        return result
 
     def start_plan(self, body):
         raise ValueError("旧多方案执行入口已停用；请在对话中使用已安装的能力工具")
 
-    def _run(self, task, messages, bound, catalog, prior_wire=None, prior_context=None):
+    def _run(self, task, messages, bound, catalog, prior_wire=None, prior_context=None, *,
+             runtime_options=None, on_event=None):
+        if self.projects is not None:
+            task.setdefault("workspace_controller", self._workspace_controller)
         control = self._controls.setdefault(task["id"], RunControl())
         if self.closed:
             control.cancel()
-        host = AgentRuntime(self.store, catalog, transport=self.transport, dispatch=self.dispatch,
-                            hooks=self.hooks, optional_hooks=self.optional_hooks,
-                            connection=self.model_connection, scheduler=self.scheduler)
+        options = dict(hooks=self.hooks, optional_hooks=self.optional_hooks,
+                       connection=self.model_connection, scheduler=self.scheduler, projects=self.projects,
+                       code_execution=self.code_execution)
+        options.update(runtime_options or {})
+        host = AgentRuntime(self.store, catalog, transport=self.transport, dispatch=self.dispatch, **options)
         def event(value):
+            if on_event is not None:
+                on_event(value)
             kind = value["kind"]
+            if kind in {"model_message", "tool_receipt", "tool_observation"}:
+                return
             if kind == "delta":
                 self._stream_event(task["id"], "delta", value["text"])
             elif kind == "content_received":
@@ -252,11 +360,13 @@ class ChatJobs:
             host.run(task, messages, bound, on_event=event, control=control,
                      prior_wire=prior_wire, prior_context=prior_context)
         finally:
-            # Drop only this task's lease. Shared instance reclamation belongs
-            # to the scheduler and respects other in-flight work.
             router = getattr(catalog, "router", None)
             try:
-                if router is not None:
+                if self.projects is not None:
+                    # The coordinator can persist on another thread. Never
+                    # wait for it while holding the shared project/store lock.
+                    self._finish_project_scope(task, catalog, bound, control)
+                elif router is not None:
                     router.release_task(task["id"])
             finally:
                 self._controls.pop(task["id"], None)
@@ -264,6 +374,108 @@ class ChatJobs:
                 with self._stream_condition:
                     self._streams.pop(task["id"], None)
                     self._stream_condition.notify_all()
+
+    def _finish_project_scope(self, task, catalog, profiles=None, control=None):
+        try:
+            drained = self._workspace_drained(task["id"], catalog, profiles, control, task=task)
+            router = getattr(catalog, "router", None)
+            if drained and router is not None:
+                router.release_task(task["id"])
+            scope = self.projects.finish_task(task["id"], drained=drained)
+        except Exception as error:
+            # A cleanup failure cannot turn an unresolved scope into success.
+            task["workspace_error"] = str(error)
+            try:
+                self.projects.finish_task(task["id"], drained=False)
+            except Exception as retained_error:
+                task["workspace_error"] += "; " + str(retained_error)
+            scope = dict(status="UNKNOWN")
+        task["workspace_status"] = scope.get("status", "UNKNOWN")
+        if task["workspace_status"] != "FINISHED":
+            task["workspace_retention_reason"] = "调用、实例归属或临时文件清理尚未确认结束；保留工作区租约，实际释放后可重新核对。"
+        else:
+            task.pop("workspace_retention_reason", None)
+            task.pop("workspace_error", None)
+        self.store.save("task", task["id"], task)
+        return task["workspace_status"] == "FINISHED"
+
+    def _workspace_drained(self, identity, catalog, profiles=None, control=None, *, task=None):
+        """Read actual call and owner facts; thread termination is not a receipt."""
+        if control is not None:
+            with control.lock:
+                if control.request is not None or control.calls:
+                    return False
+        router = getattr(catalog, "router", None)
+        task = task if task is not None else self.store.get("task", identity) or {}
+        if task.get("python_calls") and (self.code_execution is None or not self.code_execution.is_drained(task)):
+            return False
+        calls = task.get("calls") or []
+        events = [item.get("event") or {} for item in task.get("events", [])
+                  if item.get("kind") == "capability_event"]
+        if calls or events:
+            instances = {item["instance_id"] for item in calls + events if item.get("instance_id")}
+            if not instances or router is None or not hasattr(router, "lock") or not hasattr(router, "instances"):
+                return False
+            with router.lock:
+                for instance in instances:
+                    record = router.instances.get(instance)
+                    if not record or record.get("state") == "UNKNOWN" or record.get("in_flight") != 0:
+                        return False
+                    # The prior controller's empty call map is not proof.
+                    if (task.get("workspace_controller") != self._workspace_controller
+                            and not (record.get("state") == "STOPPED" and record.get("released") is True)):
+                        return False
+        dispatcher = getattr(self.dispatch, "__self__", self.scheduler)
+        if dispatcher is not None and all(hasattr(dispatcher, name) for name in ("condition", "queue", "running")):
+            with dispatcher.condition:
+                if any(request.get("run_id") == identity for request in
+                       list(dispatcher.queue.values()) + list(dispatcher.running.values())):
+                    return False
+        runtime = self.runtime or getattr(getattr(router, "platform", None), "runtime", None)
+        if runtime is not None:
+            try:
+                if any(call.get("physical") != "RETIRED" for call in runtime.call("task_calls", identity)):
+                    return False
+            except Exception:
+                return False
+        if router is not None:
+            if not all(hasattr(router, name) for name in ("lock", "affinity", "instances")):
+                return False
+            with router.lock:
+                for (owner, _), instance_id in router.affinity.items():
+                    if owner != identity:
+                        continue
+                    record = router.instances.get(instance_id)
+                    if not record or record.get("state") == "UNKNOWN" or record.get("in_flight") != 0:
+                        return False
+        manager = getattr(profiles, "managed_services", None) or getattr(
+            getattr(router, "platform", None), "managed_services", None)
+        if manager is not None:
+            if not hasattr(manager, "lock") or not hasattr(manager, "leases"):
+                return False
+            with manager.lock:
+                if any(identity in leases for leases in manager.leases.values()):
+                    return False
+        return True
+
+    def reconcile_project_leases(self, project_id):
+        """Release retained scopes only after their worker ended and calls drained."""
+        if self.projects is None:
+            return []
+        reconciled = []
+        with self.projects.lock:
+            self.projects.get(project_id)
+            scopes = self.projects.task_scopes(project_id, unresolved_only=True)
+        for scope in scopes:
+            identity = scope["task_id"]
+            if scope.get("status") == "FINISHED" or identity in self._threads:
+                continue
+            task = self.store.get("task", identity)
+            if not task or task.get("status") in {"RUNNING", "CANCELLING"}:
+                continue
+            if self._finish_project_scope(task, self.catalog, self.profiles):
+                reconciled.append(identity)
+        return reconciled
 
     def cancel(self, identity):
         task = self.store.get("task", identity)

@@ -81,12 +81,12 @@ class RepositoryIntake:
             raise ValueError("Git repository operation failed")
         return result.stdout.strip()
 
-    def prepare(self, address, revision=None, entry=None, resources=None):
+    def prepare(self, address, revision=None, entry=None, resources=None, *, discover_entries=True):
         """Accept a local directory or Git URL without importing its source code.
 
         resources is an optional list of resource paths or metadata objects.
-        An omitted entry produces static candidates, rather than a selected
-        execution entry or a decomposition answer.
+        An omitted entry produces static candidates unless discovery is disabled
+        for capability generation, which reads the frozen repository on demand.
         """
         if not isinstance(address, str) or not address.strip():
             raise ValueError("provide a repository URL or local directory")
@@ -131,7 +131,7 @@ class RepositoryIntake:
         else:
             raise ValueError("local source directory does not exist")
 
-        structure = inventory_repository(root, excluded_roots=[self.home])
+        structure = inventory_repository(root, excluded_roots=[self.home], discover_entries=discover_entries)
         if resources is not None:
             if not isinstance(resources, list):
                 raise ValueError("resources must be a list of paths or metadata objects")
@@ -146,7 +146,7 @@ class RepositoryIntake:
                     structure["resources"].append(record)
                     known.add(record["path"])
         candidates = structure["entry_candidates"]
-        inferred = dict(status="STATIC_CANDIDATES", candidates=candidates,
+        inferred = dict(status="STATIC_CANDIDATES" if discover_entries else "NOT_REQUESTED", candidates=candidates,
                         selected=None, execution="NOT_RUN")
         name = root.name if not remote else Path(urlsplit(address).path.rstrip("/")).name.removesuffix(".git")
         return dict(id=identity, name=name or identity, address=address, root=str(root),

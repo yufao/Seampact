@@ -5,6 +5,7 @@ they verify execution and close, not a Docker build or measured GPU release.
 """
 
 import copy
+from contextlib import closing
 import importlib.util
 import json
 import sys
@@ -13,6 +14,7 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from queue import Queue
 from types import SimpleNamespace
 from unittest.mock import patch
 from urllib.request import Request, urlopen
@@ -21,20 +23,75 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from seampact.capability_contract import digest
-from seampact.scheduling.capability_scheduler import CapabilityScheduler, freeze_config, load_policy, policy_config_id
+from seampact.scheduling.capability_scheduler import (
+    CANDIDATE_DIM, FEATURE_SCHEMA, OBSERVATION_DIM, CapabilityScheduler, freeze_config, load_policy, policy_config_id)
 from seampact.scheduling.unified_objective import ResourceLedger, TaskLedger, freeze_objective
+from seampact.store import Store
 import test_capability_package as package_fixture
 
 wait_for = package_fixture.wait_for
 
 
-OBJECTIVE = dict(weights=dict(quality=1, delivery=1, latency=0.1, ram=0.2, vram=0.3),
-                 scales=dict(latency_s=10, ram_byte_s=100, vram_byte_s=200),
+OBJECTIVE = dict(weights=dict(quality=1, delivery=1, latency=0.1, ram=0.2, vram=0.3, api=0),
+                 scales=dict(latency_s=10, ram_byte_s=100, vram_byte_s=200, api_tokens=1),
                  quality_evaluator="fixture-score/1: already normalized [0,1]",
                  deadline_s=10, resource_source="reserved")
 
 
 class ObjectiveAccounting(unittest.TestCase):
+    def test_delayed_quality_settlement_preserves_frozen_costs_and_is_idempotent(self):
+        with tempfile.TemporaryDirectory() as folder, closing(Store(Path(folder) / "state.sqlite3")) as store:
+            stamp = [10.0]
+            tasks = TaskLedger(OBJECTIVE, clock=lambda: stamp[0])
+            for identity in ("first", "second"):
+                tasks.begin(identity)
+            stamp[0] = 12.0
+            tasks.terminal("first")
+            tasks.terminal("second")
+            stamp[0] = 15.0
+            first = tasks.finish("first", delivered=True, metrics=dict(api_tokens=21))
+            second = tasks.finish("second", delivered=False, status="FAILED", metrics=dict(api_tokens=8))
+            for row in (first, second):
+                row["session"] = "session"
+                store.save("capability_task_result", row["task_id"], row)
+            resources = ResourceLedger()
+            life = dict(instance_id="worker", generation=1, group_id="g", resident_ms=5000,
+                        start_s=10, end_s=15, released=True, end_observed=True)
+            envelopes = dict(g=dict(ram_bytes=10, vram_bytes=20, provenance="fixture"))
+            resources.freeze(life, envelopes, start_s=10, end_s=15)
+            frozen_resources = resources.summary([], envelopes, start_s=10, end_s=15)
+            scheduler = CapabilityScheduler.__new__(CapabilityScheduler)
+            scheduler.condition, scheduler.store, scheduler.tasks = threading.RLock(), store, tasks
+            scheduler.session = "session"
+            scheduler.workload = dict(id="workload", status="COMPLETE", updated=False,
+                                      finished=["first", "second"])
+            scheduler._status_locked = lambda: dict(objective=tasks.summary(copy.deepcopy(frozen_resources)))
+            before = scheduler._status_locked()["objective"]
+            before.update(config_id="config", policy_config_id="policy", session="session")
+            scheduler.workload["summary"] = copy.deepcopy(before)
+            before_first = copy.deepcopy(first)
+            receipt = scheduler.settle_quality("first", quality=True, metrics=dict(native_hard=True), evidence_id="e1")
+            after = scheduler.workload["summary"]
+            self.assertEqual(after["denominator"], before["denominator"])
+            for field in ("latency_s", "api_tokens", "api_observed_tokens", "undelivered"):
+                self.assertEqual(after["raw"][field], before["raw"][field])
+            self.assertEqual(after["resources"], before["resources"])
+            self.assertEqual(resources.summary([], envelopes, start_s=10, end_s=15), frozen_resources)
+            for field in ("arrived_s", "finished_s", "scored_s", "latency_s", "delivered", "status"):
+                self.assertEqual(receipt[field], before_first[field])
+            self.assertEqual(tasks.totals["quality_known"], 1)
+            self.assertEqual(tasks.totals["quality_sum"], 1)
+            self.assertEqual(scheduler.settle_quality("first", quality=True, metrics=dict(native_hard=True),
+                                                      evidence_id="e1"), receipt)
+            self.assertEqual(tasks.totals["quality_known"], 1)
+            self.assertEqual(tasks.totals["quality_sum"], 1)
+            with self.assertRaisesRegex(ValueError, "不能覆盖"):
+                scheduler.settle_quality("first", quality=False, metrics=dict(native_hard=False), evidence_id="e2")
+            scheduler.workload["updated"] = True
+            with self.assertRaisesRegex(ValueError, "未更新"):
+                scheduler.settle_quality("second", quality=False, evidence_id="e3")
+            self.assertIsNone(store.get("capability_task_result", "second")["quality"])
+
     def test_failure_and_late_delivery_remain_in_denominator(self):
         stamp = [100.0]
         ledger = TaskLedger(OBJECTIVE, clock=lambda: stamp[0])
@@ -42,9 +99,9 @@ class ObjectiveAccounting(unittest.TestCase):
             ledger.begin(task)
         stamp[0] = 102.0
         ledger.finish("success", delivered=True, quality=0.9)
-        ledger.finish("failure", delivered=False, status="FAILED")
+        ledger.finish("failure", delivered=False, status="FAILED", quality=0)
         stamp[0] = 112.0
-        late = ledger.finish("late", delivered=True, quality=1)
+        late = ledger.finish("late", delivered=True, quality=0)
         self.assertFalse(late["delivered"])
         resources = dict(reserved=dict(ram_byte_s=30, vram_byte_s=40))
         result = ledger.summary(resources)
@@ -65,6 +122,66 @@ class ObjectiveAccounting(unittest.TestCase):
         self.assertIsNone(result["utility"])
         self.assertFalse(result["training_ready"])
         self.assertEqual(ledger.active, {})
+
+    def test_business_terminal_excludes_scoring_and_unknown_failure_stays_unknown(self):
+        stamp = [10.0]
+        ledger = TaskLedger(OBJECTIVE, clock=lambda: stamp[0])
+        ledger.begin("task")
+        stamp[0] = 12.0
+        ledger.terminal("task")
+        stamp[0] = 20.0
+        ledger.terminal("task")  # Idempotent notification cannot move the end.
+        row = ledger.finish("task", delivered=False, status="FAILED")
+        self.assertEqual(row["latency_s"], 2)
+        self.assertEqual(row["finished_s"], 12)
+        self.assertEqual(row["scored_s"], 20)
+        self.assertIsNone(row["quality"])
+        self.assertFalse(ledger.summary(dict(reserved=dict(ram_byte_s=0, vram_byte_s=0)))["training_ready"])
+
+    def test_api_tokens_have_their_own_coefficient_and_unknown_is_not_zero(self):
+        objective = copy.deepcopy(OBJECTIVE)
+        objective["weights"]["api"] = 0.7  # Synthetic arithmetic fixture, not experiment coefficients.
+        objective["scales"]["api_tokens"] = 100
+        ledger = TaskLedger(objective, clock=lambda: 10.0)
+        ledger.begin("known")
+        ledger.finish("known", delivered=True, quality=1, metrics=dict(api_tokens=200))
+        resources = dict(reserved=dict(ram_byte_s=0, vram_byte_s=0))
+        summary = ledger.summary(resources)
+        self.assertEqual(summary["schema"], "capability-objective/2")
+        self.assertEqual(summary["api_usage_unit"], "tokens")
+        self.assertEqual(summary["raw"]["api_tokens"], 200)
+        self.assertAlmostEqual(summary["contributions"]["api"], -1.4)
+        self.assertTrue(summary["training_ready"])
+        ledger.begin("unknown-failed-request")
+        ledger.finish("unknown-failed-request", delivered=False, status="FAILED", quality=0,
+                      metrics=dict(api_tokens=None))
+        summary = ledger.summary(resources)
+        self.assertIsNone(summary["raw"]["api_tokens"])
+        self.assertEqual(summary["raw"]["api_observed_tokens"], 200)
+        self.assertEqual(summary["raw"]["api_known"], 1)
+        self.assertFalse(summary["training_ready"])
+        disabled = TaskLedger(OBJECTIVE, clock=lambda: 10.0)
+        disabled.begin("task")
+        disabled.finish("task", delivered=True, quality=1)
+        summary = disabled.summary(resources)
+        self.assertIsNone(summary["raw"]["api_tokens"])
+        self.assertEqual(summary["contributions"]["api"], 0)
+        self.assertTrue(summary["training_ready"])
+
+    def test_old_api_objective_and_noninteger_usage_are_rejected(self):
+        with self.assertRaisesRegex(ValueError, "旧目标"):
+            freeze_objective(dict(OBJECTIVE, schema="capability-objective/1"))
+        old = copy.deepcopy(OBJECTIVE)
+        del old["weights"]["api"]
+        del old["scales"]["api_tokens"]
+        with self.assertRaises(ValueError):
+            freeze_objective(old)
+        ledger = TaskLedger()
+        ledger.begin("task")
+        for value in (-1, 1.0, True, "1"):
+            with self.assertRaisesRegex(ValueError, "api_tokens"):
+                ledger.finish("task", delivered=True, metrics=dict(api_tokens=value))
+        self.assertIn("task", ledger.active)
 
     def test_shared_lifecycle_once_release_tail_and_partial_measurement(self):
         ledger = ResourceLedger()
@@ -119,8 +236,236 @@ class ObjectiveAccounting(unittest.TestCase):
             self.assertEqual(result["reserved"]["vram_byte_s"], 3000)
             self.assertEqual(result["released_instances"], 1)
 
+    def test_continuous_measured_cutoffs_telescope_and_missing_ranges_block(self):
+        ledger = ResourceLedger()
+        ledger.enable_intervals()
+        life = dict(instance_id="shared", generation=1, group_id="g", resident_ms=6000,
+                    start_s=0, end_s=6, released=False, start_observed=True, end_observed=True)
+        def interval(start, end, a, b):
+            return dict(source="measured", attribution="instance", instance_id="shared", generation=1,
+                        provenance="fixture real endpoints", start_s=start, end_s=end,
+                        ram_byte_s=(a + b) * (end - start) / 2, vram_byte_s=0,
+                        endpoints=[dict(at_s=start, ram_bytes=a, vram_bytes=0),
+                                   dict(at_s=end, ram_bytes=b, vram_bytes=0)])
+        first_row = interval(0, 4, 0, 8)
+        ledger.record([first_row])
+        ledger.summary([life], {}, start_s=0, end_s=6)
+        first = ledger.settlement("measured", {}, {}, end_s=6)
+        self.assertTrue(first["ready"])
+        self.assertEqual(first["coverage"][0]["deferred_s"], 2)
+        self.assertEqual(first["totals"]["ram_byte_s"], 16)
+        # A split uses the original slope, not the interval's average rate.
+        self.assertEqual(ledger.interval_amount(first_row, "ram_byte_s", 0, 1), 1)
+        self.assertEqual(ledger.interval_amount(first_row, "ram_byte_s", 1, 4), 15)
+        ledger.commit_settlement(first["cutoffs"])
+        self.assertEqual(ledger.interval_rows, [])
+        ledger.record([interval(4, 6, 8, 4)])
+        life.update(end_s=8, resident_ms=8000)
+        ledger.summary([life], {}, start_s=0, end_s=8)
+        second = ledger.settlement("measured", {}, first["cutoffs"], end_s=8)
+        self.assertTrue(second["ready"])
+        self.assertEqual(second["totals"]["ram_byte_s"], 12)
+        ledger.commit_settlement(second["cutoffs"])
+        ledger.record([interval(6, 8, 4, 0)])
+        life.update(released=True)
+        ledger.freeze(life, {}, start_s=0, end_s=8)
+        final = ledger.settlement("measured", {}, second["cutoffs"], end_s=8, final=True)
+        self.assertTrue(final["ready"])
+        self.assertEqual(sum(row["totals"]["ram_byte_s"] for row in (first, second, final)),
+                         ledger.summary([], {}, start_s=0, end_s=8)["measured"]["ram_byte_s"])
+        ledger.commit_settlement(final["cutoffs"])
+        self.assertEqual(ledger.interval_lifetimes, {})
+        missing = ResourceLedger()
+        missing.enable_intervals()
+        missing.record([interval(1, 4, 2, 8)])
+        missing.summary([dict(life, released=False)], {}, start_s=0, end_s=8)
+        self.assertFalse(missing.settlement("measured", {}, {}, end_s=8)["ready"])
+
 
 class ScopedMeasurement(unittest.TestCase):
+    def test_lifecycle_owns_start_stop_and_preserves_failed_boundary_probe(self):
+        from seampact.scheduling.capability_measurement import sample_instances
+        backend = "a" * 64
+        selected = dict(id="owned", group_id="g", generation=1, released=False,
+            handle=dict(kind="docker", container="worker", container_id=backend),
+            gpu_devices=["GPU-owned"], gpu_allocation=dict(status="VERIFIED"), resource_boundaries={})
+
+        class Controller:
+            lock = threading.RLock()
+            stops_in_progress = set()
+            instances = {"owned": selected}
+            def sample_resources(self, instance_ids=None):
+                return [dict(instance_id="owned", identity=backend + ":1", status="OBSERVED",
+                    memory_current_bytes=1024, memory_semantics="private_cgroup_v2")]
+
+        controller = Controller()
+        with patch("seampact.scheduling.capability_measurement._gpu_memory", return_value=(0, "fixture")), patch(
+                "seampact.scheduling.capability_measurement._run",
+                return_value=SimpleNamespace(returncode=0, stdout=backend + " owned")) as run:
+            self.assertEqual(sample_instances(controller, {"owned"}), [])
+            run.assert_not_called()
+            started = sample_instances(controller, {"owned"}, lifecycle_boundary=True)[0]
+        self.assertEqual(started["ram_bytes"], 1024)
+        selected["resource_boundaries"]["started"] = started
+        for stop_finished in (False, True):
+            controller.stops_in_progress.clear()
+            selected["released"] = False
+            def crosses_stop(instance):
+                if stop_finished:
+                    selected["released"] = True
+                else:
+                    controller.stops_in_progress.add("owned")
+                return None, "CONTAINER_HOST_PIDS_UNAVAILABLE"
+            with patch("seampact.scheduling.capability_measurement._gpu_memory", side_effect=crosses_stop), patch(
+                    "seampact.scheduling.capability_measurement._run",
+                    return_value=SimpleNamespace(returncode=0, stdout=backend + " owned")):
+                self.assertEqual(sample_instances(controller, {"owned"}), [])
+
+        selected["released"] = False
+        controller.stops_in_progress.add("owned")
+        with patch("seampact.scheduling.capability_measurement._gpu_memory",
+                   return_value=(None, "GPU_MEMORY_COUNTER_UNAVAILABLE")), patch(
+                "seampact.scheduling.capability_measurement._run",
+                return_value=SimpleNamespace(returncode=0, stdout=backend + " owned")) as run:
+            self.assertEqual(sample_instances(controller, {"owned"}), [])
+            run.assert_not_called()
+            boundary = sample_instances(controller, {"owned"}, lifecycle_boundary=True)[0]
+        self.assertEqual(boundary["ram_bytes"], 1024)
+        self.assertIsNone(boundary["vram_bytes"])
+        self.assertTrue(boundary["vram_bytes_blocked"])
+        self.assertEqual(boundary["vram_provenance"], "GPU_MEMORY_COUNTER_UNAVAILABLE")
+        # A mandatory started probe exception must record UNKNOWN, mark the
+        # lifecycle handoff complete, and allow later periodic observations.
+        from seampact.hosting.deployment import Deployments
+        selected.update(profile="capability-package-worker/1", backend="docker")
+        owner = Deployments.__new__(Deployments)
+        owner.lock, owner.instances = controller.lock, controller.instances
+        owner.platform = SimpleNamespace(execution=None)
+        events = []
+        owner._event = lambda record, kind, **value: events.append(value["sample"])
+        with patch("seampact.scheduling.capability_measurement.sample_instances", side_effect=RuntimeError("fixture")):
+            owner._resource_boundary(selected, "started")
+        self.assertIsNone(events[-1]["ram_bytes"])
+        self.assertIsNone(events[-1]["vram_bytes"])
+        self.assertTrue(events[-1]["vram_bytes_blocked"])
+        self.assertIs(selected["resource_boundaries"]["started"], events[-1])
+
+    def test_release_boundary_arriving_during_snapshot_is_consumed_before_freeze(self):
+        scheduler = CapabilityScheduler.__new__(CapabilityScheduler)
+        scheduler.condition = threading.Condition(threading.RLock())
+        scheduler.tracked, scheduler.groups, scheduler.owned = {"owned"}, {"g"}, {}
+        scheduler.measure_samples, scheduler.metric_samples = {}, {}
+        scheduler.started_wall, scheduler.session, scheduler.store = 100.0, "fixture", None
+        scheduler.config_id = "fixture"
+        scheduler._config = dict(measurement_interval_s=1.0, vram_source="nvml_process", resource_envelopes={})
+        scheduler.instance_events = Queue()
+        scheduler.resources = ResourceLedger()
+        scheduler.resources.record([dict(source="measured", attribution="instance", instance_id="owned",
+            generation=1, provenance="fixture", start_s=100.0, end_s=101.0, ram_byte_s=10, vram_byte_s=20)])
+        before = dict(instance_id="owned", generation=1, at_s=101.0, identity="backend:1",
+                      ram_bytes=10, vram_bytes=20, boundary="before_stop")
+        scheduler.measure_samples[("owned", 1)] = before
+        for field in ("ram_bytes", "vram_bytes"):
+            scheduler.metric_samples[("owned", 1, field)] = before
+        released = dict(before, at_s=102.0, ram_bytes=0, vram_bytes=0, boundary="released")
+        event = dict(group_id="g", instance_id="owned", generation=1, kind="resource_sample", sample=released)
+
+        class StopLock:
+            lock, pending = threading.RLock(), True
+            def __enter__(self):
+                self.lock.acquire()
+                if self.pending:
+                    self.pending = False
+                    scheduler.instance_events.put(event)
+            def __exit__(self, *args):
+                self.lock.release()
+
+        scheduler.deployments = SimpleNamespace(lock=StopLock(), _held=lambda row: not row["released"],
+            instances={"owned": dict(id="owned", group_id="g", generation=1, start_wall=100.0,
+                state="STOPPED", resource_release_observed_s=102.0, released=True)})
+        scheduler.record_resources = scheduler.resources.record
+        with scheduler.condition:
+            result = scheduler._resource_summary()
+        self.assertEqual(result["released_instances"], 1)
+        self.assertEqual(result["measured"]["unknown_count"], 0)
+        self.assertEqual(result["measured"]["ram_coverage"], 1.0)
+        self.assertEqual(result["measured"]["vram_coverage"], 1.0)
+
+    def test_real_adjacent_endpoints_allow_slow_probes_and_keep_unknown_barrier(self):
+        scheduler = CapabilityScheduler.__new__(CapabilityScheduler)
+        scheduler.tracked = {"owned"}
+        scheduler.measure_samples, scheduler.metric_samples = {}, {}
+        scheduler.started_wall = 100.0
+        scheduler._config = dict(measurement_interval_s=1.0, vram_source="nvml_process")
+        scheduler.deployments = SimpleNamespace(lock=threading.RLock(), instances={"owned": dict(
+            generation=1, start_wall=100.0, resource_release_observed_s=108.2, released=True)})
+        rows = []
+        scheduler.record_resources = rows.extend
+
+        def point(at_s, ram, vram, *, identity="backend:1", boundary=None):
+            scheduler._ingest_resource_sample(dict(instance_id="owned", generation=1,
+                at_s=at_s, identity=identity, boundary=boundary, ram_bytes=ram, vram_bytes=vram,
+                vram_bytes_blocked=True))
+
+        point(99.9, 0, 0, identity="unallocated:owned:1", boundary="before_create")
+        point(100.2, 0, 0, boundary="created")
+        point(103.4, 10, 20)
+        point(104.0, 10, None)
+        point(105.0, 20, 20)
+        point(108.2, 0, 0, boundary="released")
+        ledger = ResourceLedger()
+        ledger.record(rows)
+        life = dict(instance_id="owned", generation=1, group_id="g", resident_ms=8200,
+                    start_s=100.0, end_s=108.2, released=True)
+        measured = ledger.summary([life], {}, start_s=100.0, end_s=108.2)["measured"]
+        self.assertAlmostEqual(measured["ram_coverage"], 1.0)
+        self.assertIsNotNone(measured["ram_byte_s"])
+        self.assertIsNone(measured["vram_byte_s"])
+        self.assertLess(measured["vram_coverage"], 1.0)
+        self.assertAlmostEqual(measured["max_sample_span_s"], 3.2)
+        self.assertEqual(rows[0]["endpoints"][0]["at_s"], 99.9)
+        self.assertEqual(rows[0]["start_s"], 100.0)
+
+    def test_unmatched_or_unavailable_gpu_counters_are_not_zero(self):
+        from seampact.scheduling.capability_measurement import _gpu_memory
+        instance = dict(handle=dict(container="owned"), gpu_devices=["GPU-selected"],
+                        gpu_allocation=dict(status="VERIFIED"))
+        for counter in ("GPU-selected,999,100\n", "GPU-selected,12,[N/A]\n"):
+            replies = [SimpleNamespace(returncode=0, stdout="PID\n12\n"),
+                       SimpleNamespace(returncode=0, stdout=counter),
+                       SimpleNamespace(returncode=0, stdout="PID\n12\n")]
+            with patch("seampact.scheduling.capability_measurement._run", side_effect=replies) as run:
+                amount, _ = _gpu_memory(instance)
+                self.assertIsNone(amount)
+                self.assertEqual(run.call_args_list[1].args[0][:3], ["docker", "exec", "owned"])
+
+    def test_zero_boundary_requires_actual_created_pid_zero(self):
+        from seampact.observability.resource_observation import docker_zero_boundary
+        container = "a" * 64
+        instance = dict(id="owner", name="worker", generation=3, state="STARTING",
+                        handle=dict(container="worker", container_id=container))
+        observed = dict(id=container, running=True, pid=19, status="running", instance="owner")
+        with patch("seampact.observability.resource_observation.subprocess.run",
+                   return_value=SimpleNamespace(returncode=0, stdout=json.dumps(observed))):
+            self.assertIsNone(docker_zero_boundary(instance, "created"))
+        observed.update(running=False, pid=0, status="created")
+        with patch("seampact.observability.resource_observation.subprocess.run",
+                   return_value=SimpleNamespace(returncode=0, stdout=json.dumps(observed))):
+            point = docker_zero_boundary(instance, "created")
+            self.assertEqual(point["ram_bytes"], 0)
+            self.assertEqual(point["identity"], container + ":3")
+            self.assertEqual(point["proof"]["kind"], "created_container_verified_no_process")
+
+    def test_optional_allocator_snapshot_never_initializes_cuda(self):
+        from seampact.capability_worker import allocator_snapshot
+        fake = SimpleNamespace(cuda=SimpleNamespace(is_initialized=lambda: False,
+            memory_reserved=lambda *a: self.fail("allocator query initialized CUDA")))
+        with patch.dict(sys.modules, {"torch": fake}):
+            point = allocator_snapshot()
+        self.assertEqual(point["reserved_bytes"], 0)
+        self.assertFalse(point["initialized"])
+        self.assertFalse(point["includes_cuda_context"])
+
     def test_vram_excludes_other_container_pids_and_rejects_unstable_members(self):
         from seampact.scheduling.capability_measurement import _gpu_memory
         instance = dict(handle=dict(container="owned"), gpu_devices=["GPU-selected"],
@@ -141,6 +486,7 @@ class ScopedMeasurement(unittest.TestCase):
         from seampact.scheduling.capability_measurement import sample_instances
         selected = dict(id="owned", group_id="g", generation=1, released=False,
                         handle=dict(kind="docker", container="container"),
+                        resource_boundaries=dict(started=dict(at_s=0)),
                         gpu_devices=[], gpu_allocation=dict(status="VERIFIED"))
         class Controller:
             lock = threading.RLock()
@@ -163,14 +509,101 @@ class ScopedMeasurement(unittest.TestCase):
 
 @unittest.skipUnless(importlib.util.find_spec("torch"), "optional PyTorch dependency")
 class OptionalPPO(unittest.TestCase):
+    def test_continuous_interval_bootstraps_the_actual_next_choice(self):
+        from seampact.scheduling.capability_ppo import CandidatePPO
+        policy = CandidatePPO("config", OBJECTIVE, training=True,
+                              config=dict(hidden_sizes=[4], epochs=1, batch_size=1))
+        with policy.learner.torch.no_grad():
+            for parameter in policy.learner.networks["value"].parameters():
+                parameter.zero_()
+            policy.learner.networks["value"][-1].bias.fill_(3)
+        candidates = [dict(features=[0.0] * CANDIDATE_DIM), dict(features=[1.0] * CANDIDATE_DIM)]
+        decision = dict(config_id="config", feature_schema=FEATURE_SCHEMA, session="stream",
+                        observation=[0.0] * OBSERVATION_DIM, candidates=candidates)
+        decision["selection"] = policy.choose(decision["observation"], candidates)
+        bootstrap = dict(observation=[1.0] * OBSERVATION_DIM, candidates=candidates)
+        summary = dict(training_ready=True, objective_id=policy.identity["objective_id"], utility=2,
+                       policy_config_id="config", session="stream", interval_id="one")
+        observed, original = [], policy.learner.observe
+        def capture(row):
+            observed.append(copy.deepcopy(row))
+            original(row)
+        with patch.object(policy.learner, "observe", side_effect=capture):
+            result = policy.update_interval([decision], dict(before_first=0, after_decisions=[2]), summary,
+                                            bootstrap=bootstrap)
+        self.assertFalse(observed[-1]["terminated"])
+        self.assertTrue(observed[-1]["truncated"])
+        self.assertEqual(observed[-1]["next_state"], bootstrap["observation"])
+        self.assertAlmostEqual(result["value_loss"], 4.0, places=5)  # (V=3 - (r=2 + Vnext=3))²
+        self.assertEqual(policy.choose(bootstrap["observation"], candidates)["policy_version"], 1)
+        with self.assertRaisesRegex(ValueError, "重复"):
+            policy.update_interval([decision], dict(before_first=0, after_decisions=[2]), summary, bootstrap=bootstrap)
+
+    def test_continuous_updates_preserve_instances_and_final_utility(self):
+        with tempfile.TemporaryDirectory() as folder, closing(Store(Path(folder) / "state.sqlite3")) as store:
+            deployment = SimpleNamespace(lock=threading.RLock(), instances={}, affinity={},
+                                         _held=lambda row: row.get("released") is not True,
+                                         release_task=lambda task_id: None)
+            scheduler = CapabilityScheduler(SimpleNamespace(store=store), deployment, store=store,
+                config=dict(objective=OBJECTIVE,
+                            resource_envelopes=dict(g=dict(ram_bytes=10, vram_bytes=20, provenance="fixture"))))
+            scheduler.close()  # Deterministic accounting below needs no background probes.
+            scheduler.closed = False
+            scheduler.start_workload("stream", ["first", "second", "third"], training=True, continuous=True,
+                                     learner_config=dict(hidden_sizes=[4], epochs=1, batch_size=1))
+            scheduler.begin("first")
+            scheduler.choose_optional("first", "input_received", [dict(name="optional")])
+            first = scheduler.finish("first", delivered=True, metrics=dict(api_tokens=3))
+            start = time.time()
+            deployment.instances["held"] = dict(generation=1, group_id="g", start_wall=start,
+                                                 released=False, state="READY")
+            scheduler.tracked.add("held")
+            self.assertFalse(scheduler.request_update(minimum_tasks=1)["pending"])
+            receipt = scheduler.settle_quality("first", quality=True, evidence_id="native-first")
+            self.assertEqual(receipt["finished_s"], first["finished_s"])
+            self.assertTrue(scheduler.request_update(minimum_tasks=1)["pending"])
+            self.assertFalse(scheduler.force_drain)
+            scheduler.begin("second")
+            with patch.object(scheduler.resources, "settlement", return_value=dict(ready=False, unknown=["gap"])):
+                scheduler.choose_optional("second", "input_received", [dict(name="optional")])
+            # Once a pending update was deferred, this active task must finish
+            # and supply its real score before any of its choices are consumed.
+            scheduler.choose_optional("second", "before_tool", [dict(name="optional")])
+            self.assertEqual(scheduler.workload["updates"], [])
+            self.assertEqual(scheduler.policy.learner.policy_version, 0)
+            scheduler.finish("second", delivered=False, quality=0, metrics=dict(api_tokens=4))
+            scheduler.begin("third")
+            scheduler.choose_optional("third", "input_received", [dict(name="optional")])
+            self.assertEqual(scheduler.workload["updated_tasks"], ["first", "second"])
+            self.assertTrue(scheduler.workload["updates"][0]["updated"])
+            self.assertEqual(scheduler.decisions[-1]["selection"]["policy_version"], 1)
+            self.assertFalse(deployment.instances["held"]["released"])
+            self.assertFalse(scheduler.force_drain)
+            self.assertEqual(scheduler.settle_quality("first", quality=True, evidence_id="native-first"), receipt)
+            scheduler.finish("third", delivered=True, quality=1, metrics=dict(api_tokens=5))
+            release = time.time()
+            deployment.instances["held"].update(released=True, state="STOPPED", stopped_wall=release,
+                                                resource_release_observed_s=release)
+            finished = scheduler.finish_workload(update=True)
+            self.assertEqual(finished["status"], "COMPLETE")
+            self.assertEqual(finished["updated_tasks"], ["first", "second", "third"])
+            self.assertAlmostEqual(sum(item["utility"] for item in finished["updates"]),
+                                   finished["summary"]["utility"])
+            for metric in ("ram_byte_s", "vram_byte_s"):
+                self.assertAlmostEqual(sum(item["resource_totals"][metric] for item in finished["updates"]),
+                                       finished["summary"]["resources"]["reserved"][metric])
+            self.assertTrue(finished["updates"][-1]["terminated"])
+            with self.assertRaisesRegex(ValueError, "重复"):
+                scheduler.finish_workload(update=True)
+
     def test_finite_workload_update_atomic_checkpoint_and_old_schema_rejection(self):
         from seampact.scheduling.capability_ppo import CandidatePPO
         policy = CandidatePPO("frozen-config", OBJECTIVE, training=True,
                               config=dict(hidden_sizes=[8], epochs=1, batch_size=1))
-        candidates = [dict(id="one", features=[1.0] + [0.0] * 11),
-                      dict(id="two", features=[0.0, 1.0] + [0.0] * 10)]
-        decision = dict(config_id="frozen-config", feature_schema="capability-event-features/1", session="workload",
-                        observation=[2.0, 0.0, 1.0, 4.0], candidates=candidates)
+        candidates = [dict(id="one", features=[1.0] + [0.0] * (CANDIDATE_DIM - 1)),
+                      dict(id="two", features=[0.0, 1.0] + [0.0] * (CANDIDATE_DIM - 2))]
+        decision = dict(config_id="frozen-config", feature_schema=FEATURE_SCHEMA, session="workload",
+                        observation=[2.0, 0.0, 1.0, 4.0] + [0.0] * (OBSERVATION_DIM - 4), candidates=candidates)
         decision["selection"] = policy.choose(decision["observation"], candidates)
         summary = dict(training_ready=True, complete=True, objective_id=policy.identity["objective_id"], utility=0.8,
                        policy_config_id="frozen-config", session="workload")
@@ -206,7 +639,8 @@ class OptionalPPO(unittest.TestCase):
             config = freeze_config(dict(objective=OBJECTIVE,
                 policy=dict(kind="ppo", checkpoint=str(path), learner_config=settings)))
             loaded = load_policy(config)
-            selection = loaded.choose([2, 0, 0, 4], [dict(features=[0.0] * 12), dict(features=[1.0] * 12)])
+            selection = loaded.choose([2, 0, 0, 4] + [0] * (OBSERVATION_DIM - 4),
+                                      [dict(features=[0.0] * CANDIDATE_DIM), dict(features=[1.0] * CANDIDATE_DIM)])
             self.assertIn(selection["index"], (0, 1))
             self.assertFalse(loaded.training)
             with self.assertRaises(ValueError):
@@ -266,10 +700,88 @@ class RealWorkerScheduler(unittest.TestCase):
             scheduler.invoke(units["count_words"]["id"], dict(text="late"), run_id="task")
         state = scheduler.status()
         self.assertEqual(state["objective"]["denominator"], 1)
-        self.assertEqual(state["objective"]["raw"]["quality_sum"], 0)
+        self.assertIsNone(state["objective"]["raw"]["quality_sum"])
         self.assertEqual(state["counts"]["forced_actions"], 2)
         self.assertEqual(state["recent_decisions"], [])
         self.assertEqual(scheduler.tasks.active, {})
+
+    def test_same_decide_selects_actual_hook_call_retain_and_final_drain(self):
+        units = self.prepared(auto_start=True)
+        scheduler = self.scheduler(policy=dict(kind="rule", optional_hooks={"before_tool": ["count"]}, retention="keep"))
+        scheduler.start_workload("hooks-and-retain", ["task"])
+        scheduler.begin("task")
+        options = [dict(name="required", required=True), dict(name="count", unit_id=units["count_words"]["id"])]
+        choice = scheduler.choose_optional("task", "before_tool", options, dict(text_chars=10))
+        self.assertEqual(choice["hook"], "count")
+        result = scheduler.invoke(choice["unit_id"], dict(text="alpha beta"), run_id="task")
+        self.assertEqual(result["output"]["words"], 2)
+        scheduler.business_terminal("task")
+        scheduler.finish("task", delivered=True, quality=1)
+        wait_for(lambda: scheduler.status()["counts"].get("retains", 0) > 0, timeout=5)
+        snapshot = scheduler.status()
+        self.assertTrue(any(row["event"] == "before_tool" for row in snapshot["recent_decisions"]))
+        self.assertTrue(any(row["event"] == "resource" for row in snapshot["recent_decisions"]))
+        self.assertFalse(any(candidate.get("hook") == "required" for row in snapshot["recent_decisions"] for candidate in row["candidates"]))
+        before = snapshot["counts"]["decisions"]
+        scheduler.finish_workload()
+        wait_for(lambda: self.workers[0][0].closed, timeout=5)
+        self.assertEqual(scheduler.status()["counts"]["decisions"], before)
+        # The HTTP fixture cannot confirm Docker release; it must remain untrainable.
+        self.assertFalse(scheduler.status()["objective"]["training_ready"])
+
+    def test_interactive_chat_after_evaluation_preserves_frozen_results(self):
+        scheduler = self.scheduler()
+        scheduler.start_workload("frozen-eval", ["test-case"])
+        with self.assertRaises(ValueError):
+            scheduler.begin("online")
+        scheduler.begin("test-case")
+        scheduler.finish("test-case", delivered=True, quality=1)
+        frozen = scheduler.finish_workload()
+        self.assertEqual(frozen["status"], "COMPLETE")
+        scheduler.begin("online")
+        self.assertNotEqual(scheduler.session, frozen["session"])
+        self.assertEqual(scheduler.store.get("capability_workload", "frozen-eval"), frozen)
+        self.assertEqual(scheduler.status()["objective"]["denominator"], 1)
+
+    def test_choose_next_observes_updated_feedback_without_executing_hooks(self):
+        scheduler = self.scheduler(policy=dict(kind="rule", optional_hooks={"before_tool": ["light", "heavy"]}))
+        scheduler.begin("task")
+        observed = []
+        def observe(event, payload):
+            observed.append(copy.deepcopy(payload))
+            return dict(has_evidence=payload.get("checked", False), checks_run=int(payload.get("checked", False)),
+                        risk_signal=0.8 if payload.get("checked") else 0)
+        selector = scheduler.optional_selector("task", observe=observe)
+        light, heavy = (SimpleNamespace(name=name, required=False) for name in ("light", "heavy"))
+        required = SimpleNamespace(name="required", required=True)
+        self.assertEqual(selector.choose_next("before_tool", {}, [required, light, heavy])["hook"], "light")
+        self.assertEqual(selector.choose_next("before_tool", dict(checked=True), [heavy])["hook"], "heavy")
+        self.assertEqual(observed, [{}, dict(checked=True)])
+        decisions = scheduler.status()["recent_decisions"]
+        self.assertEqual([row["observation"][10] for row in decisions], [0, 1])
+        self.assertEqual([row["observation"][-2:] for row in decisions], [[0, 0], [1, 0.8]])
+        self.assertFalse(any(candidate.get("hook") == "required" for row in decisions for candidate in row["candidates"]))
+        scheduler.finish("task", delivered=True)
+
+    @unittest.skipUnless(importlib.util.find_spec("torch"), "optional PyTorch dependency")
+    def test_explicit_fresh_workload_settles_real_decision_once(self):
+        scheduler = self.scheduler(objective=OBJECTIVE)
+        scheduler.start_workload("fresh", ["task"], training=True,
+                                 learner_config=dict(hidden_sizes=[8], epochs=1, batch_size=1))
+        scheduler.begin("task")
+        scheduler.choose_optional("task", "input_received", [dict(name="optional")])
+        scheduler.business_terminal("task")
+        scheduler.finish("task", delivered=True, quality=1)
+        complete = scheduler.finish_workload()
+        self.assertEqual(complete["status"], "COMPLETE")
+        self.assertTrue(complete["summary"]["training_ready"])
+        # No managed instance was allocated: its measured reservation sum is truly zero.
+        utility = complete["summary"]["utility"]
+        settled = scheduler.finish_workload(settlements=dict(before_first=0, after_decisions=[utility]), update=True)
+        self.assertTrue(settled["update"]["updated"])
+        self.assertEqual(settled["update"]["decisions"], 1)
+        with self.assertRaisesRegex(ValueError, "重复"):
+            scheduler.finish_workload(settlements=dict(before_first=0, after_decisions=[utility]), update=True)
 
     def test_on_demand_start_idle_close_and_unconfirmed_release_tail(self):
         units = self.prepared(auto_start=True)

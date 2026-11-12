@@ -792,6 +792,52 @@ class Deployments:
     def close(self):
         self.closed.set()
 
+    def resource_health(self, instance):
+        health = json_request(instance["endpoint"] + "/health", timeout=10)
+        self._check_identity(instance, health)
+        return health
+
+    def _resource_boundary(self, record, phase):
+        """Observe outside scheduler locks; deliver evidence through its event queue."""
+        if record.get("profile") != capability_hosting.WORKER_PROFILE or record.get("backend") != "docker":
+            return None
+        try:
+            if phase in {"before_create", "created", "released"}:
+                from seampact.observability.resource_observation import docker_zero_boundary
+                sample = docker_zero_boundary(record, phase)
+            else:
+                from seampact.scheduling.capability_measurement import sample_instances
+                execution = getattr(self.platform, "execution", None)
+                source = execution.config.get("vram_source", "nvml_process") if execution else "nvml_process"
+                rows = sample_instances(self, {record["id"]}, vram_source=source, lifecycle_boundary=True)
+                if phase in {"started", "before_stop"} and not rows:
+                    raise RuntimeError(phase + " resource probe produced no sample")
+                sample = rows[0] if rows else None
+                if sample:
+                    sample["boundary"] = phase
+            if sample is not None:
+                with self.lock:
+                    record.setdefault("resource_boundaries", {})[phase] = sample
+                    if phase == "released":
+                        record["resource_release_observed_s"] = sample["at_s"]
+                    if record["id"] in self.instances:
+                        self._event(record, "resource_sample", sample=sample)
+            return sample
+        except Exception as error:
+            with self.lock:
+                record["resource_observation_error"] = type(error).__name__
+                if phase in {"started", "before_stop"} and record["id"] in self.instances:
+                    # Failure of the mandatory lifecycle probe is a real
+                    # unknown boundary; periodic probes must not hide it.
+                    sample = dict(instance_id=record["id"], generation=record["generation"],
+                        identity=None, at_s=time.time(), boundary=phase, ram_bytes=None, vram_bytes=None,
+                        ram_bytes_blocked=True, vram_bytes_blocked=True,
+                        ram_provenance="lifecycle_probe_failed:" + type(error).__name__,
+                        vram_provenance="lifecycle_probe_failed:" + type(error).__name__)
+                    record.setdefault("resource_boundaries", {})[phase] = sample
+                    self._event(record, "resource_sample", sample=sample)
+            return None
+
     def controller_state(self):
         with self.lock:
             return dict(session=self.session, error=self.controller_error,
@@ -852,6 +898,10 @@ class Deployments:
         configured = self.platform.store.get("runtime_group_gpu", identity)
         source = "group" if configured is not None else "backend"
         selected = configured["devices"] if configured is not None else self.backend().get("gpus")
+        group = self.platform.store.get("runtime_group", identity)
+        if configured is None and group and group.get("kind") == capability_hosting.GROUP_KIND:
+            if capability_hosting.default_gpu_selection(group) == []:
+                selected, source = [], "capability"
         if configured is not None and not probe:
             return configured
         cached = self.platform.store.get("runtime_gpu_observation", identity)
@@ -1356,7 +1406,15 @@ class Deployments:
 
     def export(self, identity, body):
         with self.platform.source_lock, self.lock:
-            return self._export(identity, body)
+            group = self._group(identity)
+            if group.get("kind") != capability_hosting.GROUP_KIND:
+                return self._export(identity, body)
+            self._artifact_guard(identity)
+            frozen = copy.deepcopy(group)
+        # Large capability packages are verified, copied and archived outside
+        # the controller lock; status and unrelated instances remain readable.
+        # export_artifact rechecks identity and admission before committing.
+        return capability_hosting.export_artifact(self, frozen, body)
 
     def _export(self, identity, body):
         self._artifact_guard(identity)
@@ -1617,19 +1675,29 @@ class Deployments:
                 binding_fingerprint=artifact["binding_fingerprint"], image=reference,
                 image_id=(artifact.get("build") or {}).get("image_id"), backend=config["kind"], origin="PLATFORM_STARTED",
                 run_id=run_id, state="UNDEPLOYED", desired="RUNNING", accepting=False, in_flight=0, units=[],
-                initialization={}, created_at=now(), start_wall=time.time(), events=[])
+                initialization={}, created_at=now(), events=[])
             if allocation is not None:
                 record.update(gpu_devices=allocation["devices"], gpu_allocation=copy.deepcopy(allocation))
             if frozen:
                 record.update(**frozen, startup_kind="COLD_START", model_load_ms=None)
+            initial_sample = self._resource_boundary(record, "before_create")
+            record["start_wall"] = time.time()
             self.instances[record["id"]] = record
             self._event(record, "start_requested", replica=replica)
+            if initial_sample is not None:
+                self._event(record, "resource_sample", sample=initial_sample)
         birth_token = None
         if group.get('host', {}).get('structure_entries'):
             from seampact.hosting.value_conditioned_birth import before_start
             birth_token = before_start(self, record, artifact, config, reference)
-        result = (backends.start(record, reference, artifact["folder"], config, credential_env=credentials) if credentials else
-                  backends.start(record, reference, artifact["folder"], config))
+        def lifecycle(phase, handle):
+            with self.lock:
+                record["handle"] = copy.deepcopy(handle)
+            self._resource_boundary(record, phase)
+        lifecycle_options = ({"lifecycle": lifecycle} if record["profile"] == capability_hosting.WORKER_PROFILE
+                             and config["kind"] == "docker" else {})
+        result = backends.start(record, reference, artifact["folder"], config,
+                                **({"credential_env": credentials} if credentials else {}), **lifecycle_options)
         if birth_token is not None:
             from seampact.hosting.value_conditioned_birth import confirm_start
             confirm_start(self, birth_token, result)
@@ -2034,7 +2102,10 @@ class Deployments:
                 if item.get("retention_scope_id"):
                     images = self.platform.images
                     images.engine(images.get(item["retention_scope_id"])["engine"])
+                self._resource_boundary(item, "before_stop")
                 result = backends.stop(item, self.backend())
+                if result["status"] == "STOPPED":
+                    self._resource_boundary(item, "released")
             except ValueError as error:
                 result = dict(status="STOP_PENDING", reason=str(error))
         elif item.get("backend") in {"docker", "kubernetes"}:

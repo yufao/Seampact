@@ -1,0 +1,22 @@
+# Build with separate named contexts for public scorer scripts and the verified
+# SpreadsheetBench checkout. No private question, answer or output enters image.
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+USER root
+ARG LIBREOFFICE_CALC_VERSION
+ENV DEBIAN_FRONTEND=noninteractive
+RUN test -n "${LIBREOFFICE_CALC_VERSION}" \
+    && apt-get update \
+    && apt-get install --no-install-recommends -y "libreoffice-calc=${LIBREOFFICE_CALC_VERSION}" \
+    && rm -rf /var/lib/apt/lists/*
+RUN python -m pip install --no-cache-dir --disable-pip-version-check \
+        openpyxl==3.1.3 numpy==1.26.4 tqdm==4.66.3 \
+    && python -m pip check
+WORKDIR /opt/grader
+COPY --from=grader_upstream /evaluation /opt/grader/upstream/evaluation
+COPY --from=grader_code /score_office_spreadsheet.py /freeze_spreadsheet_office.py /opt/grader/
+COPY --from=grader_code /validate_office_spreadsheet_grader.py /opt/grader/validate_synthetic.py
+RUN python -m pip freeze --all > /opt/grader/python-dependencies.lock \
+    && dpkg-query -W > /opt/grader/debian-dependencies.lock
+ENV PYTHONDONTWRITEBYTECODE=1
+ENTRYPOINT ["python", "-B", "/opt/grader/score_office_spreadsheet.py"]

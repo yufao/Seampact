@@ -15,6 +15,7 @@ import time
 import unittest
 import uuid
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from seampact.capability_contract import (
@@ -289,6 +290,44 @@ class PackageLifecycle(unittest.TestCase):
         wait_for(lambda: worker.closed, message="adapter was not closed after draining")
         self.assertEqual(worker.closed, dict(status="CLOSED"))
         self.assertFalse(worker.accepting)
+
+    def test_export_releases_controller_lock_and_rejects_changed_installation(self):
+        self.install()
+        entered, release = threading.Event(), threading.Event()
+        package = self.platform.capabilities.package
+        result = {}
+
+        def paused_package(identity):
+            if threading.current_thread().name == "test-package-export":
+                entered.set()
+                if not release.wait(5):
+                    raise RuntimeError("test export wait expired")
+            return package(identity)
+
+        def export():
+            try:
+                result["artifact"] = self.platform.deployments.export(self.group, {})
+            except Exception as error:
+                result["error"] = error
+
+        with patch.object(self.platform.capabilities, "package", side_effect=paused_package):
+            worker = threading.Thread(target=export, name="test-package-export")
+            worker.start()
+            self.assertTrue(entered.wait(2))
+            try:
+                available = self.platform.deployments.lock.acquire(timeout=0.5)
+                if available:
+                    self.platform.deployments.lock.release()
+                self.platform.capabilities.bind(self.group, dict(greeting=dict(form="value", value="changed")))
+            finally:
+                release.set()
+                worker.join(5)
+        self.assertTrue(available, "package I/O must not hold the controller lock")
+        self.assertFalse(worker.is_alive())
+        self.assertIsInstance(result.get("error"), ValueError)
+        self.assertIn("安装已改变", str(result["error"]))
+        self.assertNotIn("artifact", result)
+        self.assertIsNone(self.platform.store.get("deployment", self.group))
 
     def test_concurrency_limit_and_cancellation_states(self):
         self.install()

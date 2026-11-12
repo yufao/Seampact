@@ -47,6 +47,55 @@ def number(value):
         return None
 
 
+def docker_zero_boundary(instance, phase):
+    """A zero endpoint requires observed absence, or a created PID=0 object.
+
+    Never use controller STARTING/STOPPED labels as evidence. The returned
+    timestamp belongs to the real backend probe; lifecycle timestamps stay intact.
+    """
+    handle = instance.get("handle") or {}
+    name = handle.get("container") or "seampact-" + instance["name"]
+    container_id = handle.get("container_id")
+    try:
+        if phase == "before_create":
+            command = ["docker", "ps", "-a", "--filter", "name=^/" + re.escape(name) + "$", "--format", "{{.ID}}"]
+            result = subprocess.run(command, capture_output=True, text=True, timeout=10, check=False)
+            if result.returncode or result.stdout.strip():
+                return None
+            proof = dict(kind="successful_backend_query_name_absent", container=name)
+            identity = "unallocated:" + instance["id"] + ":" + str(instance["generation"])
+        elif phase == "created":
+            if not isinstance(container_id, str) or not re.fullmatch(r"[0-9a-f]{64}", container_id):
+                return None
+            template = ('{"id":{{json .Id}},"running":{{json .State.Running}},"pid":{{.State.Pid}},'
+                        '"status":{{json .State.Status}},"instance":{{json (index .Config.Labels "seampact.instance")}}}')
+            result = subprocess.run(["docker", "inspect", "--format", template, container_id],
+                                    capture_output=True, text=True, timeout=10, check=False)
+            proof = json.loads(result.stdout) if result.returncode == 0 else {}
+            if (proof.get("id") != container_id or proof.get("instance") != instance["id"]
+                    or proof.get("running") is not False or proof.get("pid") != 0 or proof.get("status") != "created"):
+                return None
+            proof["kind"] = "created_container_verified_no_process"
+            identity = container_id + ":" + str(instance["generation"])
+        elif phase == "released":
+            if not isinstance(container_id, str) or not re.fullmatch(r"[0-9a-f]{64}", container_id):
+                return None
+            result = subprocess.run(["docker", "ps", "-a", "--filter", "id=" + container_id, "--format", "{{.ID}}"],
+                                    capture_output=True, text=True, timeout=10, check=False)
+            if result.returncode or result.stdout.strip():
+                return None
+            proof = dict(kind="immutable_container_id_confirmed_absent", container_id=container_id)
+            identity = container_id + ":" + str(instance["generation"])
+        else:
+            raise ValueError("unsupported zero boundary")
+        return dict(instance_id=instance["id"], generation=instance["generation"], identity=identity,
+                    at_s=time.time(), ram_bytes=0.0, vram_bytes=0.0, boundary=phase, proof=proof,
+                    ram_provenance="observed_backend_no_worker_process",
+                    vram_provenance="observed_backend_no_worker_process")
+    except (OSError, ValueError, KeyError, subprocess.TimeoutExpired):
+        return None
+
+
 def query(fields, uuids):
     # Both queries are restricted at the source; filtering below is a second guard.
     if not uuids:

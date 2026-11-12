@@ -315,6 +315,17 @@ class CapabilityCatalog:
     def tools(self):
         return [tool_definition(unit["tool_name"], unit["capability"]) for unit in self.callable_units()]
 
+    def tools_for_project(self, project_id):
+        """Offer only global capabilities and those bound to this project."""
+        offered = []
+        for unit in self.callable_units():
+            group = self._group(unit["runtime_group"])
+            owners = {binding["project_id"] for binding in group.get("bindings", {}).values()
+                      if binding.get("form") == "project"}
+            if not owners or owners == {project_id}:
+                offered.append(tool_definition(unit["tool_name"], unit["capability"]))
+        return offered
+
     def name_to_id(self, name):
         found = [unit["id"] for unit in self.callable_units() if unit["tool_name"] == name]
         if len(found) != 1:

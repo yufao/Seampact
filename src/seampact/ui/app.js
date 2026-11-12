@@ -18,6 +18,16 @@ let chatRestoring = false;
 let chatLoadVersion = 0;
 let historySearchVersion = 0;
 let historySearchTimer;
+let projects = [];
+let projectApplication = null;
+let projectApplicationVersion = 0;
+let projectApplicationBusy = false;
+let projectDemoBusy = false;
+let privacyDemoCases = null;
+let activeProjectId = 'default';
+let projectFilePath = '';
+let projectFileVersion = 0;
+let projectFileBusy = false;
 const preparationSummaries = new Map();
 const preparationErrors = new Map();
 const analysisSubmitting = new Set();
@@ -587,10 +597,220 @@ function setChatAddress(identity, push = false) {
   for (const link of document.querySelectorAll('.chat-navigation')) link.href = url;
 }
 
+function renderProjectSelection() {
+  const select = $('project-select');
+  select.replaceChildren();
+  for (const project of projects) {
+    if (project.archived && project.id !== activeProjectId) continue;
+    const option = node('option', project.name); option.value = project.id;
+    select.append(option);
+  }
+  if (![...select.options].some(option => option.value === activeProjectId)) {
+    const option = node('option', activeProjectId === 'default' ? '默认项目' : activeProjectId);
+    option.value = activeProjectId; select.append(option);
+  }
+  select.value = activeProjectId;
+  $('project-demo-case').value = '';
+  void loadProjectApplication();
+}
+
+async function loadPrivacyDemoCases() {
+  if (privacyDemoCases !== null) return;
+  try {
+    const result = await api('/api/experiments/office/privacy');
+    privacyDemoCases = result.cases || [];
+    const select = $('project-demo-case');
+    for (const item of privacyDemoCases) {
+      const option = node('option', item.title + (item.variant === 'risk' ? ' · 风险配对' : ' · 正常配对'));
+      option.value = item.id; select.append(option);
+    }
+    updateComposer();
+  } catch (error) { $('project-demo-feedback').textContent = error.message; }
+}
+
+async function startPrivacyDemo() {
+  const caseId = $('project-demo-case').value;
+  if (!caseId || projectDemoBusy || pendingTask || chatRestoring || projectFileBusy || projectApplicationBusy ||
+      !connected || !isReady(state?.models?.chat)) return;
+  const projectId = activeProjectId;
+  projectDemoBusy = true; chatRestoring = true; updateComposer();
+  $('project-demo-feedback').textContent = '正在建立本项目的模拟任务…';
+  try {
+    const result = await api('/api/experiments/office/privacy', {project_id: projectId, case_id: caseId, demo: true});
+    if (!result.task_id || !result.conversation_id) throw new Error('平台未返回任务和会话标识');
+    chatRestoring = false;
+    await loadConversation(result.conversation_id, true);
+    $('project-demo-feedback').textContent = '模拟任务已发起，交付回执保存在此会话工作区；完整检查与评分见任务详情。';
+    await refresh();
+  } catch (error) { $('project-demo-feedback').textContent = error.message; }
+  finally { projectDemoBusy = false; chatRestoring = false; updateComposer(); }
+}
+
+function renderProjectApplication() {
+  const root = $('project-library-list');
+  const current = projectApplication?.application?.project_id === activeProjectId ? projectApplication : null;
+  root.replaceChildren();
+  if (!current) { root.append(node('p', '正在读取本项目的库。', 'card-note')); return; }
+  const archived = projects.find(project => project.id === activeProjectId)?.archived;
+  const libraries = current.libraries || [];
+  $('project-application-summary').textContent = '· ' + libraries.filter(item => item.enabled).length + ' 个已启用';
+  for (const library of libraries) {
+    const row = node('label', undefined, 'project-library-row');
+    const checkbox = node('input'); checkbox.type = 'checkbox'; checkbox.checked = library.enabled;
+    checkbox.disabled = projectApplicationBusy || archived || !library.project_eligible;
+    checkbox.onchange = () => {
+      const enabled = libraries.filter(item => item.enabled && item.group_id !== library.group_id).map(item => item.group_id);
+      if (checkbox.checked) enabled.push(library.group_id);
+      void saveProjectApplication({enabled_groups: enabled});
+    };
+    const label = node('span'); label.append(node('strong', library.name));
+    const status = !library.project_eligible ? '资源属于其他项目' : !library.enabled ? '后续任务停用' :
+      library.callable_count + '/' + library.capability_count + ' 项能力可调用';
+    label.append(node('small', status + (library.enabled && library.availability?.reason ? ' · ' + library.availability.reason : '')));
+    row.append(checkbox, label); root.append(row);
+  }
+  if (!libraries.length) root.append(node('p', '尚未安装库，可在“来源与能力”中接入。', 'card-note'));
+  const effective = current.application.effective_bindings || {};
+  const pending = (current.application.binding_status || []).filter(item => item.status !== 'ENABLED');
+  $('project-application-bindings').textContent = '办公检查绑定：' + Object.keys(effective).length + ' 项生效' +
+    (pending.length ? '，' + pending.length + ' 项因停用、资源或安装状态未生效。' : '。') +
+    ' 配置版本：' + current.application.revision + '。';
+  $('project-office-preset').disabled = projectApplicationBusy || archived || !Object.keys(current.preset?.bindings || {}).length;
+  $('project-libraries-none').disabled = projectApplicationBusy || archived || !libraries.some(item => item.enabled);
+  $('project-libraries-refresh').disabled = projectApplicationBusy;
+}
+
+async function loadProjectApplication() {
+  const version = ++projectApplicationVersion;
+  const projectId = activeProjectId;
+  try {
+    const result = await api('/api/projects/application?project_id=' + encodeURIComponent(projectId));
+    if (version !== projectApplicationVersion || projectId !== activeProjectId) return;
+    projectApplication = result; renderProjectApplication(); updateComposer();
+  } catch (error) {
+    if (version !== projectApplicationVersion) return;
+    $('project-application-feedback').textContent = error.message;
+  }
+}
+
+async function saveProjectApplication(body) {
+  if (projectApplicationBusy) return;
+  const projectId = activeProjectId;
+  projectApplicationBusy = true; renderProjectApplication(); updateComposer();
+  try {
+    const result = await api('/api/projects/application', {project_id: projectId, ...body});
+    if (projectId !== activeProjectId) return;
+    projectApplication = result;
+    $('project-application-feedback').textContent = '已保存，将用于后续任务。';
+  } catch (error) { $('project-application-feedback').textContent = error.message; }
+  finally { projectApplicationBusy = false; renderProjectApplication(); updateComposer(); }
+}
+
+async function loadProjects() {
+  try {
+    const result = await api('/api/projects');
+    projects = result.projects || [];
+    renderProjectSelection();
+  } catch (error) { showNotice(error.message); }
+}
+
+function projectFileParams() {
+  const params = new URLSearchParams({project_id: activeProjectId, area: $('project-file-area').value, path: projectFilePath});
+  if (activeChatId) params.set('conversation_id', activeChatId);
+  return params;
+}
+
+function updateProjectFileControls() {
+  const workspace = $('project-file-area').value === 'workspace';
+  const unavailable = workspace && !activeChatId;
+  $('project-file-area').disabled = projectFileBusy;
+  $('project-file-up').disabled = projectFileBusy || unavailable || !projectFilePath;
+  $('project-file-refresh').disabled = projectFileBusy || unavailable;
+  $('project-file-upload-button').disabled = projectFileBusy || unavailable || Boolean(pendingTask);
+  $('project-file-upload').disabled = projectFileBusy || unavailable || Boolean(pendingTask);
+  $('project-scratch-clear').disabled = projectFileBusy || Boolean(pendingTask);
+  $('project-workspace-clear').disabled = projectFileBusy || !activeChatId || Boolean(pendingTask);
+  for (const button of document.querySelectorAll('.project-file-delete')) button.disabled = projectFileBusy || Boolean(pendingTask);
+}
+
+async function loadProjectFiles() {
+  const version = ++projectFileVersion;
+  const root = $('project-file-list');
+  $('project-file-path').textContent = '当前位置：' + (projectFilePath || '根目录');
+  updateProjectFileControls();
+  if ($('project-file-area').value === 'workspace' && !activeChatId) {
+    root.replaceChildren(node('p', '开始或选择一个会话后可查看工作区。', 'card-note')); return;
+  }
+  root.replaceChildren(node('p', '正在读取…', 'card-note'));
+  try {
+    const result = await api('/api/project-files?' + projectFileParams());
+    if (version !== projectFileVersion) return;
+    root.replaceChildren();
+    for (const entry of result.entries || []) {
+      const row = node('div', undefined, 'project-file-entry');
+      if (entry.type === 'directory' || entry.type === 'dir') {
+        const button = node('button', '文件夹：' + entry.name, 'icon-button'); button.type = 'button';
+        button.onclick = () => { projectFilePath = entry.path; void loadProjectFiles(); };
+        row.append(button);
+      } else {
+        const link = node('a', entry.name, 'detail-link');
+        const params = projectFileParams(); params.set('path', entry.path);
+        link.href = '/api/project-file?' + params; link.download = entry.name; row.append(link);
+        const remove = node('button', '删除', 'icon-button project-file-delete'); remove.type = 'button';
+        remove.setAttribute('aria-label', '删除文件：' + entry.name);
+        remove.disabled = projectFileBusy || Boolean(pendingTask);
+        remove.onclick = () => { void deleteProjectFile(entry.path); }; row.append(remove);
+      }
+      root.append(row);
+    }
+    if (!root.childElementCount) root.append(node('p', '这里还没有文件。', 'card-note'));
+    if (result.truncated) root.append(node('p', '文件较多，仅显示部分内容。', 'card-note'));
+  } catch (error) { if (version === projectFileVersion) root.replaceChildren(node('p', error.message, 'message-error')); }
+}
+
+async function deleteProjectFile(path) {
+  if (pendingTask || projectFileBusy) return;
+  const params = projectFileParams();
+  const description = params.get('area') === 'data' ? '项目资料' : '会话文件';
+  if (!window.confirm('删除这份' + description + '？已交付的结果和历史记录保留。')) return;
+  projectFileBusy = true; updateComposer();
+  try {
+    await api('/api/project-files/delete', {project_id: params.get('project_id'), area: params.get('area'),
+      ...(params.has('conversation_id') ? {conversation_id: params.get('conversation_id')} : {}), path});
+    $('project-file-feedback').textContent = '文件已删除。';
+    await loadProjectFiles();
+  } catch (error) { $('project-file-feedback').textContent = error.message; }
+  finally { projectFileBusy = false; updateComposer(); }
+}
+
+async function uploadProjectFile() {
+  const file = $('project-file-upload').files[0];
+  if (!file) { $('project-file-feedback').textContent = '请先选择文件。'; return; }
+  if (file.size > 16 * 1024 * 1024) { $('project-file-feedback').textContent = '文件过大，请选择不超过 16 MB 的文件。'; return; }
+  const params = projectFileParams();
+  const path = [projectFilePath, file.name].filter(Boolean).join('/');
+  projectFileBusy = true; updateComposer();
+  try {
+    const content = await new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(String(reader.result).split(',')[1]);
+      reader.onerror = () => reject(new Error('文件读取失败。'));
+      reader.readAsDataURL(file);
+    });
+    await api('/api/project-files', {project_id: params.get('project_id'), area: params.get('area'),
+      ...(params.has('conversation_id') ? {conversation_id: params.get('conversation_id')} : {}),
+      path, content_base64: content});
+    $('project-file-upload').value = ''; $('project-file-feedback').textContent = '文件已上传。';
+    await loadProjectFiles();
+  } catch (error) { $('project-file-feedback').textContent = error.message; }
+  finally { projectFileBusy = false; updateComposer(); }
+}
+
 function resetChat(push = true) {
   if (pendingTask || chatRestoring) return;
   chatLoadVersion += 1;
   activeChatId = null; chatLegacy = false; chatContextTask = null; renderChatContext(); messages.length = 0;
+  projectFilePath = ''; if ($('project-files').open) void loadProjectFiles();
   $('conversation').replaceChildren();
   const welcome = node('div', undefined, 'welcome');
   welcome.append(node('h2', '有什么想一起完成的？'), node('p', '发送消息开始新对话；历史会话仍保留。'));
@@ -605,7 +825,7 @@ async function loadChatHistory(offset = 0) {
   const version = ++historySearchVersion;
   const root = $('chat-history-list');
   try {
-    const result = await api('/api/chats?q=' + encodeURIComponent($('chat-history-search').value.trim()) + '&limit=50&offset=' + offset);
+    const result = await api('/api/chats?q=' + encodeURIComponent($('chat-history-search').value.trim()) + '&project_id=' + encodeURIComponent(activeProjectId) + '&limit=50&offset=' + offset);
     if (version !== historySearchVersion) return;
     if (offset) root.querySelector('.chat-history-more')?.remove();
     else root.replaceChildren();
@@ -656,13 +876,15 @@ async function deleteConversation(identity, button) {
 }
 
 async function loadConversation(identity, push = false) {
-  if (pendingTask || chatRestoring) return;
+  if (pendingTask || chatRestoring || projectFileBusy) return;
   const version = ++chatLoadVersion;
   chatRestoring = true; updateComposer();
   try {
     const chat = await api('/api/chats/' + encodeURIComponent(identity));
     if (version !== chatLoadVersion) return;
+    activeProjectId = chat.project_id || 'default'; renderProjectSelection();
     activeChatId = chat.id; chatLegacy = chat.legacy; messages.splice(0, messages.length, ...chat.messages);
+    projectFilePath = ''; if ($('project-files').open) void loadProjectFiles();
     $('conversation').replaceChildren();
     for (const message of messages) appendMessage(message.role, responseText(message.content));
     const first = messages.find(message => message.role === 'user');
@@ -698,8 +920,13 @@ function restoreChatFromLocation() {
 
 function updateComposer() {
   const ready = connected && isReady(state?.models?.chat);
-  $('send-message').disabled = !ready || Boolean(pendingTask) || chatRestoring || chatLegacy || !$('chat-input').value.trim();
-  $('new-chat').disabled = Boolean(pendingTask) || chatRestoring;
+  $('send-message').disabled = !ready || Boolean(pendingTask) || chatRestoring || chatLegacy || projectFileBusy || projectApplicationBusy || projectDemoBusy || !$('chat-input').value.trim();
+  $('new-chat').disabled = Boolean(pendingTask) || chatRestoring || projectFileBusy || projectDemoBusy;
+  $('project-select').disabled = Boolean(pendingTask) || chatRestoring || projectFileBusy || projectApplicationBusy || projectDemoBusy;
+  $('create-project').disabled = Boolean(pendingTask) || chatRestoring || projectFileBusy || projectApplicationBusy || projectDemoBusy;
+  $('project-demo-case').disabled = Boolean(pendingTask) || chatRestoring || projectFileBusy || projectApplicationBusy || projectDemoBusy;
+  $('project-demo-start').disabled = !ready || !$('project-demo-case').value || Boolean(pendingTask) || chatRestoring || projectFileBusy || projectApplicationBusy || projectDemoBusy;
+  updateProjectFileControls();
   $('send-message').querySelector('.send-label').textContent = pendingTask ? '运行中' : '发送';
   $('stop-message').hidden = !pendingTask;
   $('stop-message').disabled = !pendingTask?.id || Boolean(pendingTask?.cancelling);
@@ -708,7 +935,8 @@ function updateComposer() {
   $('composer-hint').textContent = chatRestoring ? '正在读取历史会话…' : chatLegacy ? '请新建对话继续。' : 'Enter 发送 · Shift + Enter 换行';
   $('chat-model-name').textContent = isReady(state?.models?.chat) ? state.models.chat.model : '对话模型未配置';
   $('chat-model-name').className = 'status-pill ' + (ready ? 'ready' : 'pending');
-  const available = (state?.capabilities || []).filter(unit => unit.dispatch?.status !== 'UNAVAILABLE' && unit.availability?.status === 'AVAILABLE').length;
+  const available = projectApplication?.application?.project_id === activeProjectId ?
+    projectApplication.application.eligible_capability_ids.length : 0;
   const hint = !connected ? '平台未连接。' : !ready ? '先在配置中填写对话模型接口。' :
     '对话已就绪 · ' + (available ? available + ' 个能力可按需调用。' : '当前可直接对话；仓库准备进度见“来源与能力”。');
   $('chat-readiness').textContent = hint;
@@ -718,7 +946,7 @@ function updateComposer() {
 async function sendMessage(event) {
   event.preventDefault();
   const content = $('chat-input').value.trim();
-  if (!content || pendingTask || chatRestoring || chatLegacy || !connected || !isReady(state?.models?.chat)) return;
+  if (!content || pendingTask || chatRestoring || chatLegacy || projectFileBusy || projectApplicationBusy || !connected || !isReady(state?.models?.chat)) return;
   messages.push({role: 'user', content}); chatContextTask = null; renderChatContext();
   appendMessage('user', content);
   $('chat-input').value = ''; resizeComposer();
@@ -727,11 +955,12 @@ async function sendMessage(event) {
   pendingTask = {id: null, output, sceneTaskId: null, partial: '', files: []};
   updateComposer(); showNotice('');
   try {
-    const result = await api('/api/chat', {messages, ...(activeChatId ? {conversation_id: activeChatId} : {})});
+    const result = await api('/api/chat', {messages, project_id: activeProjectId, ...(activeChatId ? {conversation_id: activeChatId} : {})});
     if (!result.task_id) throw new Error('平台未返回任务 ID');
     pendingTask.id = result.task_id;
     if (result.conversation_id) {
       activeChatId = result.conversation_id; setChatAddress(activeChatId);
+      if ($('project-files').open) void loadProjectFiles();
       $('chat-title').textContent = responseText(messages.find(message => message.role === 'user')?.content || '对话').slice(0, 32);
     }
     setMessageBody(output.body, '正在运行…', false);
@@ -840,7 +1069,8 @@ function renderScheduler() {
   badge.textContent = execution?.controller_error ? '调度异常' : '运行中';
   badge.className = 'status-pill ' + (execution?.controller_error ? 'error' : 'ready');
   if (!execution) { empty(root, '尚未取得执行状态。'); return; }
-  root.append(node('p', '规则调度 · ' + execution.active_tasks + ' 项活动任务 · ' + execution.queued_calls +
+  const policy = execution.policy_error ? '策略不可用' : execution.config?.policy?.kind === 'ppo' ? 'PPO 调度' : '规则调度';
+  root.append(node('p', policy + ' · ' + execution.active_tasks + ' 项活动任务 · ' + execution.queued_calls +
     ' 项排队调用 · ' + execution.running_calls + ' 项执行中调用', 'card-note'));
   if (execution.controller_error) root.append(node('p', execution.controller_error, 'message-error'));
   detailValue(root, '任务与成本统计', execution.objective);
@@ -867,6 +1097,49 @@ function callDetails(calls) {
     detail.append(row);
   }
   return detail;
+}
+
+function showTaskActivity(taskId) {
+  const dialog = node('dialog');
+  const body = node('div');
+  const refresh = node('button', '刷新记录', 'secondary-button');
+  const close = node('button', '关闭', 'secondary-button');
+  const ms = value => Number.isFinite(value) ? value.toFixed(0) + ' ms' : '未知';
+  const memory = value => Number.isFinite(value) ? (value / 2 ** 30).toFixed(2) + ' GiB·s' : '未取得';
+  async function load() {
+    refresh.disabled = true;
+    try {
+      const data = await api('/api/tasks/' + encodeURIComponent(taskId) + '/activity');
+      body.replaceChildren(node('p', '项目 ' + (data.project_id || '未知') + ' · ' + statusLabel(data.status)));
+      body.append(node('h3', '能力调用'));
+      if (!data.calls.length) body.append(node('p', '尚无调用'));
+      for (const call of data.calls) body.append(node('p', (call.name || '能力') +
+        ' · 执行 ' + ms(call.execute_ms) + ' · 启动等待 ' + ms(call.start_wait_ms) +
+        (call.cold_instance === true ? ' · 冷启动' : '') + ' · ' + (call.outcome || '未知')));
+      body.append(node('h3', '防护检查'));
+      if (!data.checks.length) body.append(node('p', '尚无检查结果'));
+      const actions = {allow: '放行', skip: '跳过', block: '阻断', replace: '替换内容'};
+      const support = {supported: '参考资料支持', unsupported: '参考资料未支持', unknown: '事实支持未判定'};
+      for (const item of data.checks) body.append(node('p', (item.at || '') + ' · ' + item.hook + ' · ' +
+        (actions[item.action] || item.action || '已执行') + (support[item.fact_support] ? ' · ' + support[item.fact_support] : '') +
+        (item.reason ? ' · ' + item.reason : '')));
+      if (data.instances.length) body.append(node('h3', '关联实例整个生命周期的占用'),
+        node('p', '实例可被多个任务复用。驻留时间和资源积分在实例释放后可用。', 'card-note'));
+      for (const inst of data.instances) body.append(node('p', (inst.name || '实例') + ' · ' + inst.instance_id +
+        ' · 驻留 ' + (Number.isFinite(inst.resident_s) ? inst.resident_s.toFixed(2) + ' 秒' : '未取得') +
+        ' · RAM ' + memory(inst.ram_byte_s) + ' · 显存 ' + memory(inst.vram_byte_s)));
+    } catch (error) { body.replaceChildren(node('p', error.message, 'message-error')); }
+    finally { refresh.disabled = false; }
+  }
+  refresh.onclick = load;
+  close.onclick = () => dialog.close();
+  dialog.onclose = () => dialog.remove();
+  const actions = node('div', undefined, 'form-actions');
+  actions.append(refresh, close);
+  dialog.append(node('h2', '任务运行记录'), actions, body);
+  document.body.append(dialog);
+  dialog.showModal();
+  void load();
 }
 
 function planDetails(task) {
@@ -1024,6 +1297,10 @@ function renderTasks() {
     if (typeof task.model_calls === 'number') card.append(node('p', '模型调用：' + task.model_calls + ' 次', 'card-meta'));
     if (latency(task.latency_ms)) card.append(node('p', '任务时延：' + latency(task.latency_ms), 'card-meta'));
     if (task.error) card.append(node('p', textValue(task.error), 'card-note message-error'));
+    const activity = node('button', '查看调用、检查和资源', 'secondary-button');
+    activity.type = 'button';
+    activity.onclick = () => showTaskActivity(task.id);
+    card.append(activity);
     const context = contextDetails(task); if (context) card.append(context);
     const plan = planDetails(task);
     if (plan) card.append(plan);
@@ -4155,6 +4432,55 @@ function observerOpen(open) {
 }
 
 $('chat-form').onsubmit = sendMessage;
+$('project-select').onchange = () => {
+  if (pendingTask || chatRestoring || projectFileBusy) { renderProjectSelection(); return; }
+  activeProjectId = $('project-select').value; projectFilePath = '';
+  resetChat();
+};
+$('create-project').onclick = async () => {
+  if (pendingTask || chatRestoring || projectFileBusy) return;
+  const name = window.prompt('新项目名称');
+  if (name === null || !name.trim()) return;
+  projectFileBusy = true; updateComposer();
+  try {
+    const result = await api('/api/projects', {name: name.trim()});
+    const project = result.project || result;
+    projects.push(project); activeProjectId = project.id; renderProjectSelection();
+    resetChat();
+  } catch (error) { showNotice(error.message); }
+  finally { projectFileBusy = false; updateComposer(); }
+};
+$('project-files').ontoggle = () => { if ($('project-files').open) void loadProjectFiles(); };
+$('project-application').ontoggle = () => { if ($('project-application').open) { void loadProjectApplication(); void loadPrivacyDemoCases(); } };
+$('project-office-preset').onclick = () => { void saveProjectApplication({use_office_preset: true}); };
+$('project-libraries-none').onclick = () => { void saveProjectApplication({enabled_groups: []}); };
+$('project-libraries-refresh').onclick = () => { void loadProjectApplication(); };
+$('project-demo-case').onchange = updateComposer;
+$('project-demo-start').onclick = () => { void startPrivacyDemo(); };
+$('project-file-area').onchange = () => { projectFilePath = ''; $('project-file-feedback').textContent = ''; void loadProjectFiles(); };
+$('project-file-up').onclick = () => { projectFilePath = projectFilePath.split('/').slice(0, -1).join('/'); void loadProjectFiles(); };
+$('project-file-refresh').onclick = () => { void loadProjectFiles(); };
+$('project-file-upload-button').onclick = () => { void uploadProjectFile(); };
+$('project-scratch-clear').onclick = async () => {
+  if (pendingTask || projectFileBusy) return;
+  projectFileBusy = true; updateComposer();
+  try {
+    await api('/api/projects/cleanup', {project_id: activeProjectId, target: 'scratch'});
+    $('project-file-feedback').textContent = '临时文件已清理。';
+  } catch (error) { $('project-file-feedback').textContent = error.message; }
+  finally { projectFileBusy = false; updateComposer(); }
+};
+$('project-workspace-clear').onclick = async () => {
+  if (!activeChatId || pendingTask || projectFileBusy) return;
+  if (!window.confirm('确定清空当前会话的工作区吗？工作区中的本地文件将被删除，无法恢复。项目资料、已交付结果和会话记录会保留。')) return;
+  projectFileBusy = true; updateComposer();
+  try {
+    await api('/api/projects/cleanup', {project_id: activeProjectId, target: 'workspace', conversation_id: activeChatId});
+    $('project-file-feedback').textContent = '当前会话工作区已清空。';
+    projectFilePath = ''; await loadProjectFiles();
+  } catch (error) { $('project-file-feedback').textContent = error.message; }
+  finally { projectFileBusy = false; updateComposer(); }
+};
 $('stop-message').onclick = async () => {
   const pending = pendingTask; if (!pending?.id || pending.cancelling) return;
   pending.cancelling = true; updateComposer();
@@ -4318,6 +4644,7 @@ document.addEventListener('keydown', event => {
   if (event.key === 'Escape') observerOpen(false);
 });
 updateInspectPage();
+void loadProjects();
 if (!inspectPage && !configurationPage) restoreChatFromLocation();
 refresh();
 setInterval(refresh, 1500);

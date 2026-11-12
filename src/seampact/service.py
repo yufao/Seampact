@@ -1,11 +1,14 @@
 """Repository generation, capability execution and the common Agent host."""
 import copy
+import json
+import os
 import threading
 import uuid
 from pathlib import Path
 
 from seampact import __version__
 from seampact.capability_catalog import CapabilityCatalog
+from seampact.capability_contract import digest
 from seampact.capability_generation import GenerationJobs
 from seampact.chat import ChatJobs
 from seampact.intake import RepositoryIntake, managed_checkout
@@ -19,6 +22,9 @@ from seampact.hosting.images import Images
 from seampact.observability.monitoring import ResourceMonitor
 from seampact.scheduling.capability_scheduler import CapabilityScheduler
 from seampact.run_history import RunHistory
+from seampact.project_spaces import ProjectSpaces
+from seampact.project_applications import ProjectApplications
+from seampact.isolated_execution import DockerPythonExecutor
 
 TASK_PAGE = 30
 PROTOCOL = "capability-agent/1"
@@ -37,6 +43,12 @@ class Platform:
         self.runtime = OwnerRuntime(Coordinator(self.store))
         self.intake = RepositoryIntake(self.home / "sources")
         self.capabilities = CapabilityCatalog(self.home, self.store)
+        self.projects = ProjectSpaces(self.home, self.store)
+        self.projects.default()
+        execution_config = self.home / "config" / "execution.json"
+        execution_options = json.loads(execution_config.read_text(encoding="utf-8")) if execution_config.exists() else {}
+        python_image = os.environ.get("SEAMPACT_PYTHON_IMAGE") or execution_options.get("python_image")
+        self.code_execution = DockerPythonExecutor(python_image) if python_image else None
         self.catalog = self.capabilities
         self.deployments = Deployments(self)
         self.capabilities.router = self.deployments
@@ -45,8 +57,10 @@ class Platform:
         self.profiles.managed_services = self.managed_services
         self.execution = CapabilityScheduler(self.capabilities, self.deployments, store=self.store)
         self.generation = GenerationJobs(self)
+        self.project_applications = ProjectApplications(self)
         self.chat = ChatJobs(self.store, self.profiles, self.capabilities, self.runtime,
-                             self.execution, dispatch=self.execution.invoke)
+                             self.execution, dispatch=self.execution.invoke, projects=self.projects,
+                             code_execution=self.code_execution, applications=self.project_applications)
         # Historical runs are readable, but no old trainer or source checker starts.
         self.training = RunHistory(self.home, self.store)
         self.monitor = ResourceMonitor(self)
@@ -64,6 +78,9 @@ class Platform:
             harnesses.append(item)
         capabilities = self.capabilities.public()
         return dict(version=__version__, protocol=PROTOCOL, models=self.profiles.public_roles(),
+            agent_host=dict(runtime="pi-agent-core", protocol="stdio-jsonl/1"),
+            projects=self.projects.list(), default_project_id="default",
+            code_execution=dict(configured=self.code_execution is not None, runtime="docker-python"),
             harnesses=harnesses, generations=self.generation.snapshot(), analyses=[], analysis_revisions=[],
             resources=dict(connections=self.public_connections(), weights=self.resources.public_weights(),
                            managed_services=self.managed_services.public(), dependencies=[], bindings=[]),
@@ -100,6 +117,49 @@ class Platform:
 
     def public_connections(self):
         return self.resources.public_connections()
+
+    def task_activity(self, identity):
+        task = self.task(identity)
+        session = (task.get("objective_result") or task.get("execution") or {}).get("session")
+        groups, units = {}, {}
+        for item in task.get("capability_pool", []):
+            if not isinstance(item, dict):
+                continue
+            package = item.get("package")
+            if isinstance(package, dict) and package.get("name"):
+                groups[item.get("runtime_group")] = package["name"]
+            elif isinstance(package, str):
+                groups[item.get("runtime_group")] = package
+            units[item.get("id")] = item.get("name")
+        calls, instances = [], {}
+        for call in task.get("calls", []):
+            if not isinstance(call, dict):
+                continue
+            group = call.get("group_id")
+            calls.append(dict(name=units.get(call.get("unit_id")) or groups.get(group, group), **{key: call.get(key) for key in (
+                "instance_id", "outcome", "round_trip_ms", "start_wait_ms", "execute_ms", "cold_instance")}))
+            key = (call.get("instance_id"), call.get("generation"))
+            if key in instances or key[0] is None or key[1] is None:
+                continue
+            frozen = self.store.get("capability_resource_final", digest([session, *key])) if session else None
+            measured = ((frozen or {}).get("totals") or {}).get("measured") or {}
+            instances[key] = dict(name=groups.get(group, group), instance_id=key[0], generation=key[1],
+                resident_s=((frozen or {}).get("instance") or {}).get("resident_s"),
+                ram_byte_s=measured.get("ram_byte_s"), vram_byte_s=measured.get("vram_byte_s"))
+        checks = []
+        for event in task.get("events", []):
+            if event.get("kind") not in {"hook_result", "hook_skipped"}:
+                continue
+            result = event.get("result")
+            if result is None and event["kind"] == "hook_result":
+                continue  # Internal context bookkeeping has no protective finding.
+            action = (result.get("action") if isinstance(result, dict) else "block" if result is False else "allow")
+            checks.append(dict(at=event.get("at"), phase=event.get("event"), hook=event.get("hook"),
+                action="skip" if event["kind"] == "hook_skipped" else action,
+                fact_support=result.get("fact_support") if isinstance(result, dict) else None,
+                reason=result.get("reason") if isinstance(result, dict) and action == "block" else None))
+        return dict(task_id=identity, project_id=task.get("project_id"), status=task["status"],
+                    calls=calls, instances=list(instances.values()), checks=checks)
 
 
     def delete_tasks(self, body):
@@ -139,9 +199,16 @@ class Platform:
         return dict(connections=self.public_connections(), weights=self.resources.public_weights(),
                     managed_services=self.managed_services.public(), execution_environment="worker")
 
+    def cleanup_project(self, body):
+        project_id = body.get("project_id", "default")
+        self.generation.reconcile_project_leases(project_id)
+        self.chat.reconcile_project_leases(project_id)
+        return self.projects.cleanup(project_id, body)
+
     def add_harness(self, body):
         source = self.intake.prepare(body.get("address", ""), body.get("revision"),
-                                    body.get("entry") or None, body.get("resources") or None)
+                                    body.get("entry") or None, body.get("resources") or None,
+                                    discover_entries=False)
         configuration = body.get("configuration") or {}
         if not isinstance(configuration, dict):
             raise ValueError("已有配置须为 JSON 对象")

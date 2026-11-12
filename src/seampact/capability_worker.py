@@ -29,7 +29,7 @@ from urllib.request import Request, urlopen
 
 from seampact.capability_contract import (
     IDENTITY_PROTOCOL, WORKER_PROFILE, ContractError, check_bindings, digest, load_package,
-    package_digest, validate_value,
+    package_digest, project_binding_path, validate_value,
 )
 
 SPEC_SCHEMA = "capability-worker/1"
@@ -42,6 +42,28 @@ class WorkerError(RuntimeError):
 
 class _Cancelled(Exception):
     """Raised inside the adapter by CallContext.stop_if_cancelled."""
+
+
+def allocator_snapshot():
+    """Main-process PyTorch allocator only; never import torch or initialize CUDA."""
+    row = dict(source="torch_allocator_reserved", scope="worker_main_process_pytorch_allocator",
+               includes_cuda_context=False, includes_non_pytorch=False, includes_child_processes=False,
+               at_s=time.time(), status="OBSERVED", reserved_bytes=0, allocated_bytes=0, initialized=False)
+    module = sys.modules.get("torch")
+    if module is None:
+        row["basis"] = "torch_not_imported_in_this_process"
+        return row
+    try:
+        if not module.cuda.is_initialized():
+            row["basis"] = "pytorch_cuda_allocator_not_initialized"
+            return row
+        count = module.cuda.device_count()
+        row.update(initialized=True, reserved_bytes=sum(int(module.cuda.memory_reserved(i)) for i in range(count)),
+                   allocated_bytes=sum(int(module.cuda.memory_allocated(i)) for i in range(count)),
+                   basis="pytorch_cuda_memory_reserved", device_count=count)
+    except Exception as error:
+        row.update(status="UNKNOWN", reserved_bytes=None, allocated_bytes=None, reason=type(error).__name__)
+    return row
 
 
 def json_request(url, body=None, timeout=None):
@@ -115,7 +137,9 @@ class CapabilityWorker:
         self.process_nonce = uuid.uuid4().hex
         self.coordinator = coordinator.rstrip("/")
         self.session = json_request(self.coordinator + "/api/runtime/session", timeout=30)["session"]
-        self.concurrency = self.manifest["instance"]["concurrency"]
+        writable = any(binding["form"] == "project" and not binding["read_only"]
+                       for binding in self.bindings.values())
+        self.concurrency = 1 if writable else self.manifest["instance"]["concurrency"]
         self.lock, self.initialize_lock = threading.Lock(), threading.Lock()
         self.accepting, self.in_flight, self.preparing = True, 0, 0
         self.state, self.initialization_error, self.initialization_ms = "NOT_RUN", None, None
@@ -145,10 +169,11 @@ class CapabilityWorker:
             form = binding["form"]
             if form == "value":
                 values[identity] = copy.deepcopy(binding["value"])
-            elif form == "path":
-                if not Path(binding["path"]).exists():
-                    raise WorkerError("资源 " + identity + " 的路径在实例内不存在：" + binding["path"])
-                values[identity] = binding["path"]
+            elif form in {"path", "project"}:
+                path = project_binding_path(binding) if form == "project" else binding["path"]
+                if not Path(path).exists() or (form == "project" and not Path(path).is_dir()):
+                    raise WorkerError("资源 " + identity + " 的路径在实例内不存在：" + path)
+                values[identity] = path
             elif form == "secret":
                 value = os.environ.get(binding["env"], "")
                 if not value:
@@ -242,6 +267,7 @@ class CapabilityWorker:
 
     def health(self):
         resources = {}
+        resources["torch_allocator"] = allocator_snapshot()
         try:
             import resource
             resources["peak_rss_kb"] = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss

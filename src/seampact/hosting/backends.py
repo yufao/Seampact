@@ -391,7 +391,7 @@ def worker_args(record, coordinator, advertise):
             "--instance-id", record["id"], "--generation", str(record["generation"])]
 
 
-def start(record, reference, folder, config, credential_env=None):
+def start(record, reference, folder, config, credential_env=None, lifecycle=None):
     if config["kind"] == "docker":
         name = "seampact-" + record["name"]
         argv = ["docker", "run", "-d", "--pull=never", "--name", name, "--label", "seampact.group=" + record["group_id"],
@@ -416,6 +416,23 @@ def start(record, reference, folder, config, credential_env=None):
         gap = docker_available()
         if gap:
             return dict(manual([argv], gap), handle=dict(kind="docker", container=name), applied=False)
+        if lifecycle is not None:
+            create = [value for value in argv if value != "-d"]
+            create[1] = "create"
+            first = run(create, config["operation_timeout_s"], environment=credential_env)
+            handle = dict(kind="docker", container=name, instance_id=record["id"])
+            if first["returncode"] != 0:
+                return _result([first], "APPLIED", handle=handle)
+            container_id = first.get("stdout", "").strip()
+            if not re.fullmatch(r"[0-9a-f]{64}", container_id):
+                return dict(_result([first], "APPLIED", handle=handle), status="FAILED",
+                            reason="created container identity unavailable; not started")
+            handle["container_id"] = container_id
+            lifecycle("created", handle)
+            second = run(["docker", "start", container_id], config["operation_timeout_s"])
+            if second["returncode"] == 0:
+                lifecycle("started", handle)
+            return _result([first, second], "APPLIED", handle=handle)
         step = (run(argv, config["operation_timeout_s"], environment=credential_env) if credential_env else
                 run(argv, config["operation_timeout_s"]))
         return _result([step], "APPLIED",

@@ -6,6 +6,8 @@ services:
     build:
       context: ..
       dockerfile: deploy/Dockerfile
+      additional_contexts:
+        agentdojo_input: "${SEAMPACT_AGENTDOJO_INPUT:-.}"
       args:
         DEPENDENCY_IMAGE: "${SEAMPACT_DEPENDENCY_IMAGE:?Run deploy/build_platform.py and pass its --compose-env file}"
         SEAMPACT_EXTRAS: "${SEAMPACT_EXTRAS:-}"

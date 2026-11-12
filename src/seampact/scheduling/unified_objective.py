@@ -12,9 +12,9 @@ from collections import deque
 
 from seampact.capability_contract import digest
 
-SCHEMA = "capability-objective/1"
-TERMS = ("quality", "delivery", "latency", "ram", "vram")
-SCALES = ("latency_s", "ram_byte_s", "vram_byte_s")
+SCHEMA = "capability-objective/2"
+TERMS = ("quality", "delivery", "latency", "ram", "vram", "api")
+SCALES = ("latency_s", "ram_byte_s", "vram_byte_s", "api_tokens")
 
 
 def number(value, name, *, positive=False):
@@ -34,9 +34,9 @@ def freeze_objective(value):
     if value.get("schema", SCHEMA) != SCHEMA:
         raise ValueError("旧目标格式不能用于能力调度")
     if not isinstance(value["weights"], dict) or set(value["weights"]) != set(TERMS):
-        raise ValueError("目标系数须包括 quality/delivery/latency/ram/vram")
+        raise ValueError("目标系数须明确包括 quality/delivery/latency/ram/vram/api")
     if not isinstance(value["scales"], dict) or set(value["scales"]) != set(SCALES):
-        raise ValueError("目标尺度须包括 latency_s/ram_byte_s/vram_byte_s")
+        raise ValueError("目标尺度须明确包括 latency_s/ram_byte_s/vram_byte_s/api_tokens")
     value["weights"] = {key: number(value["weights"][key], key) for key in TERMS}
     value["scales"] = {key: number(value["scales"][key], key, positive=True) for key in SCALES}
     if not isinstance(value["quality_evaluator"], str) or not value["quality_evaluator"].strip():
@@ -55,7 +55,7 @@ class TaskLedger:
         self.objective, self.clock = freeze_objective(objective), clock
         self.active = {}
         self.totals = dict(arrivals=0, finished=0, delivered=0, undelivered=0, quality_known=0,
-                           quality_sum=0.0, latency_s=0.0, failures=0)
+                           quality_sum=0.0, latency_s=0.0, failures=0, api_known=0, api_observed_tokens=0)
 
     def begin(self, task_id, *, deadline_s=None, metadata=None):
         if task_id in self.active:
@@ -70,22 +70,44 @@ class TaskLedger:
         self.totals["arrivals"] += 1
         return copy.deepcopy(row)
 
-    def finish(self, task_id, *, delivered, quality=None, status="COMPLETED", metrics=None):
+    def terminal(self, task_id, *, finished_s=None):
+        row = self.active[task_id]
+        if finished_s is None and row.get("business_finished_s") is not None:
+            return copy.deepcopy(row)
+        finished_s = self.clock() if finished_s is None else number(finished_s, "business_finished_s")
+        if not row["arrived_s"] <= finished_s <= self.clock():
+            raise ValueError("业务终态时间须在本任务到达与当前单调时钟之间")
+        previous = row.get("business_finished_s")
+        if previous is not None and previous != finished_s:
+            raise ValueError("已记录的业务终态不能改写")
+        row["business_finished_s"] = finished_s
+        return copy.deepcopy(row)
+
+    def finish(self, task_id, *, delivered, quality=None, status="COMPLETED", metrics=None, business_finished_s=None):
         if type(delivered) is not bool:
             raise ValueError("delivered 须为布尔值")
         if quality is not None:
             quality = number(quality, "quality")
             if quality > 1:
                 raise ValueError("quality 须由任务评价器归一化到 [0,1]")
+        if metrics is not None and not isinstance(metrics, dict):
+            raise ValueError("任务 metrics 须为对象")
+        metrics = copy.deepcopy(metrics or {})
+        api_tokens = metrics.setdefault("api_tokens", None)
+        if api_tokens is not None and (type(api_tokens) is not int or api_tokens < 0):
+            raise ValueError("api_tokens 须为真实非负整数或 None；未知用量不能补零")
         row = self.active[task_id]
-        elapsed = max(0.0, self.clock() - row["arrived_s"])
+        if business_finished_s is not None or "business_finished_s" not in row:
+            self.terminal(task_id, finished_s=business_finished_s)
+        ended = row["business_finished_s"]
+        elapsed = max(0.0, ended - row["arrived_s"])
         on_time = row["deadline_s"] is None or elapsed <= row["deadline_s"]
         success = delivered and on_time and status == "COMPLETED"
-        quality = quality if success else 0.0
-        row = dict(row, finished_s=self.clock(), elapsed_s=elapsed,
+        # A failure label does not supply a missing native quality measurement.
+        row = dict(row, finished_s=ended, scored_s=self.clock(), elapsed_s=elapsed,
                    latency_s=min(elapsed, row["deadline_s"]) if row["deadline_s"] is not None else elapsed,
                    delivered=success, output_delivered=delivered, on_time=on_time,
-                   quality=quality, status=status, metrics=copy.deepcopy(metrics or {}))
+                   quality=quality, status=status, metrics=metrics)
         del self.active[task_id]
         self.totals["finished"] += 1
         self.totals["delivered"] += int(success)
@@ -94,6 +116,9 @@ class TaskLedger:
         self.totals["latency_s"] += row["latency_s"]
         self.totals["quality_known"] += int(quality is not None)
         self.totals["quality_sum"] += quality if quality is not None else 0.0
+        self.totals["api_known"] += int(api_tokens is not None)
+        if api_tokens is not None:
+            self.totals["api_observed_tokens"] += api_tokens
         return copy.deepcopy(row)
 
     def summary(self, resources=None):
@@ -102,27 +127,31 @@ class TaskLedger:
         complete = n > 0 and raw["finished"] == n
         raw["quality_observed_sum"] = raw.pop("quality_sum")
         raw["quality_sum"] = raw["quality_observed_sum"] if complete and raw["quality_known"] == n else None
+        raw["api_tokens"] = raw["api_observed_tokens"] if complete and raw["api_known"] == n else None
         raw["pending"] = len(self.active)
         result = dict(schema=SCHEMA, objective=copy.deepcopy(self.objective),
                       objective_id=digest(self.objective) if self.objective else None,
                       denominator=n, raw=raw, resources=copy.deepcopy(resources), utility=None,
-                      contributions=None, training_ready=False, complete=complete)
+                      contributions=None, training_ready=False, complete=complete, api_usage_unit="tokens")
         if self.objective is None:
             result["reason"] = "尚未配置任务评价器、统一目标和尺度；仅报告原始分项"
             return result
         costs = (resources or {}).get(self.objective["resource_source"], {})
         values = dict(quality=raw["quality_sum"], delivery=raw["undelivered"] if complete else None,
                       latency=raw["latency_s"] if complete else None,
-                      ram=costs.get("ram_byte_s"), vram=costs.get("vram_byte_s"))
-        if not complete or any(value is None for value in values.values()):
-            result["reason"] = "未完成任务、质量或资源计量缺失；未知项不补零，不能训练"
+                      ram=costs.get("ram_byte_s"), vram=costs.get("vram_byte_s"), api=raw["api_tokens"])
+        if not complete or any(value is None for key, value in values.items()
+                               if key != "api" or self.objective["weights"]["api"] > 0):
+            result["reason"] = "未完成任务、质量、资源或启用的 API token 计量缺失；未知项不补零，不能训练"
             return result
         scale = self.objective["scales"]
         normalized = dict(quality=values["quality"] / n, delivery=values["delivery"] / n,
                           latency=values["latency"] / n / scale["latency_s"],
                           ram=values["ram"] / n / scale["ram_byte_s"],
-                          vram=values["vram"] / n / scale["vram_byte_s"])
-        result["contributions"] = {key: normalized[key] * self.objective["weights"][key] *
+                          vram=values["vram"] / n / scale["vram_byte_s"],
+                          api=values["api"] / n / scale["api_tokens"] if values["api"] is not None else None)
+        result["contributions"] = {key: 0.0 if self.objective["weights"][key] == 0 else
+                                   normalized[key] * self.objective["weights"][key] *
                                    (1 if key == "quality" else -1) for key in TERMS}
         result.update(utility=sum(result["contributions"].values()), training_ready=True, reason=None)
         return result
@@ -141,13 +170,131 @@ class ResourceLedger:
         self.closed_totals = self._empty()
         self.closed_count = 0
         self.recent_closed = deque(maxlen=20)
+        self.interval_rows = None
+        self.interval_lifetimes = {}
+
+    def enable_intervals(self):
+        """Keep real interval evidence for a bounded, explicit training stream."""
+        self.interval_rows = []
+
+    @staticmethod
+    def interval_amount(row, metric, start_s, end_s):
+        """Integrate a subrange only when real endpoints determine its shape."""
+        left, right = max(start_s, row["start_s"]), min(end_s, row["end_s"])
+        if right <= left:
+            return 0.0
+        amount = row.get(metric)
+        if amount is None:
+            return None
+        if left == row["start_s"] and right == row["end_s"]:
+            return amount
+        field = metric.removesuffix("_byte_s") + "_bytes"
+        endpoints = row.get("endpoints") or []
+        if (len(endpoints) != 2 or any(point.get(field) is None for point in endpoints)
+                or endpoints[0]["at_s"] > left or endpoints[1]["at_s"] < right):
+            return None
+        first, last = endpoints
+        span = last["at_s"] - first["at_s"]
+        if span <= 0:
+            return None
+        slope = (last[field] - first[field]) / span
+        full_left = first[field] + slope * (row["start_s"] - first["at_s"])
+        full_right = first[field] + slope * (row["end_s"] - first["at_s"])
+        if not math.isclose((full_left + full_right) * (row["end_s"] - row["start_s"]) / 2,
+                            amount, rel_tol=1e-7, abs_tol=1e-9):
+            return None
+        a = first[field] + slope * (left - first["at_s"])
+        b = first[field] + slope * (right - first["at_s"])
+        return (a + b) * (right - left) / 2
+
+    def settlement(self, source, envelopes, cutoffs, *, end_s, final=False):
+        """Return unconsumed evidence, leaving live trailing spans explicitly deferred.
+
+        A missing startup or interior interval is unknown and blocks settlement.
+        Only a still-live span beyond adjacent real samples may be deferred.
+        The caller commits returned cutoffs only after a successful policy update.
+        """
+        if self.interval_rows is None:
+            raise ValueError("未启用连续区间结算")
+        pieces, coverage, unknown, following = [], [], [], dict(cutoffs)
+        for identity, life in self.interval_lifetimes.items():
+            start, end = life["start_s"], min(end_s, life["end_s"])
+            if end <= start:
+                continue
+            cursor = cutoffs.get(identity, start)
+            if life.get("start_observed") is False or life.get("end_observed") is False:
+                unknown.append(dict(instance_id=identity[0], reason="unobserved_lifecycle"))
+                continue
+            if source == "reserved":
+                envelope = envelopes.get(life["group_id"], {})
+                if any(envelope.get(metric + "_bytes") is None for metric in ("ram", "vram")):
+                    unknown.append(dict(instance_id=identity[0], reason="missing_reservation"))
+                    continue
+                target = end
+                for name in ("ram", "vram"):
+                    if target > cursor:
+                        pieces.append(dict(instance_id=identity[0], generation=identity[1], metric=name + "_byte_s",
+                            start_s=cursor, end_s=target, amount=envelope[name + "_bytes"] * (target - cursor),
+                            rate=envelope[name + "_bytes"]))
+            else:
+                rows = [row for row in self.interval_rows
+                        if (row["instance_id"], row["generation"]) == identity]
+                limits = []
+                for metric in ("ram_byte_s", "vram_byte_s"):
+                    covered = cursor
+                    for row in sorted((row for row in rows if row.get(metric) is not None),
+                                      key=lambda row: row["start_s"]):
+                        if row["end_s"] <= cursor:
+                            continue
+                        if row["start_s"] > covered + 1e-6:
+                            unknown.append(dict(instance_id=identity[0], metric=metric, reason="measurement_gap",
+                                                start_s=covered, end_s=row["start_s"]))
+                            break
+                        covered = max(covered, row["end_s"])
+                    if covered == start and cursor == start:
+                        unknown.append(dict(instance_id=identity[0], metric=metric, reason="no_measured_prefix"))
+                    limits.append(covered)
+                target = min(end, *limits)
+                if (final or life.get("released")) and target < end - 1e-6:
+                    unknown.append(dict(instance_id=identity[0], reason="uncovered_release_tail",
+                                        start_s=target, end_s=end))
+                for metric in ("ram_byte_s", "vram_byte_s"):
+                    for row in rows:
+                        if row.get(metric) is None:
+                            continue
+                        left, right = max(cursor, row["start_s"]), min(target, row["end_s"])
+                        if right <= left:
+                            continue
+                        amount = self.interval_amount(row, metric, left, right)
+                        if amount is None:
+                            unknown.append(dict(instance_id=identity[0], metric=metric,
+                                                reason="subrange_requires_real_endpoints"))
+                        else:
+                            pieces.append(dict(instance_id=identity[0], generation=identity[1], metric=metric,
+                                               start_s=left, end_s=right, amount=amount, evidence=row))
+            following[identity] = target
+            coverage.append(dict(instance_id=identity[0], generation=identity[1], start_s=cursor,
+                                 observed_through_s=target, held_through_s=end,
+                                 deferred_s=max(0.0, end - target), released=life.get("released") is True))
+        return dict(ready=not unknown, pieces=pieces, coverage=coverage, unknown=unknown, cutoffs=following,
+                    totals={metric: sum(row["amount"] for row in pieces if row["metric"] == metric)
+                            for metric in ("ram_byte_s", "vram_byte_s")})
+
+    def commit_settlement(self, cutoffs):
+        """Evict consumed hot evidence; persistent interval records keep its source."""
+        self.interval_rows[:] = [row for row in self.interval_rows
+            if row["end_s"] > cutoffs.get((row["instance_id"], row["generation"]), row["start_s"])]
+        for identity, life in list(self.interval_lifetimes.items()):
+            if life.get("released") and cutoffs.get(identity, life["start_s"]) >= life["end_s"] - 1e-6:
+                del self.interval_lifetimes[identity]
 
     @staticmethod
     def _empty():
         totals = {source: dict(ram_byte_s=0.0, vram_byte_s=0.0, unknown=[], unknown_count=0)
                   for source in ("reserved", "measured")}
         totals["measured"].update(ram_observed_byte_s=0.0, vram_observed_byte_s=0.0,
-                                  ram_covered_s=0.0, vram_covered_s=0.0, required_s=0.0)
+                                  ram_covered_s=0.0, vram_covered_s=0.0, required_s=0.0,
+                                  max_sample_span_s=None)
         return totals
 
     @staticmethod
@@ -156,6 +303,9 @@ class ResourceLedger:
             for key, value in addition[source].items():
                 if key == "unknown":
                     target[source][key] = (target[source][key] + copy.deepcopy(value))[-20:]
+                elif key == "max_sample_span_s":
+                    observed = [span for span in (target[source][key], value) if span is not None]
+                    target[source][key] = max(observed) if observed else None
                 elif key not in {"ram_coverage", "vram_coverage"}:
                     before = target[source][key]
                     target[source][key] = None if before is None or value is None else before + value
@@ -171,23 +321,35 @@ class ResourceLedger:
             if end <= start:
                 raise ValueError("资源计量区间须为正且不重叠")
             row.update(start_s=start, end_s=end)
+            if row.get("sample_span_s") is not None:
+                row["sample_span_s"] = number(row["sample_span_s"], "sample_span_s")
+                if row["sample_span_s"] < end - start:
+                    raise ValueError("采样端点间隔不能短于其积分区间")
             for name in ("ram_byte_s", "vram_byte_s"):
                 row[name] = None if row.get(name) is None else number(row[name], name)
             identity = (row["instance_id"], row["generation"])
             previous = self.active.get(identity)
             if previous and row == previous["last"]:
                 continue
-            if previous and start < previous["end_s"]:
-                raise ValueError("同一实例代次的实测区间重叠或乱序，拒绝重复计费")
+            for metric in ("ram_byte_s", "vram_byte_s"):
+                metric_end = previous.get(metric + "_end_s") if previous else None
+                if row[metric] is not None and metric_end is not None and start < metric_end:
+                    raise ValueError("同一实例代次同一指标的实测区间重叠或乱序，拒绝重复计费")
             if previous is None:
                 previous = self.active[identity] = dict(start_s=start, end_s=end, last=None,
-                    ram_byte_s=0.0, vram_byte_s=0.0, ram_covered_s=0.0, vram_covered_s=0.0, intervals=0)
-            previous.update(end_s=end, last=row)
+                    ram_byte_s=0.0, vram_byte_s=0.0, ram_covered_s=0.0, vram_covered_s=0.0, intervals=0,
+                    max_sample_span_s=None)
+            previous.update(start_s=min(start, previous["start_s"]), end_s=max(end, previous["end_s"]), last=row)
+            spans = [span for span in (previous["max_sample_span_s"], row.get("sample_span_s")) if span is not None]
+            previous["max_sample_span_s"] = max(spans) if spans else None
             previous["intervals"] += 1
             for metric in ("ram_byte_s", "vram_byte_s"):
                 if row[metric] is not None:
                     previous[metric] += row[metric]
                     previous[metric.removesuffix("_byte_s") + "_covered_s"] += end - start
+                    previous[metric + "_end_s"] = end
+            if self.interval_rows is not None:
+                self.interval_rows.append(row)
 
     def _totals(self, lifetimes, envelopes, *, start_s, end_s):
         totals = self._empty()
@@ -197,11 +359,17 @@ class ResourceLedger:
             if identity in seen:
                 continue
             seen.add(identity)
+            if self.interval_rows is not None:
+                self.interval_lifetimes[identity] = copy.deepcopy(life)
             duration = life["resident_ms"] / 1000.0
             totals["measured"]["required_s"] += duration
             envelope = envelopes.get(life["group_id"], {})
             row = dict(instance_id=identity[0], generation=identity[1], group_id=life["group_id"],
                        resident_s=duration, release_confirmed=life.get("released") is True)
+            measured_instance = self.active.get(identity)
+            span = measured_instance.get("max_sample_span_s") if measured_instance else None
+            spans = [item for item in (totals["measured"]["max_sample_span_s"], span) if item is not None]
+            totals["measured"]["max_sample_span_s"] = max(spans) if spans else None
             for metric, capacity in (("ram_byte_s", "ram_bytes"), ("vram_byte_s", "vram_bytes")):
                 reserved = envelope.get(capacity)
                 if reserved is None or life.get("start_observed") is False:
