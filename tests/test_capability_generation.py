@@ -426,11 +426,15 @@ class GeneratedPackageTests(unittest.TestCase):
         self.assertEqual(prior["status"], "AVAILABLE", prior.get("error"))
         edit = dict(edits=[dict(path="adapter/__init__.py", old='return summarize(input["text"])',
                                 new='return summarize(input["text"] + " extra")')])
+        capabilities = copy.deepcopy(proposal()["manifest"]["capabilities"])
+        capabilities[0]["input"]["properties"]["text"]["maxLength"] = 4096
+        edit["manifest_updates"] = dict(capabilities=capabilities)
         jobs.transport = Model([("edit_package", edit)])
         result = jobs.start(self.inspector, wait=True, improve_from=prior["id"], configuration=dict(intent="Extend input"))
         self.assertEqual(result["status"], "AVAILABLE", result.get("error"))
         saved = json.loads((jobs.home / result["id"] / "accepted_proposal.json").read_text(encoding="utf-8"))
         self.assertIn('input["text"] + " extra"', saved["files"]["adapter/__init__.py"])
+        self.assertEqual(saved["manifest"]["capabilities"][0]["input"]["properties"]["text"]["maxLength"], 4096)
         self.assertEqual(jobs._successful_proposal(self.inspector,
             dict(improve_from=result["id"], source_id=result["source_id"], model=result["model"], reads=[]))["files"], saved["files"])
         ambiguous = dict(edits=[dict(path="adapter/__init__.py", old="self", new="changed")])
