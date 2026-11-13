@@ -37,12 +37,13 @@ class OfficeFactCheckTests(unittest.TestCase):
         self.observe('{"content":"quarantined"}', name="send_email")
         self.observe('{"content":"error"}', is_error=True)
         self.current_context('{"content":"The meeting is Monday."}')
-        self.assertEqual(self.check(), dict(action="allow", fact_support="supported"))
+        self.assertEqual(self.check()["fact_support"], "supported")
+        self.assertEqual(self.check()["check_status"], "valid")
         self.assertEqual(self.calls[0][1], dict(question="When is the meeting?", answer="The meeting is Monday.",
                                                 references=["The meeting is Monday."]))
         self.current_context()  # dropped from the next actual model request
         self.assertEqual(self.check()["fact_support"], "unknown")
-        self.assertEqual(len(self.calls), 1)
+        self.assertEqual(len(self.calls), 2)
 
     def test_empty_failed_incomplete_and_mismatched_results_are_unknown(self):
         for output in (dict(status="no_claims", claims=[], claim_count=0),
@@ -62,9 +63,43 @@ class OfficeFactCheckTests(unittest.TestCase):
         self.current_context("Meeting is Monday.")
         self.output["model_usage"] = {"private": "usage"}
         result = self.check()
-        self.assertEqual(result, dict(action="allow", fact_support="supported"))
+        self.assertEqual(result["fact_support"], "supported")
+        self.assertEqual(result["label_counts"]["Entailment"], 1)
+        self.assertNotIn("claim_text", str(result))
+        self.assertNotIn("private", str(result))
         self.output = dict(status="checking_failed", claims=[], claim_count=0, errors=["private error"])
-        self.assertEqual(self.check(), dict(action="allow", fact_support="unknown"))
+        result = self.check()
+        self.assertEqual((result["action"], result["fact_support"], result["check_status"]),
+                         ("allow", "unknown", "unavailable"))
+        self.assertNotIn("private", str(result))
+
+    def test_executed_receipt_supports_confirmation_only_while_visible(self):
+        import json
+        receipt = '{"status":"sent","id":"mail-1"}'
+        hook = self.hooks["office_visible_references"]
+        # A plan without an executed call identity must never become evidence.
+        hook.handler(dict(name="send_email", arguments={"to": "a@example.invalid"}, content=receipt), self.context)
+        self.current_context(receipt)
+        self.assertEqual(self.check()["check_status"], "not_applicable")
+        hook.handler(dict(name="send_email", call_id="c1", arguments={"to": "a@example.invalid"},
+                          content=receipt, is_error=False), self.context)
+        self.current_context(receipt)
+        self.check()
+        evidence = json.loads(self.calls[-1][1]["references"][0])
+        self.assertEqual(evidence["call_id"], "c1")
+        self.assertEqual(evidence["observed_result"], receipt)
+        self.current_context()
+        self.assertEqual(self.check()["check_status"], "not_applicable")
+
+    def test_unavailable_self_check_blocks_without_claiming_a_risk_finding(self):
+        hooks = {h.name: h for h in build_hooks(None, "task", dict(mode="app_config",
+                  bindings={"self_check_input": "unit"}))["hooks"]}
+        for failed, expected in ((True, "unavailable"), (False, "valid")):
+            context = SimpleNamespace(invoke=lambda *a, **kw: dict(output=dict(
+                failed=failed, is_blocked=True, decision="block", unavailable_reason="truncated")))
+            result = hooks["self_check_input:input_received"].handler(dict(messages=[dict(content="request")]), context)
+            self.assertEqual(result["action"], "block")
+            self.assertEqual(result["check_status"], expected)
 
     def test_unsupported_outbound_text_is_blocked_before_sending(self):
         self.observe('{"content":"The meeting is Tuesday."}')

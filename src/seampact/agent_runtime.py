@@ -204,7 +204,8 @@ class AgentRuntime:
     def __init__(self, store, catalog, *, transport=None, dispatch=None, hooks=(),
                  optional_hooks=None, connection=None, scheduler=None, projects=None, code_execution=None,
                  external_tools=(), external_execute=None, system_prompt=None, max_model_turns=40,
-                 allowed_capabilities=None, allowed_workspace_tools=None, evaluator=None):
+                 allowed_capabilities=None, allowed_workspace_tools=None, evaluator=None,
+                 internal_tool_text=False):
         self.store, self.catalog = store, catalog
         self.transport = transport or Transport()
         self.dispatch = dispatch or getattr(catalog, "invoke", None)
@@ -225,6 +226,7 @@ class AgentRuntime:
         if self.allowed_workspace_tools is not None and self.allowed_workspace_tools - set(WorkspaceTools.names(True)):
             raise ValueError("应用指定了不存在的工作区工具")
         self.evaluator = evaluator
+        self.internal_tool_text = internal_tool_text
 
     def run(self, task, messages, profiles, *, on_event=None, persist=None, control=None,
             prior_wire=None, prior_context=None):
@@ -368,7 +370,8 @@ class AgentRuntime:
                         emit("hook_skipped", hook=hook.name, event=event)
             return value
 
-        full_delivery = any(hook.event == "before_delivery" and hook.mode == "complete" for hook in self.hooks)
+        full_delivery = self.internal_tool_text or any(
+            hook.event == "before_delivery" and hook.mode == "complete" for hook in self.hooks)
 
         def deliver(text="", files=None, *, complete=False):
             control.check()
@@ -610,7 +613,12 @@ class AgentRuntime:
                 save_messages()
                 if choice.get("finish_reason") not in {"stop", "tool_calls", None}:
                     raise ValueError("模型响应未完成：" + str(choice.get("finish_reason")))
-                if full_delivery:
+                if self.internal_tool_text and message.get("tool_calls"):
+                    # Pi keeps this in the model conversation. It is a tool plan,
+                    # not a delivered answer; final text still passes delivery hooks.
+                    emit("internal_tool_text", chars=len("".join(current)),
+                         call_ids=[call["id"] for call in message["tool_calls"]])
+                elif full_delivery:
                     deliver("".join(current), pending_files, complete=True)
                     pending_files.clear()
                 if not message.get("tool_calls"):
@@ -673,7 +681,8 @@ class AgentRuntime:
                         archive_ref=reference, preview=raw["content"][:12000], truncated=True,
                         note="完整结果可用 read_conversation_memory 分页读取。")
                     content = json.dumps(visible, ensure_ascii=False)
-                hooks("tool_observation", dict(name=name, content=content, is_error=is_error))
+                hooks("tool_observation", dict(name=name, call_id=params["call_id"],
+                      arguments=copy.deepcopy(arguments), content=content, is_error=is_error))
                 message = dict(role="tool", tool_call_id=params["call_id"], content=content)
                 wire.append(copy.deepcopy(message))
                 active.append(copy.deepcopy(message))

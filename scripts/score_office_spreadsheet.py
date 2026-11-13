@@ -43,6 +43,10 @@ def score(manifest, case_id, checkout, outputs, soffice=None):
     soffice = soffice or recalc.find_libreoffice()
     answers = {Path(item["path"]).name: item for item in case["files"] if item["role"] == "answer"}
     values, reasons = [], []
+    # Upstream splits comma-separated ranges without stripping their separators.
+    # Leading separator spaces produce column tuples instead of cells. Preserve
+    # the frozen specification and compare exactly the same cells after trimming.
+    answer_position = ",".join(part.strip() for part in case["answer_position"].split(","))
     with tempfile.TemporaryDirectory() as folder, contextlib.redirect_stdout(sys.stderr):
         for index, output in enumerate(outputs, 1):
             record = answers[f"{index}_{case['source_id']}_answer.xlsx"]
@@ -61,7 +65,7 @@ def score(manifest, case_id, checkout, outputs, soffice=None):
                 continue
             try:
                 passed, detail = judge.compare_workbooks(str(answer), str(copy), case["instruction_type"],
-                                                        case["answer_position"])
+                                                        answer_position)
             except Exception as exc:
                 values.append(None)
                 reasons.append(f"scoring failed: {type(exc).__name__}")
@@ -69,6 +73,7 @@ def score(manifest, case_id, checkout, outputs, soffice=None):
                 values.append(bool(passed))
                 reasons.append(detail or None)
     return dict(case_id=case_id, source_revision=CODE_REVISION, cases=values, reasons=reasons,
+                original_answer_position=case["answer_position"], scoring_answer_position=answer_position,
                 soft=sum(values) / 3 if None not in values else None,
                 hard=False if False in values else True if None not in values else None)
 

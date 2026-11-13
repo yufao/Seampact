@@ -525,6 +525,13 @@ class CapabilityScheduler:
         if final:
             workload["updated"] = True
         if self.store:
+            if result.get("updated"):
+                checkpoint = self.store.path.parent / "checkpoints" / self.session / ("interval-" + interval_id + ".pt")
+                checkpoint.parent.mkdir(parents=True, exist_ok=True)
+                self.policy.save(checkpoint)
+                receipt["checkpoint"] = dict(path=str(checkpoint),
+                    sha256=hashlib.sha256(checkpoint.read_bytes()).hexdigest(),
+                    policy_version=self.policy.learner.policy_version)
             self.store.save("capability_workload", workload["id"], workload)
         return copy.deepcopy(receipt)
 

@@ -23,7 +23,7 @@ TEXT_FIELDS = frozenset({"content", "body", "text", "message", "description", "s
 SUSPICIOUS = re.compile(r"ignore.{0,35}(?:previous|instruction)|system\s*(?:message|prompt)|"
                        r"(?:password|api[_ -]?key|secret)\s*[:=]|[\u200b-\u200f\ufeff]", re.I | re.S)
 
-# Only actual reading/retrieval results may become references. Tool observations
+# Only actual reading/retrieval results and executed tool receipts become references. Tool observations
 # arrive after all output guards and the host's visibility/truncation decision.
 REFERENCE_TOOLS = frozenset({"read_file", "workspace_read_file", "get_file_by_id", "get_email",
                              "search_emails", "get_thread", "get_message", "search_files"})
@@ -172,12 +172,24 @@ def build_hooks(platform, task_id, config):
     if "fact_check" in bindings:
         def remember_reference(payload, context):
             name = payload.get("name", "")
-            if payload.get("is_error") or not (name in REFERENCE_TOOLS or name.startswith("search_documents_")):
+            if payload.get("is_error"):
                 return
-            for text in visible_reference_texts(payload.get("content")):
-                if (len(text) <= 3000 and len(observations) < 6
-                        and sum(len(item[1]) for item in observations) + len(text) <= 12000):
-                    observations.append((payload["content"], text))
+            if name in OUTBOUND and payload.get("call_id") and isinstance(payload.get("arguments"), dict):
+                # Bind the receipt to the executed, guarded call. Never use an
+                # assistant's planned action or claimed success as evidence.
+                texts = [json.dumps(dict(executed_tool=name, call_id=payload["call_id"],
+                    arguments=payload["arguments"], observed_result=payload.get("content")), ensure_ascii=False)]
+            elif name in REFERENCE_TOOLS or name.startswith("search_documents_"):
+                texts = visible_reference_texts(payload.get("content"))
+            else:
+                return
+            for text in texts:
+                if len(text) > 3000:
+                    continue
+                while observations and (len(observations) >= 6 or
+                        sum(len(item[1]) for item in observations) + len(text) > 12000):
+                    observations.pop(0)
+                observations.append((payload["content"], text))
         def retain_model_context(payload, context):
             visible = payload.get("tool_contents", [])
             observations[:] = [(content, text) for content, text in observations if content in visible]
@@ -200,20 +212,31 @@ def build_hooks(platform, task_id, config):
             question = "\n".join(user_message)
             answer = factual_text(payload)
             if not can_fact_check(payload):
-                return dict(action="allow", fact_support="unknown")
+                return dict(action="allow", fact_support="unknown", check_status="not_applicable")
+            diagnostic = dict(scope="outbound_content" if "name" in payload else "final_delivery",
+                              reference_count=len(references))
             try:
                 output = call(context, "fact_check", dict(question=question, answer=answer,
                                                            references=list(references)))
                 status = fact_check_status(output, len(references))
+                diagnostic["check_status"] = "valid" if status != "unknown" else "unavailable"
+                if status != "unknown":
+                    diagnostic["claim_count"] = output["claim_count"]
+                    diagnostic["label_counts"] = {label: sum(claim["label"] == label for claim in output["claims"])
+                                                   for label in ("Entailment", "Neutral", "Contradiction")}
+                else:
+                    diagnostic["unavailable_reason"] = "incomplete_result"
             except RequestCancelled:
                 raise
-            except Exception:
+            except Exception as error:
                 status = "unknown"
+                diagnostic.update(check_status="unavailable", unavailable_reason="call_error",
+                                  error_type=type(error).__name__)
             # A decision may include the aggregate support status, never the
             # private source passages or individual extracted claims.
             if status == "unsupported":
-                return dict(action="block", fact_support=status, reason="参考资料未支持待交付的事实主张")
-            return dict(action="allow", fact_support=status)
+                return dict(action="block", fact_support=status, reason="参考资料未支持待交付的事实主张", **diagnostic)
+            return dict(action="allow", fact_support=status, **diagnostic)
         add("fact_check", "before_delivery", fact_check, when=can_fact_check)
         add("fact_check", "before_tool", fact_check,
             when=lambda p: p.get("name") in OUTBOUND and can_fact_check(p))
@@ -243,14 +266,29 @@ def build_hooks(platform, task_id, config):
         add("sanitize", event, sanitize, when=lambda p, e=event: bool(payload_text(e, p)))
         add("injection", event, injection, when=lambda p, e=event: bool(payload_text(e, p)))
 
+    def self_check(context, role, arguments):
+        try:
+            out = call(context, role, arguments)
+            if out.get("failed") or out.get("check_status") == "unavailable":
+                reasons = {"truncated", "empty_output", "invalid_format", "missing_finish_reason",
+                           "incomplete", "invalid_response", "transport_error", "action_error"}
+                reason = out.get("unavailable_reason")
+                return dict(action="block", check_status="unavailable", reason="安全检查未完成，暂不放行",
+                            unavailable_reason=reason if reason in reasons else "invalid_result")
+            return dict(action="allow" if self_check_allowed(out) else "block", check_status="valid",
+                        reason="安全检查阻止请求或交付")
+        except RequestCancelled:
+            raise
+        except Exception as error:
+            return dict(action="block", check_status="unavailable", reason="安全检查未完成，暂不放行",
+                        unavailable_reason="call_error", error_type=type(error).__name__)
+
     def self_check_input(payload, context):
-        out = call(context, "self_check_input", dict(user_message=payload_text("input_received", payload)))
-        return dict(action="allow" if self_check_allowed(out) else "block", reason="输入安全检查阻止请求")
+        return self_check(context, "self_check_input", dict(user_message=payload_text("input_received", payload)))
     add("self_check_input", "input_received", self_check_input)
 
     def self_check_output(payload, context):
-        out = call(context, "self_check_output", dict(bot_message=payload["text"], user_message="\n".join(user_message)))
-        return dict(action="allow" if self_check_allowed(out) else "block", reason="输出安全检查阻止交付")
+        return self_check(context, "self_check_output", dict(bot_message=payload["text"], user_message="\n".join(user_message)))
     add("self_check_output", "before_delivery", self_check_output, when=lambda p: bool(p.get("text")))
 
     for event in ("before_delivery", "before_tool"):
@@ -309,4 +347,4 @@ def build_hooks(platform, task_id, config):
         return dict(kind="run_hook", hook=eligible[0].name)
     selector = (platform.execution.optional_selector(task_id, scheduler_bindings, observed)
                 if mode in {"ppo", "scheduler"} else SimpleNamespace(choose_next=select))
-    return dict(hooks=tuple(hooks), optional_hooks=selector)
+    return dict(hooks=tuple(hooks), optional_hooks=selector, internal_tool_text=True)

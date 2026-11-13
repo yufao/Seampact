@@ -84,7 +84,9 @@ def main():
     phase = parser.add_mutually_exclusive_group()
     phase.add_argument("--tuning", action="store_true", help="train and score on development cases only; do not touch evaluation cases")
     phase.add_argument("--evaluation-only", action="store_true", help="use this already-trained frozen protocol/checkpoint; no retraining")
+    phase.add_argument("--calibration-only", action="store_true", help="collect development scales and stop before training")
     parser.add_argument("--scales-from", type=Path, help="reuse a matching frozen protocol's actual development normalization")
+    parser.add_argument("--include-rule-baseline", action="store_true", help="also score the development rule baseline when reusing scales")
     args = parser.parse_args()
     plan = json.loads(args.protocol.read_text(encoding="utf-8"))
     if plan.get("schema") not in {"seampact.office-pilot/1", "seampact.office-comparison/1"}:
@@ -132,9 +134,14 @@ def main():
             feedback = api("/api/experiments/office/spreadsheet/score", build_feedback(folder))
             write(folder / "feedback.json", feedback)
             write(args.output / (prefix + "-task-" + str(index) + ".json"), api("/api/tasks/" + task_id))
+            if json.loads((folder / "native-score.json").read_text(encoding="utf-8")).get("quality") is None:
+                raise RuntimeError("Native spreadsheet score is unknown; retained records, stopped further admissions")
             return feedback
         for index in range(len(result["case_ids"])):
             try:
+                for future in score_futures:
+                    if future.done():
+                        future.result()
                 admission = api("/api/experiments/office/pilot", dict(common, op="admit", run_id=run_id))
                 write(args.output / (prefix + "-admit-" + str(index) + ".json"), admission)
                 print(json.dumps(dict(mode=mode, batch=batch, case=admission["case_id"], task=admission["task_id"])), flush=True)
@@ -204,7 +211,7 @@ def main():
         raise ValueError("Pilot cache proof requires one clean and one attacked corpus")
     proof = []
     preparations = [*prebuild, prebuild[0]] if legacy else prebuild
-    if args.tuning:
+    if args.tuning or args.calibration_only:
         permitted = set(plan["cases"]["training"] + plan["cases"]["development"])
         preparations = [case for case in preparations if case in permitted]
     elif args.evaluation_only:
@@ -271,11 +278,15 @@ def main():
                 pool=baseline["workload"]["pool"])
         final = args.output / "frozen-pilot-protocol.json"
         write(final, plan)
+        if args.calibration_only:
+            print("Development calibration complete; no training or evaluation was started.", flush=True)
+            return
         batches = len(workload_cases(plan, "training"))
         for batch in range(batches):
             run(final, "training", batch)
     summary_by_arm = {}
-    modes = (("validation_ppo",) if shared is not None else ("validation_resource_rule", "validation_ppo")) if args.tuning else ("app_config", "resource_rule", "ppo")
+    modes = (("validation_ppo",) if shared is not None and not args.include_rule_baseline else
+             ("validation_resource_rule", "validation_ppo")) if args.tuning else ("app_config", "resource_rule", "ppo")
     for mode in modes:
         workloads = [run(final, mode, batch) for batch in range(len(workload_cases(plan, mode)))]
         task_records, case_ids = [], []

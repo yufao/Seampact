@@ -137,6 +137,30 @@ class AgentRuntimeTests(unittest.TestCase):
         self.assertEqual(self.task["capability_usage"][0]["model_usage"][0]["data"]["usage"],
                          dict(prompt_tokens=3, completion_tokens=2))
 
+    def test_internal_tool_plan_is_kept_for_model_but_only_final_answer_is_delivered(self):
+        bodies, checked, observed = [], [], []
+        tool = dict(type="function", function=dict(name="send_email", parameters=dict(type="object")))
+        def stream(url, key, body, delta):
+            bodies.append(body)
+            if len(bodies) == 1:
+                delta("I will send the email.")
+                return completion("I will send the email.", [dict(id="c1", type="function",
+                    function=dict(name="send_email", arguments='{"to":"a@example.invalid"}'))])
+            delta("The email was sent.")
+            return completion("The email was sent.")
+        def guard(payload, context):
+            checked.append(payload["text"])
+            return dict(action="allow")
+        self.run_host(stream, internal_tool_text=True, external_tools=[tool],
+            external_execute=lambda *a, **kw: dict(content='{"status":"sent"}'),
+            hooks=[AgentHook("delivery", "before_delivery", guard, mode="complete"),
+                   AgentHook("receipt", "tool_observation", lambda p, c: observed.append(p))])
+        self.assertEqual(checked, ["The email was sent."])
+        self.assertEqual(self.task["response"], "The email was sent.")
+        self.assertIn("I will send the email.", json.dumps(bodies[1]))
+        self.assertEqual(observed[0]["arguments"], {"to": "a@example.invalid"})
+        self.assertEqual(observed[0]["call_id"], "c1")
+
     def test_private_flat_usage_survives_a_block_without_exposing_other_fields(self):
         def dispatch(unit, args, **options):
             options["on_event"](dict(kind="model_usage", call_id="c", data=dict(
@@ -251,7 +275,8 @@ class AgentRuntimeTests(unittest.TestCase):
         self.assertEqual(self.task["host"]["package"], "@earendil-works/pi-agent-core")
         self.assertEqual(self.task["host"]["version"], "1.5.2")
         self.assertEqual(executed, [("native_read", dict(value=9), "native-id")])
-        self.assertEqual(observations, [dict(name="native_read", content="filtered result", is_error=False)])
+        self.assertEqual(observations, [dict(name="native_read", call_id="native-id", arguments=dict(value=9),
+                                           content="filtered result", is_error=False)])
         self.assertIn("filtered result", contexts[-1]["tool_contents"])
         self.assertEqual(self.task["wire_messages"][2]["tool_calls"][0]["function"]["arguments"], '{"value":7}')
         self.assertEqual(finished[-1]["quality"], 1)
