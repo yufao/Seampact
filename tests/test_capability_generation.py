@@ -338,6 +338,7 @@ class GeneratedPackageTests(unittest.TestCase):
         self.assertEqual(description["environment"]["base_image"], "python:3.10-slim")
 
     def test_explicit_improvement_reuses_verified_proposal_without_private_context(self):
+        self.inspector.request["configuration"] = dict(environment=dict(python="3.10", base_image="private-runtime:3.10"))
         original = proposal()
         original["manifest"].update(source=dict(id="private-old-source"), generator=dict(model="private-old-model"))
         first = Model([("read_file", dict(path="wordlib.py")), ("submit_package", original)])
@@ -347,6 +348,7 @@ class GeneratedPackageTests(unittest.TestCase):
         catalog.invoke = lambda *a, **k: dict(output=dict(words=2), files=[])
         prior = jobs.start(self.inspector, wait=True)
         self.assertEqual(prior["status"], "AVAILABLE", prior.get("error"))
+        self.inspector.request["configuration"]["environment"] = dict(python="3.11", base_image="python:3.11-slim")
         model = Model([("submit_package", proposal())])
         jobs.transport = model
         config = dict(intent="Preserve the word count and improve caching",
@@ -354,12 +356,15 @@ class GeneratedPackageTests(unittest.TestCase):
                       parameters=dict(device="private-device"))
         result = jobs.start(self.inspector, wait=True, improve_from=prior["id"], configuration=config)
         self.assertEqual(result["status"], "AVAILABLE", result.get("error"))
+        environment = load_package(catalog.packages / result["package_digest"])["environment"]
+        self.assertEqual(environment["python"], "3.10")
+        self.assertEqual(environment["base_image"], "private-runtime:3.10")
         overview = json.loads(model.bodies[0]["messages"][1]["content"])
         self.assertEqual(overview["requested_capability"], config["intent"])
         self.assertEqual(overview["previous_successful_proposal"]["files"], original["files"])
         self.assertNotIn("source", overview["previous_successful_proposal"]["manifest"])
         self.assertNotIn("generator", overview["previous_successful_proposal"]["manifest"])
-        for private in ("private-old-source", "private-old-model", "private-project", "private-resource", "private-device"):
+        for private in ("private-old-source", "private-old-model", "private-project", "private-resource", "private-device", "private-runtime"):
             self.assertNotIn(private, json.dumps(model.bodies[0]))
         self.assertNotIn("continued_from", result)
         self.assertTrue(any(item["path"] == "wordlib.py" for item in result["reads"]))

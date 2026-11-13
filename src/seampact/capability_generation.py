@@ -1437,6 +1437,15 @@ class GenerationJobs:
         try:
             self._check(cancellation)
             inspector = self._freeze(source, job)
+            if job.get("improve_from"):
+                previous = self.store.get("capability_generation", job["improve_from"]) or {}
+                if previous.get("status") == "AVAILABLE":
+                    request = self.store.get("request", previous.get("request_id")) or {}
+                    environment = (request.get("configuration") or {}).get("environment")
+                    if isinstance(environment, dict):
+                        # Keep a verified runtime override instead of reverting to
+                        # the source's older defaults. Explicit changes below win.
+                        inspector.request.setdefault("configuration", {})["environment"] = copy.deepcopy(environment)
             if configuration is not None:
                 current = copy.deepcopy(inspector.request.get("configuration") or {})
                 for name, value in configuration.items():
