@@ -225,13 +225,16 @@ def build_hooks(platform, task_id, config):
                     diagnostic["label_counts"] = {label: sum(claim["label"] == label for claim in output["claims"])
                                                    for label in ("Entailment", "Neutral", "Contradiction")}
                 else:
-                    diagnostic["unavailable_reason"] = "incomplete_result"
+                    reasons = {"truncated", "empty_output", "invalid_format", "transport_error", "no_claims",
+                               "incomplete_result", "missing_finish_reason", "invalid_response"}
+                    reason = output.get("unavailable_reason")
+                    diagnostic["unavailable_reason"] = reason if reason in reasons else "incomplete_result"
             except RequestCancelled:
                 raise
             except Exception as error:
                 status = "unknown"
                 diagnostic.update(check_status="unavailable", unavailable_reason="call_error",
-                                  error_type=type(error).__name__)
+                                  error_type=getattr(error, "kind", type(error).__name__))
             # A decision may include the aggregate support status, never the
             # private source passages or individual extracted claims.
             if status == "unsupported":

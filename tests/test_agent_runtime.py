@@ -122,6 +122,7 @@ class AgentRuntimeTests(unittest.TestCase):
             options["on_event"](dict(kind="claims_extracted", call_id="c", data={"claim_text": "private claim"}))
             options["on_event"](dict(kind="model_usage", call_id="c", data=dict(
                 request_id="provider-id", usage_returned=True,
+                finish_reasons=["length"], empty_content=True, effective_max_tokens=4096,
                 usage=dict(prompt_tokens=3, completion_tokens=2, private="usage text"))))
             return dict(output=dict(claim="private claim"), call=dict(call_id="c"))
         def check(payload, context):
@@ -136,6 +137,8 @@ class AgentRuntimeTests(unittest.TestCase):
         self.assertNotIn("usage text", json.dumps(self.task))
         self.assertEqual(self.task["capability_usage"][0]["model_usage"][0]["data"]["usage"],
                          dict(prompt_tokens=3, completion_tokens=2))
+        self.assertEqual(self.task["capability_usage"][0]["model_usage"][0]["data"]["finish_reasons"], ["length"])
+        self.assertTrue(self.task["capability_usage"][0]["model_usage"][0]["data"]["empty_content"])
 
     def test_internal_tool_plan_is_kept_for_model_but_only_final_answer_is_delivered(self):
         bodies, checked, observed = [], [], []

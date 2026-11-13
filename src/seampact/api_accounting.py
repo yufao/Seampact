@@ -23,6 +23,18 @@ def private_receipt(data):
         result["request_count"] = count if type(count) is int and count > 0 else None
     if isinstance(data.get("request_id"), str):
         result["request_id"] = hashlib.sha256(data["request_id"].encode()).hexdigest()
+    # Private references and reasoning remain excluded; completion validity is
+    # needed to distinguish an unavailable check from a genuine verdict.
+    reasons = {"stop", "length", "tool_calls", "content_filter", "function_call"}
+    if isinstance(data.get("finish_reasons"), list):
+        result["finish_reasons"] = [value if value in reasons else "unknown"
+                                    for value in data["finish_reasons"] if isinstance(value, str)][:8]
+    for key in ("empty_content", "verdict_valid"):
+        if type(data.get(key)) is bool:
+            result[key] = data[key]
+    for key in ("effective_max_tokens", "visible_output_chars"):
+        if type(data.get(key)) is int and data[key] >= 0:
+            result[key] = data[key]
     return result
 
 
