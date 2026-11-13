@@ -33,7 +33,10 @@ RUN --network=none python -m pip install --no-deps --no-build-isolation ".${SEAM
     && python -c "from pathlib import Path; import seampact, subprocess; host = Path(seampact.__file__).parent / 'pi_host'; (host / 'node_modules').symlink_to('/opt/seampact-pi/node_modules', target_is_directory=True); subprocess.run(['node', '--input-type=module', '-e', 'await import(' + repr((host / 'bridge.mjs').as_uri()) + ')'], check=True)" \
     && python -m pip freeze --all > /app/runtime-lock.txt \
     && chmod -R a+rX /app /opt/seampact-pi \
-    && if [ -d /opt/agentdojo ]; then chmod -R a+rX /opt/agentdojo; fi
+    && if [ -d /opt/agentdojo ]; then \
+         find /opt/agentdojo \( -type d ! -perm -0555 -o -type f ! -perm -0444 \
+           -o -type f -perm /0111 ! -perm -0555 \) -exec chmod a+rX {} +; \
+       fi
 # Release metadata cannot invalidate the dependency environment.
 ARG SEAMPACT_REVISION=UNKNOWN
 ARG SEAMPACT_VERSION=UNKNOWN
