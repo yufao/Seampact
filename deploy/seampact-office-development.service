@@ -1,0 +1,12 @@
+[Unit]
+Description=SeamPact frozen development comparison
+After=network-online.target
+
+[Service]
+Type=exec
+EnvironmentFile=%h/.config/seampact/office-development.env
+ExecStart=/usr/bin/python3 -u ${SEAMPACT_CODE_DIR}/scripts/run_office_development_series.py --sweep ${SEAMPACT_SWEEP} --output ${SEAMPACT_OUTPUT} --data-root ${SEAMPACT_DATA_ROOT} --grader-root ${SEAMPACT_GRADER_ROOT} --grader-manifest ${SEAMPACT_GRADER_MANIFEST} --grader-receipt ${SEAMPACT_GRADER_RECEIPT} --business-container ${SEAMPACT_BUSINESS_CONTAINER} --expected-commit ${SEAMPACT_EXPECTED_COMMIT} --url ${SEAMPACT_URL}
+Restart=no
+
+[Install]
+WantedBy=default.target
