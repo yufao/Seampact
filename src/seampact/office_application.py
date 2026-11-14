@@ -7,6 +7,7 @@ Dataset identities and hidden scores never enter applicability or decisions.
 import copy
 import json
 import re
+from itertools import islice, zip_longest
 from types import SimpleNamespace
 
 from seampact.agent_runtime import AgentHook
@@ -15,6 +16,8 @@ from seampact.providers import RequestCancelled
 
 OUTBOUND = frozenset({"send_email", "send_slack_message", "send_direct_message", "send_channel_message", "post_message",
                       "deliver_simulated_receipt"})
+RECEIPT_TOOLS = OUTBOUND | {"append_to_file", "create_file", "delete_file", "share_file", "write_file", "workspace_write_file"}
+MAX_REFERENCES = 6
 PRIVATE_ENTITIES = ["CREDIT_CARD", "US_SSN", "IBAN_CODE", "CRYPTO"]
 METADATA_TOOLS = frozenset({"get_channels", "get_current_day", "list_files", "workspace_list_files",
                             "list_drive_file_metadata", "get_users_in_channel"})
@@ -86,6 +89,12 @@ def self_check_allowed(output):
     if type(output.get("allowed")) is bool:
         return output["allowed"]
     raise ValueError("安全自检未取得明确判定")
+
+
+def guard_decision(blocked, reason, **details):
+    if blocked:
+        return dict(action="block", reason=reason, **details)
+    return dict(action="allow", **details)
 
 
 def payload_text(event, payload):
@@ -174,7 +183,8 @@ def build_hooks(platform, task_id, config):
             name = payload.get("name", "")
             if payload.get("is_error"):
                 return
-            if name in OUTBOUND and payload.get("call_id") and isinstance(payload.get("arguments"), dict):
+            receipt = name in RECEIPT_TOOLS
+            if receipt and payload.get("call_id") and isinstance(payload.get("arguments"), dict):
                 # Bind the receipt to the executed, guarded call. Never use an
                 # assistant's planned action or claimed success as evidence.
                 texts = [json.dumps(dict(executed_tool=name, call_id=payload["call_id"],
@@ -183,17 +193,24 @@ def build_hooks(platform, task_id, config):
                 texts = visible_reference_texts(payload.get("content"))
             else:
                 return
-            for text in texts:
-                if len(text) > 3000:
-                    continue
-                while observations and (len(observations) >= 6 or
-                        sum(len(item[1]) for item in observations) + len(text) > 12000):
-                    observations.pop(0)
-                observations.append((payload["content"], text))
+            passages = list(islice(dict.fromkeys(t for t in texts if 0 < len(t) <= 3000), MAX_REFERENCES))
+            if passages:
+                observations.append((payload["content"], passages, receipt))
+                del observations[:-MAX_REFERENCES]
         def retain_model_context(payload, context):
             visible = payload.get("tool_contents", [])
-            observations[:] = [(content, text) for content, text in observations if content in visible]
-            references[:] = list(dict.fromkeys(text for content, text in observations if content in visible))
+            observations[:] = [item for item in observations if item[0] in visible]
+            references.clear()
+            remaining_chars = 12000
+            # Take the best-ranked passage from each visible call before any
+            # second-ranked passage. Within a rank, prefer the newer call.
+            for rank in zip_longest(*(passages for _, passages, _ in reversed(observations))):
+                for text in rank:
+                    if text and text not in references and len(text) <= remaining_chars:
+                        references.append(text)
+                        remaining_chars -= len(text)
+                        if len(references) == MAX_REFERENCES:
+                            return
         hooks.append(AgentHook("office_visible_references", "tool_observation", remember_reference))
         hooks.append(AgentHook("office_reference_context", "model_context", retain_model_context))
 
@@ -214,7 +231,8 @@ def build_hooks(platform, task_id, config):
             if not can_fact_check(payload):
                 return dict(action="allow", fact_support="unknown", check_status="not_applicable")
             diagnostic = dict(scope="outbound_content" if "name" in payload else "final_delivery",
-                              reference_count=len(references))
+                              reference_count=len(references), receipt_reference_count=len({
+                                  texts[0] for _, texts, receipt in observations if receipt and texts[0] in references}))
             try:
                 output = call(context, "fact_check", dict(question=question, answer=answer,
                                                            references=list(references)))
@@ -264,8 +282,7 @@ def build_hooks(platform, task_id, config):
             out = call(context, "injection", dict(prompt=payload_text(stage, payload)))
             if type(out.get("valid")) is not bool:
                 raise ValueError("注入检测未返回明确判定")
-            return dict(action="allow" if out["valid"] else "block", reason="检测到指令注入",
-                        risk=max(0.0, min(1.0, float(out.get("risk_score", 0)))))
+            return guard_decision(not out["valid"], "检测到指令注入", risk=max(0.0, min(1.0, float(out.get("risk_score", 0)))))
         add("sanitize", event, sanitize, when=lambda p, e=event: bool(payload_text(e, p)))
         add("injection", event, injection, when=lambda p, e=event: bool(payload_text(e, p)))
 
@@ -278,8 +295,7 @@ def build_hooks(platform, task_id, config):
                 reason = out.get("unavailable_reason")
                 return dict(action="block", check_status="unavailable", reason="安全检查未完成，暂不放行",
                             unavailable_reason=reason if reason in reasons else "invalid_result")
-            return dict(action="allow" if self_check_allowed(out) else "block", check_status="valid",
-                        reason="安全检查阻止请求或交付")
+            return guard_decision(not self_check_allowed(out), "安全检查阻止请求或交付", check_status="valid")
         except RequestCancelled:
             raise
         except Exception as error:
@@ -297,12 +313,12 @@ def build_hooks(platform, task_id, config):
     for event in ("before_delivery", "before_tool"):
         def privacy(payload, context, stage=event):
             out = call(context, "privacy", dict(text=payload_text(stage, payload), entities=PRIVATE_ENTITIES, anonymize=False))
-            return dict(action="block" if out.get("findings") else "allow", reason="交付内容包含受保护的财务身份信息",
-                        risk=float(bool(out.get("findings"))))
+            found = bool(out.get("findings"))
+            return guard_decision(found, "交付内容包含受保护的财务身份信息", risk=float(found))
         def secrets(payload, context, stage=event):
             out = call(context, "secrets", dict(text=payload_text(stage, payload), filename="outbound.txt"))
-            return dict(action="block" if out.get("detected") else "allow", reason="交付内容包含凭据",
-                        risk=float(bool(out.get("detected"))))
+            found = bool(out.get("detected"))
+            return guard_decision(found, "交付内容包含凭据", risk=float(found))
         predicate = (lambda p: bool(p.get("text"))) if event == "before_delivery" else (
             lambda p: p.get("name") in OUTBOUND)
         add("privacy", event, privacy, when=predicate)
@@ -325,8 +341,7 @@ def build_hooks(platform, task_id, config):
         out = call(context, "code_scan", dict(files=[dict(name="task.py", source=source)]))
         issues = out.get("issues", [])
         severe = [i for i in issues if i.get("issue_severity", i.get("severity")) == "HIGH"]
-        return dict(action="block" if severe else "allow", reason="代码含高严重性风险",
-                    risk=float(bool(issues)), issue_count=len(issues))
+        return guard_decision(severe, "代码含高严重性风险", risk=float(bool(issues)), issue_count=len(issues))
     add("code_scan", "before_tool", scan_code, when=lambda p: p.get("name") == "submit_spreadsheet_solution" or
         p.get("name") in {"run_python", "workspace_run_python"} and bool(p.get("arguments", {}).get("code")))
 

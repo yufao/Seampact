@@ -1,4 +1,5 @@
 """Office fact checks use only material in the actual model context."""
+import json
 import sys
 import unittest
 from pathlib import Path
@@ -74,7 +75,6 @@ class OfficeFactCheckTests(unittest.TestCase):
         self.assertNotIn("private", str(result))
 
     def test_executed_receipt_supports_confirmation_only_while_visible(self):
-        import json
         receipt = '{"status":"sent","id":"mail-1"}'
         hook = self.hooks["office_visible_references"]
         # A plan without an executed call identity must never become evidence.
@@ -91,9 +91,32 @@ class OfficeFactCheckTests(unittest.TestCase):
         self.current_context()
         self.assertEqual(self.check()["check_status"], "not_applicable")
 
+    def test_ranked_reads_and_executed_write_share_bounded_references(self):
+        batches = [json.dumps({"result": {"output": {"results": [{"content": prefix + str(i)}
+                   for i in range(10)]}}}) for prefix in ("first ", "second ")]
+        for batch in batches:
+            self.observe(batch, name="search_documents_example")
+        receipt = "filename: notes.txt\ncontent: updated"
+        event = dict(name="append_to_file", call_id="c2", arguments={"file_id": "9", "content": "updated"},
+                     content=receipt, is_error=False)
+        self.hooks["office_visible_references"].handler(dict(event, content="failed", is_error=True), self.context)
+        self.hooks["office_visible_references"].handler(event, self.context)
+        self.current_context(*batches, receipt, "failed")
+        result = self.check()
+        texts = self.calls[-1][1]["references"]
+        self.assertEqual((result["reference_count"], result["receipt_reference_count"]), (6, 1))
+        self.assertEqual(json.loads(texts[0])["observed_result"], receipt)
+        self.assertEqual(texts[1:], ["second 0", "first 0", "second 1", "first 1", "second 2"])
+        self.current_context(batches[0])
+        self.assertEqual(self.check()["receipt_reference_count"], 0)
+        self.assertEqual(self.calls[-1][1]["references"], ["first " + str(i) for i in range(6)])
+
     def test_unavailable_self_check_blocks_without_claiming_a_risk_finding(self):
         hooks = {h.name: h for h in build_hooks(None, "task", dict(mode="app_config",
                   bindings={"self_check_input": "unit"}))["hooks"]}
+        clean = SimpleNamespace(invoke=lambda *a, **kw: dict(output=dict(is_blocked=False, decision="allow")))
+        self.assertEqual(hooks["self_check_input:input_received"].handler(dict(messages=[]), clean),
+                         dict(action="allow", check_status="valid"))
         for failed, expected in ((True, "unavailable"), (False, "valid")):
             context = SimpleNamespace(invoke=lambda *a, **kw: dict(output=dict(
                 failed=failed, is_blocked=True, decision="block", unavailable_reason="truncated")))
