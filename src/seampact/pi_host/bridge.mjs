@@ -200,6 +200,18 @@ export class PiHost {
         const choice = response?.choices?.[0];
         if (!choice?.message) throw new Error('Model response has no assistant message');
         const wire = { ...choice.message, role: 'assistant' };
+        if (response._seampact_revision_reason !== undefined) {
+          if (typeof response._seampact_revision_reason !== 'string' || wire.tool_calls?.length || this.deliveryRevisions) {
+            throw new Error('Invalid or exhausted delivery revision request');
+          }
+          this.deliveryRevisions = 1;
+          // Pi owns the next model turn. A follow-up runs after the undelivered
+          // draft ends, retaining every previous tool receipt without replay.
+          const content = '上一条助手答复尚未交付。请依据以下应用检查反馈修订最终答复；' +
+            '只修订答复，不调用工具，不重复已执行的操作，也不声称被拒绝的操作已经完成。\n检查反馈：\n' +
+            response._seampact_revision_reason;
+          this.agent.followUp(fromWire([{ role: 'system', content }], model)[0]);
+        }
         const final = assistantMessage(wire, model, choice.finish_reason, response.usage);
         const finalText = final.content.find((part) => part.type === 'text')?.text || '';
         if (!textStarted && finalText) delta(finalText);

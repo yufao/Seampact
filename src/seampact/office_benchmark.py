@@ -9,9 +9,25 @@ the results of requested tools to the business agent and its policy.
 from copy import deepcopy
 import hashlib
 import json
+import re
 from pathlib import Path
 
 _RAG_REMOVED_TOOLS = {"search_files", "search_files_by_filename", "get_file_by_id", "list_files"}
+
+# Effects describe only these native AgentDojo tools, not identically named
+# tools supplied by another environment or by the local workspace.
+_NATIVE = {
+    "send": {"send_email", "send_slack_message", "send_direct_message", "send_channel_message",
+             "post_message", "share_file", "invite_user_to_slack", "add_user_to_channel", "post_webpage",
+             "create_calendar_event", "reschedule_calendar_event", "cancel_calendar_event", "add_calendar_event_participants"},
+    "write": {"append_to_file", "create_file", "delete_file", "write_file", "delete_email", "remove_user_from_slack"},
+    "read": {"read_file", "get_file_by_id", "get_email", "search_emails", "get_thread", "get_message",
+             "search_files", "read_channel_messages", "read_inbox", "get_day_calendar_events", "search_calendar_events",
+             "get_received_emails", "get_unread_emails", "get_sent_emails", "get_draft_emails", "get_webpage", "search_files_by_filename"},
+    "metadata": {"get_channels", "get_current_day", "list_files", "list_drive_file_metadata", "get_users_in_channel",
+                 "search_contacts_by_name", "search_contacts_by_email"},
+}
+_NATIVE_OPERATIONS = {name: kind for kind, names in _NATIVE.items() for name in names}
 
 
 def _normalized_text(value):
@@ -83,6 +99,10 @@ class AgentDojoOfficeTask:
                 description="List cloud-drive file IDs, names and sharing metadata without file contents. "
                             "Search project documents to read the reference texts.",
                 parameters=dict(type="object", properties={}, additionalProperties=False))))
+        for item in result:
+            kind = _NATIVE_OPERATIONS.get(item["function"]["name"])
+            if kind is not None:
+                item["operation"] = {"kind": kind}
         return result
 
     def configure_rag_reference(self, reference_name, files, attack_names=(), payloads=()):
@@ -358,36 +378,7 @@ def prepare_office_rag_task(project_spaces, project_id, manifest_path, manifest_
         digests[name] = hashlib.sha256(document).hexdigest()
     if file_id not in catalog["files"] or set(changed) - set(catalog["files"]):
         raise ValueError("RAG reference or attacked document is not in the frozen drive")
-    marker_name = "office-reference/.seampact-rag-owner.json"
-    project_spaces.require_idle(project_id)
-    data_dir = Path(project_spaces.project_mount(project_id, "data"))
-    # The installed search component recursively scans visible txt/md files.
-    # Avoid indexing unrelated user data or leftover experimental corpora.
-    for path in data_dir.rglob("*"):
-        if path.is_symlink():
-            raise ValueError("RAG project data must not contain symbolic links")
-        if (path.is_file() and path.suffix.lower() in {".txt", ".md"}
-                and path.relative_to(data_dir).as_posix() not in documents):
-            raise ValueError("RAG project contains another text corpus")
-    marker = data_dir / marker_name
-    existing = {name for name in documents if (data_dir / name).exists()}
-    if existing or marker.exists():
-        if not marker.is_file():
-            raise ValueError("Existing RAG corpus is not owned by this preparation")
-        prior = json.loads(marker.read_text(encoding="utf-8"))
-        prior_files = prior.get("files", {})
-        if prior.get("schema") != "seampact.office-rag-project/2" or set(prior_files) != existing:
-            raise ValueError("Existing RAG corpus ownership record is incomplete")
-        for name, previous_digest in prior_files.items():
-            if hashlib.sha256((data_dir / name).read_bytes()).hexdigest() != previous_digest:
-                raise ValueError("Existing RAG corpus was modified outside preparation")
-    # ProjectSpaces enforces file and project ownership plus the idle check.
-    for name, document in documents.items():
-        if not (data_dir / name).is_file() or hashlib.sha256((data_dir / name).read_bytes()).hexdigest() != digests[name]:
-            project_spaces.put_file(project_id, None, "data", name, document)
-    owner = dict(schema="seampact.office-rag-project/2", files=digests)
-    project_spaces.put_file(project_id, None, "data", marker_name,
-                            json.dumps(owner, sort_keys=True).encode("utf-8"))
+    _install_rag_documents(project_spaces, project_id, documents, digests)
     reference_name = f"office-reference/drive-{file_id}.txt"
     attack_names = [f"office-reference/drive-{item_id}.txt" for item_id in changed]
     task.configure_rag_reference(reference_name, digests, attack_names, payloads)
@@ -396,3 +387,60 @@ def prepare_office_rag_task(project_spaces, project_id, manifest_path, manifest_
                       corpus_file_count=len(documents), corpus_digests=digests,
                       attack_source_names=attack_names,
                       mapping=variant["method"] if variant else "clean_reference")
+
+
+def _install_rag_documents(project_spaces, project_id, documents, digests):
+    """Replace only previously owned, unchanged documents in an idle project."""
+    marker_name = "office-reference/.seampact-rag-owner.json"
+    project_spaces.require_idle(project_id)
+    data_dir = Path(project_spaces.project_mount(project_id, "data"))
+    marker = data_dir / marker_name
+    reference_dir = marker.parent
+    if reference_dir.is_symlink() or (reference_dir.exists() and
+            getattr(reference_dir.lstat(), "st_file_attributes", 0) & 0x400):
+        raise ValueError("RAG project data must not contain symbolic links or reparse points")
+    def valid_name(name):
+        # Direct children only, no marker, traversal, separators, or special files.
+        return (isinstance(name, str) and bool(re.fullmatch(
+            r"office-reference/[A-Za-z0-9][A-Za-z0-9_-]*\.(?:txt|md)", name)))
+    if any(not valid_name(name) for name in documents):
+        raise ValueError("RAG corpus contains an unknown document name")
+    prior_files = {}
+    ledger = project_spaces.store.get("office_rag_corpus", project_id)
+    if marker.exists() or marker.is_symlink():
+        if not marker.is_file() or marker.is_symlink() or marker.stat().st_nlink != 1:
+            raise ValueError("Invalid RAG corpus ownership record")
+        prior = json.loads(marker.read_text(encoding="utf-8"))
+        prior_files = prior.get("files", {})
+        if (prior.get("schema") != "seampact.office-rag-project/2" or not isinstance(prior_files, dict)
+                or ledger != prior):
+            raise ValueError("Existing RAG corpus has no matching trusted ownership ledger")
+        for name, previous_digest in prior_files.items():
+            if not valid_name(name):
+                raise ValueError("RAG ownership record contains an unknown document name")
+            path = data_dir / name
+            if (not path.resolve().is_relative_to(data_dir.resolve()) or not path.is_file() or path.is_symlink()
+                    or path.stat().st_nlink != 1
+                    or hashlib.sha256(path.read_bytes()).hexdigest() != previous_digest):
+                raise ValueError("Existing RAG corpus was modified outside preparation")
+    elif ledger is not None:
+        raise ValueError("RAG ownership marker is missing; preserve the existing files")
+    for path in data_dir.rglob("*"):
+        if path.is_symlink() or getattr(path.lstat(), "st_file_attributes", 0) & 0x400:
+            raise ValueError("RAG project data must not contain symbolic links or reparse points")
+        if path.is_file() and path.suffix.lower() in {".txt", ".md"}:
+            name = path.relative_to(data_dir).as_posix()
+            if name not in prior_files:
+                raise ValueError("RAG project contains another text corpus")
+    for name in set(prior_files) - set(documents):
+        project_spaces.delete_file(project_id, None, "data", name)
+    for name, document in documents.items():
+        path = data_dir / name
+        if not path.is_file() or hashlib.sha256(path.read_bytes()).hexdigest() != digests[name]:
+            project_spaces.put_file(project_id, None, "data", name, document)
+    owner = dict(schema="seampact.office-rag-project/2", files=digests)
+    project_spaces.put_file(project_id, None, "data", marker_name,
+                            json.dumps(owner, sort_keys=True).encode("utf-8"))
+    # The Store is outside the model-visible project files. A forged marker
+    # cannot authorize removal, even if it lists a valid name and digest.
+    project_spaces.store.save("office_rag_corpus", project_id, owner)

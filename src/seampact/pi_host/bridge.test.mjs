@@ -82,6 +82,42 @@ test('Pi validates malformed and unknown tool calls without executing Python eff
   assert.equal(output.at(-1).error, undefined);
 });
 
+test('delivery repair is one native Pi follow-up with retained tool receipts', async () => {
+  let models = 0;
+  let effects = 0;
+  const output = await scenario((request) => {
+    if (request.method === 'context') return { ...request.params, tools: models === 2 ? [] : [tool] };
+    if (request.method === 'tool') {
+      effects += 1;
+      return { content: 'effect completed once', isError: false };
+    }
+    models += 1;
+    if (models === 1) return response({ content: null, tool_calls: [call('once', '{"value":1}')] }, 'tool_calls');
+    if (models === 2) return { ...response({ content: 'undelivered draft' }), _seampact_revision_reason: 'Use supported facts.' };
+    assert.equal(request.params.tools.length, 0);
+    assert.equal(request.params.messages.at(-1).role, 'system');
+    assert.match(request.params.messages.at(-1).content, /Use supported facts\./);
+    assert.equal(request.params.messages.filter((message) => message.tool_call_id === 'once').length, 1);
+    return response({ content: 'revised answer' });
+  });
+  assert.equal(models, 3);
+  assert.equal(effects, 1);
+  assert.equal(output.filter((value) => value.event?.type === 'agent_start').length, 1);
+  assert.equal(output.at(-1).error, undefined);
+  assert.equal(output.at(-1).context_messages.at(-1).content, 'revised answer');
+});
+
+test('the bridge rejects a second delivery repair without a third model answer', async () => {
+  let models = 0;
+  const output = await scenario((request) => {
+    if (request.method === 'context') return { ...request.params, tools: [] };
+    models += 1;
+    return { ...response({ content: 'undelivered' }), _seampact_revision_reason: 'Still unsupported.' };
+  });
+  assert.equal(models, 2);
+  assert.match(output.at(-1).error, /exhausted delivery revision/);
+});
+
 test('abort never starts the remaining side effect or replays an active tool', async () => {
   let effects = 0;
   let models = 0;

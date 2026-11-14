@@ -5,13 +5,14 @@ configuration selected before running. Development data alone fixes scales;
 unknown measurements or scores stop PPO training instead of being imputed.
 """
 import argparse
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 import copy
 import hashlib
 import json
 from pathlib import Path
 import subprocess
 import sys
+import threading
 import time
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
@@ -39,6 +40,55 @@ def service_path(path, local_root=None, server_root=None):
 
 def sum_known(values):
     return None if any(value is None for value in values) else sum(values)
+
+
+def timed_admissions(blocks, admit):
+    """Pace the offered load independently of result collection inside a block."""
+    stop = threading.Event()
+    def send(block, receipts):
+        origin = time.perf_counter()
+        wall_origin = time.time()
+        for index, offset, receipt in zip(block["indices"], block["offsets_ms"], receipts):
+            due = origin + offset / 1000
+            remaining = due - time.perf_counter()
+            while remaining > 0:
+                if stop.wait(remaining):
+                    return
+                remaining = due - time.perf_counter()
+            if stop.is_set():
+                return
+            sent = time.perf_counter() - origin
+            timing = dict(block_origin_unix_s=wall_origin, scheduled_offset_ms=offset,
+                          client_send_offset_ms=sent * 1000, profile=block["profile"])
+            try:
+                result = admit(index, timing)
+                receipt.set_result(result)
+            except Exception as error:
+                receipt.set_exception(error)
+                return
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        try:
+            for block in blocks:
+                receipts = [Future() for _ in block["indices"]]
+                sending = pool.submit(send, block, receipts)
+                for index, receipt in zip(block["indices"], receipts):
+                    yield index, receipt.result()
+                sending.result()
+        finally:
+            stop.set()
+
+
+def allowed_prebuild(plan, preparations, *, calibration_only=False, tuning=False, evaluation_only=False):
+    if calibration_only:
+        permitted = set(plan["cases"]["development"])
+    elif tuning:
+        permitted = set(plan["cases"]["training"] + plan["cases"]["development"])
+    elif evaluation_only:
+        permitted = set(plan["cases"]["evaluation"])
+    else:
+        return preparations
+    return [case for case in preparations if case in permitted]
 
 
 def combined_summary(workloads):
@@ -137,14 +187,27 @@ def main():
             if json.loads((folder / "native-score.json").read_text(encoding="utf-8")).get("quality") is None:
                 raise RuntimeError("Native spreadsheet score is unknown; retained records, stopped further admissions")
             return feedback
+        waves = result.get("arrival_waves") or [[i] for i in range(len(result["case_ids"]))]
+        blocks = result.get("arrival_blocks") or [dict(indices=wave, offsets_ms=[0] * len(wave),
+                                                       profile="batch") for wave in waves]
+        def admit(index, timing):
+            for future in score_futures.copy():
+                if future.done():
+                    future.result()
+            admission = api("/api/experiments/office/pilot", dict(common, op="admit", run_id=run_id))
+            if admission.get("task_id") != result["task_ids"][index]:
+                raise ValueError("Admission differs from the frozen task sequence")
+            admission["dispatch_timing"] = dict(timing, client_ack_unix_s=time.time())
+            write(args.output / (prefix + "-admit-" + str(index) + ".json"), admission)
+            print(json.dumps(dict(mode=mode, batch=batch, case=admission["case_id"], task=admission["task_id"])), flush=True)
+            return admission
+        stream = timed_admissions(blocks, admit)
         for index in range(len(result["case_ids"])):
             try:
                 for future in score_futures:
                     if future.done():
                         future.result()
-                admission = api("/api/experiments/office/pilot", dict(common, op="admit", run_id=run_id))
-                write(args.output / (prefix + "-admit-" + str(index) + ".json"), admission)
-                print(json.dumps(dict(mode=mode, batch=batch, case=admission["case_id"], task=admission["task_id"])), flush=True)
+                _, admission = next(stream)
                 while True:
                     task = api("/api/tasks/" + admission["task_id"])
                     if task["status"] not in {"RUNNING", "CANCELLING"} and task.get("workspace_status"):
@@ -172,10 +235,12 @@ def main():
                     with (args.output / (prefix + "-updates.jsonl")).open("a", encoding="utf-8") as stream:
                         stream.write(json.dumps(dict(completed=index + 1, result=requested), ensure_ascii=False) + "\n")
             except Exception as error:
+                stream.close()
                 write(args.output / (prefix + "-error.json"), dict(case_index=index, error=str(error), run_id=run_id))
                 if scoring is not None:
                     scoring.shutdown(wait=True, cancel_futures=True)
                 raise
+        stream.close()
         while True:
             result = api("/api/experiments/office/pilot", dict(common, op="drain", run_id=run_id))
             if result["status"] != "DRAINING":
@@ -211,11 +276,8 @@ def main():
         raise ValueError("Pilot cache proof requires one clean and one attacked corpus")
     proof = []
     preparations = [*prebuild, prebuild[0]] if legacy else prebuild
-    if args.tuning or args.calibration_only:
-        permitted = set(plan["cases"]["training"] + plan["cases"]["development"])
-        preparations = [case for case in preparations if case in permitted]
-    elif args.evaluation_only:
-        preparations = [case for case in preparations if case in set(plan["cases"]["evaluation"])]
+    preparations = allowed_prebuild(plan, preparations, calibration_only=args.calibration_only,
+                                    tuning=args.tuning, evaluation_only=args.evaluation_only)
     for index, case_id in enumerate(preparations):
         prepared = api("/api/experiments/office/pilot", dict(op="prebuild", protocol=remote(development),
                        protocol_sha256=digest(development), case_id=case_id))
@@ -275,7 +337,7 @@ def main():
             plan["development_evidence"] = dict(protocol_sha256=digest(development), run_id=baseline["id"],
                 run_ids=[row["id"] for row in baselines],
                 observed_totals=observed, denominator=n, scales=scales, zero_fallbacks=zero_fallbacks,
-                pool=baseline["workload"]["pool"])
+                pool=baseline["workload"]["pool"], application=baseline["application"])
         final = args.output / "frozen-pilot-protocol.json"
         write(final, plan)
         if args.calibration_only:

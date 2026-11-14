@@ -10,7 +10,9 @@ from pathlib import PurePosixPath
 
 
 def _definition(name, description, properties, required=()):
-    return dict(type="function", function=dict(name=name, description=description,
+    kinds = {"list_files": "metadata", "read_file": "read", "write_file": "write",
+             "deliver_file": "write", "run_python": "execute"}
+    return dict(type="function", operation={"kind": kinds[name]}, function=dict(name=name, description=description,
         parameters=dict(type="object", properties=properties, required=list(required), additionalProperties=False)))
 
 
@@ -67,22 +69,24 @@ class WorkspaceTools:
                     current.get(key) != self.scope.get(key) for key in ("project_id", "conversation_id", "task_id")):
                 raise ValueError("会话工作区没有本任务的有效租约")
             project, conversation = self.scope["project_id"], self.scope["conversation_id"]
+            input_task = self.scope["task_id"] if current.get("private_inputs") else None
             if name == "list_files":
-                return self.projects.list_files(project, conversation, **arguments)
+                return self.projects.list_files(project, conversation, input_task=input_task, **arguments)
             if name == "read_file":
-                return self.projects.read_file(project, conversation, **dict(arguments, area=arguments.get("area", "data")))
+                return self.projects.read_file(project, conversation, input_task=input_task,
+                    **dict(arguments, area=arguments.get("area", "data")))
             if name == "write_file":
                 if arguments.get("area", "workspace") != "workspace":
                     raise ValueError("Agent 只能写入当前会话工作区")
                 return self.projects.write_file(project, conversation, **dict(arguments, area="workspace"))
             if name == "deliver_file":
-                return self._deliver(project, conversation, control=control, **arguments)
+                return self._deliver(project, conversation, control=control, input_task=input_task, **arguments)
             raise ValueError("未知工作区工具")
 
-    def _deliver(self, project, conversation, path, area="workspace", *, control):
+    def _deliver(self, project, conversation, path, area="workspace", *, control, input_task=None):
         if self.artifacts is None:
             raise ValueError("文件交付存储尚未接通")
-        target = self.projects.file_path(project, conversation, area, path)
+        target = self.projects.file_path(project, conversation, area, path, input_task=input_task)
         try:
             with target.open("rb") as stream:
                 identity, size = hashlib.sha256(), 0

@@ -168,7 +168,7 @@ class SpreadsheetTask:
             raise ValueError("Solution frozen: further tools and model edits are disabled")
 
     def tools(self):
-        return [dict(type="function", function=dict(name="submit_spreadsheet_solution",
+        return [dict(type="function", operation={"kind": "execute", "code_workspace_file": "solution.py"}, function=dict(name="submit_spreadsheet_solution",
             description="Freeze the tested reusable solution.py and replay it unchanged on all three original inputs. "
                         "After submission no tool calls or code edits are allowed. Hidden replay results are not model feedback.",
             parameters=dict(type="object", properties={}, additionalProperties=False)))]
@@ -300,10 +300,9 @@ def start_spreadsheet_task(platform, body, *, internal_task_id=None, pilot_confi
         application = build_hooks(platform, identity, pilot_config)
         options.update(application, hooks=hooks + application["hooks"])
     with platform.deployments.lock, platform.projects.lock:
-        platform.projects.put_file(body["project_id"], None, "data", namespace + "/" + inputs[0]["name"], inputs[0]["data"])
         return platform.chat.start(dict(project_id=body["project_id"], messages=[dict(role="user", content=prompt)],
                                         deadline_s=pilot_config.get("deadline_s", 1200) if pilot_config is not None else 1200),
-            runtime_options=options,
+            runtime_options=options, input_files={namespace + "/" + inputs[0]["name"]: inputs[0]["data"]},
             metadata=dict(arm=pilot_config["mode"] if pilot_config else "spreadsheetbench_pi_frozen_replay", case=case["id"], source_revision=SOURCE_REVISION,
                           manifest_sha256=body["manifest_sha256"], family_id=case["family_id"],
                           original_manifest_sha256=case["original_manifest_sha256"],

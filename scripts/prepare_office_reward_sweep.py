@@ -43,11 +43,21 @@ def main():
     base = json.loads(raw)
     if (base.get("schema") != "seampact.office-comparison/1" or not base.get("continuous_training") or
             base.get("update_after_tasks") != 16 or base.get("scheduler", {}).get("objective") is not None or
-            [len(base["cases"][s]) for s in ("development", "training", "evaluation")] != [32, 256, 72] or
-            base.get("workload_trace", {}).get("order") != "shuffle"):
-        raise ValueError("Expected the unfrozen continuous shuffle comparison protocol")
+            base.get("workload_trace", {}).get("order") not in {"shuffle", "timed_mixed"} or
+            any(not base["cases"].get(s) for s in ("development", "training", "evaluation"))):
+        raise ValueError("Expected a prepared continuous office comparison protocol")
     if "reward_sweep" in base:
         raise ValueError("Base protocol already belongs to a reward sweep")
+    extension_sources = base.get("workload_trace", {}).get("development_extensions", {})
+    if extension_sources:
+        if not set(extension_sources) <= {"office_ci", "office_summedits", "office_routing", "office_access", "office_links"}:
+            raise ValueError("Unsupported development extension denominators")
+        if any(row.get("distinct_cases") != row.get("original_tasks") or
+               row.get("distinct_cases") != row.get("families")
+               for row in extension_sources.values()):
+            raise ValueError("Development extension denominators are inconsistent")
+        if sum(row["distinct_cases"] for row in extension_sources.values()) > len(base["cases"]["development"]):
+            raise ValueError("Development extension counts exceed the development dispatch")
     args.output.mkdir(parents=True, exist_ok=False)
     rows = []
     for name, costs in GROUPS.items():
@@ -77,18 +87,22 @@ def main():
                   "不跨不同奖励函数比较奖励总分。依据开发结果选定一组后，使用同一冻结协议和检查点进行正式评测，"
                   "不重新训练。每组的这些权重是预先固定的偏好，不由模型学习。", ""])
     (args.output / "README.md").write_text("\n".join(lines), encoding="utf-8")
+    counts = {name: len(ids) for name, ids in base["cases"].items()}
     manifest = dict(schema="seampact.office-reward-sweep/1", status="PREPARED_NOT_RUN",
         base_protocol=str(args.base.resolve()), base_protocol_sha256=base_sha, groups=rows,
         readable_summary="README.md",
         seed=base["seed"], workload_trace=base["workload_trace"],
         cost_order=list(METRICS), fixed_weights=dict(quality=1, delivery=1),
         normalization="one shared set of development scales established by balanced, reused by six remaining groups",
-        development="seven independent 256-task training runs and seven 32-task PPO development evaluations; one 32-task app calibration and one 32-task rule baseline",
+        planned_arrivals=counts,
+        development_source_denominators=extension_sources,
+        development=f"seven {counts['training']}-task training runs and seven {counts['development']}-task PPO development evaluations; one common calibration and one rule baseline on development",
         selection="select on development evidence, preserve unknowns, compare native quality, delivery and resource metrics rather than scalar totals across reward functions",
-        final_evaluation="after selection only: three 72-task arms, using the selected frozen protocol and trained checkpoint without retraining",
+        final_evaluation=f"after selection only: three {counts['evaluation']}-task arms, using the selected frozen protocol and trained checkpoint without retraining",
         note="Fixed cost preferences; no automatic weight learning or non-linear utility is implied.")
     manifest_sha = write(args.output / "manifest.json", manifest)
-    print(json.dumps(dict(groups=len(rows), manifest_sha256=manifest_sha, status="PREPARED_NOT_RUN")))
+    print(json.dumps(dict(groups=len(rows), manifest_sha256=manifest_sha, status="PREPARED_NOT_RUN",
+                          development_source_denominators=extension_sources)))
 
 
 if __name__ == "__main__":

@@ -15,6 +15,7 @@ import time
 import unittest
 import uuid
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
@@ -25,7 +26,7 @@ from seampact.capability_contract import (
 from seampact.capability_worker import CapabilityWorker, make_worker_server
 from seampact.hosting import capability_hosting
 from seampact.hosting.capability_hosting import CapabilityError
-from seampact.hosting.deployment import IDENTITY_PROTOCOL
+from seampact.hosting.deployment import Deployments, IDENTITY_PROTOCOL
 from seampact.runtime import ProtocolError
 from seampact.server import make_server
 from seampact.service import Platform
@@ -80,7 +81,7 @@ TEXT = dict(type="object", properties=dict(text=dict(type="string"), fail=dict(t
             required=["text"], additionalProperties=False)
 
 
-def write_example_package(root, concurrency=1):
+def write_example_package(root, concurrency=1, replicable=False):
     """A package as a generator would write it: adapter, reused source and manifest."""
     root = Path(root)
     (root / "adapter").mkdir(parents=True)
@@ -93,7 +94,7 @@ def write_example_package(root, concurrency=1):
         generator=dict(template="python-adapter/1"),
         environment=dict(python=".".join(map(str, sys.version_info[:2])), requirements=[], packages=[]),
         implementation=dict(module="adapter", symbol="WordTools"),
-        instance=dict(concurrency=concurrency, replicable=False, cancel="cooperative"),
+        instance=dict(concurrency=concurrency, replicable=replicable, cancel="cooperative"),
         resources=[dict(id="greeting", kind="parameter", required=True, description="结果中使用的问候语")],
         capabilities=[
             dict(schema=IR_SCHEMA, id="count_words", name="统计词数", purpose="统计文本词数及词表内词数",
@@ -167,6 +168,49 @@ class ContractTests(unittest.TestCase):
                     check_manifest(broken)
 
 
+class IdleReplicaSafety(unittest.TestCase):
+    def test_idle_replica_rechecks_busy_affinity_and_last_ready_before_draining(self):
+        controller = Deployments.__new__(Deployments)
+        controller.lock = threading.RLock()
+        controller.affinity = {}
+        first = dict(id="first", group_id="group", state="READY", accepting=True,
+                     in_flight=0, released=False, pending_stop=None)
+        second = dict(id="second", group_id="group", state="READY", accepting=True,
+                      in_flight=0, released=False, pending_stop=None)
+        controller.instances = {"first": first, "second": second}
+        group = dict(contract=dict(replicas=dict(replicable=True),
+                                   operations=dict(drain_stop=dict(status="SUPPORTED"))))
+        controller.platform = SimpleNamespace(store=SimpleNamespace(get=lambda kind, identity: group))
+        controller._guard = lambda *args: None
+        controller._instances = lambda group_id, states=None: [row for row in controller.instances.values()
+            if row["group_id"] == group_id and (states is None or row["state"] in states)]
+        events = []
+        controller._event = lambda item, kind, **facts: events.append((item["id"], kind))
+        controller._advance_stops = lambda: None
+        controller._notify = lambda *args: self.fail("fixture has no endpoint to notify")
+        controller._view = lambda item: dict(item)
+        request = dict(instance_id="first", idle_replica=True)
+
+        first["in_flight"] = 1
+        self.assertEqual(controller.drain_stop("group", request)["status"], "SKIPPED")
+        first["in_flight"] = 0
+        controller.affinity[("task", "group")] = "first"
+        self.assertEqual(controller.drain_stop("group", request)["status"], "SKIPPED")
+        controller.affinity.clear()
+        second.update(state="STARTING", accepting=False)
+        self.assertEqual(controller.drain_stop("group", request)["status"], "SKIPPED")
+        self.assertEqual(first["state"], "READY")
+        self.assertFalse(events)
+
+        second.update(state="READY", accepting=True)
+        outcome = controller.drain_stop("group", request)
+        self.assertEqual([row["id"] for row in outcome["instances"]], ["first"])
+        self.assertEqual(first["state"], "DRAINING")
+        self.assertFalse(first["accepting"])
+        self.assertEqual(second["state"], "READY")
+        self.assertEqual(events, [("first", "drain_requested")])
+
+
 class PackageLifecycle(unittest.TestCase):
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory(prefix="seampact-capability-")
@@ -194,8 +238,8 @@ class PackageLifecycle(unittest.TestCase):
         sys.path[:] = self.paths
         self.directory.cleanup()
 
-    def install(self, concurrency=1):
-        write_example_package(self.root / "generated", concurrency)
+    def install(self, concurrency=1, replicable=False):
+        write_example_package(self.root / "generated", concurrency, replicable)
         installation = self.platform.capabilities.install(self.root / "generated")
         self.group = installation["group_id"]
         return installation
@@ -367,6 +411,143 @@ class PackageLifecycle(unittest.TestCase):
         thread.join(30)
         self.assertEqual(outcome["ignoring"]["output"], dict(waited=True))
         self.assertEqual(outcome["ignoring"]["cancel"], dict(requested=True, confirmed=False))
+
+    def test_replica_capacity_and_task_affinity_are_reserved_atomically(self):
+        self.install(replicable=True)
+        self.platform.capabilities.bind(self.group, dict(greeting=dict(form="value", value="hi")))
+        artifact = self.reported_image()
+        _, first = self.start_worker(artifact)
+        _, second = self.start_worker(artifact)
+        capabilities, units = self.platform.capabilities, self.units()
+        waiting, same_started = threading.Event(), threading.Event()
+        results, errors = {}, []
+
+        def invoke(key, task_id, unit, args, on_event=None):
+            try:
+                with self.platform.runtime.context(task_id):
+                    results[key] = capabilities.invoke(unit, args, on_event=on_event)
+            except Exception as error:
+                errors.append(error)
+
+        def events(event):
+            if event["kind"] == "waiting":
+                results["first_instance"] = event["instance_id"]
+                waiting.set()
+
+        first_call = threading.Thread(target=invoke, args=("first", "same-task", units["wait"]["id"],
+            dict(seconds=1.5), events))
+        same_call = threading.Thread(target=invoke, args=("same", "same-task", units["count_words"]["id"],
+            dict(text="alpha"), lambda event: same_started.set() if event["kind"] == "call_started" else None))
+        other_call = threading.Thread(target=invoke, args=("other", "other-task", units["count_words"]["id"],
+            dict(text="beta")))
+        first_call.start()
+        self.assertTrue(waiting.wait(5))
+        same_call.start()
+        self.assertFalse(same_started.wait(0.15), "an affinity-bound call must wait for its busy instance")
+        other_call.start()
+        other_call.join(3)
+        self.assertFalse(other_call.is_alive(), "an idle replica should serve a different task")
+        self.assertNotEqual(results["other"]["call"]["instance_id"], results["first_instance"])
+        first_call.join(5)
+        same_call.join(5)
+        self.assertFalse(first_call.is_alive() or same_call.is_alive())
+        self.assertFalse(errors)
+        self.assertEqual(results["same"]["call"]["instance_id"], results["first_instance"])
+        self.assertEqual({first["id"], second["id"]},
+                         {results["first_instance"], results["other"]["call"]["instance_id"]})
+
+    def test_drain_waits_for_an_already_reserved_capability_call(self):
+        self.install()
+        self.platform.capabilities.bind(self.group, dict(greeting=dict(form="value", value="hi")))
+        worker, record = self.start_worker(self.reported_image())
+        entered, resume = threading.Event(), threading.Event()
+        real_call, outcome = capability_hosting.call, {}
+
+        def pause_before_worker(*args, **kwargs):
+            entered.set()
+            if not resume.wait(5):
+                raise RuntimeError("test reservation was not resumed")
+            return real_call(*args, **kwargs)
+
+        def invoke():
+            try:
+                outcome["result"] = self.platform.capabilities.invoke(
+                    self.units()["count_words"]["id"], dict(text="alpha"))
+            except Exception as error:
+                outcome["error"] = error
+
+        with patch.object(capability_hosting, "call", side_effect=pause_before_worker):
+            thread = threading.Thread(target=invoke)
+            thread.start()
+            self.assertTrue(entered.wait(5))
+            try:
+                result = self.platform.deployments.drain_stop(self.group, {"instance_id": record["id"]})
+                self.assertEqual(result["instances"][0]["state"], "DRAINING")
+                self.assertTrue(worker.accepting, "a reserved call has not reached the worker yet")
+            finally:
+                resume.set()
+                thread.join(5)
+        self.assertFalse(thread.is_alive())
+        self.assertNotIn("error", outcome)
+        self.assertEqual(outcome["result"]["output"]["words"], 1)
+
+    def test_simultaneous_cold_capability_calls_share_one_start(self):
+        self.install()
+        self.platform.capabilities.bind(self.group, dict(greeting=dict(form="value", value="hi")))
+        artifact, unit = self.reported_image(), self.units()["wait"]["id"]
+        gate, starts, results = threading.Barrier(2), [], []
+
+        def start_once(placement, unit_id, *, bind_affinity=True):
+            self.assertFalse(bind_affinity)
+            starts.append(placement["group_id"])
+            time.sleep(0.1)
+            _, record = self.start_worker(artifact)
+            return record
+
+        def call(task):
+            try:
+                gate.wait(3)
+                with self.platform.runtime.context(task):
+                    results.append(self.platform.capabilities.invoke(unit, dict(seconds=0.2)))
+            except Exception as error:
+                results.append(error)
+
+        with patch.object(self.platform.deployments, "_ensure", side_effect=start_once):
+            threads = [threading.Thread(target=call, args=(f"cold-{i}",)) for i in range(2)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(8)
+        self.assertTrue(all(not thread.is_alive() for thread in threads))
+        self.assertEqual(len(starts), 1)
+        self.assertEqual(len(results), 2)
+        self.assertTrue(all(isinstance(item, dict) and item["output"]["waited"] for item in results), results)
+
+    def test_completed_task_cleanup_does_not_wait_for_another_tasks_shared_worker_call(self):
+        self.install()
+        self.platform.capabilities.bind(self.group, dict(greeting=dict(form="value", value="hi")))
+        self.start_worker(self.reported_image())
+        capabilities, units = self.platform.capabilities, self.units()
+        events, other_started = [], threading.Event()
+        with self.platform.runtime.context("finished-task"):
+            completed = capabilities.invoke(units["count_words"]["id"], dict(text="alpha"), on_event=events.append)
+
+        def other():
+            with self.platform.runtime.context("other-task"):
+                capabilities.invoke(units["wait"]["id"], dict(seconds=0.8),
+                    on_event=lambda event: other_started.set() if event["kind"] == "waiting" else None)
+
+        thread = threading.Thread(target=other)
+        thread.start()
+        self.assertTrue(other_started.wait(5))
+        task = dict(id="finished-task", workspace_controller=self.platform.chat._workspace_controller,
+                    calls=[completed["call"]], events=[dict(kind="capability_event", event=e) for e in events])
+        try:
+            self.assertTrue(self.platform.chat._workspace_drained("finished-task", capabilities, task=task))
+            self.assertTrue(thread.is_alive(), "the other task must still be using the instance")
+        finally:
+            thread.join(5)
+        self.assertFalse(thread.is_alive())
 
     def test_changed_package_bytes_are_refused_by_the_worker(self):
         self.install()

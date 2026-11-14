@@ -27,7 +27,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("manifest", type=Path)
     parser.add_argument("corpus", type=Path)
-    parser.add_argument("settings", type=Path, help="private project ID, RAG unit, hook bindings and scheduler settings")
+    parser.add_argument("settings", type=Path, help="private project ID, RAG unit and scheduler settings")
     parser.add_argument("output", type=Path)
     args = parser.parse_args()
     manifest, corpus = args.manifest.resolve(), args.corpus.resolve()
@@ -47,13 +47,17 @@ def main():
     plan = dict(schema="seampact.office-pilot/1", manifest=str(manifest), manifest_sha256=manifest_hash,
         project_id=settings["project_id"], rag=dict(corpus_dir=str(corpus), corpus_sha256=corpus_hash,
                                                      capability_id=settings["rag_unit_id"]),
-        bindings=settings["bindings"], scheduler=settings["scheduler"], policies=settings["policies"],
+        scheduler=settings["scheduler"], policies=settings["policies"],
         resource_source=settings["resource_source"], seed=20261111,
         learner_config=settings.get("learner_config", {}), deadline_s=source["protocol"]["timeout_s"],
         cases=dict(development=DEVELOPMENT, training=TRAINING, evaluation=EVALUATION), prebuild=PREBUILD,
         limitations=["Small descriptive pilot, not evidence of a statistical advantage",
                      "Training includes within-split near-duplicate families: workspace 5/11 and Slack 7/12",
                      "RAG adaptation is not the native leaderboard task environment"])
+    if "guard_policy" in settings:
+        plan["guard_policy"] = settings["guard_policy"]
+    if "bindings" in settings:
+        plan["bindings"] = settings["bindings"]
     args.output.parent.mkdir(parents=True, exist_ok=True)
     with args.output.open("x", encoding="utf-8") as stream:
         json.dump(plan, stream, ensure_ascii=False, indent=2)

@@ -8,9 +8,11 @@ import pytest
 from seampact.capability_contract import (
     IR_SCHEMA, PACKAGE_SCHEMA, ContractError, check_bindings, package_digest, project_binding_path,
 )
+from seampact.capability_catalog import CapabilityCatalog
 from seampact.hosting.capability_hosting import (
-    check_project_scope, instance_contract, project_scope, resource_backend,
+    check_project_scope, group_identity, instance_contract, project_scope, resource_backend,
 )
+from seampact.project_applications import belongs_to_project
 from seampact.project_spaces import ProjectSpaces
 from seampact.runtime import ProtocolError, _task_context
 from seampact.store import Store
@@ -106,3 +108,55 @@ def test_project_guard_checks_active_task_or_explicit_diagnostic_scope(platform)
             check_project_scope(platform, group)
     finally:
         _task_context.reset(token)
+
+
+def test_installation_isolated_by_project_and_bind_cannot_transfer_owner(platform, tmp_path, monkeypatch):
+    description = manifest()
+    current = [description]
+    monkeypatch.setattr("seampact.capability_catalog.load_package", lambda folder: current[0])
+    folder = tmp_path / "source-package"
+    folder.mkdir()
+    (folder / "content").write_text("fixture", encoding="utf-8")
+    catalog = CapabilityCatalog(platform.projects.home, platform.store)
+    first = catalog.install(folder, bindings(description, "first"))
+    second = catalog.install(folder, bindings(description, "second"))
+    assert first["group_id"] != second["group_id"]
+    assert first["capabilities"] != second["capabilities"]
+    assert catalog.unit(first["capabilities"][0])["status"] == "READY"
+    assert catalog.unit(second["capabilities"][0])["status"] == "READY"
+
+    revised = copy.deepcopy(description)
+    revised["source"]["version"] = "v2"
+    current[0] = revised
+    updated = catalog.install(folder, bindings(revised, "first"))
+    assert updated["group_id"] == first["group_id"]
+    assert catalog.unit(second["capabilities"][0])["status"] == "READY"
+    assert catalog._group(second["group_id"])["bindings"] == bindings(description, "second")
+    with pytest.raises(ValueError, match="其他项目"):
+        catalog.bind(first["group_id"], bindings(revised, "second"))
+    unbound = catalog.bind(first["group_id"], {"corpus": None, "index": None})
+    assert catalog._group(first["group_id"])["project_owner"] == "first"
+    assert belongs_to_project(catalog, catalog.unit(unbound["capabilities"][0]), "first")
+    assert not belongs_to_project(catalog, catalog.unit(unbound["capabilities"][0]), "second")
+    with pytest.raises(ValueError, match="其他项目"):
+        catalog.bind(first["group_id"], bindings(revised, "second"))
+
+
+def test_existing_project_group_keeps_identity_on_regeneration(platform, tmp_path, monkeypatch):
+    description = manifest()
+    monkeypatch.setattr("seampact.capability_catalog.load_package", lambda folder: description)
+    folder = tmp_path / "source-package"
+    folder.mkdir()
+    (folder / "content").write_text("fixture", encoding="utf-8")
+    catalog = CapabilityCatalog(platform.projects.home, platform.store)
+    old_id = group_identity(description)
+    old = catalog._register(description, package_digest(description), old_id, bindings(description, "first"))
+    # Simulate an installation predating the explicit owner field.
+    old_group = catalog._group(old_id)
+    old_group.pop("project_owner")
+    platform.store.save("runtime_group", old_id, old_group)
+    assert catalog.install(folder, bindings(description, "first"))["group_id"] == old_id
+    new = catalog.install(folder, bindings(description, "second"))
+    assert new["group_id"] != old_id
+    assert catalog.unit(old["capabilities"][0])["status"] == "READY"
+    assert catalog.group_for_install(description, {}) != old_id

@@ -42,6 +42,10 @@ EFFECT_KINDS = {"filesystem", "network", "external"}
 EFFECT_ACCESS = {"read", "write"}
 RESOURCE_KINDS = {"weight", "service", "credential", "device", "parameter", "data"}
 CANCEL_MODES = {"none", "cooperative"}
+GUARD_KINDS = {"fact_support", "injection", "privacy", "secrets", "code_safety",
+               "input_safety", "output_safety", "sanitize"}
+GUARD_SUBJECTS = {"input", "tool_output", "text", "code", "response", "message", "document"}
+OPERATION_KINDS = {"read", "retrieve", "write", "send", "execute", "metadata"}
 
 _TYPES = {"object": dict, "array": list, "string": str, "integer": int,
           "number": (int, float), "boolean": bool, "null": type(None)}
@@ -169,7 +173,7 @@ def check_capability(capability, resource_ids=(), source_paths=None):
     _require(isinstance(identity, str) and IDENTIFIER.fullmatch(identity), "能力 id 须为字母开头的 ASCII 标识")
     label = "能力 " + identity
     unknown = set(capability) - {"schema", "id", "name", "purpose", "method", "input", "output", "state",
-                                 "effects", "resources", "provenance"}
+                                 "effects", "resources", "provenance", "guard", "operation"}
     _require(not unknown, label + " 含未知字段：" + ", ".join(sorted(unknown)))
     _text(capability.get("name"), label + " 的 name")
     _text(capability.get("purpose"), label + " 的 purpose")
@@ -196,12 +200,44 @@ def check_capability(capability, resource_ids=(), source_paths=None):
     _require(isinstance(used, list) and all(isinstance(item, str) for item in used) and len(set(used)) == len(used),
              label + ".resources 须为不重复的资源 id 列表")
     _require(set(used) <= set(resource_ids), label + " 使用了包内未声明的资源")
-    for item in capability.get("provenance", []):
-        _require(isinstance(item, dict) and isinstance(item.get("path"), str)
-                 and type(item.get("start")) is int and type(item.get("end")) is int
-                 and 1 <= item["start"] <= item["end"], label + ".provenance 每项需要 path、start、end")
-        if source_paths is not None:
-            _require(item["path"] in source_paths, label + " 的来源依据不在冻结源码内：" + item["path"])
+    references = [(label + ".provenance", capability.get("provenance", []))]
+    if "guard" in capability:
+        guard = capability["guard"]
+        _require(isinstance(guard, dict) and set(guard) <= {"kind", "subjects", "evidence", "provenance"}
+                 and isinstance(guard.get("kind"), str) and guard["kind"] in GUARD_KINDS,
+                 label + ".guard 需要受支持的语义 kind")
+        subjects = guard.get("subjects")
+        _require(isinstance(subjects, list) and subjects and all(isinstance(item, str) and item in GUARD_SUBJECTS
+                 for item in subjects) and len(set(subjects)) == len(subjects),
+                 label + ".guard.subjects 须为不重复的受支持检查对象列表")
+        if "evidence" in guard:
+            _require(guard["evidence"] == "references", label + ".guard.evidence 只支持 references")
+        _require(guard["kind"] != "fact_support" or guard.get("evidence") == "references",
+                 label + ".guard 的 fact_support 需要 references 依据")
+        _require(isinstance(guard.get("provenance"), list) and guard["provenance"],
+                 label + ".guard 需要冻结源码 provenance")
+        references.append((label + ".guard.provenance", guard["provenance"]))
+    if "operation" in capability:
+        operation = capability["operation"]
+        _require(isinstance(operation, dict) and set(operation) <= {"kind", "text_fields", "provenance"}
+                 and isinstance(operation.get("kind"), str) and operation["kind"] in OPERATION_KINDS,
+                 label + ".operation 需要受支持的语义 kind")
+        if "text_fields" in operation:
+            fields = operation["text_fields"]
+            _require(isinstance(fields, list) and fields and all(isinstance(item, str) and item
+                     for item in fields) and len(set(fields)) == len(fields)
+                     and set(fields) <= set(capability["input"].get("properties", {})),
+                     label + ".operation.text_fields 须为不重复的已声明输入属性列表")
+        _require(isinstance(operation.get("provenance"), list) and operation["provenance"],
+                 label + ".operation 需要冻结源码 provenance")
+        references.append((label + ".operation.provenance", operation["provenance"]))
+    for location, items in references:
+        for item in items:
+            _require(isinstance(item, dict) and isinstance(item.get("path"), str)
+                     and type(item.get("start")) is int and type(item.get("end")) is int
+                     and 1 <= item["start"] <= item["end"], location + " 每项需要 path、start、end")
+            if source_paths is not None:
+                _require(item["path"] in source_paths, location + " 的来源依据不在冻结源码内：" + item["path"])
     return capability
 
 

@@ -164,7 +164,8 @@ class ProjectSpaces:
             session = self.session(conversation_id)
             if not session or session["project_id"] != project_id:
                 raise ValueError("任务会话与项目归属不一致")
-            paths = [(self._directory(project_id, ["data"]), "/data", True),
+            inputs = ["tasks", task_id, "inputs"] if lease.get("private_inputs") else ["data"]
+            paths = [(self._directory(project_id, inputs), "/data", True),
                      (self._directory(project_id, ["sessions", conversation_id, "workspace"]), "/workspace", False),
                      (self._directory(project_id, ["tasks", task_id, "scratch"]), "/scratch", False)]
             return [dict(source=str(path), target=target, read_only=read_only)
@@ -219,7 +220,7 @@ class ProjectSpaces:
         with self._locked():
             return self._ensure_session(_identity(project_id), conversation_id)
 
-    def begin_task(self, project_id, conversation_id, task_id):
+    def begin_task(self, project_id, conversation_id, task_id, *, input_files=None):
         project_id, conversation_id, task_id = map(_identity, (project_id, conversation_id, task_id))
         with self._locked():
             self._available(project_id)
@@ -227,12 +228,30 @@ class ProjectSpaces:
             if old:
                 if (old["project_id"] == project_id and old["conversation_id"] == conversation_id
                         and old["status"] == "ACTIVE"):
+                    if input_files is not None:
+                        raise ValueError("活动任务不能再次装入输入文件")
                     return old
                 raise ValueError("此任务标识已被使用")
             if self._has_unresolved(project_id, conversation_id):
                 raise ValueError("此会话有运行中或状态未确认的任务")
             self._ensure_session(project_id, conversation_id)
             lease = dict(task_id=task_id, project_id=project_id, conversation_id=conversation_id, status="ACTIVE")
+            if input_files is not None:
+                base = ["tasks", task_id, "inputs"]
+                if not isinstance(input_files, dict) or not input_files:
+                    raise ValueError("任务输入需要文件")
+                try:
+                    for name, data in input_files.items():
+                        parts = _parts(name)
+                        if not parts or not isinstance(data, bytes) or len(data) > _MAX_FILE:
+                            raise ValueError("任务输入文件无效或超过 16 MiB")
+                        parent = self._directory(project_id, [*base, *parts[:-1]], create=True)
+                        with (parent / parts[-1]).open("xb") as stream:
+                            stream.write(data)
+                except Exception:
+                    self._clear_directory(project_id, base)
+                    raise
+                lease["private_inputs"] = True
             self._directory(project_id, ["tasks", task_id, "scratch"], create=True)
             self.store.create("project_lease", task_id, lease)
             return lease
@@ -249,6 +268,8 @@ class ProjectSpaces:
                 lease["status"] = "UNKNOWN"
             else:
                 self._clear_directory(lease["project_id"], ["tasks", task_id, "scratch"])
+                if lease.get("private_inputs"):
+                    self._clear_directory(lease["project_id"], ["tasks", task_id, "inputs"])
                 lease["status"] = "FINISHED"
             self.store.save("project_lease", task_id, lease)
             return lease
@@ -329,11 +350,19 @@ class ProjectSpaces:
             raise ValueError("项目会话不存在")
         return self._directory(project_id, ["sessions", conversation_id, "workspace"], create=create)
 
-    def _resolve(self, project_id, conversation_id, area, path, *, create_parents=False, allow_root=False):
+    def _resolve(self, project_id, conversation_id, area, path, *, create_parents=False, allow_root=False,
+                 input_task=None):
         parts = _parts(path)
         if not parts and not allow_root:
             raise ValueError("请指定文件路径")
-        current = self._base(_identity(project_id), conversation_id, area, create=create_parents)
+        if input_task is not None and area == "data":
+            lease = self.task_scope(input_task)
+            if not lease or (lease["project_id"], lease["conversation_id"], lease["status"]) != (
+                    project_id, conversation_id, "ACTIVE") or not lease.get("private_inputs"):
+                raise ValueError("该任务没有活动的只读输入目录")
+            current = self._directory(project_id, ["tasks", input_task, "inputs"])
+        else:
+            current = self._base(_identity(project_id), conversation_id, area, create=create_parents)
         for part in parts[:-1]:
             current = current / part
             if create_parents:
@@ -345,8 +374,8 @@ class ProjectSpaces:
             _checked(current)
         return current
 
-    def list_files(self, project_id, cid=None, area="data", path=""):
-        directory = self._resolve(project_id, cid, area, path, allow_root=True)
+    def list_files(self, project_id, cid=None, area="data", path="", *, input_task=None):
+        directory = self._resolve(project_id, cid, area, path, allow_root=True, input_task=input_task)
         _checked(directory, directory=True)
         entries = []
         with os.scandir(directory) as scan:
@@ -363,15 +392,15 @@ class ProjectSpaces:
                 entries.append(entry)
         return dict(area=area, path=path, entries=entries, truncated=False)
 
-    def file_path(self, project_id, cid, area, path):
-        result = self._resolve(project_id, cid, area, path)
+    def file_path(self, project_id, cid, area, path, *, input_task=None):
+        result = self._resolve(project_id, cid, area, path, input_task=input_task)
         _checked(result, directory=False)
         return result
 
-    def read_file(self, project_id, cid, area, path, offset=0, limit=_MAX_READ):
+    def read_file(self, project_id, cid, area, path, offset=0, limit=_MAX_READ, *, input_task=None):
         if type(offset) is not int or offset < 0 or type(limit) is not int or not 1 <= limit <= _MAX_READ:
             raise ValueError("读取范围无效")
-        file = self.file_path(project_id, cid, area, path)
+        file = self.file_path(project_id, cid, area, path, input_task=input_task)
         with file.open("rb") as stream:
             stream.seek(offset)
             # Retain enough lookahead to finish a UTF-8 character and detect

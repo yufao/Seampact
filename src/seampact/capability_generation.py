@@ -22,8 +22,10 @@ from seampact.capability_contract import (
     IR_SCHEMA, MANIFEST, PACKAGE_SCHEMA, ContractError, canonical, check_bindings,
     check_manifest, digest, load_package, package_digest, scan_files, validate_value,
 )
-from seampact.hosting.capability_hosting import CapabilityError, group_identity, project_scope
+from seampact.hosting.capability_hosting import CapabilityError, project_scope
+from seampact.guard_contract import verification_error
 from seampact.hosting.environments import discover_environment, normalize_environment
+from seampact.context_memory import context_status
 from seampact.providers import Transport, completion_body
 from seampact.source.inspection import Inspector, decode_text, excluded, withheld_source
 from seampact.store import now
@@ -48,15 +50,23 @@ TOOLS = [
     _tool("list_resources", "Page repository asset metadata or withheld paths without reading their contents.",
           dict(kind=dict(type="string", enum=["resources", "withheld"]),
                offset=dict(type="integer"), count=dict(type="integer"))),
+    _tool("read_metadata", "Page exact frozen source/environment metadata when an index is too large. start/count are character offsets; metadata references do not replace read_file source evidence.",
+          dict(kind=dict(type="string", enum=["source", "environment", "resources", "withheld", "source_reads"]),
+               start=dict(type="integer"), count=dict(type="integer")), ["kind"]),
     _tool("read_file", "Read a frozen source/config/README with line numbers; read before citing.",
           dict(path=dict(type="string"), start=dict(type="integer"), count=dict(type="integer")), ["path"]),
     _tool("search_source", "Find literal text in frozen files; returns bounded source locations.",
           dict(text=dict(type="string"), path=dict(type="string")), ["text"]),
-    _tool("edit_package", "Revise a previously validated candidate. Apply unique file replacements and optional manifest_updates (replace only the supplied top-level manifest fields; untouched fields are retained). Submit all required changes together for normal validation; source/generator/files identities are platform-owned.",
+    _tool("read_package", "Read an existing verified candidate on demand. path is an adapter file or files (hash index)/manifest/resource_matches/examples/gaps/coverage_notes; start/count are character offsets, not source lines. Returns exact content, its SHA-256, the base_digest and a continuation offset.",
+          dict(path=dict(type="string"), start=dict(type="integer"), count=dict(type="integer")), ["path"]),
+    _tool("edit_package", "Revise a previously validated candidate. Supply its base_digest when paged. Apply unique file replacements, optional hash-checked file_updates for additions/replacements/deletions, manifest_updates (supplied top-level fields; environment merges supplied subfields), and proposal_updates for resource_matches/examples/gaps/coverage_notes. Unchanged code, dependencies and evidence remain. All changes receive full normal validation; source/generator/files identities are platform-owned.",
           dict(edits=dict(type="array", items=dict(type="object", properties=dict(
-              path=dict(type="string"), old=dict(type="string"), new=dict(type="string")),
+              path=dict(type="string"), old=dict(type="string"), new=dict(type="string"), sha256=dict(type="string")),
               required=["path", "old", "new"], additionalProperties=False)),
-               manifest_updates=dict(type="object")), ["edits"]),
+               base_digest=dict(type="string"), manifest_updates=dict(type="object"), proposal_updates=dict(type="object"),
+               file_updates=dict(type="array", items=dict(type="object", properties=dict(path=dict(type="string"),
+                   sha256=dict(type=["string", "null"]), text=dict(type=["string", "null"])),
+                   required=["path", "sha256", "text"], additionalProperties=False))), ["edits"]),
     _tool("submit_package", "Submit the complete capability manifest, generated Python files and source-anchored examples.",
           dict(manifest=dict(type="object"), files=dict(type="object"), resource_matches=dict(type="object"),
                examples=dict(type="array", items=dict(type="object")), gaps=dict(type="array", items=dict(type="object")),
@@ -88,6 +98,10 @@ manifest={schema:'capability-package/1',name:<stable repository capability name>
  environment:{python:'3.11',requirements:[<frozen pip files>],project:<project dir or ''>,
  packages:[<only necessary extra pip requirements>]},implementation:{module:'adapter',symbol:'Adapter'},
  instance:{concurrency:1,replicable:false,cancel:'none'},resources:[...],capabilities:[...]}
+Derive instance.concurrency and instance.replicable independently from the selected implementation.
+An isolated read-only detector can run one request per worker yet permit several independent workers.
+Inspect mutable caches, index writers, external effects, session affinity and initialization. Allow
+replication only when independently initialized workers preserve the selected capability's behavior.
 Platform generates files hashes and freezes source/generator identity. No arbitrary shell/Docker
 instructions. Use original requirements/project installation declarations when applicable; never
 silently omit dependencies. Select environment based on actual README/install config.
@@ -95,6 +109,34 @@ Each capability uses schema:'capability-ir/1', id ASCII identifier, name, purpos
 input JSON Schema with type:'object', output:{kind:'json'|'text'|'files',schema?:...},
 state:{scope:'call'|'instance'},effects:[{kind:'filesystem'|'network'|'external',access:'read'|'write',target:...}],
 resources:[<ids>],provenance:[{path:<original relative path>,start:<line>,end:<line>}].
+When a source-implemented safety check fits a supported guard interface, declare guard:{kind:'fact_support'|'injection'|
+'privacy'|'secrets'|'code_safety'|'input_safety'|'output_safety'|'sanitize',
+subjects:[one or more of 'input','tool_output','text','code','response','message','document'],
+evidence:'references' (required only for fact_support),provenance:[source references]}.
+These are semantic families and checked subjects, never repository names or bespoke role IDs.
+Generate standard adapter I/O for automatic binding: sanitize input text -> sanitized_text,was_modified;
+injection input prompt -> valid,risk_score; privacy input text,entities,anonymize -> findings;
+secrets input text,filename -> detected; code_safety input files -> issues;
+input_safety input user_message -> decision,is_blocked,failed;
+output_safety input bot_message,user_message -> decision,is_blocked,failed;
+fact_support input question:string,answer:string,references:array[string] -> status:string,
+claims:array[{claim_text:string,label:string,labels_by_reference:array[string]}],claim_count:integer.
+For per-reference judgments inspect the upstream return axes and preserve the claim/reference
+pairing for multiple passages. Where the source supplies a multi-reference example, use it
+for the real first call so a single-item example cannot conceal a wrong tensor or list shape.
+Text inputs and sanitized_text are strings; was_modified, valid, anonymize, detected, is_blocked,
+failed are booleans; risk_score is numeric; decision is a string. entities is array[string],
+findings is an array, files is array[{name:string,source:string}], and issues is array of objects
+with required severity:string or issue_severity:string. All listed output fields are required;
+required input fields must be among the listed fields. A guard's subjects must apply to a host event.
+Normalize shape only while preserving the original algorithm, labels, failure and unknown states.
+Do not invent a verdict, probability, claim evidence or successful decision to fit an interface;
+when meaningful mapping is unavailable, retain the native interface and report the precise limitation.
+Omit guard metadata when the standard interface cannot preserve the source verdict. A failed or
+unknown result must remain failed or unknown; never convert it to allow or a successful verdict.
+For business operations with a supported source-backed effect, declare operation:{kind:'read'|'retrieve'|'write'|'send'|'execute'|
+'metadata',text_fields:[declared outgoing text input properties, when applicable],provenance:[...]}
+based on actual external effects. Calling a model over HTTP does not by itself mean sending a user message.
 Schema supports type/properties/required/additionalProperties/items/enum/minimum/maximum/
 minLength/maxLength/minItems/maxItems and description/title/default/examples; no other keywords.
 resources each has id, kind:'weight'|'service'|'credential'|'device'|'parameter'|'data', required:boolean,
@@ -147,11 +189,21 @@ If no usable example or resource exists, still submit the package and report pre
 gaps:[{kind:<short category>,reason:<specific missing condition>}]. Unknown is not success.
 gaps contains only actual unresolved conditions requiring input or preventing the declared
 capability from working (missing resource, valid sample, permission, or result-relevant choice).
+The platform resolves resources and runs the examples after you submit. Write the required
+resource_matches and examples even when you cannot call them yourself. Only report a blocker
+when a specific requirement is missing; a pending platform verification is not a missing input.
 Put deliberate coverage boundaries in coverage_notes:[{kind:<scope category>,reason:...}] instead:
 JSON cannot carry live Python objects; unselected independent features or an original CLI file
 interface are scope notes when the selected complete purpose works. Do not request input merely
 to reproduce every upstream feature. Preserve those limitations without marking a working tool
 as blocked.
+Large accepted proposals are exposed as content-hash summaries. Use read_package to page exact
+adapter or manifest content on demand; read_file always refers to frozen source. For a paged base,
+edit_package must include the supplied base_digest. file_updates uses the previous file sha256
+(null for a new file), and text:null deletes an existing file. All edits are atomic: failure retains
+the prior candidate. proposal_updates may replace resource_matches/examples/gaps/coverage_notes
+when the changed contract needs different resource evidence or valid samples. Preserve working
+environment declarations, dependency files and source evidence unless the change requires revision.
 """
 
 
@@ -162,6 +214,196 @@ class GenerationCancelled(Exception):
 class GenerationRepairable(ValueError):
     """A build produced a concrete diagnostic the generator can act on."""
     pass
+
+
+def generation_context_budget(profile):
+    """Reserve the configured output and tool schema inside the provider window.
+
+    The UTF-8 estimate is deliberately approximate, with a 20% headroom. A
+    provider without window metadata still gets the existing bounded input.
+    """
+    body = completion_body(profile, [], TOOLS)
+    output = body.get("max_completion_tokens", body.get("max_tokens"))
+    output_basis = "configured_or_provider_metadata"
+    if type(output) is not int or output < 1:
+        output = 4096  # Also set this explicit bound on the actual generation request.
+        output_basis = "platform_default_requested_4096"
+    bounded = dict(profile, parameters=dict(max_tokens=output))
+    status = context_status(bounded, [], TOOLS)
+    available = status["available_input_tokens"]
+    tool_bytes = len(canonical(TOOLS).encode("utf-8"))
+    limit = MAX_CONTEXT
+    if available is not None:
+        # Include tool-call envelopes and message overhead in the headroom.
+        limit = min(limit, int(available * 0.8 * 3) - tool_bytes - 2400)
+    if limit < 4096:
+        raise ValueError("分析模型的上下文窗口不足以容纳生成规则、工具和已配置的输出预留；请调整分析模型配置")
+    return dict(message_bytes=limit, tool_bytes=tool_bytes, context_window=status["context_window"],
+                available_input_tokens=available,
+                requested_output_tokens=output, output_basis=output_basis,
+                estimate_basis="ascii_bytes_div_3_plus_nonascii_bytes_approximate",
+                budget_units="ascii_bytes+3*nonascii_utf8_bytes", headroom=0.2)
+
+
+def _context_units(value):
+    """ASCII uses bytes/3; non-ASCII bytes get a conservative token allowance.
+
+    Tokenization depends on the model. Counting Unicode as ASCII-sized text
+    can badly underestimate CJK, rare symbols and emoji in generated/source
+    text, so each non-ASCII UTF-8 byte receives one estimated token.
+    """
+    data = canonical(value).encode("utf-8")
+    return len(data) + 2 * sum(byte >= 128 for byte in data)
+
+
+def _complete_tool_history(messages):
+    """Only replay checkpoints whose tool transactions have complete replies."""
+    if not isinstance(messages, list) or len(messages) < 2:
+        return False
+    pending = set()
+    for message in messages:
+        if not isinstance(message, dict):
+            return False
+        if message.get("role") == "tool":
+            identity = message.get("tool_call_id")
+            if not isinstance(identity, str) or identity not in pending:
+                return False
+            pending.remove(identity)
+            continue
+        if pending:
+            return False
+        calls = message.get("tool_calls") or []
+        if not isinstance(calls, list) or any(not isinstance(call, dict) or not isinstance(call.get("id"), str)
+                                               or not call["id"] for call in calls):
+            return False
+        pending = {call["id"] for call in calls}
+        if len(pending) != len(calls):
+            return False
+    return not pending
+
+
+def _compact_read_history(messages, limit, read_count):
+    """Drop complete old reads after text compaction; keep actual failures.
+
+    Source read ranges are verified and retained outside this conversation.
+    """
+    if _context_units(messages) <= limit:
+        return 0
+    names = {"list_source", "list_resources", "read_metadata", "read_file", "search_source", "read_package"}
+    index, removed = 2, 0
+    while index < len(messages) - 2 and _context_units(messages) > limit - 1200:
+        calls = messages[index].get("tool_calls") or []
+        end = index + len(calls) + 1
+        if (messages[index].get("role") != "assistant" or not calls or end > len(messages) - 2
+                or any((call.get("function") or {}).get("name") not in names for call in calls)):
+            index += 1
+            continue
+        replies = messages[index + 1:end]
+        if (any(item.get("role") != "tool" for item in replies)
+                or {item.get("tool_call_id") for item in replies} != {call.get("id") for call in calls}):
+            index += 1
+            continue
+        failed = False
+        for reply in replies:
+            try:
+                value = json.loads(reply.get("content", ""))
+            except (TypeError, ValueError):
+                failed = True
+                break
+            if not isinstance(value, dict) or value.get("status") in {"ERROR", "NOT_RUN"}:
+                failed = True
+                break
+        if failed:
+            index = end
+            continue
+        del messages[index:end]
+        removed += len(calls)
+    if removed:
+        messages.append(dict(role="user", content=canonical(dict(read_transactions_compacted=removed,
+            verified_source_read_count=read_count, access="read_metadata(kind='source_reads',start=0,count=...)",
+            instruction="旧读取回合已移出当前上下文；已核验的来源阅读范围仍保留，源码及候选正文可按需重新读取。"))))
+    return removed
+
+
+def _proposal_summary(proposal, max_units=12000):
+    manifest = proposal.get("manifest") if isinstance(proposal.get("manifest"), dict) else {}
+    files = proposal.get("files") if isinstance(proposal.get("files"), dict) else {}
+    capabilities = manifest.get("capabilities") if isinstance(manifest.get("capabilities"), list) else []
+    resources = manifest.get("resources") if isinstance(manifest.get("resources"), list) else []
+    summary = dict(history_compacted=True, base_digest=digest(proposal), proposal_digest=digest(proposal),
+        capabilities=[{name: item.get(name)[:256] if isinstance(item.get(name), str) else item.get(name)
+                       for name in ("id", "purpose", "method")}
+                      for item in capabilities[:20] if isinstance(item, dict)],
+        capability_count=len(capabilities),
+        resources=[{name: item.get(name) for name in ("id", "kind", "required")}
+                   for item in resources[:20] if isinstance(item, dict)], resource_count=len(resources),
+        files=[dict(path=path, sha256=digest(text.encode("utf-8")), characters=len(text))
+               for path, text in list(files.items())[:20] if isinstance(text, str)], file_count=len(files),
+        access="read_package(path='files'|'manifest'|'resource_matches'|'examples'|'gaps'|'coverage_notes'|<adapter path>, start=0, count=...)",
+        note="正文按需分页读取；edit_package 使用 base_digest，未改内容和来源证据保留。")
+    for field in ("files", "resources", "capabilities"):
+        while summary[field] and _context_units(summary) > max_units:
+            summary[field].pop()
+    return summary
+
+
+def _edit_proposal(base, arguments, require_digest=False):
+    """Apply an atomic edit to a copy; a rejected change never mutates its base."""
+    if not isinstance(base, dict) or not isinstance(base.get("files"), dict):
+        raise ValueError("没有可修订的已验证候选")
+    if set(arguments) - {"edits", "manifest_updates", "proposal_updates", "file_updates", "base_digest"}:
+        raise ValueError("修订参数不正确")
+    if (require_digest or "base_digest" in arguments) and arguments.get("base_digest") != digest(base):
+        raise ValueError("修订 base_digest 与当前已核验候选不一致；请重新 read_package")
+    edits, updates = arguments.get("edits"), arguments.get("manifest_updates", {})
+    proposal_updates, file_updates = arguments.get("proposal_updates", {}), arguments.get("file_updates", [])
+    if (not isinstance(edits, list) or len(edits) > 12 or not isinstance(updates, dict)
+            or not isinstance(proposal_updates, dict) or not isinstance(file_updates, list) or len(file_updates) > 12
+            or not (edits or updates or proposal_updates or file_updates)):
+        raise ValueError("修订需要至多12个精确文本替换、文件变更或非空契约更新")
+    if set(updates) & {"source", "generator", "files"}:
+        raise ValueError("源码、生成器和文件身份由平台生成，不能通过契约修订覆盖")
+    if set(proposal_updates) - {"resource_matches", "examples", "gaps", "coverage_notes"}:
+        raise ValueError("proposal_updates 只接受资源匹配、样例、缺口与覆盖说明")
+    revised = copy.deepcopy(base)
+    revised["manifest"].update(copy.deepcopy(updates))
+    if "environment" in updates and isinstance(updates["environment"], dict):
+        revised["manifest"]["environment"] = dict(base["manifest"].get("environment") or {}, **copy.deepcopy(updates["environment"]))
+    revised.update(copy.deepcopy(proposal_updates))
+    for edit in edits:
+        if not isinstance(edit, dict) or not {"path", "old", "new"} <= set(edit) or set(edit) - {"path", "old", "new", "sha256"}:
+            raise ValueError("每个修订需要 path、old 和 new，可提供 sha256")
+        path, old, new = edit["path"], edit["old"], edit["new"]
+        if (not isinstance(path, str) or path not in revised["files"] or not isinstance(old, str)
+                or not old or not isinstance(new, str) or revised["files"][path].count(old) != 1):
+            raise ValueError("修订只能替换已有文件中唯一匹配的非空文本")
+        if "sha256" in edit and edit["sha256"] != digest(base["files"][path].encode("utf-8")):
+            raise ValueError("修订文件 SHA-256 与已核验候选不一致")
+        revised["files"][path] = revised["files"][path].replace(old, new, 1)
+    paths = set()
+    for update in file_updates:
+        if not isinstance(update, dict) or set(update) != {"path", "sha256", "text"}:
+            raise ValueError("文件变更需要 path、sha256 与 text")
+        path = _relative(update["path"])
+        if not path.startswith("adapter/") or not path.endswith(".py") or path in paths:
+            raise ValueError("文件变更仅接受不重复的 adapter/ Python 路径")
+        if any(edit["path"] == path for edit in edits):
+            raise ValueError("同一文件不能同时使用精确替换和完整文件变更")
+        paths.add(path)
+        previous = base["files"].get(path)
+        expected = digest(previous.encode("utf-8")) if previous is not None else None
+        if update["sha256"] != expected:
+            raise ValueError("文件变更 SHA-256 与已核验候选不一致")
+        text = update["text"]
+        if text is None:
+            if previous is None:
+                raise ValueError("不能删除不存在的候选文件")
+            del revised["files"][path]
+        elif isinstance(text, str):
+            revised["files"][path] = text
+        else:
+            raise ValueError("文件变更 text 须为文字或删除标记 null")
+    return revised
 
 
 def _relative(value):
@@ -359,6 +601,9 @@ def write_package(folder, proposal, inspector, read_ranges, model):
                                    implementation_digest=IMPLEMENTATION_DIGEST, model=model))
     for capability in manifest.get("capabilities", []):
         _references(inspector, capability.get("provenance"), read_ranges)
+        for field in ("guard", "operation"):
+            if field in capability:
+                _references(inspector, capability[field].get("provenance") if isinstance(capability[field], dict) else None, read_ranges)
     matches = proposal.get("resource_matches", {})
     examples, gaps = proposal.get("examples", []), proposal.get("gaps", [])
     if not isinstance(matches, dict) or not isinstance(examples, list) or not isinstance(gaps, list):
@@ -372,6 +617,10 @@ def write_package(folder, proposal, inspector, read_ranges, model):
         if identity not in {item["id"] for item in manifest.get("resources", [])} or not isinstance(selection, dict):
             raise ValueError("资源匹配引用未声明的资源")
         _references(inspector, selection.get("provenance"), read_ranges)
+        if ("value" in selection and not selection.get("configuration_key") and
+                any(resource["id"] == identity and resource["kind"] in {"parameter", "device"}
+                    for resource in manifest["resources"]) and not _literal_default(inspector, selection)):
+            raise ValueError("资源 " + identity + " 的默认值未出现在引用的源码行内；请核对实际定义并修订引用")
     capabilities = {item["id"]: item for item in manifest.get("capabilities", [])}
     for sample in examples:
         if not isinstance(sample, dict) or set(sample) != {"capability", "input", "provenance"} or sample["capability"] not in capabilities:
@@ -393,6 +642,9 @@ def write_package(folder, proposal, inspector, read_ranges, model):
             raise ValueError("本地运行环境覆盖只接受 python 与 base_image")
         manifest["environment"] = dict(manifest.get("environment") or {}, **copy.deepcopy(override))
     check_manifest(manifest)
+    from seampact.guard_contract import validate_guard_contract
+    for capability in manifest["capabilities"]:
+        validate_guard_contract(capability)
     manifest["environment"] = normalize_environment(manifest["environment"], inspector)
     static = _static_adapter(manifest, files, inspector)
     static["dependency_files"] = _dependency_references(inspector, manifest["environment"])
@@ -407,6 +659,24 @@ def write_package(folder, proposal, inspector, read_ranges, model):
     (Path(folder) / MANIFEST).write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
     load_package(folder)
     return manifest, static
+
+
+def _prior_verification(candidate, job):
+    """Expose bounded outcomes for declared IDs only, never bindings, texts or provider metadata."""
+    manifest = candidate["manifest"]
+    resources = {r["id"] for r in manifest.get("resources", [])}
+    capabilities = {c["id"]: c for c in manifest["capabilities"]}
+    bound = [r["resource_id"] for r in job.get("resource_matches", [])
+             if r.get("status") == "BOUND" and r.get("resource_id") in resources]
+    outcomes = []
+    for call in (job.get("first_call") or {}).get("calls", []):
+        capability = capabilities.get(call.get("capability"))
+        if capability is None or call.get("status") not in {"FAILED", "SUCCEEDED"}:
+            continue
+        error = verification_error(capability, call.get("input"), call.get("result"))
+        status = "FAILED" if error else call["status"]
+        outcomes.append(dict(capability=capability["id"], status=status))
+    return dict(previously_bound=bound, previous_examples=outcomes)
 
 
 def coverage_scope(manifest, gaps, notes=()):
@@ -807,7 +1077,8 @@ class GenerationJobs:
         result = inspector.read_file(path, start=start, count=count)
         if "lines" in result:
             # Bound individual tool messages for minified/generated source files.
-            while result["lines"] and len(canonical(result)) > 22000:
+            page_limit = min(22000, max(1000, (job.get("context_budget") or {}).get("message_bytes", MAX_CONTEXT) // 5))
+            while result["lines"] and _context_units(result) > page_limit:
                 result["lines"].pop()
             if not result["lines"] and result["total_lines"] >= start:
                 raise ValueError("该源码行过长，不能作为完整行依据")
@@ -817,15 +1088,58 @@ class GenerationJobs:
             job["reads"].append(dict(path=path, start=start, end=end, sha256=result["sha256"]))
         return result
 
+    @staticmethod
+    def _metadata(inspector, kind, job=None):
+        if kind == "source":
+            return dict(files=list(inspector.files.values()), total=len(inspector.files), dependency_closure="UNKNOWN")
+        if kind == "environment":
+            return discover_environment(inspector)
+        if kind == "source_reads":
+            values = [record for record in (job or {}).get("reads", [])
+                      if record.get("path") in inspector.files and
+                      record.get("sha256") == inspector.files[record["path"]]["sha256"]]
+            return dict(reads=values, total=len(values), source_version=inspector.request["source_version"])
+        values = inspector.request.get("resources" if kind == "resources" else "withheld_sources", [])
+        if kind == "withheld":
+            values = [{key: item.get(key) for key in ("path", "status", "reason")} for item in values]
+        return dict(kind=kind, items=values, total=len(values))
+
+    @staticmethod
+    def _bound_metadata_page(page, field, offset, max_units, kind):
+        while page[field] and _context_units(page) > max_units:
+            page[field].pop()
+        page["next_offset"] = offset + len(page[field]) if offset + len(page[field]) < page["total"] else None
+        if not page[field] and page["next_offset"] is not None:
+            page["access"] = f"单项元数据超过本页预算；请 read_metadata(kind='{kind}',start=0,count=...) 按字符读取完整索引"
+        return page
+
     def _source_tool(self, inspector, name, arguments, ranges, job):
+        page_limit = min(22000, max(1000, (job.get("context_budget") or {}).get("message_bytes", MAX_CONTEXT) // 6))
         if name == "read_file":
             if set(arguments) - {"path", "start", "count"}:
                 raise ValueError("read_file 参数不正确")
             return self._read(inspector, ranges, job, **arguments)
         if name == "list_source":
-            if set(arguments) - {"offset", "count"} or not 1 <= arguments.get("count", 100) <= 200:
+            if (set(arguments) - {"offset", "count"} or type(arguments.get("count", 100)) is not int
+                    or not 1 <= arguments.get("count", 100) <= 200):
                 raise ValueError("list_source 参数不正确")
-            return inspector.list_source(**arguments)
+            return self._bound_metadata_page(inspector.list_source(**arguments), "files", arguments.get("offset", 0),
+                                             page_limit, "source")
+        if name == "read_metadata":
+            if set(arguments) - {"kind", "start", "count"} or arguments.get("kind") not in {"source", "environment", "resources", "withheld", "source_reads"}:
+                raise ValueError("read_metadata 参数不正确")
+            start, count = arguments.get("start", 0), arguments.get("count", 12000)
+            if type(start) is not int or start < 0 or type(count) is not int or not 1 <= count <= 20000:
+                raise ValueError("元数据读取需要非负字符起点与 1–20000 的 count")
+            text = canonical(self._metadata(inspector, arguments["kind"], job))
+            end = min(len(text), start + count)
+            result = dict(kind=arguments["kind"], source_version=inspector.request["source_version"],
+                sha256=digest(text.encode("utf-8")), start=start, total_characters=len(text))
+            while True:
+                result.update(text=text[start:end], next_offset=end if end < len(text) else None)
+                if _context_units(result) <= page_limit or end <= start:
+                    return result
+                end = start + (end - start) // 2
         if name == "list_resources":
             if set(arguments) - {"kind", "offset", "count"}:
                 raise ValueError("list_resources 参数不正确")
@@ -836,7 +1150,7 @@ class GenerationJobs:
             page = values[offset:offset + count]
             if kind == "withheld":
                 page = [{key: item.get(key) for key in ("path", "status", "reason")} for item in page]
-            return dict(kind=kind, items=page, total=len(values), next_offset=offset + len(page) if offset + len(page) < len(values) else None)
+            return self._bound_metadata_page(dict(kind=kind, items=page, total=len(values)), "items", offset, page_limit, kind)
         if name == "search_source":
             if set(arguments) - {"text", "path"} or not isinstance(arguments.get("text"), str) or not arguments["text"]:
                 raise ValueError("search_source 需要非空文字")
@@ -847,20 +1161,50 @@ class GenerationJobs:
                 for index, line in enumerate(decode_text(path, inspector.data(path))[0].splitlines(), 1):
                     if arguments["text"] in line:
                         matches.append(dict(path=path, line=index, text=line[:400]))
-                        if len(matches) >= 60:
+                        if len(matches) >= 60 or _context_units(dict(matches=matches, truncated=True)) >= page_limit:
+                            while matches and _context_units(dict(matches=matches, truncated=True)) > page_limit:
+                                matches.pop()
                             return dict(matches=matches, truncated=True)
             return dict(matches=matches, truncated=False)
         raise ValueError("没有这个源码读取工具")
 
     @staticmethod
-    def _compact(messages):
+    def _read_package(base, arguments, count_limit=16000, max_units=22000):
+        if not isinstance(base, dict) or not isinstance(base.get("files"), dict):
+            raise ValueError("没有可读取的已核验候选")
+        if set(arguments) - {"path", "start", "count"}:
+            raise ValueError("read_package 参数不正确")
+        path, start, count = arguments.get("path"), arguments.get("start", 0), arguments.get("count", count_limit)
+        if (not isinstance(path, str) or type(start) is not int or start < 0 or type(count) is not int
+                or not 1 <= count <= 20000):
+            raise ValueError("候选读取需要 path、非负字符起点和 1–20000 的 count")
+        if path in base["files"]:
+            text = base["files"][path]
+        elif path in {"manifest", "resource_matches", "examples", "gaps", "coverage_notes"}:
+            text = canonical(base.get(path, [] if path in {"examples", "gaps", "coverage_notes"} else {}))
+        elif path == "files":
+            text = canonical([dict(path=name, sha256=digest(value.encode("utf-8")), characters=len(value))
+                              for name, value in base["files"].items()])
+        else:
+            raise ValueError("候选内没有这个文件或提案字段")
+        end = min(len(text), start + min(count, count_limit))
+        result = dict(path=path, sha256=digest(text.encode("utf-8")), base_digest=digest(base),
+                      start=start, total_characters=len(text))
+        while True:
+            result.update(text=text[start:end], next_offset=end if end < len(text) else None)
+            if _context_units(result) <= max_units or end <= start:
+                return result
+            end = start + (end - start) // 2
+
+    @staticmethod
+    def _compact(messages, limit=MAX_CONTEXT):
         """Keep the latest complete proposal and replace older bodies with handles.
 
         Tool IDs, ordering and actual validation replies remain intact. Source
         text has stable read handles; old proposals retain identity and scope.
         """
-        size, removed = len(canonical(messages)), 0
-        if size <= MAX_CONTEXT * 0.8:
+        size, removed = _context_units(messages), 0
+        if size <= limit * 0.8:
             return removed
         proposals = []
         for message in messages:
@@ -906,7 +1250,7 @@ class GenerationJobs:
                        for path, text in (proposal.get("files") or {}).items() if isinstance(text, str)]
                       if isinstance(proposal.get("files"), dict) else [],
                 note="旧提案正文已移出；保留最后一个完整提案用于修复。原校验/运行错误仍保留在对应回复中。")
-            if len(canonical(summary)) >= len(original):
+            if _context_units(summary) >= _context_units(original):
                 continue
             if message is None:
                 owner["arguments"] = canonical(summary)
@@ -914,7 +1258,28 @@ class GenerationJobs:
                 owner["previous_proposal"] = summary
                 message["content"] = canonical(container)
             removed += 1
-        size = len(canonical(messages))
+        # Initial source windows are also evidence pages, not permanent prompt
+        # overhead. Preserve their immutable read handles as tool pages do.
+        for message in messages:
+            if message.get("role") != "user":
+                continue
+            try:
+                value = json.loads(message.get("content", ""))
+            except (ValueError, TypeError):
+                continue
+            if not isinstance(value, dict):
+                continue
+            changed = False
+            for field in ("initial_reads", "previous_source_reads"):
+                for page in value.get(field, []) if isinstance(value.get(field), list) else []:
+                    if isinstance(page, dict) and "lines" in page and "path" in page:
+                        page["end"] = page["start"] + len(page.pop("lines")) - 1
+                        page["content"] = "已读取的冻结源码页；需要正文时再次 read_file"
+                        changed = True
+                        removed += 1
+            if changed:
+                message["content"] = canonical(value)
+        size = _context_units(messages)
         for message in messages[2:-2]:
             if message.get("role") != "tool":
                 continue
@@ -931,20 +1296,23 @@ class GenerationJobs:
             elif "matches" in value and not value.get("compacted"):
                 replacement = dict(matches=[{key: item[key] for key in ("path", "line") if key in item} for item in value["matches"]],
                                    compacted=True, content="搜索结果正文已移出；请按路径和行号 read_file")
+            elif "text" in value and ("base_digest" in value or "source_version" in value):
+                replacement = {key: item for key, item in value.items() if key != "text"}
+                replacement["content"] = "此前读取的内容页；需要正文时按同一内容身份和字符起点再次调用原读取工具"
             else:
                 continue
-            before = len(message["content"])
+            before = _context_units(message)
             message["content"] = canonical(replacement)
-            size -= before - len(message["content"])
+            size -= before - _context_units(message)
             removed += 1
-            if size <= MAX_CONTEXT * 0.65:
+            if size <= limit * 0.65:
                 break
         return removed
 
-    def _successful_proposal(self, inspector, job):
+    def _successful_proposal(self, inspector, job, allowed_status=("AVAILABLE",)):
         """Recover only a verified proposal, never its prior conversation or bindings."""
         previous = self.store.get("capability_generation", job["improve_from"])
-        if (not previous or previous.get("status") != "AVAILABLE"
+        if (not previous or previous.get("status") not in allowed_status
                 or previous.get("source_id") != job["source_id"]
                 or previous.get("source_version") != inspector.request["source_version"]
                 or previous.get("model") != job["model"]):
@@ -957,14 +1325,9 @@ class GenerationJobs:
         if (package_digest(manifest) != package or manifest.get("source") !=
                 dict(id=job["source_id"], version=inspector.request["source_version"])):
             raise ValueError("既有成功包与其内容身份或源码不一致")
-        checkpoint = self.home / previous["id"] / "conversation.json"
-        try:
-            recovered = json.loads(checkpoint.read_text(encoding="utf-8"))
-            messages = recovered["messages"]
-        except (OSError, ValueError, KeyError, TypeError):
-            raise ValueError("既有成功提案会话不可读取") from None
-        if recovered.get("source_version") != inspector.request["source_version"] or not isinstance(messages, list):
-            raise ValueError("既有成功提案会话与源码版本不一致")
+        expected_source = {"source/" + path: record["sha256"] for path, record in inspector.files.items()}
+        if {item["path"]: item["sha256"] for item in manifest["files"] if item["path"].startswith("source/")} != expected_source:
+            raise ValueError("既有成功包的冻结源码文件与本次源码身份不一致")
         candidate = None
         try:
             saved = json.loads((self.home / previous["id"] / "accepted_proposal.json").read_text(encoding="utf-8"))
@@ -973,6 +1336,18 @@ class GenerationJobs:
         except (OSError, ValueError, TypeError):
             pass
         saved_candidate = candidate is not None
+        # The saved proposal is the accepted transaction. A checkpoint may
+        # predate sequential edits; only use it as a legacy fallback.
+        messages = []
+        if not saved_candidate:
+            checkpoint = self.home / previous["id"] / "conversation.json"
+            try:
+                recovered = json.loads(checkpoint.read_text(encoding="utf-8"))
+                messages = recovered["messages"]
+            except (OSError, ValueError, KeyError, TypeError):
+                recovered, messages = {}, []
+            if not isinstance(messages, list) or recovered.get("source_version") != inspector.request["source_version"]:
+                raise ValueError("既有成功提案会话与源码版本不一致")
         for index, message in enumerate(messages):
             if not isinstance(message, dict):
                 continue
@@ -989,8 +1364,10 @@ class GenerationJobs:
                     continue
                 if not saved_candidate and status == "PASSED" and isinstance(value, dict) and isinstance(value.get("files"), dict):
                     candidate = value
-        if candidate is None or len(canonical(candidate)) > MAX_CONTEXT // 2:
-            raise ValueError("既有成功提案不存在或超过可复用上下文上限")
+        if candidate is None:
+            raise ValueError("既有成功提案不存在")
+        if previous.get("accepted_proposal_digest") and digest(candidate) != previous["accepted_proposal_digest"]:
+            raise ValueError("既有成功提案与已记录内容身份不一致")
         expected = {item["path"]: item["sha256"] for item in manifest["files"] if item["path"].startswith("adapter/")}
         files = candidate["files"]
         if (set(files) != set(expected) or any(not isinstance(text, str) or digest(text.encode("utf-8")) != expected[name]
@@ -999,6 +1376,14 @@ class GenerationJobs:
         candidate = copy.deepcopy(candidate)
         if not isinstance(candidate.get("manifest"), dict):
             raise ValueError("既有成功提案缺少能力描述")
+        for field in ("implementation", "instance", "resources", "capabilities"):
+            if candidate["manifest"].get(field) != manifest.get(field):
+                raise ValueError("既有成功提案的能力契约与安装包不一致：" + field)
+        effective_environment = dict(candidate["manifest"].get("environment") or {},
+                                     python=manifest["environment"]["python"],
+                                     base_image=manifest["environment"]["base_image"])
+        if normalize_environment(effective_environment, inspector) != manifest["environment"]:
+            raise ValueError("既有成功提案的依赖与安装环境不一致")
         # These fields are assigned locally when the new package is written;
         # they may contain source or model identities that must not be sent.
         for field in ("source", "generator", "files"):
@@ -1011,15 +1396,26 @@ class GenerationJobs:
         return candidate
 
     def _generate(self, inspector, profile, key, job, cancellation, feedback=None):
+        budget = generation_context_budget(profile)
+        limit = budget["message_bytes"]
+        job["context_budget"] = budget
+        def view(proposal):
+            return (copy.deepcopy(proposal) if _context_units(proposal) <= min(MAX_CONTEXT // 2, limit // 3)
+                    else _proposal_summary(proposal, max_units=max(1500, limit // 6)))
         improved = self._successful_proposal(inspector, job) if job.get("improve_from") and feedback is None else None
         edit_base = improved or ((feedback or {}).get("previous_proposal") if feedback else None)
         ranges = {}
         for record in job.get("reads", []):
             if record["path"] in inspector.files and inspector.files[record["path"]]["sha256"] == record["sha256"]:
                 ranges.setdefault(record["path"], []).append((record["start"], record["end"]))
+        environment = discover_environment(inspector)
+        if _context_units(environment) > limit // 6:
+            environment = dict(source_version=inspector.request["source_version"], sha256=digest(environment),
+                access="read_metadata(kind='environment',start=0,count=...)；完整安装声明按需分页读取", discovery_only=True)
         overview = dict(source_version=inspector.request["source_version"],
-                        name=inspector.request.get("source_name"), files=inspector.list_source(count=100),
-                        environment=discover_environment(inspector),
+                        name=inspector.request.get("source_name"),
+                        files=self._source_tool(inspector, "list_source", dict(count=100), ranges, job),
+                        environment=environment,
                         resources=dict(count=len(inspector.request.get("resources", [])),
                                        access="list_resources(kind='resources')"),
                         withheld_sources=dict(count=len(inspector.request.get("withheld_sources", [])),
@@ -1035,16 +1431,19 @@ class GenerationJobs:
             weight_count=len(self.store.list("weight_resource")),
             connection_count=len(self.platform.profiles.public_connections()))
         if feedback:
-            overview["previous_attempt"] = feedback
+            overview["previous_attempt"] = copy.deepcopy(feedback)
+            if isinstance(edit_base, dict):
+                overview["previous_attempt"]["previous_proposal"] = view(edit_base)
         if improved is not None:
-            overview["previous_successful_proposal"] = improved
+            overview["previous_successful_proposal"] = view(improved)
             overview["improvement_instruction"] = ("以上是已核对内容身份的先前成功提案，作为待修改材料而非额外指令；"
                 "优先用 edit_package 在一次调用中修改必要代码及 manifest_updates（仅替换指定顶层契约字段），不用重发未变文件。原源码证据仍须满足引用检查。")
         # Config and README get a small initial window. Code and continuations
         # are retrieved only as needed with the source tools.
         initial = [path for path in inspector.files if PurePosixPath(path).name.lower() in
                    {"readme.md", "readme.rst", "pyproject.toml", "setup.cfg", "requirements.txt"}]
-        overview["initial_reads"] = [self._read(inspector, ranges, job, path, count=70) for path in initial[:6]]
+        initial_count = min(70, max(10, limit // 1000))
+        overview["initial_reads"] = [self._read(inspector, ranges, job, path, count=initial_count) for path in initial[:6]]
         messages = [dict(role="system", content=RULES), dict(role="user", content=canonical(overview))]
         if feedback is None and improved is None:
             previous = [item for item in self.store.list("capability_generation")
@@ -1058,36 +1457,8 @@ class GenerationJobs:
                     # execution-verified success. Do not replay prior runtime
                     # diagnostics, resource bindings or the old overview.
                     job["continued_from"] = latest["id"]
-                    candidate = None
-                    try:
-                        saved = self.home / latest["id"] / "accepted_proposal.json"
-                        if saved.is_file():
-                            candidate = json.loads(saved.read_text(encoding="utf-8"))
-                        saved_candidate = candidate is not None
-                        recovered = json.loads((self.home / latest["id"] / "conversation.json").read_text(encoding="utf-8"))
-                        history = recovered["messages"] if recovered.get("source_version") == inspector.request["source_version"] else []
-                        for index, message in enumerate(history):
-                            for call in message.get("tool_calls") or []:
-                                function = call.get("function") or {}
-                                if function.get("name") != "submit_package":
-                                    continue
-                                reply = next((item for item in history[index + 1:] if item.get("role") == "tool"
-                                              and item.get("tool_call_id") == call.get("id")), None)
-                                try:
-                                    value = json.loads(function.get("arguments", ""))
-                                    status = json.loads(reply["content"]).get("status") if reply else None
-                                except (ValueError, TypeError, KeyError, AttributeError):
-                                    continue
-                                if not saved_candidate and status == "PASSED" and isinstance(value, dict) and isinstance(value.get("manifest"), dict):
-                                    candidate = value
-                    except (OSError, ValueError, TypeError, KeyError, AttributeError):
-                        pass
-                    if candidate is not None and len(canonical(candidate)) <= MAX_CONTEXT // 2:
-                        candidate = copy.deepcopy(candidate)
-                        for field in ("source", "generator", "files"):
-                            candidate["manifest"].pop(field, None)
-                    else:
-                        candidate = None
+                    candidate = self._successful_proposal(inspector, dict(job, improve_from=latest["id"], reads=[]),
+                                                          allowed_status=("NEEDS_INPUT",))
                     edit_base = candidate
                     carried = []
                     for record in latest.get("reads", []):
@@ -1098,8 +1469,10 @@ class GenerationJobs:
                             job["reads"].append(copy.deepcopy(record))
                             carried.append({key: record[key] for key in ("path", "start", "end", "sha256")})
                     messages.append(dict(role="user", content=canonical(dict(
-                        previous_candidate=candidate, previous_source_reads=carried,
+                        previous_candidate=view(candidate), previous_source_reads=carried,
+                        previous_verification=_prior_verification(candidate, latest),
                         instruction="相同冻结源码和模型；这是需要修复的未完成候选，并非已验证成功包。"
+                                    "对照平台实际绑定与样例结果修正过时缺项。当前绑定与真实调用仍由平台复核。"
                                     "使用已核对的阅读范围检查引用、效果和所需资源，结合本次意图重新提交完整提案。"))))
                 else:
                     previous = [item for item in previous if item.get("status") == "FAILED"]
@@ -1119,6 +1492,12 @@ class GenerationJobs:
                         break
                 previous = max(previous, key=lambda item: item["started_at"])
                 job["continued_from"] = previous["id"]
+                if previous.get("package_digest") and (self.home / previous["id"] / "accepted_proposal.json").is_file():
+                    # Static acceptance is reusable evidence even if the real
+                    # worker later failed. Verify the saved candidate against
+                    # the installed package before exposing an editable base.
+                    edit_base = self._successful_proposal(inspector, dict(job, improve_from=previous["id"], reads=[]),
+                                                          allowed_status=("FAILED",))
                 checkpoint = self.home / previous["id"] / "conversation.json"
                 recovered = None
                 try:
@@ -1126,7 +1505,7 @@ class GenerationJobs:
                 except (OSError, ValueError):
                     pass
                 if (isinstance(recovered, dict) and recovered.get("source_version") == inspector.request["source_version"]
-                        and isinstance(recovered.get("messages"), list) and recovered["messages"]):
+                        and _complete_tool_history(recovered.get("messages"))):
                     messages = recovered["messages"]
                     messages[0] = dict(role="system", content=RULES)
                     messages[1] = dict(role="user", content=canonical(overview))
@@ -1139,16 +1518,6 @@ class GenerationJobs:
                         previous_runtime_errors=runtime_errors,
                         previous_validation=[step for step in previous.get("steps", []) if step["name"] == "validation_failed"],
                         instruction="相同冻结源码与模型，接续此前失败任务。使用已读来源及最后的真实诊断完成修复，不从头穷举仓库。"))))
-                    for item in messages:
-                        if item.get("role") != "user":
-                            continue
-                        try:
-                            value = json.loads(item.get("content", ""))
-                            candidate = value.get("previous_candidate") if isinstance(value, dict) else None
-                        except (ValueError, TypeError):
-                            continue
-                        if isinstance(candidate, dict) and isinstance(candidate.get("files"), dict):
-                            edit_base = candidate
                 else:
                     # Early versions had only read handles, not a conversation
                     # checkpoint. Reconstruct a bounded set from immutable bytes.
@@ -1169,18 +1538,93 @@ class GenerationJobs:
                         instruction="相同冻结源码，以上恢复此前已读的核心代码；优先利用这些材料完成提交，不重复穷举。"))))
         if isinstance(edit_base, dict) and isinstance(edit_base.get("files"), dict):
             messages.append(dict(role="user", content="已有通过静态检查的候选。优先针对本次要求直接使用 edit_package 精确替换少量已有代码，或提交完整提案；确有必要时最多读取3至4页关键源码，不要穷举仓库。修订仍会执行完整校验。"))
+        paged_base = bool(edit_base and view(edit_base).get("history_compacted"))
+        if edit_base:
+            current_digest = digest(edit_base)
+            for item in messages:
+                if item.get("role") != "tool":
+                    continue
+                try:
+                    page = json.loads(item.get("content", ""))
+                except (ValueError, TypeError):
+                    continue
+                if isinstance(page, dict) and "base_digest" in page and page["base_digest"] != current_digest:
+                    page.pop("text", None)
+                    page.update(status="STALE_CANDIDATE_PAGE", current_base_digest=current_digest,
+                                content="此页属于旧候选，不能用于当前文件身份；请重新 read_package。")
+                    item["content"] = canonical(page)
+        for item in messages:
+            if item.get("role") != "user":
+                continue
+            try:
+                value = json.loads(item.get("content", ""))
+            except (TypeError, ValueError):
+                continue
+            if isinstance(value, dict) and isinstance(value.get("previous_source_reads"), list):
+                reads = value["previous_source_reads"]
+                if _context_units(reads) > limit // 6:
+                    value["source_reads_index"] = dict(total=len(reads),
+                        access="read_metadata(kind='source_reads',start=0,count=...)；完整核验阅读记录保留在本地")
+                    while reads and _context_units(reads) > limit // 6:
+                        reads.pop()
+                    item["content"] = canonical(value)
+        if paged_base:
+            def same_candidate(value):
+                if not isinstance(value, dict) or not isinstance(value.get("manifest"), dict):
+                    return False
+                stripped = copy.deepcopy(value)
+                for field in ("source", "generator", "files"):
+                    stripped["manifest"].pop(field, None)
+                return stripped == edit_base
+            summary = view(edit_base)
+            for item in messages:
+                for call in item.get("tool_calls") or []:
+                    function = call.get("function") or {}
+                    if function.get("name") == "submit_package":
+                        try:
+                            candidate = json.loads(function.get("arguments", ""))
+                        except (TypeError, ValueError):
+                            continue
+                        if same_candidate(candidate):
+                            function["arguments"] = canonical(summary)
+                if item.get("role") != "user":
+                    continue
+                try:
+                    value = json.loads(item.get("content", ""))
+                except (TypeError, ValueError):
+                    continue
+                if not isinstance(value, dict):
+                    continue
+                owners = [value, value.get("previous_attempt")]
+                changed = False
+                for owner in owners:
+                    if not isinstance(owner, dict):
+                        continue
+                    for field in ("previous_candidate", "previous_proposal", "previous_successful_proposal"):
+                        if same_candidate(owner.get(field)):
+                            owner[field] = summary
+                            changed = True
+                if changed:
+                    item["content"] = canonical(value)
+            messages.append(dict(role="user", content=canonical(dict(editable_candidate=summary,
+                instruction="此候选已按冻结源码和包内容核验；运行失败诊断仍保留。按需 read_package，修订时提交 base_digest。"))))
         signatures = set()
         for round_number in range(job.get("rounds", 0) + 1, MAX_ROUNDS + 1):
             self._check(cancellation)
-            compacted = self._compact(messages)
-            if compacted:
-                job["source_pages_compacted"] = job.get("source_pages_compacted", 0) + compacted
-            if len(canonical(messages)) > MAX_CONTEXT:
-                raise ValueError("生成结果与必要诊断仍超出上下文上限；本次任务保留真实失败，未安装未经核验的包")
             if round_number in (12, 20):
                 messages.append(dict(role="user", content=f"已进行 {round_number - 1} 轮，剩余 {MAX_ROUNDS - round_number + 1} 轮。请优先提交已查明的完整能力，不穷举其他独立功能；不确定部分列为具体 gaps。"))
+            available = budget["available_input_tokens"]
+            request_limit = min(limit, int(available * 0.8 * 3) - budget["tool_bytes"] - 24 * len(messages) - 128) if available is not None else limit
+            compacted = self._compact(messages, request_limit)
+            compacted += _compact_read_history(messages, request_limit, len(job.get("reads", [])))
+            if compacted:
+                job["source_pages_compacted"] = job.get("source_pages_compacted", 0) + compacted
+            if _context_units(messages) > request_limit:
+                raise ValueError("生成结果与必要诊断仍超出上下文上限；本次任务保留真实失败，未安装未经核验的包")
             self._save(job, "generating", rounds=round_number)
             body = completion_body(profile, messages, TOOLS)
+            if "max_tokens" not in body and "max_completion_tokens" not in body:
+                body["max_tokens"] = budget["requested_output_tokens"]
             answer = self._await(lambda: self.transport.send(profile["base_url"] + "/chat/completions", key, body), cancellation)
             message = answer["choices"][0]["message"]
             # Provider reasoning is not persisted or reused as source evidence.
@@ -1200,8 +1644,11 @@ class GenerationJobs:
                 messages[-1] = dict(role="assistant", content=None, tool_calls=[dict(calls[0], type="function")])
             if len(calls) > 12:
                 raise ValueError("一次请求的源码工具调用过多")
+            if (any(not isinstance(call, dict) or not isinstance(call.get("id"), str) or not call["id"] for call in calls)
+                    or len({call["id"] for call in calls}) != len(calls)):
+                raise ValueError("同一回答的工具调用需要不重复的有效身份")
             accepted = None
-            for call in calls:
+            for call_number, call in enumerate(calls):
                 self._check(cancellation)
                 function = call["function"]
                 name = function["name"]
@@ -1217,25 +1664,7 @@ class GenerationJobs:
                         if accepted:
                             raise ValueError("一次只能提交一个完整能力包")
                         if name == "edit_package":
-                            if not isinstance(edit_base, dict) or not isinstance(edit_base.get("files"), dict):
-                                raise ValueError("没有可修订的已验证候选")
-                            edits, updates = arguments.get("edits"), arguments.get("manifest_updates", {})
-                            if (set(arguments) - {"edits", "manifest_updates"} or not isinstance(edits, list)
-                                    or len(edits) > 12 or not isinstance(updates, dict) or not (edits or updates)):
-                                raise ValueError("修订需要至多12个精确文本替换或非空 manifest_updates")
-                            if set(updates) & {"source", "generator", "files"}:
-                                raise ValueError("源码、生成器和文件身份由平台生成，不能通过契约修订覆盖")
-                            revised = copy.deepcopy(edit_base)
-                            revised["manifest"].update(copy.deepcopy(updates))
-                            for edit in edits:
-                                if not isinstance(edit, dict) or set(edit) != {"path", "old", "new"}:
-                                    raise ValueError("每个修订需要 path、old 和 new")
-                                path, old, new = edit["path"], edit["old"], edit["new"]
-                                if (not isinstance(path, str) or path not in revised["files"] or not isinstance(old, str)
-                                        or not old or not isinstance(new, str) or revised["files"][path].count(old) != 1):
-                                    raise ValueError("修订只能替换已有文件中唯一匹配的非空文本")
-                                revised["files"][path] = revised["files"][path].replace(old, new, 1)
-                            arguments = revised
+                            arguments = _edit_proposal(edit_base, arguments, require_digest=paged_base)
                         self._save(job, "validating")
                         folder = self.home / job["id"] / ("attempt-" + str(job["repairs"]))
                         # Each attempt owns a new path; no partial proposal can
@@ -1243,8 +1672,13 @@ class GenerationJobs:
                         folder.mkdir(parents=True)
                         manifest, checks = write_package(folder, arguments, inspector, ranges, job["model"])
                         (self.home / job["id"] / "accepted_proposal.json").write_text(canonical(arguments), encoding="utf-8")
+                        job["accepted_proposal_digest"] = digest(arguments)
                         accepted = (folder, manifest, arguments, checks)
                         reply = dict(status="PASSED", checks=checks)
+                        edit_base = arguments
+                    elif name == "read_package":
+                        reply = self._read_package(edit_base, arguments, count_limit=min(16000, max(1000, limit // 12)),
+                                                   max_units=max(1000, limit // 6))
                     else:
                         reply = self._source_tool(inspector, name, arguments, ranges, job)
                 except (ValueError, KeyError, TypeError, SyntaxError, OSError) as error:
@@ -1259,6 +1693,9 @@ class GenerationJobs:
                             job["repairs"] += 1
                 messages.append(dict(role="tool", tool_call_id=call["id"], content=canonical(reply)))
                 if terminal_error:
+                    for pending_call in calls[call_number + 1:]:
+                        messages.append(dict(role="tool", tool_call_id=pending_call["id"], content=canonical(dict(
+                            status="NOT_RUN", reason="此前提交已达到修复终止条件，本批剩余工具未执行"))))
                     self._save(job)
                     self._checkpoint(inspector, job, messages)
                     raise ValueError(terminal_error) from None
@@ -1298,7 +1735,9 @@ class GenerationJobs:
             self.platform, inspector, proposal.get("resource_matches", {}), bindings)
         projects = {binding["project_id"] for binding in bindings.values() if binding.get("form") == "project"}
         project_id = next(iter(projects)) if len(projects) == 1 else None
-        examples = {example["capability"]: example for example in proposal.get("examples", [])}
+        examples = {}
+        for example in proposal.get("examples", []):
+            examples.setdefault(example["capability"], []).append(example)
         job["first_call"] = dict(status="NOT_RUN", calls=[], release=None)
         # Existing instances belong to their current users; verification never
         # releases them or borrows them for a new generated installation.
@@ -1306,6 +1745,7 @@ class GenerationJobs:
             job["gaps"].append(dict(kind="verification", reason="已有运行实例仍在使用；首调用验证延后，不中断现有任务"))
             return
         attempted = False
+        verified_capabilities = 0
         lease = None
         operation_complete = threading.Event()
         operation_complete.set()
@@ -1320,9 +1760,9 @@ class GenerationJobs:
         try:
             for capability in manifest["capabilities"]:
                 self._check(cancellation)
-                sample = examples.get(capability["id"])
+                samples = examples.get(capability["id"], [])
                 gap = self._sample_gap(capability, bindings, authorized_services)
-                if not sample or gap:
+                if not samples or gap:
                     for identity in installation["capabilities"]:
                         if catalog.unit(identity)["entry_id"] == capability["id"]:
                             catalog.record_verification(identity, "NEEDS_INPUT", gap or "请提供有效调用样例；成功的明确调用会开放此能力")
@@ -1338,35 +1778,48 @@ class GenerationJobs:
                                                               job["id"] + "_verification_" + str(attempt))
                     self._save(job, verification_attempt=attempt, project_lease=lease)
                 self._save(job, "verifying")
-                # Invocation stays in the worker, including initialize/close.
-                operation_complete.clear()
-                def invoke_sample():
-                    try:
-                        # _await runs a fresh thread; ContextVars must be set
-                        # here, not on the generation thread that is waiting.
-                        with project_scope(project_id) if project_id is not None else nullcontext():
-                            return catalog.invoke(unit["id"], sample["input"], on_event=event)
-                    finally:
-                        operation_complete.set()
-                        # Cancellation can arrive while startup has not yet
-                        # created an instance. If the late invocation finishes,
-                        # request release then as well; never strand its worker
-                        # merely because the waiting generation thread ended.
-                        if cancellation.is_set() or self.closed.is_set():
+                catalog.begin_verification_batch(unit["id"])
+                batch_status, batch_reason, last_call = "NEEDS_INPUT", "首调用验证尚未完成", None
+                try:
+                    for sample in samples:
+                        self._check(cancellation)
+                        # Invocation stays in the worker, including initialize/close.
+                        operation_complete.clear()
+                        def invoke_sample():
                             try:
-                                if catalog.router.live_instances(group_id):
-                                    release = catalog.router.drain_stop(group_id, {}, reason="generation_verification_cancelled")
-                                    job["first_call"]["late_release_request"] = release
-                                    self._save(job)
-                            except Exception as error:
-                                job["first_call"]["late_release_error"] = str(error)
-                                self._save(job)
-                result = self._await(invoke_sample, cancellation)
-                catalog.record_verification(unit["id"], "SUCCEEDED", call=result.get("call"))
-                job["first_call"]["calls"].append(dict(capability=capability["id"], input=sample["input"],
-                                                         provenance=sample["provenance"], result=result, status="SUCCEEDED"))
-                self._save(job)
-            job["first_call"]["status"] = ("SUCCEEDED" if len(job["first_call"]["calls"]) == len(manifest["capabilities"])
+                                # _await starts a new thread; set ContextVars there.
+                                with project_scope(project_id) if project_id is not None else nullcontext():
+                                    return catalog.invoke(unit["id"], sample["input"], on_event=event, auto_verify=False)
+                            finally:
+                                operation_complete.set()
+                                if cancellation.is_set() or self.closed.is_set():
+                                    try:
+                                        if catalog.router.live_instances(group_id):
+                                            release = catalog.router.drain_stop(group_id, {}, reason="generation_verification_cancelled")
+                                            job["first_call"]["late_release_request"] = release
+                                            self._save(job)
+                                    except Exception as error:
+                                        job["first_call"]["late_release_error"] = str(error)
+                                        self._save(job)
+                        result = self._await(invoke_sample, cancellation)
+                        last_call = result.get("call")
+                        reason = verification_error(capability, sample["input"], result)
+                        job["first_call"]["calls"].append(dict(capability=capability["id"], input=sample["input"],
+                            provenance=sample["provenance"], result=result,
+                            status="FAILED" if reason else "SUCCEEDED", **({"error": reason} if reason else {})))
+                        self._save(job)
+                        if reason:
+                            raise GenerationRepairable(reason)
+                    batch_status, batch_reason = "SUCCEEDED", None
+                    verified_capabilities += 1
+                except GenerationCancelled:
+                    raise
+                except Exception as error:
+                    batch_status, batch_reason = "FAILED", str(error)
+                    raise
+                finally:
+                    catalog.end_verification_batch(unit["id"], batch_status, batch_reason, call=last_call)
+            job["first_call"]["status"] = ("SUCCEEDED" if verified_capabilities == len(manifest["capabilities"])
                                               else "PARTIAL" if job["first_call"]["calls"] else "NOT_RUN")
         except GenerationCancelled:
             if active_call.get("id"):
@@ -1396,10 +1849,11 @@ class GenerationJobs:
     def _install_generated(self, folder, manifest, proposal, checks, inspector, job, cancellation):
         self._check(cancellation)
         gaps, notes = coverage_scope(manifest, proposal.get("gaps", []), proposal.get("coverage_notes", []))
-        job.update(package_digest=package_digest(manifest), group_id=group_identity(manifest),
+        job.update(package_digest=package_digest(manifest), group_id=None,
                    package_folder=str(folder), checks=checks, gaps=gaps, coverage_notes=notes)
         self._save(job, "binding")
         bindings, gaps, resource_facts = resolve_resources(self.platform, manifest, proposal.get("resource_matches", {}), inspector)
+        job["group_id"] = self.platform.capabilities.group_for_install(manifest, bindings)
         job["gaps"].extend(gaps)
         self._save(job, resource_matches=resource_facts)
         self._check(cancellation)
@@ -1412,6 +1866,7 @@ class GenerationJobs:
                 self._save(job, "deferred", status="NEEDS_INPUT")
                 return
             raise
+        job["group_id"] = installation["group_id"]
         job["installation_id"] = installation["installation_id"]
         job["availability"] = installation["availability"]
         if check_bindings(manifest, bindings):

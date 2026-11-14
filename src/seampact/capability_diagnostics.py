@@ -5,6 +5,7 @@ import time
 import uuid
 
 from seampact.hosting.capability_hosting import project_scope
+from seampact.guard_contract import verification_error
 from seampact.store import now
 
 
@@ -42,7 +43,9 @@ def invoke(platform, body):
         # corpus changes or cleanup until this physical call has ended.
         with project_scope(project_id) if project_id is not None else nullcontext():
             result = catalog.invoke(unit["id"], body["input"], run_id=identity, on_event=observe)
-        record.update(status="COMPLETED", result=result)
+        reason = verification_error(unit["capability"], body["input"], result)
+        record.update(status="FAILED" if reason else "COMPLETED", result=result,
+                      verification=dict(status="FAILED" if reason else "SUCCEEDED", reason=reason))
     except Exception as error:
         record.update(status="FAILED", error=str(error))
         raise
@@ -69,4 +72,4 @@ def invoke(platform, body):
         record["finished_at"] = now()
         platform.store.save("capability_diagnostic", identity, record)
     return dict(result, diagnostic={key: record.get(key) for key in
-                ("id", "release", "release_error", "project_lease", "model_usage")})
+                ("id", "status", "verification", "release", "release_error", "project_lease", "model_usage")})

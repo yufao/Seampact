@@ -5,6 +5,7 @@ import json
 import math
 import subprocess
 import threading
+import time
 import uuid
 from collections import deque
 from contextlib import nullcontext
@@ -80,6 +81,25 @@ class ChatJobs:
                 self.store.save("task", task["id"], task)
 
     def _stream_event(self, identity, kind, text="", **facts):
+        # Phase metadata is public. Raw inputs, plans, candidates, check
+        # evidence and feedback remain in the task's research record.
+        fields = {
+            "content_received": ("chars",), "hook_started": ("hook", "event", "required", "enforced_recheck"),
+            "hook_result": ("hook", "event"), "hook_skipped": ("hook", "event"),
+            "tool_requested": ("name", "call_id"), "before_tool": ("name", "call_id"),
+            "tool_result": ("name", "call_id"), "before_delivery": ("chars", "file_count", "complete"),
+            "model_started": ("request_index", "stream"), "file": ("file",),
+            "scoped_operation_denied": ("name", "call_id", "hooks"),
+            "scoped_operation_cleared": ("name", "call_id", "hooks"),
+            "delivery_revision_requested": ("hooks",), "delivery_revision_accepted": ("hooks",),
+            "delivery_revision_exhausted": ("hooks",), "task_finished": ("status",),
+            "capability_event": ("call_id", "unit_id", "instance_id", "kind"),
+            "resource_preparing": ("group_id", "role"), "resource_ready": ("groups", "role"),
+        }
+        if kind not in {"reset", "start", "delta"}:
+            text = ""
+            source = facts.get("data") if isinstance(facts.get("data"), dict) else facts
+            facts = dict(data={name: copy.deepcopy(source[name]) for name in fields.get(kind, ()) if name in source})
         with self._stream_condition:
             stream = self._streams.setdefault(identity, dict(events=deque(maxlen=256), parts=[], sequence=0))
             if kind == "reset":
@@ -167,7 +187,7 @@ class ChatJobs:
         if latest.get("status") == "COMPLETED" and latest.get("response"):
             messages.append(dict(role="assistant", content=latest["response"]))
         result = dict(id=identity, messages=messages, legacy=not bool(latest.get("messages")),
-                    task={key: latest.get(key) for key in ("id", "status", "response", "partial_response", "error", "latency_ms", "context_status", "context_events", "files", "cancel")})
+                    task=self.snapshot(latest))
         if self.projects is not None:
             with self.projects.lock:
                 session = self.projects.session(identity)
@@ -180,6 +200,21 @@ class ChatJobs:
             result["task"]["project_id"] = project_id
             result["task"].update({key: latest[key] for key in
                 ("workspace_status", "workspace_retention_reason", "workspace_error") if key in latest})
+        return result
+
+    @staticmethod
+    def snapshot(task):
+        """Normal chat state contains delivered content and structural status only."""
+        result = {key: copy.deepcopy(task.get(key)) for key in
+            ("id", "status", "response", "partial_response", "error", "latency_ms", "context_status", "files", "cancel")}
+        result["context_events"] = [{key: copy.deepcopy(event[key]) for key in
+            ("operation", "archive_ref", "status", "messages_before", "messages_after", "usage", "error_type") if key in event}
+            for event in task.get("context_events", []) if isinstance(event, dict)]
+        # Artifacts become attachments exclusively through delivery's files gate.
+        delivered = {file.get("sha256") for file in task.get("files", []) if isinstance(file, dict)}
+        artifacts = task.get("artifacts")
+        result["artifacts"] = ([copy.deepcopy(file) for file in artifacts if isinstance(file, dict)
+                                and file.get("sha256") in delivered] if isinstance(artifacts, list) else None)
         return result
 
     def delete_conversation(self, identity):
@@ -197,7 +232,7 @@ class ChatJobs:
         return dict(restored=self.conversation(identity)["id"])
 
     def start(self, body, *, runtime_options=None, on_event=None, metadata=None, internal_task_id=None,
-              capability_snapshot=None, apply_project_application=False):
+              capability_snapshot=None, apply_project_application=True, input_files=None):
         # Dynamic availability may wait for the coordinator, whose journal
         # uses the store lock. Read it before entering project admission.
         capability_snapshot = (self.catalog.public() if capability_snapshot is None else capability_snapshot)
@@ -210,10 +245,10 @@ class ChatJobs:
         with deployment_lock if deployment_lock is not None else nullcontext(), self._start_lock:
             return self._start(body, runtime_options=runtime_options, on_event=on_event, metadata=metadata,
                                internal_task_id=internal_task_id, capability_snapshot=capability_snapshot,
-                               apply_project_application=apply_project_application)
+                               apply_project_application=apply_project_application, input_files=input_files)
 
     def _start(self, body, *, runtime_options=None, on_event=None, metadata=None, internal_task_id=None,
-               capability_snapshot, apply_project_application=False):
+               capability_snapshot, apply_project_application=True, input_files=None):
         messages = body.get("messages")
         if not isinstance(messages, list) or not messages:
             raise ValueError("请提交完整对话消息")
@@ -224,6 +259,9 @@ class ChatJobs:
                 raise ValueError("消息内容需要文字或模型支持的多模态内容")
         if self.closed:
             raise ValueError("平台已停止")
+        access = body.get("tool_access", "project")
+        if access not in ("read_only", "project"):
+            raise ValueError("工具权限须为 read_only 或 project")
         deadline = body.get("deadline_s")
         if deadline is not None and (type(deadline) not in (int, float) or
                 not math.isfinite(deadline) or deadline <= 0):
@@ -274,16 +312,17 @@ class ChatJobs:
                 raise ValueError("内部任务身份无效或已被使用")
         identity = internal_task_id or uuid.uuid4().hex
         task = dict(id=identity, status="RUNNING", started_at=now(), response=None,
+            tool_access=access,
             error=None, partial_response="", calls=[], model_calls=0, usage=[], latency_ms=None, phase="conversation",
             conversation_id=conversation_id, messages=copy.deepcopy(messages),
             context_calibration=copy.deepcopy(prior_calibration), models=bound.public(), role_resources=bound.resources(),
             capability_pool=copy.deepcopy(capability_snapshot))
-        if self.applications is not None and self.projects is not None and (runtime_options is None or apply_project_application):
+        if self.applications is not None and self.projects is not None and apply_project_application:
             from seampact.project_applications import TaskCapabilityCatalog
             application, eligible = self.applications.snapshot(project_id, capability_snapshot)
             task["application"] = application
             task["capability_pool"] = copy.deepcopy(eligible)
-            transparent = set(application["effective_bindings"].values())
+            transparent = {unit["id"] for unit in eligible if "guard" in unit.get("capability", {})}
             catalog = TaskCapabilityCatalog(self.catalog, [u for u in eligible if u["id"] not in transparent])
             application_options = self.applications.runtime_options(identity, application)
             runtime_options = dict(runtime_options or {})
@@ -298,7 +337,7 @@ class ChatJobs:
         if self.projects is not None:
             task["project_id"] = project_id
             task["workspace_controller"] = self._workspace_controller
-            scope = self.projects.begin_task(project_id, conversation_id, identity)
+            scope = self.projects.begin_task(project_id, conversation_id, identity, input_files=input_files)
             task["workspace"] = {key: scope[key] for key in ("project_id", "conversation_id", "task_id")}
         try:
             self.store.save("task", identity, task)
@@ -377,6 +416,17 @@ class ChatJobs:
 
     def _finish_project_scope(self, task, catalog, profiles=None, control=None):
         try:
+            # A prewarm or replica launch can outlive the request that caused
+            # it. Keep this task's project lease until its own action exits.
+            dispatcher = getattr(self.dispatch, "__self__", self.scheduler)
+            if dispatcher is not None and hasattr(dispatcher, "condition") and hasattr(dispatcher, "elastic_runs"):
+                deadline = time.monotonic() + 30.0
+                with dispatcher.condition:
+                    while dispatcher.elastic_runs.get(task["id"], 0):
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0 or self.closed or getattr(dispatcher, "closed", False):
+                            break
+                        dispatcher.condition.wait(min(0.5, remaining))
             drained = self._workspace_drained(task["id"], catalog, profiles, control, task=task)
             router = getattr(catalog, "router", None)
             if drained and router is not None:
@@ -409,17 +459,46 @@ class ChatJobs:
         task = task if task is not None else self.store.get("task", identity) or {}
         if task.get("python_calls") and (self.code_execution is None or not self.code_execution.is_drained(task)):
             return False
+        if router is not None and hasattr(router, "lock"):
+            with router.lock:
+                reservations = getattr(router, "capability_task_reservations", {})
+                if any(owner == identity and count for (owner, _), count in reservations.items()):
+                    return False
         calls = task.get("calls") or []
         events = [item.get("event") or {} for item in task.get("events", [])
                   if item.get("kind") == "capability_event"]
+        def busy_for_task(record, instance_id):
+            if record.get("state") == "STOPPED" and record.get("released") is True:
+                return False
+            # A started call without this task's terminal receipt remains
+            # uncertain even if another call owns the shared instance now.
+            starts = [item for item in events if item.get("instance_id") == instance_id
+                      and item.get("kind") == "call_started"]
+            receipts = [item for item in calls if item.get("instance_id") == instance_id]
+            if (any(not item.get("call_id") for item in starts) or any(not item.get("call_id") or
+                    item.get("outcome") not in {"result", "error", "cancelled"} for item in receipts)):
+                return True
+            started = {item["call_id"] for item in starts}
+            terminal = {item["call_id"] for item in receipts}
+            if not started.issubset(terminal):
+                return True
+            if record.get("in_flight") == 0:
+                return False
+            reservations = getattr(router, "capability_task_reservations", None)
+            if not isinstance(reservations, dict) or task.get("workspace_controller") != self._workspace_controller:
+                return True
+            return bool(reservations.get((identity, instance_id), 0))
         if calls or events:
+            if (any(item.get("kind") == "call_started" and not item.get("instance_id") for item in events)
+                    or any(item.get("call_id") and not item.get("instance_id") for item in calls)):
+                return False
             instances = {item["instance_id"] for item in calls + events if item.get("instance_id")}
             if not instances or router is None or not hasattr(router, "lock") or not hasattr(router, "instances"):
                 return False
             with router.lock:
                 for instance in instances:
                     record = router.instances.get(instance)
-                    if not record or record.get("state") == "UNKNOWN" or record.get("in_flight") != 0:
+                    if not record or record.get("state") == "UNKNOWN" or busy_for_task(record, instance):
                         return False
                     # The prior controller's empty call map is not proof.
                     if (task.get("workspace_controller") != self._workspace_controller
@@ -430,6 +509,8 @@ class ChatJobs:
             with dispatcher.condition:
                 if any(request.get("run_id") == identity for request in
                        list(dispatcher.queue.values()) + list(dispatcher.running.values())):
+                    return False
+                if getattr(dispatcher, "elastic_runs", {}).get(identity, 0):
                     return False
         runtime = self.runtime or getattr(getattr(router, "platform", None), "runtime", None)
         if runtime is not None:
@@ -446,7 +527,7 @@ class ChatJobs:
                     if owner != identity:
                         continue
                     record = router.instances.get(instance_id)
-                    if not record or record.get("state") == "UNKNOWN" or record.get("in_flight") != 0:
+                    if not record or record.get("state") == "UNKNOWN" or busy_for_task(record, instance_id):
                         return False
         manager = getattr(profiles, "managed_services", None) or getattr(
             getattr(router, "platform", None), "managed_services", None)

@@ -14,7 +14,8 @@ import threading
 import uuid
 from pathlib import Path
 
-from seampact.capability_contract import digest, load_package, package_digest, tool_definition, validate_value
+from seampact.capability_contract import check_bindings, digest, load_package, package_digest, tool_definition, validate_value
+from seampact.guard_contract import verification_error
 from seampact.hosting.capability_hosting import GROUP_KIND, cancel as cancel_call, group_identity, instance_contract
 from seampact.store import now
 
@@ -60,16 +61,41 @@ class CapabilityCatalog:
         self.session = uuid.uuid4().hex
         self.lock = threading.RLock()
         self._image_work = threading.Lock()
-        self._slots, self._preparing = {}, {}
+        self._preparing = {}
+        self._verification_batches = set()
 
     # Installation.
+
+    @staticmethod
+    def _project_owner(group):
+        owners = {binding["project_id"] for binding in (group.get("bindings") or {}).values()
+                  if binding.get("form") == "project"}
+        if group.get("project_owner"):
+            owners.add(group["project_owner"])
+        if len(owners) > 1:
+            raise ValueError("能力组项目归属不一致")
+        return next(iter(owners), None)
+
+    def group_for_install(self, manifest, bindings):
+        """Keep an existing project's old identity; isolate all new project owners."""
+        if bindings is not None:
+            check_bindings(manifest, bindings)
+        selected = self._project_owner(dict(bindings=bindings or {}))
+        legacy_id = group_identity(manifest)
+        legacy = self.store.get("runtime_group", legacy_id) or {}
+        owner = self._project_owner(legacy)
+        if selected:
+            return legacy_id if owner == selected else group_identity(manifest, selected)
+        if owner and bindings is not None:
+            return group_identity(manifest, isolated_global=True)
+        return legacy_id
 
     def install(self, folder, bindings=None):
         """Install a generated package folder and register its capabilities."""
         manifest = load_package(folder)
         package = package_digest(manifest)
-        group_id = group_identity(manifest)
         with self.lock:
+            group_id = self.group_for_install(manifest, bindings)
             self._require_released(group_id)
             target = self.packages / package
             if target.exists():
@@ -110,8 +136,25 @@ class CapabilityCatalog:
             return self._register(manifest, group["package_digest"], group_id, merged)
 
     def _register(self, manifest, package, group_id, bindings):
+        check_bindings(manifest, bindings)
+        previous = self.store.get("runtime_group", group_id) or {}
+        owner = self._project_owner(previous)
+        selected = self._project_owner(dict(bindings=bindings))
+        if owner and selected and owner != selected:
+            raise ValueError("能力组属于其他项目；请为目标项目安装独立能力组")
+        if not owner and selected:
+            scoped_id = group_identity(manifest, selected)
+            scoped = self.store.get("runtime_group", scoped_id)
+            if scoped_id != group_id and scoped and not scoped.get("detached"):
+                raise ValueError("项目已有独立能力组；请使用该项目的能力组")
+        owner = owner or selected
         contract = instance_contract(group_id, manifest, package, bindings)
-        installation = digest([package, contract["bindings_digest"]])[:32]
+        installation_identity = [package, contract["bindings_digest"]]
+        # An unbound project-owned group must not share unit identities with
+        # an unbound global group or another project's unbound installation.
+        if owner and not selected:
+            installation_identity.extend(["project", owner])
+        installation = digest(installation_identity)[:32]
         missing = contract["missing_resources"]
         status = "NEEDS_INPUT" if missing else "READY"
         reason = "缺少必需资源绑定：" + ", ".join(missing) if missing else None
@@ -135,6 +178,8 @@ class CapabilityCatalog:
                      units=[unit["id"] for unit in units], bindings=bindings, resources=manifest["resources"],
                      resource_kinds={resource["id"]: resource["kind"] for resource in manifest["resources"]},
                      contract=contract, detached=False, installed_at=now())
+        if owner:
+            group["project_owner"] = owner
         with self.store.transaction():
             for previous in self.store.list("capability"):
                 if (previous["runtime_group"] == group_id and previous["installation_id"] != installation
@@ -337,14 +382,7 @@ class CapabilityCatalog:
     def validate_input(self, unit_id, arguments):
         validate_value(arguments, self.unit(unit_id)["parameters"], "input")
 
-    def _slot(self, group):
-        key = (group["id"], group["contract"]["digest"])
-        with self.lock:
-            if key not in self._slots:
-                self._slots[key] = threading.BoundedSemaphore(group["contract"]["concurrency"])
-            return self._slots[key]
-
-    def invoke(self, unit_id, arguments, on_event=None, run_id=None):
+    def invoke(self, unit_id, arguments, on_event=None, run_id=None, *, auto_verify=True):
         """Run one capability on an instance, starting one on demand.
 
         Returns the output, delivered files and the call's execution facts.
@@ -357,13 +395,15 @@ class CapabilityCatalog:
         group = self._group(unit["runtime_group"])
         placement = dict(group_id=group["id"], run_id=run_id, contract_digest=group["contract"]["digest"],
                          start_timeout_s=self.router.backend()["start_timeout_s"])
-        with self._slot(group):
-            try:
-                result, facts = self.router.invoke_placed(placement, unit, arguments, on_event=on_event)
-            except Exception as error:
+        try:
+            result, facts = self.router.invoke_placed(placement, unit, arguments, on_event=on_event)
+        except Exception as error:
+            if auto_verify:
                 self.record_verification(unit_id, "FAILED", str(error))
-                raise
-        self.record_verification(unit_id, "SUCCEEDED", call=facts)
+            raise
+        if auto_verify:
+            reason = verification_error(unit["capability"], arguments, result)
+            self.record_verification(unit_id, "FAILED" if reason else "SUCCEEDED", reason, call=facts)
         return dict(result, call=facts)
 
     def record_verification(self, unit_id, status, reason=None, call=None):
@@ -373,6 +413,10 @@ class CapabilityCatalog:
         later business failure does not erase an earlier successful validation.
         """
         with self.lock:
+            # A concurrent explicit call cannot open a unit whose declared
+            # generation examples are still being checked as one batch.
+            if unit_id in getattr(self, "_verification_batches", ()):
+                return
             unit = self.unit(unit_id)
             previous = unit.get("generation_verification")
             if previous is None or (previous["status"] == "SUCCEEDED" and status != "SUCCEEDED"):
@@ -380,6 +424,23 @@ class CapabilityCatalog:
             unit["generation_verification"] = dict(status=status, reason=reason, at=now(),
                 call={name: call.get(name) for name in ("call_id", "instance_id", "generation")} if call else None)
             self.store.save("capability", unit_id, unit)
+
+    def begin_verification_batch(self, unit_id):
+        with self.lock:
+            if unit_id in self._verification_batches:
+                raise ValueError("该能力的生成样例正在验证")
+            unit = self.unit(unit_id)
+            if unit.get("generation_verification") is not None:
+                unit["generation_verification"] = dict(status="PENDING", reason="正在验证全部生成样例", at=now(), call=None)
+                self.store.save("capability", unit_id, unit)
+            self._verification_batches.add(unit_id)
+
+    def end_verification_batch(self, unit_id, status, reason=None, call=None):
+        with self.lock:
+            if unit_id not in self._verification_batches:
+                raise ValueError("没有正在进行的生成样例验证")
+            self._verification_batches.remove(unit_id)
+            self.record_verification(unit_id, status, reason, call=call)
 
     def cancel(self, call_id):
         """Request cancellation of an in-flight call named by its call_started event."""

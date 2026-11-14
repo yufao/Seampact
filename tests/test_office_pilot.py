@@ -3,17 +3,129 @@ import copy
 import json
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 from seampact.office_experiment import pilot_quality
-from seampact.office_pilot import _read_plan, training_batches, workload_cases
-from run_office_pilot import reuse_calibration
+from seampact.office_pilot import _read_plan, arrival_waves, frozen_application, handle, scheduled_blocks, training_batches, workload_cases
+from run_office_pilot import allowed_prebuild, reuse_calibration, timed_admissions
 
 
 class PilotChecks(unittest.TestCase):
+    def test_timed_arrivals_do_not_wait_for_first_result_and_barrier_precedes_rag(self):
+        ids = ["a", "b", "c", "r"]
+        blocks = [dict(profile="mixed", offsets_ms=[0, 0, 2]), dict(profile="rag", offsets_ms=[0])]
+        plan = dict(continuous_training=True, arrival_width=2, cases={"training": ids},
+                    arrival_schedule={"training": blocks})
+        cases = {i: {"rag_adaptation": i == "r"} for i in ids}
+        frozen = scheduled_blocks(plan, "training", ids, cases)
+        issued, later = [], threading.Event()
+        def admit(index, timing):
+            issued.append(index)
+            if index == 2:
+                self.assertGreaterEqual(timing["client_send_offset_ms"], 2)
+                later.set()
+            return ids[index]
+        stream = timed_admissions(frozen, admit)
+        with self.subTest("independent admissions"):
+            self.assertEqual(next(stream), (0, "a"))
+            self.assertTrue(later.wait(2))
+            self.assertEqual(issued, [0, 1, 2])
+            self.assertEqual(list(stream), [(1, "b"), (2, "c"), (3, "r")])
+        cases["c"]["rag_adaptation"] = True
+        with self.assertRaisesRegex(ValueError, "独占"):
+            scheduled_blocks(plan, "training", ids, cases)
+
+    def test_parallel_arrivals_isolate_shared_fixture_changes(self):
+        cases = {"a": {}, "b": {}, "c": {"_source": "privacy"}, "d": {"rag_adaptation": True}}
+        ids = ["a", "a", "b", "c", "a", "d", "b"]
+        self.assertEqual(arrival_waves({"arrival_width": 2}, ids, cases),
+                         [[0, 1], [2], [3], [4], [5], [6]])
+        self.assertEqual(arrival_waves({}, ids, cases), [[i] for i in range(len(ids))])
+
+    def test_calibration_prebuild_never_uses_training_or_evaluation_cases(self):
+        plan = dict(cases=dict(development=["dev"], training=["train"], evaluation=["held"]))
+        cases = ["train", "dev", "held"]
+        self.assertEqual(allowed_prebuild(plan, cases, calibration_only=True), ["dev"])
+        self.assertEqual(allowed_prebuild(plan, cases, tuning=True), ["train", "dev"])
+        self.assertEqual(allowed_prebuild(plan, cases, evaluation_only=True), ["held"])
+
+    def test_development_only_protocol_cannot_start_or_prebuild_other_splits(self):
+        plan = dict(local_development_only=True, cases={"development": ["dev"]})
+        store = SimpleNamespace(get=lambda *_: None)
+        platform = SimpleNamespace(store=store, execution=object())
+        with patch("seampact.office_pilot._read_plan", return_value=("identity", plan, {})):
+            for mode in ("training", "app_config", "validation_ppo", "ppo"):
+                with self.assertRaisesRegex(ValueError, "不允许训练"):
+                    handle(platform, dict(op="start", mode=mode))
+            with self.assertRaisesRegex(ValueError, "只允许预构开发题"):
+                handle(platform, dict(op="prebuild", case_id="held-out"))
+
+    def test_development_admission_routes_opted_in_checks_to_scheduler(self):
+        case = dict(id="office-case", _source="privacy")
+        plan = dict(project_id="project", deadline_s=30, development_selector="scheduler",
+                    manifest="manifest.json", manifest_sha256="digest")
+        row = dict(id="run", protocol_sha256="identity", mode="development", status="RUNNING",
+                   case_ids=[case["id"]], task_ids=["task"], admitted=[], application={})
+        records = {("office_pilot", "run"): row}
+        store = SimpleNamespace(get=lambda kind, key: records.get((kind, key)),
+                                save=lambda kind, key, value: records.__setitem__((kind, key), value))
+        platform = SimpleNamespace(store=store, execution=object())
+        def start(_platform, request, *, internal_task_id, pilot_config):
+            self.assertEqual(pilot_config["mode"], "scheduler")
+            self.assertEqual(internal_task_id, "task")
+            return dict(task_id=internal_task_id)
+        with patch("seampact.office_pilot._read_plan", return_value=("identity", plan, {case["id"]: case})), \
+             patch("seampact.office_privacy.start_privacy_task", side_effect=start):
+            result = handle(platform, dict(op="admit", run_id="run"))
+        self.assertEqual(result["task_id"], "task")
+        self.assertEqual(records[("office_pilot", "run")]["admitted"], ["task"])
+
+    def test_frozen_policy_and_semantic_guard_stay_identical_across_arms(self):
+        guard = dict(id="p", entry_id="new_source_entry", tool_name="guard_tool", runtime_group="g",
+            capability=dict(guard=dict(kind="privacy", subjects=["message"],
+                                       provenance=[dict(path="source.py", start=1, end=1)]),
+                input=dict(properties={"text": {"type": "string"},
+                                       "entities": {"type": "array", "items": {"type": "string"}},
+                                       "anonymize": {"type": "boolean"}}),
+                output=dict(properties={"findings": {"type": "array"}}, required=["findings"])))
+        rag = dict(id="r", tool_name="arbitrary_retriever", capability=dict(
+            operation=dict(kind="retrieve", provenance=[dict(path="index.py", start=1, end=1)])))
+        policy = {"required_outbound": ["privacy"], "outbound_finding": "block"}
+        platform = SimpleNamespace(project_applications=SimpleNamespace(configuration=lambda _: {"guard_policy": policy}))
+        plan = dict(project_id="p", bindings={"privacy": "p"})
+        frozen = frozen_application(platform, plan, [guard], rag, {})
+        self.assertEqual(frozen["guard_policy"]["outbound_finding"], "block")
+        self.assertEqual(frozen["guard_candidates"][0]["guard"]["subjects"], ["message"])
+        self.assertEqual(frozen["operations"]["arbitrary_retriever"]["kind"], "retrieve")
+        policy["outbound_finding"] = "deny_operation"
+        self.assertEqual(frozen_application(platform, plan, [guard], rag, {"application": frozen}), frozen)
+        changed = copy.deepcopy(guard)
+        changed["capability"]["guard"]["subjects"] = ["text"]
+        with self.assertRaisesRegex(ValueError, "冻结应用"):
+            frozen_application(platform, plan, [changed], rag, {"application": frozen})
+        with self.assertRaisesRegex(ValueError, "必需检查"):
+            frozen_application(platform, dict(plan, bindings={}), [], rag, {})
+
+        automatic = dict(project_id="p", guard_policy={"required_outbound": []})
+        second = dict(guard, id="another-provider")
+        project = dict(guard_candidates=[
+            dict(role="privacy", unit_id=unit["id"]) for unit in (guard, second)])
+        baseline = frozen_application(platform, automatic, [guard, second], rag, {}, project=project)
+        self.assertCountEqual([item["unit_id"] for item in baseline["guard_candidates"]], ["p", "another-provider"])
+        calibrated = dict(automatic, development_evidence={"application": baseline})
+        self.assertEqual(frozen_application(platform, calibrated, [second, guard], rag, {}, project=project), baseline)
+        changed_project = dict(project, guard_candidates=project["guard_candidates"][:1])
+        with self.assertRaisesRegex(ValueError, "开发校准"):
+            frozen_application(platform, calibrated, [guard], rag, {}, project=changed_project)
+        with self.assertRaisesRegex(ValueError, "检索声明"):
+            frozen_application(platform, automatic, [guard, second], dict(rag, capability={}), {}, project=project)
+
     def test_reward_sweep_reuses_cost_units_but_rejects_other_data_or_seed(self):
         base = dict(cases=dict(development=["dev"], training=["train"], evaluation=["held"]), seed=7,
                     scheduler=dict(objective=None), objective_weights=dict(quality=1, delivery=1, api=0.1))
@@ -81,6 +193,17 @@ class PilotChecks(unittest.TestCase):
             self.assertEqual(training_batches(continuous), 1)
             self.assertEqual(workload_cases(continuous, "training"), [selections["training"]])
             self.assertEqual(workload_cases(continuous, "ppo"), [selections["evaluation"]])
+            plan["development_selector"] = "scheduler"
+            plan["policies"] = {"app_config": {"kind": "rule", "optional_hooks": "all"}}
+            protocol.write_text(json.dumps(plan), encoding="utf-8")
+            body["protocol_sha256"] = hashlib.sha256(protocol.read_bytes()).hexdigest()
+            self.assertEqual(_read_plan(body)[1]["development_selector"], "scheduler")
+            plan["policies"]["app_config"]["kind"] = "ppo"
+            protocol.write_text(json.dumps(plan), encoding="utf-8")
+            body["protocol_sha256"] = hashlib.sha256(protocol.read_bytes()).hexdigest()
+            with self.assertRaisesRegex(ValueError, "规则策略"):
+                _read_plan(body)
+            plan["policies"]["app_config"]["kind"] = "rule"
             plan["training_batch_size"] = 4
             protocol.write_text(json.dumps(plan), encoding="utf-8")
             body["protocol_sha256"] = hashlib.sha256(protocol.read_bytes()).hexdigest()

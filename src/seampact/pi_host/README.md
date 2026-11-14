@@ -47,6 +47,43 @@ reply. The final assistant message remains authoritative. Model failures become
 Pi error messages, never a fresh model retry. Tool failures remain Pi error tool
 results. A tool error with `fatal:true` aborts the run.
 
+Python may add `_seampact_revision_reason` to a successful final model reply
+when its complete delivery checks reject the still-undelivered answer. The
+bridge queues that bounded public feedback using the same Pi Agent's native
+`followUp` method. Pi retains the draft and prior tool receipts and requests
+one further business-model answer; no tool operation is replayed. Python supplies
+no tools for that repair turn, rejects any requested tool calls before execution,
+and rechecks the revised answer before publishing text or files. A second
+revision request is invalid. Delivery exhaustion publishes neither answer.
+
+The Python hook actions are `deny_operation` at `before_tool` and
+`revise_delivery` at complete `before_delivery`; both take a public `reason`.
+The former returns one native Pi error tool result and lets the Agent continue.
+After a denial the same optional check is enforced for subsequent applicable
+tools until a rechecked operation is allowed and successfully executed. Failed
+effects and unrelated tools leave that obligation pending; after success fresh
+operations are optional again. The tool payload exposes `operation_required_hooks` and
+`revision_required_hooks` before evaluating applicability, so a check can retain
+its tool scope even when later evidence is unavailable. Complete delivery
+payloads expose `revision_remaining` (1 then 0), `revision_recheck`, and
+`revision_required_hooks`. Rejecting delivery checks are enforced again even if
+their original applicability or optional selection changes. Enforced checks must
+return an explicit `allow`, `replace`, or rejecting action; an absent assessment
+fails closed. Existing `block` remains a terminal stop. Checks own removal of
+private evidence from feedback; the host only bounds text and control characters.
+
+Task traces record `scoped_operation_denied`, `scoped_operation_cleared`, `delivery_revision_requested`,
+`delivery_revision_accepted` or `delivery_revision_exhausted`, plus each hook's
+`enforced_recheck` flag. Pending files, including additions by stateful required
+delivery hooks, remain attached to the checked revision.
+
+Normal chat streams expose phase metadata and approved delivery events only.
+Persisted continuation wire/context exclude withheld answer candidates and
+transient revision system feedback, including while repair is in progress.
+Only withheld candidate messages are retained in the task's existing research
+detail under `delivery_revision.withheld_messages`; there is no duplicate raw
+conversation history. Later chats retain real tool receipts and approved answers.
+
 Each native Pi lifecycle event is emitted as
 `{"type":"event","event":{...}}`. Only `message_end` adds
 `event.wire_message` in OpenAI form. Pi may reject unknown tools or invalid
@@ -62,7 +99,7 @@ Replies arriving after abort are discarded. Closing stdin aborts the process.
 The run ends with `{"type":"done","identity":{...},"messages":[...],"context_messages":[...],"aborted":false}`,
 optionally including `error`. `messages` is Pi's own retained state;
 `context_messages` is the latest prepared context plus completed messages. Python
-keeps its original wire history and archives independently. On interruption,
+keeps its continuation-safe wire history and archives independently. On interruption,
 Python closes pending calls with unknown outcomes before a later user turn;
 the bridge never resumes an incomplete side effect.
 

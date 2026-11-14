@@ -3,9 +3,20 @@
 
 def receipt_usage(data):
     """Read the two per-request event formats without inferring missing usage."""
-    if isinstance(data.get("usage"), dict) or "usage_returned" in data:
-        return data.get("usage"), data.get("usage_returned", True) is True
-    return data, data.get("usage_received") is True
+    usage = data.get("usage") if isinstance(data.get("usage"), dict) else data
+    if "usage_returned" in data:
+        returned = data["usage_returned"] is True
+    elif "usage_received" in data:
+        returned = data["usage_received"] is True
+    else:
+        returned = isinstance(data.get("usage"), dict)
+    return usage, returned
+
+
+def local_inference(data):
+    """Only explicitly identified local classification is outside API tokens."""
+    return (data.get("metering_scope") == "local_inference" or
+            data.get("provider") == "transformers" and data.get("request_type") == "sequence_classification")
 
 
 def private_receipt(data):
@@ -18,6 +29,8 @@ def private_receipt(data):
     result = dict(usage={key: usage[key] for key in fields
                          if type(usage.get(key)) is int and usage[key] >= 0},
                   usage_returned=returned)
+    if local_inference(data):
+        result["metering_scope"] = "local_inference"
     if "request_count" in data:
         count = data["request_count"]
         result["request_count"] = count if type(count) is int and count > 0 else None
@@ -61,6 +74,8 @@ def summarize(business_usage, capability_calls):
         receipts, seen = [], set()
         for event in call.get("model_usage", []):
             data = event.get("data") or {}
+            if local_inference(data):
+                continue
             request_id = data.get("request_id")
             if request_id is not None:
                 key = (event.get("call_id"), request_id)

@@ -129,8 +129,7 @@ def make_server(platform, port=8880, host="127.0.0.1", public_port=None):
                         task = platform.store.get("task", parts[3])
                         if not task:
                             raise ValueError("没有这个任务")
-                        return self.send(200, {key: task.get(key) for key in
-                            ("id", "status", "response", "partial_response", "error", "latency_ms", "context_status", "context_events", "files", "artifacts", "cancel")})
+                        return self.send(200, platform.chat.snapshot(task))
                 if path.startswith("/api/chats/"):
                     return self.send(200, platform.chat.conversation(path.rsplit("/", 1)[1]))
                 if path == "/api/runtime/session":

@@ -62,7 +62,7 @@ def main():
         file_id = hashlib.sha256(case["id"].encode("utf-8")).hexdigest()[:20]
         admission = api("/api/experiments/office/native", dict(
             manifest=str(args.manifest.resolve()), manifest_sha256=fingerprint,
-            case_id=case["id"], project_id=args.project_id))
+            case_id=case["id"], project_id=args.project_id, host_reference=True))
         save("admitted-" + file_id + ".json", admission)
         print(json.dumps(dict(case=case["id"], task_id=admission["task_id"], status="RUNNING")), flush=True)
         while True:

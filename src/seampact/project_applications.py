@@ -3,57 +3,55 @@
 import copy
 
 from seampact.capability_contract import digest, tool_definition
+from seampact.guard_contract import GUARD_INTERFACES, _source_backed, compatible
+from seampact.office_policy import applicable_subject, normalize_policy
 from seampact.store import now
 
 
-# These are the existing office application's interfaces, not inferred checks.
-OFFICE_INTERFACES = {
-    "sanitize": ("sanitize_text", {"text"}, {"sanitized_text", "was_modified"}),
-    "injection": ("scan_prompt_injection", {"prompt"}, {"valid", "risk_score"}),
-    "privacy": ("detect_and_anonymize", {"text", "entities", "anonymize"}, {"findings"}),
-    "secrets": ("scan_text", {"text", "filename"}, {"detected"}),
-    "code_scan": ("scan_python_source", {"files"}, {"issues"}),
-    "self_check_input": ("self_check_input", {"user_message"}, {"decision", "is_blocked", "failed"}),
-    "self_check_output": ("self_check_output", {"bot_message", "user_message"}, {"decision", "is_blocked", "failed"}),
-    "fact_check": ("fact_check_response", {"question", "answer", "references"},
-                   {"status", "claims", "claim_count"}),
-}
+def _declared_operation(unit):
+    declared = unit.get("capability", {}).get("operation")
+    return copy.deepcopy(declared) if _source_backed(declared) else {"kind": "other"}
 
 
 def belongs_to_project(catalog, unit, project_id):
     group = catalog._group(unit["runtime_group"])
     owners = {binding["project_id"] for binding in group.get("bindings", {}).values()
               if binding.get("form") == "project"}
+    if group.get("project_owner"):
+        owners.add(group["project_owner"])
     return not owners or owners == {project_id}
 
 
-def compatible(role, unit):
-    entry, inputs, outputs = OFFICE_INTERFACES[role]
-    capability = unit.get("capability", {})
-    output = capability.get("output", {})
-    output = output.get("schema", output)
-    input_schema = capability.get("input", {})
-    input_fields, output_fields = input_schema.get("properties", {}), output.get("properties", {})
-    if role in {"self_check_input", "self_check_output"} and "allowed" in output_fields:
-        outputs = {"allowed"}  # Previously installed self-check contract.
-    if not (unit.get("entry_id") == entry and inputs <= set(input_fields) and outputs <= set(output_fields)):
-        return False
-    if role != "fact_check":
-        return True
-    claims = output_fields["claims"]
-    fields = claims.get("items", {}).get("properties", {})
-    return (set(inputs) <= set(input_schema.get("required", []))
-            and input_fields["question"].get("type") == "string"
-            and input_fields["answer"].get("type") == "string"
-            and input_fields["references"].get("type") == "array"
-            and input_fields["references"].get("items", {}).get("type") == "string"
-            and output_fields["status"].get("type") == "string"
-            and output_fields["claim_count"].get("type") == "integer"
-            and claims.get("type") == "array"
-            and fields.get("claim_text", {}).get("type") == "string"
-            and fields.get("label", {}).get("type") == "string"
-            and fields.get("labels_by_reference", {}).get("type") == "array"
-            and fields["labels_by_reference"].get("items", {}).get("type") == "string")
+def application_config(units, candidates, guard_policy=None, *, mode="scheduler"):
+    """Freeze source-backed guard and business-operation metadata for hooks."""
+    indexed = {unit["id"]: unit for unit in units}
+    frozen = []
+    seen = set()
+    for item in candidates:
+        role, identity = item["role"], item["unit_id"]
+        if (role, identity) in seen:
+            raise ValueError("办公检查候选重复：" + role)
+        seen.add((role, identity))
+        unit = indexed.get(identity)
+        if unit is None or not compatible(role, unit):
+            raise ValueError("办公检查能力缺失或接口不匹配：" + role)
+        frozen.append(dict(role=role, unit_id=identity, guard=copy.deepcopy(unit["capability"]["guard"])))
+    policy = normalize_policy(guard_policy)
+    _check_required(policy, frozen)
+    declared = {unit["tool_name"]: _declared_operation(unit)
+                for unit in units if unit.get("tool_name") and not unit.get("capability", {}).get("guard")}
+    return dict(mode=mode, guard_candidates=sorted(frozen, key=lambda item: (item["role"], item["unit_id"])),
+                operations=declared, guard_policy=policy)
+
+
+def _check_required(policy, candidates):
+    for role in policy["required_outbound"]:
+        matches = [item for item in candidates if item["role"] == role and
+                   applicable_subject(role, "before_tool", item["guard"])]
+        if not matches:
+            raise ValueError("外发必需检查不可用或不支持检查外发消息：" + role)
+        if len(matches) > 1:
+            raise ValueError("外发必需检查有多个可用能力，请明确绑定：" + role)
 
 
 class TaskCapabilityCatalog:
@@ -90,19 +88,7 @@ class ProjectApplications:
         self.projects.get(project_id)
         return self.store.get("project_application", project_id) or dict(
             schema="project-application/1", project_id=project_id, revision=0,
-            enabled_groups=None, bindings={})
-
-    def preset(self, project_id, units):
-        """Reuse unambiguous installed office interfaces without calling them."""
-        candidates = [unit for unit in units if belongs_to_project(self.catalog, unit, project_id)]
-        bindings, ambiguous = {}, []
-        for role in OFFICE_INTERFACES:
-            matches = [unit for unit in candidates if compatible(role, unit)]
-            if len(matches) == 1:
-                bindings[role] = matches[0]["id"]
-            elif matches:
-                ambiguous.append(role)
-        return dict(bindings=bindings, ambiguous_roles=ambiguous)
+            enabled_groups=None, bindings={}, guard_policy=normalize_policy())
 
     def snapshot(self, project_id, units):
         config = copy.deepcopy(self.configuration(project_id))
@@ -112,15 +98,31 @@ class ProjectApplications:
         eligible = [unit for unit in selected if unit.get("availability", {}).get("status") == "AVAILABLE"
                     and unit.get("dispatch", {}).get("status") in {"READY_INSTANCE", "COLD_STARTABLE"}]
         current, admitted = {unit["id"]: unit for unit in units}, {unit["id"] for unit in eligible}
-        bindings, binding_status = {}, []
+        binding_status, candidates = [], []
         for role, identity in config["bindings"].items():
             unit = current.get(identity)
-            status = ("MISSING" if unit is None else "OTHER_PROJECT" if unit not in scoped else
+            status = ("DISABLED" if identity is None else "MISSING" if unit is None else "OTHER_PROJECT" if unit not in scoped else
+                      "INCOMPATIBLE" if not compatible(role, unit) else
                       "DISABLED" if unit not in selected else "UNAVAILABLE" if identity not in admitted else "ENABLED")
             binding_status.append(dict(role=role, unit_id=identity, status=status))
             if status == "ENABLED":
-                bindings[role] = identity
-        config.update(source="project", effective_bindings=bindings, binding_status=binding_status,
+                candidates.append(dict(role=role, unit_id=identity,
+                                       guard=copy.deepcopy(unit["capability"]["guard"])))
+        # A configured role selects one provider or disables the role.
+        # Otherwise every matching provider competes as its own candidate.
+        for role in GUARD_INTERFACES:
+            if role in config["bindings"]:
+                continue
+            matches = [unit for unit in eligible if unit.get("capability", {}).get("guard") and compatible(role, unit)]
+            candidates.extend(dict(role=role, unit_id=unit["id"],
+                                   guard=copy.deepcopy(unit["capability"]["guard"])) for unit in matches)
+            if len(matches) == 1:
+                binding_status.append(dict(role=role, unit_id=matches[0]["id"], status="ENABLED", source="automatic"))
+        declared = {unit["tool_name"]: _declared_operation(unit)
+                    for unit in eligible if unit.get("tool_name") and not unit.get("capability", {}).get("guard")}
+        config.update(source="project", binding_status=binding_status,
+                      guard_policy=normalize_policy(config.get("guard_policy")),
+                      guard_candidates=sorted(candidates, key=lambda item: (item["role"], item["unit_id"])), operations=declared,
                       eligible_capability_ids=sorted(admitted),
                       enabled_group_ids=sorted({unit["runtime_group"] for unit in selected}))
         config["digest"] = digest(config)
@@ -140,11 +142,11 @@ class ProjectApplications:
                                   project_eligible=permitted, capability_count=len(members),
                                   callable_count=sum(unit["id"] in snapshot["eligible_capability_ids"] for unit in members),
                                   availability=members[0].get("availability")))
-        return dict(application=snapshot, libraries=libraries, preset=self.preset(project_id, units),
+        return dict(application=snapshot, libraries=libraries,
                     applies_to="future_tasks", runtime_actions=False)
 
     def configure(self, project_id, body):
-        if set(body) - {"project_id", "enabled_groups", "bindings", "use_office_preset"}:
+        if set(body) - {"project_id", "enabled_groups", "bindings", "guard_policy"}:
             raise ValueError("项目能力配置只接收启用库和办公应用绑定")
         # Availability can wait for the controller; read before project/store locking.
         units = self.catalog.public()
@@ -160,18 +162,18 @@ class ProjectApplications:
                 if groups is not None and set(groups) - scoped:
                     raise ValueError("不能启用未安装或属于其他项目的库")
                 config["enabled_groups"] = None if groups is None else sorted(groups)
-            if body.get("use_office_preset") is not None and type(body["use_office_preset"]) is not bool:
-                raise ValueError("办公预设选择须为布尔值")
-            bindings = (self.preset(project_id, units)["bindings"] if body.get("use_office_preset") else
-                        body.get("bindings", config["bindings"]))
-            if not isinstance(bindings, dict) or set(bindings) - set(OFFICE_INTERFACES):
+            bindings = body.get("bindings", config["bindings"])
+            if not isinstance(bindings, dict) or set(bindings) - set(GUARD_INTERFACES):
                 raise ValueError("办公应用绑定角色无效")
             indexed = {unit["id"]: unit for unit in units}
             for role, identity in bindings.items():
+                if identity is None:
+                    continue
                 unit = indexed.get(identity) if isinstance(identity, str) else None
                 if unit is None or not belongs_to_project(self.catalog, unit, project_id) or not compatible(role, unit):
                     raise ValueError("办公应用绑定不属于本项目或不匹配已有接口：" + role)
-            config.update(bindings=copy.deepcopy(bindings), revision=config["revision"] + 1, updated_at=now())
+            config.update(bindings=copy.deepcopy(bindings), guard_policy=normalize_policy(body.get("guard_policy", config.get("guard_policy"))),
+                          revision=config["revision"] + 1, updated_at=now())
             self.store.save("project_application", project_id, config)
         return self.view(project_id, units)
 
@@ -179,9 +181,13 @@ class ProjectApplications:
         unavailable = [row["role"] for row in snapshot["binding_status"]
                        if row["status"] not in {"ENABLED", "DISABLED"}]
         if unavailable:
-            raise ValueError("本项目的办公检查绑定尚不可调用，请先处理资源或重新复用绑定：" + ", ".join(unavailable))
-        bindings = snapshot["effective_bindings"]
-        if not bindings:
+            raise ValueError("本项目的办公检查绑定尚不可调用，请处理资源；若接口不兼容，请重新分析来源并重新绑定：" + ", ".join(unavailable))
+        policy = normalize_policy(snapshot.get("guard_policy"))
+        candidates = snapshot.get("guard_candidates", [])
+        _check_required(policy, candidates)
+        if not candidates:
             return {}
         from seampact.office_application import build_hooks
-        return build_hooks(self.platform, task_id, dict(mode="scheduler", bindings=bindings))
+        return build_hooks(self.platform, task_id, dict(mode="scheduler",
+            operations=copy.deepcopy(snapshot.get("operations", {})),
+            guard_candidates=copy.deepcopy(candidates), guard_policy=policy))

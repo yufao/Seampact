@@ -34,7 +34,7 @@
       <details id="project-application" class="project-files"><summary>本项目使用的库 <span id="project-application-summary"></span></summary><div class="project-files-body">
         <p class="card-note">选择适用于后续任务的库。每项任务保留开始时的配置；保存选择不会启停实例。</p>
         <div id="project-library-list" class="project-library-list" aria-live="polite"></div>
-        <div class="project-file-actions"><button id="project-office-preset" class="secondary-button" type="button" disabled>复用办公检查绑定</button><button id="project-libraries-none" class="secondary-button" type="button">全部停用</button><button id="project-libraries-refresh" class="secondary-button" type="button">刷新</button></div>
+        <div class="project-file-actions"><button id="project-libraries-none" class="secondary-button" type="button">全部停用</button><button id="project-guards-auto" class="secondary-button" type="button" hidden>恢复自动匹配</button><button id="project-libraries-refresh" class="secondary-button" type="button">刷新</button></div>
         <p id="project-application-bindings" class="card-note"></p><p id="project-application-feedback" class="card-note" role="status" aria-live="polite"></p>
         <div class="project-file-actions"><label for="project-demo-case">模拟办公任务</label><select id="project-demo-case"><option value="">请选择一种虚构任务</option></select><button id="project-demo-start" class="secondary-button" type="button" disabled>开始模拟任务</button></div>
         <p class="card-note">手动发起后使用当前项目与模型，在新会话中运行。所有收件目标和资料均虚构，交付仅记为本项目的模拟回执；透明检查继续由调度器选择。</p><p id="project-demo-feedback" class="card-note" role="status" aria-live="polite"></p>
@@ -59,7 +59,7 @@
         <form id="chat-form" class="composer">
           <label class="visually-hidden" for="chat-input">消息</label>
           <textarea id="chat-input" rows="1" placeholder="发送消息…" aria-describedby="composer-hint" required></textarea>
-          <div class="composer-footer"><span id="composer-hint" class="composer-hint">Enter 发送 · Shift + Enter 换行</span><button id="stop-message" class="secondary-button" type="button" hidden>停止交付</button><button id="send-message" class="primary-button" type="submit" disabled><span class="send-label">发送</span><span aria-hidden="true">↑</span></button></div>
+          <div class="composer-footer"><label><input id="chat-read-only" type="checkbox">本轮只读</label><span id="composer-hint" class="composer-hint">Enter 发送 · Shift + Enter 换行</span><button id="stop-message" class="secondary-button" type="button" hidden>停止交付</button><button id="send-message" class="primary-button" type="submit" disabled><span class="send-label">发送</span><span aria-hidden="true">↑</span></button></div>
         </form>
         <p id="chat-context-status" class="chat-footnote" aria-live="polite">上下文用量：暂无记录</p>
         <p id="chat-readiness" class="chat-footnote">正在连接平台。</p>

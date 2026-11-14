@@ -692,6 +692,9 @@ class Deployments:
         self.platform = platform
         self.session = uuid.uuid4().hex
         self.lock = threading.RLock()
+        self.capability_capacity = threading.Condition(self.lock)
+        self.capability_start_locks = {}
+        self.capability_task_reservations = {}
         self.instances, self.affinity, self.unit_state = {}, {}, {}
         self.capability_calls = {}  # in-flight capability call -> instance
         self.run_locks, self.environment_changes = {}, {}
@@ -1873,6 +1876,20 @@ class Deployments:
                     raise ValueError("没有可释放的运行组契约")
                 targets = [item for item in self._instances(identity) if self._held(item)
                            and body.get("instance_id") in (None, item["id"])]
+                if body.get("idle_replica"):
+                    target = targets[0] if len(targets) == 1 and body.get("instance_id") else None
+                    other_ready = any(item is not target and item.get("state") == "READY"
+                                      and item.get("accepting", True) and not item.get("pending_stop")
+                                      and item.get("released") is not True
+                                      for item in self._instances(identity))
+                    starting = any(item.get("state") in {"UNDEPLOYED", "STARTING"}
+                                   and item.get("released") is not True for item in self._instances(identity))
+                    if (group["contract"]["replicas"]["replicable"] is not True or not target
+                            or target.get("state") != "READY" or not target.get("accepting", True)
+                            or target.get("pending_stop") or target.get("in_flight")
+                            or target.get("released") is True or target["id"] in self.affinity.values()
+                            or not other_ready or starting):
+                        return dict(group_id=identity, instances=[], status="SKIPPED")
                 if not targets:
                     raise ValueError("没有可停止的实例")
                 for item in targets:
@@ -1888,7 +1905,8 @@ class Deployments:
                         item["state"] = "DRAINING"
                     self._event(item, "drain_requested", reason=reason)
             for item in targets:
-                if item.get("endpoint") and item["state"] == "DRAINING":
+                if (item.get("endpoint") and item["state"] == "DRAINING"
+                        and not item.get("capability_reservations")):
                     self._notify(item, "/drain")
             self._advance_stops()
             return dict(group_id=identity, instances=[self._view(item) for item in targets])
@@ -2340,6 +2358,8 @@ class Deployments:
 
     def invoke_placed(self, placement, unit, arguments, native_arguments=(), on_event=None):
         """Functional mode: a fixed controller prepares an instance, then the call is dispatched."""
+        if unit.get("schema") == "capability-unit/1":
+            return self._invoke_capability_placed(placement, unit, arguments, on_event)
         waited = None
         with self.lock:
             self._guard(placement["group_id"], placement["run_id"])
@@ -2360,7 +2380,81 @@ class Deployments:
         facts.update(start_wait_ms=waited, cold_instance=waited is not None)
         return result, facts
 
-    def _ensure(self, placement, unit_id):
+    def _invoke_capability_placed(self, placement, unit, arguments, on_event):
+        """Atomically pin a task and reserve one slot on an actual instance."""
+        group_id, task_id = placement["group_id"], _task_context.get()
+        waited = None
+        while True:
+            with self.capability_capacity:
+                if self.closed.is_set():
+                    raise ProtocolError("实例管理器已关闭")
+                self._guard(group_id, placement["run_id"])
+                self.check_gpu_placement(placement)
+                if getattr(self.platform, "images", None):
+                    self.platform.images.dispatch_check(group_id, placement["run_id"], placement.get("retention_scope_id"))
+                group = self._group(group_id)
+                if group["contract"]["digest"] != placement["contract_digest"]:
+                    raise ProtocolError("运行组契约已变化；冻结运行不能改用新契约")
+                capacity = group["contract"]["concurrency"]
+                bound = self.instances.get(self.affinity.get((task_id, group_id))) if task_id else None
+                if bound and (bound["state"] != "READY" or not bound.get("accepting") or
+                              bound.get("pending_stop") or unit["id"] not in bound.get("units", [])):
+                    raise ProtocolError("本任务绑定的实例不可用；原 owner 状态不迁移到其他实例")
+                ready = ([bound] if bound else [item for item in self._instances(group_id, {"READY"})
+                         if item.get("accepting") and not item.get("pending_stop") and unit["id"] in item.get("units", [])])
+                free = [item for item in ready if item["in_flight"] < capacity]
+                if free:
+                    record = min(free, key=lambda item: (item["in_flight"], item["generation"]))
+                    if task_id:
+                        self.affinity[(task_id, group_id)] = record["id"]
+                    # This reservation is visible to drain/idle checks before
+                    # releasing the lock; the worker call does not count it twice.
+                    record["in_flight"] += 1
+                    record["capability_reservations"] = record.get("capability_reservations", 0) + 1
+                    if task_id:
+                        key = (task_id, record["id"])
+                        self.capability_task_reservations[key] = self.capability_task_reservations.get(key, 0) + 1
+                    record["last_activity_wall"] = time.time()
+                    break
+                if ready:
+                    self.capability_capacity.wait(timeout=0.25)
+                    continue
+                start_lock = self.capability_start_locks.setdefault(group_id, threading.Lock())
+            # Only one caller starts a cold group. Recheck after acquiring the
+            # lock because a concurrent dispatch may already have started it.
+            with start_lock:
+                with self.lock:
+                    ready = [item for item in self._instances(group_id, {"READY"})
+                             if item.get("accepting") and unit["id"] in item.get("units", [])]
+                if not ready:
+                    started = time.perf_counter()
+                    self._ensure(placement, unit["id"], bind_affinity=False)
+                    waited = (time.perf_counter() - started) * 1000
+        try:
+            if record.get("profile") != capability_hosting.WORKER_PROFILE:
+                raise ProtocolError("生成能力必须使用已验证的能力 worker")
+            try:
+                result, facts = capability_hosting.call(self, record, unit, arguments, on_event, preclaimed=True)
+            except capability_hosting.CapabilityError as error:
+                error.facts.update(start_wait_ms=waited, cold_instance=waited is not None)
+                raise
+            facts.update(start_wait_ms=waited, cold_instance=waited is not None)
+            return result, facts
+        finally:
+            with self.capability_capacity:
+                record["in_flight"] -= 1
+                record["capability_reservations"] -= 1
+                if task_id:
+                    key = (task_id, record["id"])
+                    remaining = self.capability_task_reservations[key] - 1
+                    if remaining:
+                        self.capability_task_reservations[key] = remaining
+                    else:
+                        del self.capability_task_reservations[key]
+                record["last_activity_wall"] = time.time()
+                self.capability_capacity.notify_all()
+
+    def _ensure(self, placement, unit_id, *, bind_affinity=True):
         if placement["group_id"].startswith("service:"):
             current = self._group(placement["group_id"])
             if current["contract"]["digest"] != placement["contract_digest"]:
@@ -2379,7 +2473,7 @@ class Deployments:
         while record is None and time.monotonic() < deadline:
             with self.lock:
                 pending = [item for item in self._instances(group["id"], {"UNDEPLOYED", "STARTING"})
-                           if item.get("run_id") == placement["run_id"]]
+                           if not bind_affinity or item.get("run_id") == placement["run_id"]]
                 retiring = [item for item in self._instances(group["id"], {"DRAINING"}) if item.get("pending_stop")]
             if pending:
                 record = pending[0]
@@ -2393,6 +2487,8 @@ class Deployments:
                 if record["state"] == "READY":
                     if unit_id not in record["units"]:
                         raise ProtocolError("实例宿主环境未满足该成员：" + str(record.get("missing", {}).get(unit_id)))
+                    if not bind_affinity:
+                        return record
                     routed = self._route(group["id"], unit_id, _task_context.get())
                     if routed is not None:
                         return routed

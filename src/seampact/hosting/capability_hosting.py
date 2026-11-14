@@ -53,6 +53,8 @@ def check_project_scope(platform, group, task_id=None):
     """A worker bound to a project may only receive that project's calls."""
     projects = {binding["project_id"] for binding in group.get("bindings", {}).values()
                 if binding.get("form") == "project"}
+    if group.get("project_owner"):
+        projects.add(group["project_owner"])
     if not projects:
         return
     if len(projects) != 1:
@@ -85,9 +87,14 @@ def core():
     return core_identity(CORE_SCOPE)
 
 
-def group_identity(manifest):
-    """Stable per source and package name, so a regenerated package replaces its predecessor."""
-    return "cap-" + digest([manifest["source"].get("id"), manifest["name"]])[:24]
+def group_identity(manifest, project_id=None, *, isolated_global=False):
+    """Stable source/package identity, additionally scoped when project resources are bound."""
+    identity = [manifest["source"].get("id"), manifest["name"]]
+    if project_id is not None:
+        identity.extend(["project", project_id])
+    elif isolated_global:
+        identity.append("global")
+    return "cap-" + digest(identity)[:24]
 
 
 def default_gpu_selection(group):
@@ -265,7 +272,8 @@ def resource_backend(platform, group, config):
     """Derive worker mounts from registered weights and managed project identities."""
     config = copy.deepcopy(config)
     mappings = copy.deepcopy(config.get("mounts", []))
-    project_bound = any(binding.get("form") == "project" for binding in group.get("bindings", {}).values())
+    project_bound = bool(group.get("project_owner")) or any(
+        binding.get("form") == "project" for binding in group.get("bindings", {}).values())
     # Backend mappings may name the platform's entire state directory. They
     # help translate container paths; project workers receive declared resources
     # only, never that broader state/workspace mount.
@@ -369,7 +377,7 @@ def cancel(deployments, call_id):
     return dict(requested=answer.get("requested") is True, mode=answer.get("mode"), reason=answer.get("reason"))
 
 
-def call(deployments, record, unit, arguments, on_event=None):
+def call(deployments, record, unit, arguments, on_event=None, *, preclaimed=False):
     """One call on one instance. A lost response is UNKNOWN and is never replayed."""
     platform = deployments.platform
     group = platform.store.get("runtime_group", record["group_id"])
@@ -391,9 +399,12 @@ def call(deployments, record, unit, arguments, on_event=None):
             dropped_events += 1
 
     with deployments.lock:
-        if record["state"] != "READY" or not record.get("accepting") or record.get("source_detached"):
+        accepted = (record["state"] == "READY" and record.get("accepting") or
+                    preclaimed and record["state"] == "DRAINING" and record.get("capability_reservations", 0) > 0)
+        if not accepted or record.get("source_detached"):
             raise ProtocolError("实例已停止接单或来源已摘除，不能开始新的调用")
-        record["in_flight"] += 1
+        if not preclaimed:
+            record["in_flight"] += 1
         record["last_activity_wall"] = time.time()
         deployments.capability_calls[call_id] = record["id"]
     started = time.perf_counter()
@@ -424,7 +435,8 @@ def call(deployments, record, unit, arguments, on_event=None):
         raise ProtocolError("调用响应未取得；不重放，执行结果保留为 UNKNOWN：" + str(error)) from error
     finally:
         with deployments.lock:
-            record["in_flight"] -= 1
+            if not preclaimed:
+                record["in_flight"] -= 1
             record["last_activity_wall"] = time.time()
             deployments.capability_calls.pop(call_id, None)
     elapsed = (time.perf_counter() - started) * 1000

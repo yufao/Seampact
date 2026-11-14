@@ -156,8 +156,8 @@ class ProjectChatTests(unittest.TestCase):
         return task, bodies
 
     def test_real_pi_external_name_collision_namespaces_only_workspace_and_records_final_delivery(self):
-        external_calls = []
-        native = dict(type="function", function=dict(name="list_files", description="Native cloud files",
+        external_calls, checks = [], []
+        native = dict(type="function", operation=dict(kind="read"), function=dict(name="list_files", description="Native cloud files",
             parameters=dict(type="object", properties={}, additionalProperties=False)))
         def execute(name, arguments, call_id=None):
             external_calls.append((name, arguments, call_id))
@@ -165,10 +165,14 @@ class ProjectChatTests(unittest.TestCase):
         def delivery(payload, context):
             if payload["text"] == "raw final":
                 return dict(action="replace", text="delivered final")
+        hooks = [AgentHook(event, event, lambda payload, context, stage=event:
+                           checks.append((stage, payload["name"], payload["tool_source"], payload["operation"]["kind"])) )
+                 for event in ("before_tool", "after_tool", "tool_observation")]
+        hooks.append(AgentHook("delivery", "before_delivery", delivery, mode="complete"))
         task, bodies = self.runtime([
             completion("looking", name="list_files", identity="native-list"),
             completion("local", name="workspace_list_files", arguments=dict(area="workspace"), identity="workspace-list"),
-            completion("raw final")], [AgentHook("delivery", "before_delivery", delivery, mode="complete")],
+            completion("raw final")], hooks,
             external_tools=[native], external_execute=execute)
         self.assertEqual(task["status"], "COMPLETED", task.get("error"))
         self.assertEqual(task["host"]["package"], "@earendil-works/pi-agent-core")
@@ -176,13 +180,18 @@ class ProjectChatTests(unittest.TestCase):
         specs = {item["function"]["name"]: item["function"] for item in bodies[0]["tools"]}
         self.assertEqual(specs["list_files"]["description"], "Native cloud files")
         self.assertIn("本地会话工作区", specs["workspace_list_files"]["description"])
+        self.assertTrue(all("operation" not in item for item in bodies[0]["tools"]))
+        self.assertEqual(checks, [(stage, name, source, kind) for name, source, kind in
+            (("list_files", "external", "read"), ("workspace_list_files", "workspace", "metadata"))
+            for stage in ("before_tool", "after_tool", "tool_observation")])
         self.assertIn("read_file", specs)
         self.assertNotIn("workspace_read_file", specs)
         requested = [message["tool_calls"][0]["function"]["name"] for message in task["wire_messages"] if message.get("tool_calls")]
         self.assertEqual(requested, ["list_files", "workspace_list_files"])
         self.assertEqual(task["final_response"], "delivered final")
-        self.assertEqual(task["response"], "lookinglocaldelivered final")
-        self.assertEqual(task["wire_messages"][-1]["content"], "raw final")
+        self.assertEqual(task["response"], "delivered final")
+        self.assertEqual(task["wire_messages"][-1]["content"], "delivered final")
+        self.assertEqual(task["delivery_revision"]["withheld_messages"][0]["content"], "raw final")
 
     def test_prefixed_workspace_collision_is_rejected_before_model_execution(self):
         tools = [dict(type="function", function=dict(name=name, parameters=dict(type="object")))
@@ -191,6 +200,21 @@ class ProjectChatTests(unittest.TestCase):
         self.assertEqual(task["status"], "FAILED")
         self.assertIn("名称不能重复", task["error"])
         self.assertEqual(bodies, [])
+
+    def test_environment_effects_are_owned_by_the_environment(self):
+        from seampact.office_benchmark import AgentDojoOfficeTask
+        from seampact.workspace_tools import WorkspaceTools
+        native = AgentDojoOfficeTask.__new__(AgentDojoOfficeTask)
+        native._rag = False
+        native._runtime = SimpleNamespace(functions={name: SimpleNamespace(name=name, description="",
+            parameters=SimpleNamespace(model_json_schema=lambda: dict(type="object")))
+            for name in ("send_email", "list_files", "unrecognized")})
+        effects = {item["function"]["name"]: item.get("operation") for item in native.tool_specs()}
+        self.assertEqual(effects, {"send_email": {"kind": "send"}, "list_files": {"kind": "metadata"},
+                                   "unrecognized": None})
+        local = {item["function"]["name"]: item["operation"] for item in WorkspaceTools.tools(True)}
+        self.assertEqual(local["list_files"], {"kind": "metadata"})
+        self.assertEqual(local["run_python"], {"kind": "execute"})
 
     def test_file_tools_use_existing_checks_and_persist_delivered_bytes(self):
         self.projects.write_file(self.project, None, "data", "input.txt", "source text")
@@ -324,6 +348,76 @@ class ProjectChatTests(unittest.TestCase):
         self.assertEqual(task["workspace_status"], "UNKNOWN")
         self.assertEqual(self.projects.task_scope(task["id"])["status"], "UNKNOWN")
         self.assertEqual(released, [])
+
+    def test_finished_task_can_release_shared_busy_instance_but_not_its_own_work(self):
+        router = SimpleNamespace(lock=threading.RLock(),
+            affinity={("own", "group"): "worker", ("other", "group"): "worker"},
+            instances={"worker": dict(state="READY", in_flight=1)},
+            capability_task_reservations={("other", "worker"): 1})
+        self.catalog.router = router
+        task = dict(id="own", workspace_controller=self.jobs._workspace_controller,
+            calls=[dict(instance_id="worker", call_id="done", outcome="result")],
+            events=[dict(kind="capability_event", event=dict(kind="call_started", call_id="done", instance_id="worker"))])
+        self.assertTrue(self.jobs._workspace_drained("own", self.catalog, task=task))
+        router.capability_task_reservations[("own", "worker")] = 1
+        self.assertFalse(self.jobs._workspace_drained("own", self.catalog, task=task))
+        self.assertFalse(self.jobs._workspace_drained("own", self.catalog,
+            task=dict(id="own", workspace_controller=self.jobs._workspace_controller)),
+            "a reserved call must block cleanup even before its first event")
+        del router.capability_task_reservations[("own", "worker")]
+        task["calls"] = []
+        self.assertFalse(self.jobs._workspace_drained("own", self.catalog, task=task),
+                         "a started call without its own terminal receipt is unresolved")
+        router.instances["worker"]["in_flight"] = 0
+        self.assertFalse(self.jobs._workspace_drained("own", self.catalog, task=task),
+                         "an empty live counter cannot prove an unreceipted call ended")
+        router.instances["worker"].update(state="STOPPED", released=True)
+        self.assertTrue(self.jobs._workspace_drained("own", self.catalog, task=task))
+        router.instances["worker"].update(state="READY", released=False, in_flight=1)
+        task["calls"] = [dict(instance_id="worker", call_id="done", outcome="result")]
+        router.instances["worker"]["state"] = "UNKNOWN"
+        self.assertFalse(self.jobs._workspace_drained("own", self.catalog, task=task))
+        router.instances["worker"]["state"] = "READY"
+        task["workspace_controller"] = "prior-controller"
+        self.assertFalse(self.jobs._workspace_drained("own", self.catalog, task=task))
+
+    def test_task_scope_waits_for_its_elastic_action_before_cleanup(self):
+        self.projects.begin_task(self.project, "elastic-session", "elastic-task")
+        condition = threading.Condition()
+        dispatcher = SimpleNamespace(condition=condition, queue={}, running={},
+                                     elastic_runs={"elastic-task": 1}, closed=False)
+        self.jobs.scheduler = dispatcher
+        task = dict(id="elastic-task", status="COMPLETED", project_id=self.project,
+                    workspace_controller=self.jobs._workspace_controller)
+        self.assertFalse(self.jobs._workspace_drained("elastic-task", self.catalog, task=task))
+        outcome = []
+        thread = threading.Thread(target=lambda: outcome.append(self.jobs._finish_project_scope(task, self.catalog)))
+        thread.start()
+        thread.join(0.1)
+        self.assertTrue(thread.is_alive(), "the task must wait while its elastic action is active")
+        with condition:
+            self.assertEqual(self.projects.task_scope("elastic-task")["status"], "ACTIVE")
+            dispatcher.elastic_runs.pop("elastic-task")
+            condition.notify_all()
+        thread.join(3)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(outcome, [True])
+        self.assertEqual(self.projects.task_scope("elastic-task")["status"], "FINISHED")
+
+    def test_other_tasks_elastic_action_does_not_hold_scope_and_shutdown_stays_unknown(self):
+        condition = threading.Condition()
+        dispatcher = SimpleNamespace(condition=condition, queue={}, running={},
+                                     elastic_runs={"other": 1}, closed=False)
+        self.jobs.scheduler = dispatcher
+        own = dict(id="own", workspace_controller=self.jobs._workspace_controller)
+        self.assertTrue(self.jobs._workspace_drained("own", self.catalog, task=own))
+        self.projects.begin_task(self.project, "closing-session", "closing-task")
+        dispatcher.elastic_runs["closing-task"] = 1
+        dispatcher.closed = True
+        closing = dict(id="closing-task", status="COMPLETED", project_id=self.project,
+                       workspace_controller=self.jobs._workspace_controller)
+        self.assertFalse(self.jobs._finish_project_scope(closing, self.catalog))
+        self.assertEqual(self.projects.task_scope("closing-task")["status"], "UNKNOWN")
 
     def test_failed_scratch_cleanup_keeps_uncertain_lease_and_reason(self):
         finish = self.projects.finish_task

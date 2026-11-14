@@ -86,9 +86,21 @@ class PrivacyReceiptTests(unittest.TestCase):
                 self.assertTrue(captured["options"]["apply_project_application"])
                 options = captured["options"]["runtime_options"]
                 self.assertNotIn("evaluator_only", captured["body"]["messages"][0]["content"])
-                projects.begin_task(project, "session", result["task_id"])
+                files = captured["options"]["input_files"]
+                projects.begin_task(project, "session", result["task_id"], input_files=files)
                 mounts = projects.container_mounts(result["task_id"])
                 self.assertTrue(next(mount for mount in mounts if mount["target"] == "/data")["read_only"])
+                path = next(iter(files))
+                projects.begin_task(project, "parallel", "parallel", input_files={path: b"other input"})
+                self.assertEqual(projects.read_file(project, "parallel", "data", path,
+                                                    input_task="parallel")["content"], "other input")
+                self.assertEqual(projects.read_file(project, "session", "data", path,
+                    input_task=result["task_id"])["content"].encode(), files[path])
+                self.assertEqual(projects.list_files(project, None)["entries"], [])
+                with self.assertRaises(ValueError):
+                    projects.read_file(project, "session", "data", path, input_task="parallel")
+                projects.finish_task("parallel")
+                self.assertEqual(list(Path(projects.project_mount(project, "data")).iterdir()), [])
                 execute = options["external_execute"]
                 with self.assertRaisesRegex(ValueError, "虚构地址"):
                     execute("deliver_simulated_receipt", dict(destination="https://example.invalid", content=self.public), "bad")

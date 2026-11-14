@@ -51,13 +51,13 @@ def start_native_task(platform, body, *, internal_task_id=None, pilot_config=Non
 
 def _start_native_task(platform, body, *, internal_task_id=None, pilot_config=None,
                        capability_snapshot, project_tools):
-    """Run one selected native case; optional defenses are separate arm bindings.
-
-    The initial native-reference arm measures the migrated host and task suite.
-    It cannot be mislabeled as the pending eight-library policy comparison.
-    """
-    if set(body) - {"manifest", "manifest_sha256", "case_id", "project_id", "rag"}:
-        raise ValueError("原生任务入口只接收冻结清单、题目和项目标识")
+    """Run a native case with project guards, frozen pilot guards, or the bare-host reference."""
+    unknown = set(body) - {"manifest", "manifest_sha256", "case_id", "project_id", "rag", "host_reference", "synthetic_rag"}
+    if unknown:
+        raise ValueError("原生任务入口不支持这些请求字段：" + ", ".join(sorted(unknown)))
+    reference = body.get("host_reference", False)
+    if type(reference) is not bool or reference and pilot_config is not None:
+        raise ValueError("纯宿主基线不能同时使用比较策略")
     content = Path(body["manifest"]).read_bytes()
     actual = hashlib.sha256(content).hexdigest()
     if actual != body["manifest_sha256"]:
@@ -66,7 +66,8 @@ def _start_native_task(platform, body, *, internal_task_id=None, pilot_config=No
     case = next((c for c in manifest["cases"] if c["id"] == body["case_id"]), None)
     if case is None:
         raise ValueError("题目不在冻结清单中")
-    native_source = source_identity()
+    synthetic = body.get("synthetic_rag")
+    native_source = (dict(source="seampact-synthetic-office-rag/1") if synthetic else source_identity())
     rag, rag_name, rag_metadata = body.get("rag"), None, None
     allowed = []
     if case.get("rag_adaptation"):
@@ -79,8 +80,14 @@ def _start_native_task(platform, body, *, internal_task_id=None, pilot_config=No
         if rag_name not in {tool["function"]["name"] for tool in project_tools}:
             raise ValueError("检索能力尚未在本项目完成资源绑定和真实首调")
         allowed = [rag["capability_id"]]
-        environment, rag_metadata = prepare_office_rag_task(platform.projects, body["project_id"],
-            body["manifest"], actual, rag["corpus_dir"], rag["corpus_sha256"], case["id"])
+        if synthetic:
+            from seampact.office_synthetic_rag import prepare_synthetic_rag_task
+            if synthetic.get("manifest") != body["manifest"] or synthetic.get("manifest_sha256") != actual:
+                raise ValueError("Synthetic RAG source does not match requested manifest")
+            environment, rag_metadata = prepare_synthetic_rag_task(platform.projects, body["project_id"], synthetic, case["id"])
+        else:
+            environment, rag_metadata = prepare_office_rag_task(platform.projects, body["project_id"],
+                body["manifest"], actual, rag["corpus_dir"], rag["corpus_sha256"], case["id"])
         rag_metadata.update(capability_id=unit["id"], package_digest=unit["package_digest"])
     else:
         if rag is not None:
@@ -113,7 +120,7 @@ def _start_native_task(platform, body, *, internal_task_id=None, pilot_config=No
         metrics = environment.evaluate(final)
         quality = pilot_quality(metrics, bool(case.get("injection_task_id"))) if pilot_config is not None else None
         result = dict(status="EVALUATED", terminal_status=task["status"], quality=quality, metrics=metrics,
-                      evaluator="agentdojo/" + native_source["revision"])
+                      evaluator=("seampact-synthetic-office-rag/1" if synthetic else "agentdojo/" + native_source["revision"]))
         if rag_name:
             result["retrieval"] = environment.rag_status()
         return result
@@ -129,23 +136,28 @@ def _start_native_task(platform, body, *, internal_task_id=None, pilot_config=No
 
     options = dict(external_tools=environment.tool_specs(),
         external_execute=environment.execute, allowed_capabilities=allowed,
-        allowed_workspace_tools=[] if rag_name else None,
+        allowed_workspace_tools=[] if rag_name or (pilot_config or {}).get("native_environment_only") else None,
         max_model_turns=maximum, evaluator=evaluate)
     if pilot_config is not None:
         from seampact.office_application import build_hooks
         options.update(build_hooks(platform, internal_task_id, pilot_config))
+    if pilot_config is not None:
+        arm, scope = pilot_config["mode"], "frozen office policy comparison"
+    elif reference:
+        arm, scope = ("pi_rag_reference" if rag_name else "pi_native_reference"), "host reference"
+    else:
+        arm, scope = "project_policy", "configured project policy"
     admitted = platform.chat.start(
         dict(project_id=body["project_id"], deadline_s=timeout,
              messages=[dict(role="user", content=environment.prompt)]),
         runtime_options=options, on_event=event, internal_task_id=internal_task_id,
         capability_snapshot=capability_snapshot,
-        metadata=dict(arm=pilot_config["mode"] if pilot_config is not None else ("pi_rag_reference" if rag_name else "pi_native_reference"), case=case["id"], split=case["split"],
+        apply_project_application=pilot_config is None and not reference,
+        metadata=dict(arm=arm, case=case["id"], split=case["split"],
                       manifest_sha256=actual, native_source=native_source,
                       environment=environment.identity, protocol=protocol,
                       rag=rag_metadata,
-                      comparison_scope=("small pilot: shared AgentDojo/RAG cases, descriptive only" if pilot_config is not None else
-                                        "Dojo+RAG adaptation; not the native leaderboard or eight-library comparison"
-                                        if rag_name else "host native reference; not the eight-library comparison")))
+                      comparison_scope=scope))
     def expire():
         task = platform.store.get("task", admitted["task_id"])
         if task and task.get("status") == "RUNNING":

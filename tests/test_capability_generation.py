@@ -13,14 +13,19 @@ import threading
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from seampact.capability_catalog import CapabilityCatalog
-from seampact.capability_contract import MANIFEST, digest, load_package, package_digest
-from seampact.capability_generation import GenerationJobs, resolve_resources, write_package
-from seampact.hosting.capability_hosting import CapabilityError, check_project_scope, worker_spec
+from seampact.capability_contract import MANIFEST, canonical, digest, load_package, package_digest
+from seampact.capability_generation import (GenerationJobs, TOOLS, _compact_read_history, _complete_tool_history,
+                                          _context_units, _edit_proposal, generation_context_budget,
+                                          resolve_resources, write_package)
+from seampact.context_memory import context_status
+from seampact.hosting.capability_hosting import CapabilityError, check_project_scope, group_identity, worker_spec
 from seampact.intake import RepositoryIntake
+from seampact.project_applications import belongs_to_project
 from seampact.source.inspection import Inspector
 from seampact.store import Store
 from seampact.project_spaces import ProjectSpaces
@@ -184,7 +189,7 @@ class GeneratedPackageTests(unittest.TestCase):
         catalog = self.platform.capabilities
         catalog.prepare = lambda group, wait=False: catalog.installation(group)
 
-        def invoke(unit_id, arguments, on_event=None):
+        def invoke(unit_id, arguments, on_event=None, **kwargs):
             unit = catalog.unit(unit_id)
             group = self.store.get("runtime_group", unit["runtime_group"])
             root, _ = catalog.package(unit["package_digest"])
@@ -293,7 +298,7 @@ class GeneratedPackageTests(unittest.TestCase):
         catalog = self.platform.capabilities
         catalog.prepare = lambda group, wait=False: catalog.installation(group)
 
-        def invoke(unit_id, arguments, on_event=None):
+        def invoke(unit_id, arguments, on_event=None, **kwargs):
             unit = catalog.unit(unit_id)
             group = self.store.get("runtime_group", unit["runtime_group"])
             check_project_scope(self.platform, group)
@@ -306,10 +311,57 @@ class GeneratedPackageTests(unittest.TestCase):
         job = jobs.start(self.inspector, wait=True)
         self.assertEqual(job["status"], "AVAILABLE", job.get("error"))
         self.assertEqual(job["project_lease"]["status"], "FINISHED")
+        installed = self.store.get("runtime_group", job["group_id"])
+        self.assertEqual(installed["project_owner"], "default")
+        self.assertEqual(catalog.group_for_install(load_package(self.root / "platform" / "packages" /
+            job["package_digest"]), installed["bindings"]), job["group_id"])
         self.platform.projects.put_file("default", None, "data", "after.txt", b"allowed")
         self.assertIsNotNone(jobs._sample_gap(dict(capability, effects=[
             dict(kind="filesystem", access="write", target="resource:corpus")]),
             self.store.get("runtime_group", job["group_id"])["bindings"]))
+
+    def test_project_installs_are_independent_and_legacy_owner_is_preserved(self):
+        value = proposal()
+        value["manifest"]["resources"] = [dict(id="corpus", kind="data", description="corpus", required=True)]
+        value["manifest"]["capabilities"][0]["resources"] = ["corpus"]
+        description, _ = self.write(value)
+        folder = self.root / "package"
+        catalog = self.platform.capabilities
+        resource = lambda project: dict(corpus=dict(form="project", project_id=project, area="data", read_only=True))
+        first = catalog.install(folder, resource("first"))
+        second = catalog.install(folder, resource("second"))
+        self.assertNotEqual(first["group_id"], second["group_id"])
+        self.assertEqual(catalog.unit(first["capabilities"][0])["status"], "READY")
+        self.assertEqual(catalog.unit(second["capabilities"][0])["status"], "READY")
+        value["manifest"]["capabilities"][0]["purpose"] += " revised"
+        revised, _ = write_package(self.root / "package-revised", value, self.inspector, self.ranges, dict(model="offline"))
+        replacement = catalog.install(self.root / "package-revised", resource("first"))
+        self.assertEqual(replacement["group_id"], first["group_id"])
+        self.assertEqual(catalog.unit(second["capabilities"][0])["status"], "READY")
+        with self.assertRaisesRegex(ValueError, "其他项目"):
+            catalog.bind(first["group_id"], resource("second"))
+        unbound = catalog.bind(first["group_id"], dict(corpus=None))
+        self.assertTrue(belongs_to_project(catalog, catalog.unit(unbound["capabilities"][0]), "first"))
+        self.assertFalse(belongs_to_project(catalog, catalog.unit(unbound["capabilities"][0]), "second"))
+        global_unbound = catalog.install(self.root / "package-revised", {})
+        self.assertNotEqual(unbound["capabilities"], global_unbound["capabilities"])
+        self.assertEqual(catalog.unit(unbound["capabilities"][0])["runtime_group"], first["group_id"])
+        with self.assertRaisesRegex(ValueError, "项目已有独立能力组"):
+            catalog.bind(global_unbound["group_id"], resource("first"))
+        with self.assertRaisesRegex(ValueError, "其他项目"):
+            catalog.bind(first["group_id"], resource("second"))
+
+        value["manifest"]["name"] = "legacy-word-tools"
+        legacy_folder = self.root / "legacy-package"
+        legacy_manifest, _ = write_package(legacy_folder, value, self.inspector, self.ranges, dict(model="offline"))
+        legacy_id = group_identity(legacy_manifest)
+        catalog._register(legacy_manifest, package_digest(legacy_manifest), legacy_id, resource("legacy"))
+        old_group = catalog._group(legacy_id)
+        old_group.pop("project_owner")
+        self.store.save("runtime_group", legacy_id, old_group)
+        self.assertEqual(catalog.install(legacy_folder, resource("legacy"))["group_id"], legacy_id)
+        self.assertNotEqual(catalog.install(legacy_folder, resource("fourth"))["group_id"], legacy_id)
+        self.assertNotEqual(catalog.group_for_install(legacy_manifest, {}), legacy_id)
 
     def test_analyzer_receives_requested_purpose_without_local_configuration(self):
         value = proposal()
@@ -442,11 +494,247 @@ class GeneratedPackageTests(unittest.TestCase):
         self.assertEqual(saved["manifest"]["capabilities"][0]["input"]["properties"]["text"]["maxLength"], 4096)
         self.assertEqual(jobs._successful_proposal(self.inspector,
             dict(improve_from=result["id"], source_id=result["source_id"], model=result["model"], reads=[]))["files"], saved["files"])
+        # A checkpoint from before a sequential edit cannot override the saved,
+        # hash-verified accepted transaction.
+        (jobs.home / result["id"] / "conversation.json").write_text(canonical(dict(
+            source_version="stale checkpoint", messages=[dict(role="user", content=canonical(proposal()))])), encoding="utf-8")
+        self.assertEqual(jobs._successful_proposal(self.inspector,
+            dict(improve_from=result["id"], source_id=result["source_id"], model=result["model"], reads=[]))["files"], saved["files"])
         ambiguous = dict(edits=[dict(path="adapter/__init__.py", old="self", new="changed")])
         jobs.transport = Model([("edit_package", ambiguous), ("edit_package", ambiguous)])
         rejected = jobs.start(self.inspector, wait=True, improve_from=result["id"], configuration=dict(intent="Revise"))
         self.assertEqual(rejected["status"], "FAILED")
         self.assertIn("唯一匹配", rejected["error"])
+
+    def test_large_verified_improvement_pages_content_and_preserves_environment_and_evidence(self):
+        original = proposal()
+        original["files"]["adapter/__init__.py"] += "\n# " + "large frozen generated comment " * 6000 + "\n"
+        first = Model([("read_file", dict(path="wordlib.py")), ("submit_package", original)])
+        jobs = GenerationJobs(self.platform, first)
+        catalog = self.platform.capabilities
+        catalog.prepare = lambda group, wait=False: catalog.installation(group)
+        catalog.invoke = lambda *a, **k: dict(output=dict(words=2), files=[])
+        prior = jobs.start(self.inspector, wait=True)
+        self.assertEqual(prior["status"], "AVAILABLE", prior.get("error"))
+        base = jobs._successful_proposal(self.inspector, dict(improve_from=prior["id"], source_id=prior["source_id"],
+                                                              model=prior["model"], reads=[]))
+        # Recovery uses the verified proposal and frozen package; a large old
+        # conversation is neither necessary nor inserted in the new request.
+        (jobs.home / prior["id"] / "conversation.json").unlink()
+        profile = dict(self.platform.profiles.role_profile("analyzer"), declared_context_window=32768,
+                       declared_max_output_tokens=4096)
+        self.platform.profiles.role_profile = lambda role: copy.deepcopy(profile)
+        edit = dict(base_digest=digest(base), edits=[dict(path="adapter/__init__.py",
+            sha256=digest(base["files"]["adapter/__init__.py"].encode("utf-8")),
+            old='return summarize(input["text"])', new='return summarize(input["text"].strip())')])
+        model = Model([("read_package", dict(path="adapter/__init__.py", count=20000)), ("edit_package", edit)])
+        jobs.transport = model
+        result = jobs.start(self.inspector, wait=True, improve_from=prior["id"], configuration=dict(intent="Trim input"))
+        self.assertEqual(result["status"], "AVAILABLE", result.get("error"))
+        overview = json.loads(model.bodies[0]["messages"][1]["content"])
+        summary = overview["previous_successful_proposal"]
+        self.assertTrue(summary["history_compacted"])
+        self.assertEqual(summary["base_digest"], digest(base))
+        self.assertEqual(summary["files"][0]["sha256"], digest(original["files"]["adapter/__init__.py"].encode("utf-8")))
+        page = next(json.loads(item["content"]) for item in model.bodies[1]["messages"]
+                    if item.get("role") == "tool" and "base_digest" in item.get("content", ""))
+        self.assertIsNotNone(page["next_offset"])
+        self.assertLess(len(page["text"]), 20000)
+        for body in model.bodies:
+            status = context_status(profile, body["messages"], body["tools"])
+            self.assertLess(status["estimated_input_tokens"] + body["max_tokens"], profile["declared_context_window"])
+        revised = load_package(catalog.packages / result["package_digest"])
+        self.assertEqual(revised["environment"], load_package(catalog.packages / prior["package_digest"])["environment"])
+        self.assertEqual(revised["capabilities"][0]["provenance"], original["manifest"]["capabilities"][0]["provenance"])
+        self.assertTrue(any(item["path"] == "wordlib.py" for item in result["reads"]))
+
+    def test_incremental_edits_are_hash_checked_atomic_and_keep_unspecified_dependencies(self):
+        base = proposal()
+        base["manifest"]["environment"].update(project=".", requirements=["requirements.txt"])
+        arguments = dict(base_digest=digest(base), edits=[], manifest_updates=dict(environment=dict(python="3.10")),
+            proposal_updates=dict(examples=copy.deepcopy(base["examples"])),
+            file_updates=[dict(path="adapter/helper.py", sha256=None, text="def helper():\n    return 1\n")])
+        revised = _edit_proposal(base, arguments, require_digest=True)
+        self.assertEqual(revised["manifest"]["environment"]["requirements"], ["requirements.txt"])
+        self.assertEqual(revised["manifest"]["environment"]["project"], ".")
+        self.assertEqual(revised["manifest"]["environment"]["python"], "3.10")
+        self.assertNotIn("adapter/helper.py", base["files"])
+        for change, expected in [
+            (dict(arguments, base_digest="0" * 64), "base_digest"),
+            (dict(arguments, file_updates=[dict(path="adapter/__init__.py", sha256="0" * 64, text="pass")]), "SHA-256"),
+            (dict(arguments, manifest_updates=dict(source=dict(id="forged"))), "平台生成"),
+            (dict(arguments, proposal_updates=dict(files={})), "proposal_updates"),
+        ]:
+            with self.subTest(expected=expected), self.assertRaisesRegex(ValueError, expected):
+                _edit_proposal(base, change, require_digest=True)
+        self.assertEqual(base["files"]["adapter/__init__.py"], ADAPTER)
+
+    def test_failed_worker_continuation_pages_accepted_code_and_retains_real_diagnostic(self):
+        original = proposal()
+        original["files"]["adapter/__init__.py"] += "\n# " + "accepted large adapter " * 7000 + "\n"
+        model = Model([("read_file", dict(path="wordlib.py")), ("submit_package", original)])
+        jobs = GenerationJobs(self.platform, model)
+        catalog = self.platform.capabilities
+        catalog.prepare = lambda group, wait=False: catalog.installation(group)
+        def fail_in_worker(*args, **kwargs):
+            raise CapabilityError("offline worker source dependency failed", kind="ImportError", facts={})
+        catalog.invoke = fail_in_worker
+        prior = jobs.start(self.inspector, wait=True)
+        self.assertEqual(prior["status"], "FAILED")
+        self.assertIn("source dependency failed", prior["attempts"][0]["error"])
+        base = jobs._successful_proposal(self.inspector, dict(improve_from=prior["id"], source_id=prior["source_id"],
+            model=prior["model"], reads=[]), allowed_status=("FAILED",))
+        profile = dict(self.platform.profiles.role_profile("analysis"), declared_context_window=32768,
+                       declared_max_output_tokens=4096)
+        self.platform.profiles.role_profile = lambda role: copy.deepcopy(profile)
+        catalog.invoke = lambda *a, **k: dict(output=dict(words=2), files=[])
+        jobs.transport = Model([("read_package", dict(path="manifest", count=2000)),
+            ("edit_package", dict(base_digest=digest(base), edits=[dict(path="adapter/__init__.py",
+             old='return summarize(input["text"])', new='return summarize(input["text"].strip())')]))])
+        result = jobs.start(self.inspector, wait=True)
+        self.assertEqual(result["status"], "AVAILABLE", result.get("error"))
+        self.assertEqual(result["continued_from"], prior["id"])
+        first_body = jobs.transport.bodies[0]
+        self.assertIn("source dependency failed", canonical(first_body))
+        self.assertNotIn("accepted large adapter accepted large adapter", canonical(first_body))
+        self.assertTrue(any(item["path"] == "wordlib.py" for item in result["reads"]))
+
+    def test_provider_budget_reserves_tools_output_and_multibyte_input(self):
+        profile = dict(model="offline", declared_context_window=32768, declared_max_output_tokens=4096)
+        budget = generation_context_budget(profile)
+        self.assertEqual(budget["tool_bytes"], len(canonical(TOOLS).encode("utf-8")))
+        self.assertEqual(budget["available_input_tokens"], 32768 - 4096)
+        larger_output = generation_context_budget(dict(profile, declared_max_output_tokens=16384))
+        self.assertLess(larger_output["message_bytes"], budget["message_bytes"])
+        with self.assertRaisesRegex(ValueError, "上下文窗口不足"):
+            generation_context_budget(dict(profile, declared_max_output_tokens=32768))
+        page = dict(path="wordlib.py", sha256="0" * 64, start=1, total_lines=500,
+                    next_line=501, lines=["安全" * 1000] * 20)
+        messages = [dict(role="system", content="rules"), dict(role="user", content="overview"),
+                    dict(role="assistant", tool_calls=[dict(id="source", function=dict(name="read_file", arguments='{}'))]),
+                    dict(role="tool", tool_call_id="source", content=canonical(page)),
+                    dict(role="assistant", content="read"), dict(role="user", content="continue")]
+        self.assertLess(len(canonical(messages)), budget["message_bytes"])
+        self.assertGreater(len(canonical(messages).encode("utf-8")), budget["message_bytes"])
+        self.assertEqual(GenerationJobs._compact(messages, budget["message_bytes"]), 1)
+        self.assertNotIn("lines", json.loads(messages[3]["content"]))
+
+    def test_omitted_output_limit_is_bounded_on_the_actual_request(self):
+        model = Model([("read_file", dict(path="wordlib.py")), ("submit_package", proposal())])
+        jobs = GenerationJobs(self.platform, model)
+        catalog = self.platform.capabilities
+        catalog.prepare = lambda group, wait=False: catalog.installation(group)
+        catalog.invoke = lambda *a, **k: dict(output=dict(words=2), files=[])
+        result = jobs.start(self.inspector, wait=True)
+        self.assertEqual(result["status"], "AVAILABLE", result.get("error"))
+        self.assertEqual(result["context_budget"]["requested_output_tokens"], 4096)
+        self.assertTrue(all(body["max_tokens"] == 4096 for body in model.bodies))
+
+    def test_large_metadata_indexes_and_unicode_pages_stay_bounded(self):
+        jobs = GenerationJobs(self.platform)
+        job = dict(context_budget=dict(message_bytes=18000))
+        files = {"仓库" * 80 + str(i) + ".py": dict(path="仓库" * 80 + str(i) + ".py", sha256="0" * 64, bytes=1)
+                 for i in range(100)}
+        fake = SimpleNamespace(files=files, request=dict(source_version="frozen"),
+            list_source=lambda offset=0, count=100: dict(files=list(files.values())[offset:offset + count],
+                total=len(files), next_offset=offset + count if offset + count < len(files) else None))
+        page = jobs._source_tool(fake, "list_source", dict(count=100), {}, job)
+        self.assertLessEqual(_context_units(page), 3000)
+        self.assertLess(len(page["files"]), 100)
+        self.assertEqual(page["next_offset"], len(page["files"]))
+        environment = dict(declarations=[dict(path="安装" * 100, description="🔒" * 100)] * 1000)
+        with patch("seampact.capability_generation.discover_environment", return_value=environment):
+            result = jobs._source_tool(fake, "read_metadata", dict(kind="environment", count=20000), {}, job)
+        self.assertLessEqual(_context_units(result), 3000)
+        self.assertEqual(result["sha256"], digest(canonical(environment).encode("utf-8")))
+        self.assertEqual(result["text"], canonical(environment)[:result["next_offset"]])
+        self.assertGreater(result["next_offset"], 0)
+        candidate = proposal()
+        candidate["files"]["adapter/__init__.py"] = "安全🔒" * 10000
+        package_page = jobs._read_package(candidate, dict(path="adapter/__init__.py", count=20000), max_units=3000)
+        self.assertLessEqual(_context_units(package_page), 3000)
+        self.assertGreater(package_page["next_offset"], 0)
+        self.assertGreater(_context_units(candidate), len(canonical(candidate).encode("utf-8")))
+
+    def test_terminal_multi_call_failure_records_unexecuted_replies_for_safe_continuation(self):
+        invalid = proposal()
+        invalid["manifest"]["resources"] = [dict(id="invalid-id", kind="parameter", required=True, description="invalid")]
+        calls = [dict(id="invalid_" + str(i), type="function", function=dict(name="submit_package", arguments=canonical(invalid)))
+                 for i in range(2)]
+        calls.append(dict(id="unexecuted", type="function", function=dict(name="read_file", arguments='{"path":"wordlib.py"}')))
+        model = SimpleNamespace(send=lambda *a: dict(choices=[dict(message=dict(role="assistant", content=None, tool_calls=calls))]))
+        jobs = GenerationJobs(self.platform, model)
+        result = jobs.start(self.inspector, wait=True)
+        self.assertEqual(result["status"], "FAILED")
+        checkpoint = json.loads((jobs.home / result["id"] / "conversation.json").read_text(encoding="utf-8"))
+        self.assertTrue(_complete_tool_history(checkpoint["messages"]))
+        self.assertEqual(json.loads(checkpoint["messages"][-1]["content"])["status"], "NOT_RUN")
+        self.assertFalse(any(item["path"] == "wordlib.py" for item in result["reads"]))
+
+    def test_read_history_compaction_keeps_tool_pairs_errors_and_evidence_index(self):
+        messages = [dict(role="system", content="rules"), dict(role="user", content="overview")]
+        for i in range(20):
+            identity = "read_" + str(i)
+            messages.extend([dict(role="assistant", tool_calls=[dict(id=identity, function=dict(name="read_file", arguments="{}"))]),
+                             dict(role="tool", tool_call_id=identity, content=canonical(dict(path="源码" * 100, start=1, end=2)))])
+        failure = canonical(dict(status="ERROR", reason="actual validation failure"))
+        messages.extend([dict(role="assistant", tool_calls=[dict(id="proposal", function=dict(name="submit_package", arguments="{}"))]),
+                         dict(role="tool", tool_call_id="proposal", content=failure),
+                         dict(role="user", content="continue"), dict(role="assistant", content="ready")])
+        self.assertGreater(_compact_read_history(messages, 5000, 20), 0)
+        self.assertTrue(_complete_tool_history(messages))
+        self.assertEqual(next(item["content"] for item in messages if item.get("tool_call_id") == "proposal"), failure)
+        self.assertLessEqual(_context_units(messages), 5000)
+        self.assertIn("source_reads", messages[-1]["content"])
+        self.assertFalse(_complete_tool_history([dict(role="system", content="rules"),
+            dict(role="assistant", tool_calls=[dict(id="missing", function=dict(name="read_file", arguments="{}"))])]))
+
+    def test_semantic_guard_and_business_operation_metadata_are_source_anchored(self):
+        value = proposal()
+        capability = value["manifest"]["capabilities"][0]
+        references = copy.deepcopy(capability["provenance"])
+        capability["guard"] = dict(kind="secrets", subjects=["text", "tool_output"], provenance=references)
+        capability["operation"] = dict(kind="read", text_fields=["text"], provenance=references)
+        capability["input"]["properties"]["filename"] = dict(type="string")
+        capability["output"]["schema"].update(properties=dict(detected=dict(type="boolean")), required=["detected"])
+        manifest, _ = self.write(value)
+        self.assertEqual(manifest["capabilities"][0]["guard"], capability["guard"])
+        wrong_schema = copy.deepcopy(value)
+        wrong_schema["manifest"]["capabilities"][0]["output"]["schema"]["properties"]["detected"]["type"] = "string"
+        with self.assertRaisesRegex(ValueError, "标准输入、输出或检查对象不匹配"):
+            self.write(wrong_schema)
+        wrong_schema["manifest"]["capabilities"][0].pop("guard")
+        self.write(wrong_schema)  # Ordinary operations do not need guard semantics.
+        invalid = copy.deepcopy(value)
+        invalid["manifest"]["capabilities"][0]["guard"]["provenance"][0]["end"] = 20
+        with self.assertRaisesRegex(ValueError, "实际行"):
+            self.write(invalid)
+        for field, change in [
+            ("guard", dict(kind="unknown", subjects=["text"], provenance=references)),
+            ("guard", dict(kind="secrets", subjects=["bespoke_role"], provenance=references)),
+            ("guard", dict(kind="fact_support", subjects=["response"], provenance=references)),
+            ("operation", dict(kind="send", text_fields=["missing"], provenance=references)),
+        ]:
+            invalid = copy.deepcopy(value)
+            invalid["manifest"]["capabilities"][0][field] = change
+            with self.subTest(field=field, change=change), self.assertRaises(ValueError):
+                self.write(invalid)
+
+    def test_invalid_guard_contract_is_returned_for_model_repair(self):
+        invalid = proposal()
+        invalid["manifest"]["capabilities"][0]["guard"] = dict(
+            kind="secrets", subjects=["text"], provenance=[dict(path="wordlib.py", start=1, end=2)])
+        model = Model([("read_file", dict(path="wordlib.py")), ("submit_package", invalid),
+                       ("submit_package", proposal())])
+        jobs = GenerationJobs(self.platform, model)
+        catalog = self.platform.capabilities
+        catalog.prepare = lambda group, wait=False: catalog.installation(group)
+        catalog.invoke = lambda *a, **k: dict(output=dict(words=2), files=[])
+        result = jobs.start(self.inspector, wait=True)
+        self.assertEqual(result["status"], "AVAILABLE", result.get("error"))
+        feedback = [message["content"] for message in model.bodies[-1]["messages"]
+                    if message.get("role") == "tool"]
+        self.assertTrue(any("标准输入、输出或检查对象不匹配" in item for item in feedback))
 
     def test_cancelled_diagnostic_scope_waits_for_operation_and_instance_release(self):
         jobs = GenerationJobs(self.platform)
@@ -492,7 +780,7 @@ class GeneratedPackageTests(unittest.TestCase):
         catalog.prepare = lambda group, wait=False: catalog.installation(group)
         attempts = []
 
-        def invoke(unit_id, arguments, on_event=None):
+        def invoke(unit_id, arguments, on_event=None, **kwargs):
             attempts.append(unit_id)
             if len(attempts) == 1:
                 on_event(dict(kind="model_usage", call_id="first-call", data=dict(raw="private-usage")))

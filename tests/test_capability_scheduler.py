@@ -14,7 +14,7 @@ import threading
 import time
 import unittest
 from pathlib import Path
-from queue import Queue
+from queue import Queue, SimpleQueue
 from types import SimpleNamespace
 from unittest.mock import patch
 from urllib.request import Request, urlopen
@@ -36,6 +36,244 @@ OBJECTIVE = dict(weights=dict(quality=1, delivery=1, latency=0.1, ram=0.2, vram=
                  scales=dict(latency_s=10, ram_byte_s=100, vram_byte_s=200, api_tokens=1),
                  quality_evaluator="fixture-score/1: already normalized [0,1]",
                  deadline_s=10, resource_source="reserved")
+
+
+class ElasticCandidateTests(unittest.TestCase):
+    def setUp(self):
+        self.group = dict(id="group", package_digest="package", installation_id="install",
+            contract=dict(digest="contract", concurrency=1, replicas=dict(replicable=True),
+                          operations=dict(prewarm=dict(status="SUPPORTED"), add_replica=dict(status="SUPPORTED"))))
+        self.deployments = SimpleNamespace(lock=threading.RLock(), instances={}, affinity={},
+            runtime_fact=lambda group, unit: dict(ready_instance=bool(self.deployments.instances),
+                cold_startable=not self.deployments.instances, warm=False), backend=lambda: dict(start_timeout_s=1))
+        s = self.scheduler = CapabilityScheduler.__new__(CapabilityScheduler)
+        s._config = freeze_config(dict(elastic_actions=True, max_replicas_per_group=2, max_in_flight=4))
+        s.catalog = SimpleNamespace(_group=lambda group: self.group)
+        s.deployments = self.deployments
+        s.condition = threading.Condition(threading.RLock())
+        s.queue, s.running, s.owned = {}, {}, {}
+        s.groups, s.tracked = {"group"}, set()
+        s.elastic_active, s.elastic_runs, s.elastic_attempted, s.elastic_waited = {}, __import__("collections").Counter(), set(), {}
+        s.retention_due, s.force_drain, s.closed = {}, False, False
+        s.instance_events, s.measure_wake = SimpleQueue(), threading.Event()
+        s.counts, s.store, s.workload, s.session = __import__("collections").Counter(), None, None, "test-session"
+        self.request = dict(id="waiting", unit_id="unit", group_id="group", run_id="task",
+            execution_run_id="task", concurrency=1, queued_wall=time.time(),
+            identity=dict(package_digest="package", contract_digest="contract", installation_id="install"))
+
+    def instance(self, identity="first", *, inflight=0):
+        self.deployments.instances[identity] = dict(id=identity, group_id="group", generation=1,
+            state="READY", accepting=True, released=False, units=["unit"], in_flight=inflight,
+            ready_wall=time.time(), last_activity_wall=time.time())
+        return self.deployments.instances[identity]
+
+    def test_cold_prewarm_only_with_real_demand_and_rule_still_dispatches(self):
+        s = self.scheduler
+        self.assertFalse(any(c["kind"] == "prewarm" for c in s._candidates()[1]))
+        s.queue["waiting"] = self.request
+        choices = s._candidates()[1]
+        self.assertEqual({c["kind"] for c in choices}, {"dispatch", "prewarm"})
+        from seampact.scheduling.capability_scheduler import RulePolicy
+        self.assertEqual(choices[RulePolicy().choose([], choices)["index"]]["kind"], "dispatch")
+        s.elastic_attempted.add(("prewarm", "waiting"))
+        self.assertEqual([c["kind"] for c in s._candidates()[1]], ["dispatch"])
+
+    def test_overload_replica_and_wait_are_bounded_and_respect_affinity(self):
+        s = self.scheduler
+        self.instance(inflight=1)
+        s.queue["waiting"] = self.request
+        s.running["active"] = dict(id="active", group_id="group")
+        choices = s._candidates()[1]
+        self.assertEqual({c["kind"] for c in choices}, {"wait", "add_replica"})
+        from seampact.scheduling.capability_scheduler import RulePolicy
+        self.assertEqual(choices[RulePolicy().choose([], choices)["index"]]["kind"], "wait")
+        pressure = RulePolicy(dict(kind="rule", scale_when_saturated=True))
+        self.assertEqual(choices[pressure.choose([], choices)["index"]]["kind"], "add_replica")
+        s.elastic_active.update({str(i): dict(kind="prewarm") for i in range(3)})
+        self.assertEqual(s._candidates()[1], [])
+        s.elastic_active.clear()
+        wait = next(c for c in choices if c["kind"] == "wait")
+        s.elastic_waited["group"] = wait["wait_token"]
+        self.assertEqual(s._candidates()[1], [])
+        s.elastic_waited.clear()
+        self.deployments.affinity[("task", "group")] = "first"
+        self.assertEqual(s._candidates()[1], [])
+        self.deployments.affinity.clear()
+        self.instance("second")
+        self.assertEqual([c["kind"] for c in s._candidates()[1]], ["dispatch"])
+        self.group["contract"]["replicas"]["replicable"] = False
+        self.assertEqual(s._candidates()[1], [])
+
+    def test_busy_group_offers_only_proven_idle_owned_replica(self):
+        s = self.scheduler
+        first, second = self.instance("first", inflight=1), self.instance("second")
+        s.owned["second"] = dict(group_id="group", run_id="owner")
+        s.running["active"] = dict(id="active", group_id="group", instance_id="first")
+        self.deployments.affinity[("task", "group")] = "first"
+
+        def release_choices():
+            return [c for c in s._candidates()[1] if c.get("instance_id") == "second"]
+
+        choices = release_choices()
+        self.assertEqual({c["kind"] for c in choices}, {"retain", "drain_stop"})
+        self.assertTrue(all(c["idle_replica"] for c in choices))
+        cases = [
+            (lambda: s.queue.update(waiting=self.request), lambda: s.queue.clear()),
+            (lambda: s.elastic_active.update(group=dict(kind="add_replica")), lambda: s.elastic_active.clear()),
+            (lambda: s.running["active"].pop("instance_id"), lambda: s.running["active"].update(instance_id="first")),
+            (lambda: s.running["active"].update(instance_id="second"), lambda: s.running["active"].update(instance_id="first")),
+            (lambda: first.update(in_flight=0), lambda: first.update(in_flight=1)),
+            (lambda: first.update(state="DRAINING"), lambda: first.update(state="READY")),
+            (lambda: first.update(state="STARTING"), lambda: first.update(state="READY")),
+            (lambda: second.update(in_flight=1), lambda: second.update(in_flight=0)),
+            (lambda: self.deployments.affinity.update({("other", "group"): "second"}),
+             lambda: self.deployments.affinity.pop(("other", "group"))),
+            (lambda: self.group["contract"]["replicas"].update(replicable=False),
+             lambda: self.group["contract"]["replicas"].update(replicable=True)),
+            (lambda: s.owned.pop("second"), lambda: s.owned.update(second=dict(group_id="group", run_id="owner"))),
+        ]
+        for change, restore in cases:
+            with self.subTest(change=change):
+                change()
+                self.assertEqual(release_choices(), [])
+                restore()
+
+    def test_elastic_start_tracks_actual_instance_and_aborted_work_does_not_start(self):
+        s = self.scheduler
+        s.queue["waiting"] = self.request
+        starts, warms = [], []
+        def start(group, body, run_id=None, replica=False):
+            starts.append((group, run_id, replica))
+            return self.instance("new")
+        def prewarm(group, body, run_id=None):
+            warms.append((group, body, run_id))
+            return dict(status="PREPARED", initialization_ready=True)
+        self.deployments.start, self.deployments.prewarm = start, prewarm
+        action = dict(kind="prewarm", group_id="group", unit_id="unit", request_id="waiting", instance_id=None)
+        s.elastic_active["group"] = dict(kind="prewarm")
+        s.elastic_runs["task"] += 1
+        s._elastic_action(action, "task")
+        self.assertEqual(starts, [("group", "task", False)])
+        self.assertEqual(warms[0][1]["instance_id"], "new")
+        self.assertIn("new", s.tracked)
+        self.assertEqual(s.owned["new"]["run_id"], "task")
+        self.assertFalse(s.elastic_active)
+        s.force_drain = True
+        s.elastic_active["group"] = dict(kind="prewarm")
+        s._elastic_action(action, "task")
+        self.assertEqual(len(starts), 1)
+        self.assertFalse(s.elastic_active)
+
+    def test_replica_start_and_disappearing_demand_keep_ownership(self):
+        s = self.scheduler
+        self.instance(inflight=1)
+        s.queue["waiting"] = self.request
+        starts = []
+        def start(group, body, run_id=None, replica=False):
+            starts.append((group, run_id, replica))
+            record = self.instance("replica")
+            # The request can be cancelled while a real launch is in progress.
+            s.queue.pop("waiting")
+            record.update(state="STARTING", accepting=False)
+            return record
+        self.deployments.start = start
+        action = dict(kind="add_replica", group_id="group", unit_id="unit", request_id="waiting")
+        s.elastic_active["group"] = dict(kind="add_replica")
+        s.elastic_runs["task"] += 1
+        s._elastic_action(action, "task")
+        self.assertEqual(starts, [("group", "task", True)])
+        self.assertIn("replica", s.tracked)
+        self.assertEqual(s.owned["replica"]["run_id"], "task")
+        self.assertFalse(s.elastic_active)
+        self.assertEqual(s.counts["elastic_cancelled"], 1)
+
+    def test_workload_cannot_finish_while_elastic_action_is_active(self):
+        s = self.scheduler
+        s.tasks = SimpleNamespace(active={})
+        s.workload = dict(id="workload", status="RUNNING", finished=["task"], task_ids=["task"],
+                          training=False, updated=False)
+        s.workload_decision_ids = []
+        s._status_locked = lambda: dict(objective={"complete": True})
+        s._has_held = lambda: False
+        s.elastic_active["group"] = dict(kind="prewarm")
+        self.assertEqual(s.finish_workload()["status"], "DRAINING")
+        self.assertTrue(s.force_drain)
+        s.elastic_active.clear()
+        self.assertEqual(s.finish_workload()["status"], "COMPLETE")
+
+    def test_pressure_rule_expands_only_under_real_queued_demand(self):
+        first_entered, release_first, second_done = threading.Event(), threading.Event(), threading.Event()
+        instances = {"first": dict(id="first", group_id="group", generation=1, state="READY", accepting=True,
+            released=False, units=["unit"], in_flight=0, initialization={"unit": "BOUND"},
+            last_activity_wall=time.time())}
+        deploy = SimpleNamespace(lock=threading.RLock(), instances=instances, affinity={},
+            backend=lambda: dict(start_timeout_s=2), release_task=lambda task: None)
+        def runtime_fact(group, unit):
+            with deploy.lock:
+                return dict(ready_instance=True, cold_startable=False, warm=True)
+        deploy.runtime_fact = runtime_fact
+        starts = []
+        def start(group, body, run_id=None, replica=False):
+            self.assertTrue(replica)
+            with deploy.lock:
+                record = dict(id="second", group_id=group, generation=2, state="READY", accepting=True,
+                    released=False, units=["unit"], in_flight=0, initialization={"unit": "BOUND"},
+                    run_id=run_id, last_activity_wall=time.time())
+                instances["second"] = record
+                starts.append(record["id"])
+                return dict(record)
+        deploy.start = start
+        deploy.drain_stop = lambda group, body, **kwargs: instances[body["instance_id"]].update(released=True, state="STOPPED")
+        group = self.group
+        def invoke(unit, arguments, on_event=None, run_id=None):
+            with deploy.lock:
+                available = [row for row in instances.values() if row["state"] == "READY" and row["in_flight"] == 0]
+                if not available:
+                    raise AssertionError("dispatch exceeded available replica capacity")
+                row = min(available, key=lambda item: item["generation"])
+                row["in_flight"] += 1
+            try:
+                if arguments["call"] == "first":
+                    first_entered.set()
+                    if not release_first.wait(4):
+                        raise AssertionError("test failed to release first call")
+                else:
+                    second_done.set()
+                return dict(call=dict(outcome="result"))
+            finally:
+                with deploy.lock:
+                    row["in_flight"] -= 1
+        catalog = SimpleNamespace(store=None, _group=lambda identity: group,
+            unit=lambda identity: dict(id=identity, runtime_group="group"),
+            validate_input=lambda *args: None, invoke=invoke)
+        scheduler = CapabilityScheduler(catalog, deploy, config=dict(elastic_actions=True,
+            max_replicas_per_group=2, policy=dict(kind="rule", scale_when_saturated=True)))
+        errors = []
+        def call(name):
+            try:
+                scheduler.invoke("unit", dict(call=name), run_id=name)
+            except Exception as exc:
+                errors.append(exc)
+        first = threading.Thread(target=call, args=("first",))
+        second = threading.Thread(target=call, args=("second",))
+        try:
+            first.start()
+            self.assertTrue(first_entered.wait(2))
+            self.assertEqual(starts, [])
+            second.start()
+            self.assertTrue(second_done.wait(3), "queued request did not use added capacity")
+            self.assertEqual(starts, ["second"])
+            self.assertTrue(first.is_alive())
+            decisions = list(scheduler.decisions)
+            self.assertTrue(any(d["candidates"][d["selection"]["index"]]["kind"] == "add_replica" for d in decisions))
+            self.assertIn("second", scheduler.tracked)
+        finally:
+            release_first.set()
+            first.join(3)
+            if second.ident is not None:
+                second.join(3)
+            scheduler.close()
+        self.assertEqual(errors, [])
 
 
 class ObjectiveAccounting(unittest.TestCase):
@@ -283,6 +521,32 @@ class ObjectiveAccounting(unittest.TestCase):
 
 
 class ScopedMeasurement(unittest.TestCase):
+    def test_candidate_memory_uses_only_fresh_identified_instance_samples(self):
+        scheduler = CapabilityScheduler.__new__(CapabilityScheduler)
+        scheduler._config = dict(measurement_interval_s=1.0, vram_source="nvml_process")
+        instance = dict(id="one", group_id="g", generation=2, state="READY", released=False,
+                        handle=dict(container_id="backend"))
+        scheduler.deployments = SimpleNamespace(lock=threading.RLock(), instances={"one": instance})
+        scheduler.tracked = {"one"}
+        sample = dict(identity="backend:2", at_s=100.0, ram_bytes=1024, vram_bytes=0,
+                      vram_source="nvml_process")
+        scheduler.measure_samples = {("one", 2): sample}
+        group_action = dict(group_id="g")
+        instance_action = dict(group_id="g", instance_id="one")
+        self.assertEqual(scheduler._candidate_memory(group_action, 101.0), (1024, 0))
+        self.assertEqual(scheduler._candidate_memory(instance_action, 101.0), (1024, 0))
+        self.assertEqual(scheduler._candidate_memory(group_action, 103.0), (None, None))
+        scheduler.deployments.instances["two"] = dict(id="two", group_id="g", generation=1,
+                                                       state="READY", released=False)
+        self.assertEqual(scheduler._candidate_memory(group_action, 101.0), (None, None))
+        self.assertEqual(scheduler._candidate_memory(instance_action, 101.0), (1024, 0))
+        sample["vram_source"] = "different_source"
+        self.assertEqual(scheduler._candidate_memory(instance_action, 101.0), (1024, None))
+        sample["identity"] = "old-backend:2"
+        self.assertEqual(scheduler._candidate_memory(instance_action, 101.0), (None, None))
+        sample.update(identity="backend:2", boundary="created")
+        self.assertEqual(scheduler._candidate_memory(instance_action, 101.0), (None, None))
+
     def test_lifecycle_owns_start_stop_and_preserves_failed_boundary_probe(self):
         from seampact.scheduling.capability_measurement import sample_instances
         backend = "a" * 64
@@ -618,6 +882,9 @@ class OptionalPPO(unittest.TestCase):
             policy.learner.save(old, checkpoint_metadata=dict(schema="joint/1"))
             with self.assertRaisesRegex(ValueError, "拒绝"):
                 policy.load(old)
+            policy.learner.save(old, checkpoint_metadata=dict(policy.identity, feature_schema="capability-event-features/6"))
+            with self.assertRaisesRegex(ValueError, "拒绝"):
+                policy.load(old)
         with self.assertRaisesRegex(ValueError, "不能更新"):
             policy.update_workload([], dict(before_first=0, after_decisions=[]), dict(summary, training_ready=False))
 
@@ -679,6 +946,35 @@ class RealWorkerScheduler(unittest.TestCase):
             self.start_worker(artifact)
         return self.units()
 
+    def test_remote_worker_startup_uses_actual_controller_start_and_registration_events(self):
+        self.install(replicable=True)
+        self.platform.capabilities.bind(self.group, dict(greeting=dict(form="value", value="hi")))
+        self.reported_image()
+        deployments = self.platform.deployments
+        scheduler = self.scheduler(policy=dict(kind="rule", retention="keep"))
+
+        def local_backend(record, reference, folder, config, **kwargs):
+            # Replace Docker creation only; use the real remote worker, attach,
+            # controller launch timestamps and registration event callback.
+            worker = package_fixture.CapabilityWorker(Path(folder) / "worker.json", self.coordinator,
+                instance_id=record["id"], generation=record["generation"])
+            server = package_fixture.make_worker_server(worker, "127.0.0.1", 0)
+            threading.Thread(target=server.serve_forever, daemon=True).start()
+            self.workers.append((worker, server))
+            deployments.attach("http://127.0.0.1:" + str(server.server_port))
+            return dict(status="APPLIED", steps=[])
+
+        with patch.object(self.platform, "execution", scheduler), patch.object(
+                deployments, "_start", side_effect=deployments._start_unprotected), patch(
+                "seampact.hosting.deployment.backends.start", side_effect=local_backend):
+            result = scheduler.invoke(self.units()["count_words"]["id"], dict(text="actual worker"))
+        instance = deployments.instances[result["call"]["instance_id"]]
+        row = scheduler._perception(dict(group_id=self.group), time.time(), time.monotonic())
+        self.assertEqual(instance["profile"], package_fixture.capability_hosting.WORKER_PROFILE)
+        self.assertEqual(row["samples"]["startup"], 1)
+        self.assertAlmostEqual(row["metrics"]["startup_to_ready_s"], instance["ready_wall"] - instance["start_wall"])
+        self.assertGreater(row["metrics"]["startup_to_ready_s"], 0)
+
     def test_real_call_failure_and_forced_action_do_not_invoke_policy(self):
         units = self.prepared()
         scheduler = self.scheduler()
@@ -710,11 +1006,31 @@ class RealWorkerScheduler(unittest.TestCase):
         scheduler = self.scheduler(policy=dict(kind="rule", optional_hooks={"before_tool": ["count"]}, retention="keep"))
         scheduler.start_workload("hooks-and-retain", ["task"])
         scheduler.begin("task")
-        options = [dict(name="required", required=True), dict(name="count", unit_id=units["count_words"]["id"])]
+        options = [dict(name="required", required=True), dict(name="count", hook_family="fact_support",
+                                                               unit_id=units["count_words"]["id"])]
         choice = scheduler.choose_optional("task", "before_tool", options, dict(text_chars=10))
         self.assertEqual(choice["hook"], "count")
+        self.assertEqual(choice["features"][28:30], [0.0, 0.0])
+        self.assertEqual(choice["features"][19:21], [1.0, 0.0])
+        invoke = scheduler.catalog.invoke
+        def without_timing(*args, **kwargs):
+            result = invoke(*args, **kwargs)
+            result["call"].pop("round_trip_ms", None)
+            return result
+        with patch.object(scheduler.catalog, "invoke", side_effect=without_timing):
+            scheduler.invoke(choice["unit_id"], dict(text="alpha beta"), run_id="task")
+        self.assertEqual(scheduler._features(choice)[28:30], [0.0, 0.0])
         result = scheduler.invoke(choice["unit_id"], dict(text="alpha beta"), run_id="task")
         self.assertEqual(result["output"]["words"], 2)
+        next_choice = scheduler.choose_optional("task", "before_tool", options, dict(text_chars=10))
+        self.assertEqual(next_choice["features"][29], 1.0)
+        self.assertGreaterEqual(next_choice["features"][28], 0.0)
+        self.assertEqual(scheduler._features(dict(kind="run_hook", group_id=choice["group_id"],
+                                                  unit_id="another-unit"))[28:30], [0.0, 0.0])
+        current_group = copy.deepcopy(scheduler.catalog._group(choice["group_id"]))
+        current_group["installation_id"] = "different-installation"
+        with patch.object(scheduler.catalog, "_group", return_value=current_group):
+            self.assertEqual(scheduler._features(choice)[28:30], [0.0, 0.0])
         scheduler.business_terminal("task")
         scheduler.finish("task", delivered=True, quality=1)
         wait_for(lambda: scheduler.status()["counts"].get("retains", 0) > 0, timeout=5)
@@ -731,14 +1047,18 @@ class RealWorkerScheduler(unittest.TestCase):
 
     def test_interactive_chat_after_evaluation_preserves_frozen_results(self):
         scheduler = self.scheduler()
+        scheduler.recent_call_costs["old"] = dict(identity=(), samples=[1])
         scheduler.start_workload("frozen-eval", ["test-case"])
+        self.assertEqual(scheduler.recent_call_costs, {})
         with self.assertRaises(ValueError):
             scheduler.begin("online")
         scheduler.begin("test-case")
         scheduler.finish("test-case", delivered=True, quality=1)
         frozen = scheduler.finish_workload()
         self.assertEqual(frozen["status"], "COMPLETE")
+        scheduler.recent_call_costs["evaluation"] = dict(identity=(), samples=[2])
         scheduler.begin("online")
+        self.assertEqual(scheduler.recent_call_costs, {})
         self.assertNotEqual(scheduler.session, frozen["session"])
         self.assertEqual(scheduler.store.get("capability_workload", "frozen-eval"), frozen)
         self.assertEqual(scheduler.status()["objective"]["denominator"], 1)
@@ -759,8 +1079,39 @@ class RealWorkerScheduler(unittest.TestCase):
         self.assertEqual(observed, [{}, dict(checked=True)])
         decisions = scheduler.status()["recent_decisions"]
         self.assertEqual([row["observation"][10] for row in decisions], [0, 1])
-        self.assertEqual([row["observation"][-2:] for row in decisions], [[0, 0], [1, 0.8]])
+        self.assertEqual([row["observation"][12:14] for row in decisions], [[0, 0], [1, 0.8]])
         self.assertFalse(any(candidate.get("hook") == "required" for row in decisions for candidate in row["candidates"]))
+        scheduler.finish("task", delivered=True)
+
+    def test_semantic_context_distinguishes_unknown_and_known_observations(self):
+        scheduler = self.scheduler()
+        scheduler.begin("task", deadline_s=60)
+        options = [dict(name="first", hook_family="fact_support"),
+                   dict(name="different-name", hook_family="fact_support")]
+        scheduler.choose_optional("task", "before_tool", options, dict(
+            linked_receipt=False, linked_source=True, missing_evidence=False, finding_valid=True, evidence_partial=True,
+            family_results={"fact_support": False},
+            revision_remaining=0, operation_effect="send", operation_destination="external",
+            operation_phase="pending"))
+        row = scheduler.status()["recent_decisions"][-1]
+        self.assertEqual(row["feature_schema"], FEATURE_SCHEMA)
+        self.assertEqual(len(row["observation"]), OBSERVATION_DIM)
+        self.assertEqual(row["observation"][14:26], [0, 1, 1, 1, 0, 1, 1, 1, 1, 1, 0, 1])
+        self.assertEqual(row["observation"][26:32], [0, 0, 1, 0, 0, 1])
+        self.assertEqual(row["observation"][32:37], [0, 1, 0, 0, 1])
+        self.assertEqual(row["observation"][37:42], [0, 1, 0, 0, 1])
+        self.assertEqual(row["candidates"][1]["features"][19:28],
+                         row["candidates"][2]["features"][19:28])
+        self.assertEqual(len(row["candidates"][1]["features"]), CANDIDATE_DIM)
+        first, second = row["candidates"][1:]
+        self.assertEqual(first["deadline_wall"], second["deadline_wall"])
+        self.assertGreater(first["features"][3], 0)
+        self.assertEqual(first["features"][15], 1)
+        self.assertEqual(first["features"][40:42], [1, 0])
+        self.assertEqual(first["features"][4:], second["features"][4:])
+        scheduler.choose_optional("task", "before_tool", options, {})
+        unknown = scheduler.status()["recent_decisions"][-1]["observation"]
+        self.assertEqual(unknown[14:], [0] * (OBSERVATION_DIM - 14))
         scheduler.finish("task", delivered=True)
 
     @unittest.skipUnless(importlib.util.find_spec("torch"), "optional PyTorch dependency")
@@ -793,6 +1144,7 @@ class RealWorkerScheduler(unittest.TestCase):
         # reported as confirmed physical release or a complete training return.
         instance = self.platform.deployments.instances[first_id]
         wait_for(lambda: instance.get("pending_stop", {}).get("blocked"), timeout=5)
+        wait_for(lambda: scheduler.status()["counts"].get("idle_drains", 0) >= 1, timeout=5)
         state = scheduler.status()
         self.assertFalse(instance["released"])
         self.assertGreater(state["objective"]["resources"]["instances"][0]["resident_s"], 0)

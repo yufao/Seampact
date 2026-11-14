@@ -670,12 +670,13 @@ function renderProjectApplication() {
     row.append(checkbox, label); root.append(row);
   }
   if (!libraries.length) root.append(node('p', '尚未安装库，可在“来源与能力”中接入。', 'card-note'));
-  const effective = current.application.effective_bindings || {};
-  const pending = (current.application.binding_status || []).filter(item => item.status !== 'ENABLED');
-  $('project-application-bindings').textContent = '办公检查绑定：' + Object.keys(effective).length + ' 项生效' +
-    (pending.length ? '，' + pending.length + ' 项因停用、资源或安装状态未生效。' : '。') +
-    ' 配置版本：' + current.application.revision + '。';
-  $('project-office-preset').disabled = projectApplicationBusy || archived || !Object.keys(current.preset?.bindings || {}).length;
+  const candidates = current.application.guard_candidates || [];
+  const pending = (current.application.binding_status || []).filter(item => !['ENABLED', 'DISABLED'].includes(item.status));
+  const auto = $('project-guards-auto');
+  auto.hidden = !Object.keys(current.application.bindings || {}).length;
+  auto.disabled = projectApplicationBusy || archived;
+  $('project-application-bindings').textContent = '已启用的库提供 ' + candidates.length + ' 项可调度检查。' +
+    (pending.length ? ' 未生效的指定检查：' + pending.map(item => item.role).join('、') + '。' : '');
   $('project-libraries-none').disabled = projectApplicationBusy || archived || !libraries.some(item => item.enabled);
   $('project-libraries-refresh').disabled = projectApplicationBusy;
 }
@@ -955,7 +956,9 @@ async function sendMessage(event) {
   pendingTask = {id: null, output, sceneTaskId: null, partial: '', files: []};
   updateComposer(); showNotice('');
   try {
-    const result = await api('/api/chat', {messages, project_id: activeProjectId, ...(activeChatId ? {conversation_id: activeChatId} : {})});
+    const result = await api('/api/chat', {messages, project_id: activeProjectId,
+      tool_access: $('chat-read-only').checked ? 'read_only' : 'project',
+      ...(activeChatId ? {conversation_id: activeChatId} : {})});
     if (!result.task_id) throw new Error('平台未返回任务 ID');
     pendingTask.id = result.task_id;
     if (result.conversation_id) {
@@ -4452,8 +4455,8 @@ $('create-project').onclick = async () => {
 };
 $('project-files').ontoggle = () => { if ($('project-files').open) void loadProjectFiles(); };
 $('project-application').ontoggle = () => { if ($('project-application').open) { void loadProjectApplication(); void loadPrivacyDemoCases(); } };
-$('project-office-preset').onclick = () => { void saveProjectApplication({use_office_preset: true}); };
 $('project-libraries-none').onclick = () => { void saveProjectApplication({enabled_groups: []}); };
+$('project-guards-auto').onclick = () => { void saveProjectApplication({bindings: {}}); };
 $('project-libraries-refresh').onclick = () => { void loadProjectApplication(); };
 $('project-demo-case').onchange = updateComposer;
 $('project-demo-start').onclick = () => { void startPrivacyDemo(); };
