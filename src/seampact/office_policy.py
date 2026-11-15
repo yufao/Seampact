@@ -1,9 +1,5 @@
 """Project dispositions and semantic tool effects used by the office host."""
 
-ROLE_KIND = {"sanitize": "sanitize", "injection": "injection", "privacy": "privacy",
-             "secrets": "secrets", "code_scan": "code_safety", "self_check_input": "input_safety",
-             "self_check_output": "output_safety", "fact_check": "fact_support"}
-
 TEXT_ARGUMENTS = ("subject", "body", "content", "message", "text", "title", "description")
 OUTBOUND_ROLES = {"privacy", "secrets", "fact_check"}
 
@@ -35,12 +31,3 @@ def operation(name, declared):
     if name in declared:
         return declared[name]
     return {"kind": "other"}
-
-
-def applicable_subject(role, event, guard):
-    if not guard:
-        return False
-    subject = {"input_received": "input", "after_tool": "tool_output", "before_delivery": "response",
-               "before_tool": {"code_scan": "code", "self_check_input": "input"}.get(role, "message")}[event]
-    accepted = set(guard["subjects"])
-    return subject in accepted or "text" in accepted and subject != "code"

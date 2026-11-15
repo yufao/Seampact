@@ -3,8 +3,8 @@
 import copy
 
 from seampact.capability_contract import digest, tool_definition
-from seampact.guard_contract import GUARD_INTERFACES, _source_backed, compatible
-from seampact.office_policy import applicable_subject, normalize_policy
+from seampact.guard_contract import GUARD_INTERFACES, _source_backed, applicable_subject, compatible
+from seampact.office_policy import normalize_policy
 from seampact.store import now
 
 

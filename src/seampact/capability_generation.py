@@ -121,6 +121,9 @@ input_safety input user_message -> decision,is_blocked,failed;
 output_safety input bot_message,user_message -> decision,is_blocked,failed;
 fact_support input question:string,answer:string,references:array[string] -> status:string,
 claims:array[{claim_text:string,label:string,labels_by_reference:array[string]}],claim_count:integer.
+For a source with binary document support, use Entailment and NotSupported; a negative score
+cannot assert Neutral or Contradiction. Preserve the source threshold. A three-way NLI source
+can return Entailment, Neutral, Contradiction. Declare the native mapping in label.enum.
 For per-reference judgments inspect the upstream return axes and preserve the claim/reference
 pairing for multiple passages. Where the source supplies a multi-reference example, use it
 for the real first call so a single-item example cannot conceal a wrong tensor or list shape.
@@ -578,8 +581,12 @@ def _static_adapter(manifest, files, inspector):
 
 def write_package(folder, proposal, inspector, read_ranges, model):
     """Materialize a model proposal, replacing all model-supplied identity fields."""
-    if not isinstance(proposal, dict) or set(proposal) - {"manifest", "files", "resource_matches", "examples", "gaps", "coverage_notes"}:
+    if not isinstance(proposal, dict):
         raise ValueError("生成结果需要 manifest/files/resource_matches/examples/gaps")
+    extra = set(proposal) - {"manifest", "files", "resource_matches", "examples", "gaps", "coverage_notes"}
+    if extra:
+        raise ValueError("submit_package 顶层含未知字段 " + ", ".join(sorted(extra)) +
+                         "。capabilities、resources 和 environment 只放在 manifest 内。")
     manifest = copy.deepcopy(proposal.get("manifest"))
     files = proposal.get("files")
     if not isinstance(manifest, dict) or not isinstance(files, dict) or not files:

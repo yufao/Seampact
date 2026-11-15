@@ -1,4 +1,4 @@
-"""Run a frozen, development-only calibration followed by seven preference groups.
+"""Run a frozen, development-only calibration followed by the selected reward sweep.
 
 All inputs must already be rebound and frozen for this deployment. This driver
 does not deploy, create bindings, run a formal evaluation, or resume a failed run.
@@ -14,8 +14,7 @@ import subprocess
 import sys
 from datetime import datetime, timezone
 
-GROUPS = ("balanced", "ram_priority", "vram_priority", "latency_priority",
-          "api_priority", "quality_priority", "no_api_cost")
+from prepare_office_reward_sweep import DESIGNS, METRICS
 CODE = Path(__file__).resolve().parents[1]
 
 
@@ -121,6 +120,7 @@ def main():
     parser.add_argument("--grader-receipt", type=Path, required=True)
     parser.add_argument("--business-container", required=True)
     parser.add_argument("--expected-commit", required=True)
+    parser.add_argument("--group-limit", type=int, help="run only the first N groups of the frozen design")
     parser.add_argument("--url", default="http://127.0.0.1:8882")
     args = parser.parse_args()
     root = args.data_root.resolve(strict=True)
@@ -141,7 +141,8 @@ def main():
         raise ValueError("Frozen server protocols must be under the platform data root")
     manifest = checked_json(sweep / "manifest.json")
     entries = manifest["groups"]
-    if [row["group"] for row in entries] != list(GROUPS):
+    groups = DESIGNS[manifest.get("design", "joint")]
+    if [row["group"] for row in entries] != list(groups):
         raise ValueError("Unexpected development group list")
     plans = []
     for row in entries:
@@ -149,11 +150,18 @@ def main():
         if not path.is_relative_to(sweep) or sha(path) != row["sha256"]:
             raise ValueError("Group protocol identity mismatch")
         plan = checked_json(path)
+        expected = dict(quality=1, delivery=1, **dict(zip(METRICS, groups[row["group"]])))
+        if plan["objective_weights"] != expected or row["weights"] != expected:
+            raise ValueError("Reward weights differ from the selected sweep design")
         if len(plan["cases"]["development"]) != 225:
             raise ValueError("Expected the frozen 225-item development set")
         plans.append((path, plan))
     if any(comparable(plan) != comparable(plans[0][1]) for _, plan in plans[1:]):
         raise ValueError("Non-weight fields differ between groups")
+    if args.group_limit is not None:
+        if not 1 <= args.group_limit <= len(entries):
+            parser.error("--group-limit must be within the number of frozen groups")
+        entries, plans = entries[:args.group_limit], plans[:args.group_limit]
 
     def assert_code():
         commit = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=CODE, text=True).strip()
@@ -171,7 +179,7 @@ def main():
     output.mkdir(parents=True, exist_ok=False)
     (output / "logs").mkdir()
     state = dict(status="STARTING", commit=args.expected_commit, current=None, completed=[],
-                 scope="calibration and seven development groups; no formal evaluation")
+                 scope=f"calibration and {len(entries)} development groups; no formal evaluation")
 
     def save():
         state["updated_at"] = datetime.now(timezone.utc).isoformat()

@@ -111,6 +111,21 @@ class OfficeFactCheckTests(unittest.TestCase):
                          ("allow", "unknown", "unavailable"))
         self.assertNotIn("private", str(result))
 
+    def test_non_support_is_an_observation_for_delivery_but_an_outbound_finding(self):
+        source = '{"content":"The room was reserved."}'
+        self.observe(source)
+        self.current_context(source)
+        hook = self.hooks["fact_check:before_tool"]
+        payload = dict(name="send_email", operation={"kind": "send"}, arguments=dict(body="The meeting is Monday."))
+        for label in ("NotSupported", "Neutral"):
+            self.output["claims"][0].update(label=label, labels_by_reference=[label])
+            result = self.check()
+            self.assertEqual((result["action"], result["fact_finding"]), ("allow", "unconfirmed"))
+            self.assertNotIn("support_score", result)
+            self.assertEqual(hook.handler(payload, self.context)["action"], "deny_operation")
+        self.output["claims"][0]["support_probabilities"] = [0.13]
+        self.assertEqual(self.check()["support_score"], 0.13)
+
     def test_executed_receipt_supports_confirmation_only_while_visible(self):
         receipt = '{"status":"sent","id":"mail-1"}'
         hook = self.hooks["office_visible_references"]
@@ -277,6 +292,24 @@ class OfficeFactCheckTests(unittest.TestCase):
         recheck = dict(text="Revised", revision_required_hooks=[choice["hook"]])
         self.assertTrue(hooks[choice["hook"]].when(recheck))
         self.assertEqual(hooks[choice["hook"]].handler(recheck, self.context)["action"], "revise_delivery")
+
+    def test_resource_rule_uses_recorded_cost_and_stops_after_support(self):
+        candidates = [dict(role="fact_check", unit_id=unit,
+                           guard=dict(subjects=["response"], kind="fact_support", evidence="references"))
+                      for unit in ("fast", "slow")]
+        execution = SimpleNamespace(recent_call_cost={"fast": 0.1, "slow": 3.0}.get)
+        app = build_hooks(SimpleNamespace(execution=execution), "task",
+                          dict(mode="resource_rule", guard_candidates=candidates))
+        hooks = {hook.name: hook for hook in app["hooks"]}
+        hooks["office_visible_references"].handler(dict(name="lookup", operation={"kind": "read"},
+            call_id="lookup-1", content="Source text"), self.context)
+        hooks["office_reference_context"].handler(dict(tool_messages=[dict(call_id="lookup-1", content="Source text")]), self.context)
+        fast, slow = (hooks["fact_check:before_delivery:" + unit] for unit in ("fast", "slow"))
+        choose = app["optional_hooks"].choose_next
+        self.assertEqual(choose("before_delivery", {}, [slow, fast])["hook"], fast.name)
+        for verdict, expected in (("supported", "continue"), ("unconfirmed", "run_hook")):
+            checks = {fast.name: dict(check_status="valid", fact_support=verdict, fact_finding=verdict)}
+            self.assertEqual(choose("before_delivery", dict(checks=checks), [slow])["kind"], expected)
 
     def test_required_role_demands_a_single_provider(self):
         candidates = [dict(role="privacy", unit_id=unit, guard=dict(kind="privacy", subjects=["message"]))

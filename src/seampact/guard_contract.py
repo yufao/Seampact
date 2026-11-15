@@ -1,7 +1,23 @@
 """Shared host guard interfaces and source-backed compatibility checks."""
 
+import math
+
 from seampact.capability_contract import GUARD_SUBJECTS
-from seampact.office_policy import ROLE_KIND, applicable_subject
+
+ROLE_KIND = {"sanitize": "sanitize", "injection": "injection", "privacy": "privacy",
+             "secrets": "secrets", "code_scan": "code_safety", "self_check_input": "input_safety",
+             "self_check_output": "output_safety", "fact_check": "fact_support"}
+
+FACT_LABELS = ("Entailment", "Neutral", "Contradiction", "NotSupported")
+
+
+def applicable_subject(role, event, guard):
+    if not guard:
+        return False
+    subject = {"input_received": "input", "after_tool": "tool_output", "before_delivery": "response",
+               "before_tool": {"code_scan": "code", "self_check_input": "input"}.get(role, "message")}[event]
+    accepted = set(guard["subjects"])
+    return subject in accepted or "text" in accepted and subject != "code"
 
 
 def fact_check_status(output, reference_count):
@@ -17,17 +33,30 @@ def fact_check_status(output, reference_count):
         if not isinstance(claim, dict) or not isinstance(claim.get("claim_text"), str) or not claim["claim_text"].strip():
             return "unknown"
         per_reference = claim.get("labels_by_reference")
-        allowed = {"Entailment", "Neutral", "Contradiction"}
         if (not isinstance(per_reference, list) or len(per_reference) != reference_count
-                or any(not isinstance(label, str) or label not in allowed for label in per_reference)
-                or not isinstance(claim.get("label"), str) or claim["label"] not in allowed):
+                or any(not isinstance(label, str) or label not in FACT_LABELS for label in per_reference)
+                or claim.get("label") not in FACT_LABELS):
+            return "unknown"
+        if "NotSupported" in per_reference and any(label in {"Neutral", "Contradiction"} for label in per_reference):
             return "unknown"
         merged = ("Entailment" if "Entailment" in per_reference else
-                  "Contradiction" if "Contradiction" in per_reference else "Neutral")
+                  "Contradiction" if "Contradiction" in per_reference else per_reference[0])
         if claim["label"] != merged:
             return "unknown"
         labels.append(claim["label"])
     return "supported" if all(label == "Entailment" for label in labels) else "unsupported"
+
+
+def minimum_claim_support(claims, references):
+    """Use a native score only when every claim has scores for the same passages."""
+    best = []
+    for claim in claims:
+        scores = claim.get("support_probabilities")
+        if (not isinstance(scores, list) or len(scores) != references
+                or any(type(v) not in (float, int) or not 0 <= v <= 1 or not math.isfinite(v) for v in scores)):
+            return None
+        best.append(max(scores))
+    return min(best) if best else None
 
 
 def self_check_allowed(output):

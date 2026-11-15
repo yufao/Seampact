@@ -21,13 +21,14 @@ from seampact.scheduling.capability_perception import GroupTiming, FEATURE_DIM a
 from seampact.scheduling.unified_objective import ResourceLedger, TaskLedger, freeze_objective, number
 
 SCHEMA = "capability-scheduler/1"
-FEATURE_SCHEMA = "capability-event-features/7"
+FEATURE_SCHEMA = "capability-event-features/8"
 HOOK_FAMILIES = ("fact_support", "injection", "privacy", "secrets", "code_safety",
                  "input_safety", "output_safety", "sanitize")
 OPERATION_EFFECTS = ("read", "write", "send", "execute", "other")
 OPERATION_DESTINATIONS = ("local", "external", "user", "unknown")
 OPERATION_PHASES = ("input", "pending", "executed", "delivery")
-OBSERVATION_DIM = 14 + 2 * 5 + 2 + len(OPERATION_EFFECTS) + 1 + len(OPERATION_DESTINATIONS) + 1 + len(OPERATION_PHASES) + 1
+FACT_FINDINGS = ("supported", "unconfirmed", "contradiction", "unknown")
+OBSERVATION_DIM = 14 + 2 * 5 + 2 + len(OPERATION_EFFECTS) + 1 + len(OPERATION_DESTINATIONS) + 1 + len(OPERATION_PHASES) + 1 + len(FACT_FINDINGS) + 2
 CANDIDATE_DIM = 19 + len(HOOK_FAMILIES) + 1 + 2 + 4 + 2 + 6 + TIMING_DIM
 DEFAULTS = dict(schema=SCHEMA, max_in_flight=4, idle_timeout_s=60.0,
                 measurement_interval_s=1.0, retention_recheck_s=None,
@@ -263,6 +264,7 @@ class CapabilityScheduler:
             value = context.get(key)
             return [*[float(value == choice) for choice in choices], float(value in choices)]
         remaining = context.get("revision_remaining")
+        score = context.get("support_score")
         return [float(len(self.queue)), float(len(self.running)), float(len(self.owned)),
                 float(self._config["max_in_flight"]),
                 *[float(event == stage) for stage in ("input_received", "before_tool", "after_tool", "before_delivery")],
@@ -275,7 +277,9 @@ class CapabilityScheduler:
                 float(remaining is not None),
                 *category("operation_effect", OPERATION_EFFECTS),
                 *category("operation_destination", OPERATION_DESTINATIONS),
-                *category("operation_phase", OPERATION_PHASES)]
+                *category("operation_phase", OPERATION_PHASES),
+                *[float(value in context.get("fact_findings", ())) for value in FACT_FINDINGS],
+                number(score, "support_score") if score is not None else 0.0, float(score is not None)]
 
     def _features(self, item, *, now=None, monotonic_s=None, group_context=None):
         now = time.time() if now is None else now
@@ -433,6 +437,11 @@ class CapabilityScheduler:
         if tuple(identity[key] for key in ("package_digest", "contract_digest", "installation_id")) != record["identity"]:
             return None
         return sum(record["samples"]) / len(record["samples"])
+
+    def recent_call_cost(self, unit_id):
+        """Seconds observed on this installation; None precedes its first sample."""
+        with self.condition:
+            return self._recent_cost(unit_id, self.catalog.unit(unit_id)["runtime_group"])
 
     def decide(self, event, candidates, *, task_id=None, context=None, observation=None):
         """Select and record once. Execution always happens after this lock is left."""

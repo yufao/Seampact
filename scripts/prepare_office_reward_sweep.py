@@ -1,4 +1,4 @@
-"""Prepare seven fixed, development-only reward preferences without running them."""
+"""Prepare frozen reward settings for development-only comparison."""
 import argparse
 import copy
 import hashlib
@@ -16,6 +16,11 @@ GROUPS = {
     "no_api_cost": (0.1, 0.1, 0.1, 0.0),
 }
 METRICS = ("ram", "vram", "latency", "api")
+ONE_FACTOR = {"balanced": GROUPS["balanced"]}
+for level, value in (("high", 0.20), ("low", 0.05)):
+    for metric in METRICS:
+        ONE_FACTOR[f"{metric}_{level}"] = tuple(value if name == metric else 0.10 for name in METRICS)
+DESIGNS = {"one-factor": ONE_FACTOR, "joint": GROUPS}
 
 
 def digest(data):
@@ -35,6 +40,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("base", type=Path)
     parser.add_argument("output", type=Path, help="new private sweep directory")
+    parser.add_argument("--design", choices=DESIGNS, default="one-factor",
+                        help="one-factor varies one coefficient around 0.10; joint reproduces the earlier preferences")
     args = parser.parse_args()
     raw = args.base.read_bytes()
     base_sha = digest(raw)
@@ -60,7 +67,7 @@ def main():
             raise ValueError("Development extension counts exceed the development dispatch")
     args.output.mkdir(parents=True, exist_ok=False)
     rows = []
-    for name, costs in GROUPS.items():
+    for name, costs in DESIGNS[args.design].items():
         plan = copy.deepcopy(base)
         weights = dict(quality=1, delivery=1, **dict(zip(METRICS, costs)))
         plan["objective_weights"] = weights
@@ -76,27 +83,25 @@ def main():
             raise ValueError("A non-weight protocol field changed")
         path = args.output / f"{name}.json"
         rows.append(dict(group=name, protocol=path.name, sha256=write(path, plan), weights=weights))
-    lines = ["# 固定奖励偏好：开发侧准备", "", "状态：未运行。七组使用相同任务、顺序、种子和训练量。", "",
+    lines = ["# 办公调度开发侧权重比较", "", f"共 {len(rows)} 组。各组使用同一题单、顺序、种子和训练量。", "",
              "| 组别 | 质量 | 交付 | RAM | VRAM | 时延 | API |",
              "| --- | ---: | ---: | ---: | ---: | ---: | ---: |"]
     for row in rows:
         w = row["weights"]
         lines.append(f"| {row['group']} | {w['quality']} | {w['delivery']} | {w['ram']} | {w['vram']} | {w['latency']} | {w['api']} |")
-    lines.extend(["", "先由 balanced 开发校准确定共同归一化尺度，其余六组复用。no_api_cost 将 token 惩罚设为零，"
-                  "但仍记录 token 消耗。比较原生质量、交付和各资源指标，"
-                  "不跨不同奖励函数比较奖励总分。依据开发结果选定一组后，使用同一冻结协议和检查点进行正式评测，"
-                  "不重新训练。每组的这些权重是预先固定的偏好，不由模型学习。", ""])
+    lines.extend(["", "balanced 的开发校准提供共同归一化尺度。每个候选用完整训练集独立训练，"
+                  "以开发集的原生质量、防护、交付和各项资源实测选择参数，选定后用冻结检查点评价。", ""])
     (args.output / "README.md").write_text("\n".join(lines), encoding="utf-8")
     counts = {name: len(ids) for name, ids in base["cases"].items()}
     manifest = dict(schema="seampact.office-reward-sweep/1", status="PREPARED_NOT_RUN",
-        base_protocol=str(args.base.resolve()), base_protocol_sha256=base_sha, groups=rows,
+        base_protocol=str(args.base.resolve()), base_protocol_sha256=base_sha, design=args.design, groups=rows,
         readable_summary="README.md",
         seed=base["seed"], workload_trace=base["workload_trace"],
         cost_order=list(METRICS), fixed_weights=dict(quality=1, delivery=1),
-        normalization="one shared set of development scales established by balanced, reused by six remaining groups",
+        normalization="one shared set of development scales established by balanced, reused by all groups",
         planned_arrivals=counts,
         development_source_denominators=extension_sources,
-        development=f"seven {counts['training']}-task training runs and seven {counts['development']}-task PPO development evaluations; one common calibration and one rule baseline on development",
+        development=f"{len(rows)} training runs of {counts['training']} tasks and {len(rows)} PPO development evaluations of {counts['development']} tasks; one common calibration and one rule baseline on development",
         selection="select on development evidence, preserve unknowns, compare native quality, delivery and resource metrics rather than scalar totals across reward functions",
         final_evaluation=f"after selection only: three {counts['evaluation']}-task arms, using the selected frozen protocol and trained checkpoint without retraining",
         note="Fixed cost preferences; no automatic weight learning or non-linear utility is implied.")

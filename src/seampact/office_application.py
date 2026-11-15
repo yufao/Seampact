@@ -11,10 +11,11 @@ from pathlib import PurePosixPath, PureWindowsPath
 from types import SimpleNamespace
 
 from seampact.agent_runtime import AgentHook
-from seampact.guard_contract import fact_check_status, self_check_allowed
+from seampact.guard_contract import (FACT_LABELS, ROLE_KIND, applicable_subject, fact_check_status,
+                                     minimum_claim_support, self_check_allowed)
 from seampact.office_diagnostics import observation_enabled
 from seampact.office_evidence import EvidenceWindow
-from seampact.office_policy import ROLE_KIND, TEXT_ARGUMENTS, applicable_subject, normalize_policy, operation
+from seampact.office_policy import TEXT_ARGUMENTS, normalize_policy, operation
 from seampact.providers import RequestCancelled
 
 
@@ -223,7 +224,10 @@ def build_hooks(platform, task_id, config):
                 if status != "unknown":
                     diagnostic["claim_count"] = output["claim_count"]
                     diagnostic["label_counts"] = {label: sum(claim["label"] == label for claim in output["claims"])
-                                                   for label in ("Entailment", "Neutral", "Contradiction")}
+                                                   for label in FACT_LABELS}
+                    score = minimum_claim_support(output["claims"], len(references))
+                    if score is not None:
+                        diagnostic["support_score"] = score
                 else:
                     reasons = {"truncated", "empty_output", "invalid_format", "transport_error", "no_claims",
                                "incomplete_result", "missing_finish_reason", "invalid_response"}
@@ -238,6 +242,10 @@ def build_hooks(platform, task_id, config):
             # A decision may include the aggregate support status, never the
             # private source passages or individual extracted claims.
             if status == "unsupported":
+                contradicted = diagnostic["label_counts"]["Contradiction"] > 0
+                diagnostic["fact_finding"] = "contradiction" if contradicted else "unconfirmed"
+                if "name" not in payload and not contradicted and policy["delivery_finding"] == "revise_delivery":
+                    return dict(action="allow", fact_support=status, **diagnostic)
                 return dict(action="block", fact_support=status,
                             reason="请只保留可见资料支持的事实。已执行的操作不会因答复受阻而撤销；"
                                    "不要重复执行，请依据实际工具回执描述已发生的操作。", **diagnostic)
@@ -377,6 +385,10 @@ def build_hooks(platform, task_id, config):
                      operation_effect=effect, operation_destination=destination, operation_phase=phase, **evidence.facts())
         if checks:
             facts["finding_valid"] = all(result["check_status"] == "valid" for result in checks)
+            facts["fact_findings"] = [result.get("fact_finding", result["fact_support"]) for result in checks
+                                      if "fact_support" in result and result["check_status"] != "not_applicable"]
+            facts["support_score"] = next((result["support_score"] for result in reversed(checks)
+                                           if "support_score" in result), None)
             facts["family_results"] = {scheduler_bindings[name]["hook_family"]: result["check_status"] == "valid"
                                        for name, result in payload["checks"].items() if name in scheduler_bindings
                                        and isinstance(result, dict) and "check_status" in result}
@@ -393,9 +405,16 @@ def build_hooks(platform, task_id, config):
                                 if facts["risk_signal"] else set())
             if re.search(r"\b\d[\d -]{7,}\b", text_at(event, payload)):
                 selected.add("privacy")
-            if evidence.references:
+            if evidence.references and "supported" not in facts.get("fact_findings", ()):
                 selected.add("fact_check")
             eligible = [hook for hook in eligible if roles.get(hook.name) in selected]
+            if eligible and roles[eligible[0].name] == "fact_check":
+                checks = [hook for hook in eligible if roles[hook.name] == "fact_check"]
+                if len(checks) > 1:
+                    def priority(hook):
+                        cost = platform.execution.recent_call_cost(scheduler_bindings[hook.name]["unit_id"])
+                        return (cost is not None, cost if cost is not None else 0.0, hook.name)
+                    return dict(kind="run_hook", hook=min(checks, key=priority).name)
         if not eligible:
             return dict(kind="continue")
         return dict(kind="run_hook", hook=eligible[0].name)

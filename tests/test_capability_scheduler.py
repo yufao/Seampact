@@ -1090,7 +1090,7 @@ class RealWorkerScheduler(unittest.TestCase):
                    dict(name="different-name", hook_family="fact_support")]
         scheduler.choose_optional("task", "before_tool", options, dict(
             linked_receipt=False, linked_source=True, missing_evidence=False, finding_valid=True, evidence_partial=True,
-            family_results={"fact_support": False},
+            family_results={"fact_support": False}, fact_findings=["unconfirmed"], support_score=0.4,
             revision_remaining=0, operation_effect="send", operation_destination="external",
             operation_phase="pending"))
         row = scheduler.status()["recent_decisions"][-1]
@@ -1100,6 +1100,7 @@ class RealWorkerScheduler(unittest.TestCase):
         self.assertEqual(row["observation"][26:32], [0, 0, 1, 0, 0, 1])
         self.assertEqual(row["observation"][32:37], [0, 1, 0, 0, 1])
         self.assertEqual(row["observation"][37:42], [0, 1, 0, 0, 1])
+        self.assertEqual(row["observation"][-6:], [0, 1, 0, 0, 0.4, 1])
         self.assertEqual(row["candidates"][1]["features"][19:28],
                          row["candidates"][2]["features"][19:28])
         self.assertEqual(len(row["candidates"][1]["features"]), CANDIDATE_DIM)
