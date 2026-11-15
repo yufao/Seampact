@@ -210,7 +210,9 @@ export class PiHost {
           const content = '上一条助手答复尚未交付。请依据以下应用检查反馈修订最终答复；' +
             '只修订答复，不调用工具，不重复已执行的操作，也不声称被拒绝的操作已经完成。\n检查反馈：\n' +
             response._seampact_revision_reason;
-          this.agent.followUp(fromWire([{ role: 'system', content }], model)[0]);
+          // Send host feedback in the next conversational turn. Some chat
+          // templates only accept a system message at the start of history.
+          this.agent.followUp(fromWire([{ role: 'user', content }], model)[0]);
         }
         const final = assistantMessage(wire, model, choice.finish_reason, response.usage);
         const finalText = final.content.find((part) => part.type === 'text')?.text || '';

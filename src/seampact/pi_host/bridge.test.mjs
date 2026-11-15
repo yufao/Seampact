@@ -95,7 +95,8 @@ test('delivery repair is one native Pi follow-up with retained tool receipts', a
     if (models === 1) return response({ content: null, tool_calls: [call('once', '{"value":1}')] }, 'tool_calls');
     if (models === 2) return { ...response({ content: 'undelivered draft' }), _seampact_revision_reason: 'Use supported facts.' };
     assert.equal(request.params.tools.length, 0);
-    assert.equal(request.params.messages.at(-1).role, 'system');
+    assert.equal(request.params.messages.at(-1).role, 'user');
+    assert.ok(request.params.messages.slice(1).every((message) => message.role !== 'system'));
     assert.match(request.params.messages.at(-1).content, /Use supported facts\./);
     assert.equal(request.params.messages.filter((message) => message.tool_call_id === 'once').length, 1);
     return response({ content: 'revised answer' });
