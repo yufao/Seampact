@@ -72,6 +72,16 @@ class ProviderStreamingTests(unittest.TestCase):
             result = Transport().stream("http://example.invalid", "", {}, visible.append)
         self.assertEqual(result["choices"][0]["message"]["content"], "firstsecond")
 
+    def test_response_field_evidence_does_not_promote_unknown_reasoning_to_answer(self):
+        raw = frame({"reasoning": "private dialect"}) + frame({"content": "answer"}, "stop")
+        result = self.request(raw, [])
+        evidence = result["_seampact_response_fields"]
+        self.assertEqual(evidence["fields"]["reasoning"], dict(chars=15, types=["str"]))
+        self.assertEqual(evidence["fields"]["content"]["chars"], 6)
+        self.assertNotIn("private dialect", json.dumps(evidence))
+        self.assertEqual(result["choices"][0]["message"]["content"], "answer")
+        self.assertNotIn("reasoning", result["choices"][0]["message"])
+
     def test_eof_or_done_without_finish_never_returns_a_complete_tool(self):
         partial = frame({"content": "partial", "tool_calls": [dict(index=0, id="call",
             function=dict(name="execute_harness_plan", arguments="{"))]})

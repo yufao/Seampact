@@ -668,17 +668,37 @@ class AgentRuntime:
                         task["usage"].append(None)
                         save()
                         emit("model_started", request_index=task["model_calls"], stream=stream)
-                        if not stream:
-                            options = {"control": request_control} if "control" in inspect.signature(self.transport.send).parameters else {}
-                            response = self.transport.send(url, key, body, **options)
-                            text = response["choices"][0]["message"].get("content")
-                            if isinstance(text, str) and text:
-                                delta(text)
-                            return response
-                        options = {} if include_usage else {"include_usage": False}
-                        if "control" in inspect.signature(self.transport.stream).parameters:
-                            options["control"] = request_control
-                        return self.transport.stream(url, key, body, delta, **options)
+                        request_started = time.perf_counter()
+                        try:
+                            if not stream:
+                                options = {"control": request_control} if "control" in inspect.signature(self.transport.send).parameters else {}
+                                response = self.transport.send(url, key, body, **options)
+                                text = response["choices"][0]["message"].get("content")
+                                if isinstance(text, str) and text:
+                                    delta(text)
+                            else:
+                                options = {} if include_usage else {"include_usage": False}
+                                if "control" in inspect.signature(self.transport.stream).parameters:
+                                    options["control"] = request_control
+                                response = self.transport.stream(url, key, body, delta, **options)
+                        except Exception as error:
+                            emit("model_request_failed", request_index=task["model_calls"],
+                                 request_elapsed_s=time.perf_counter() - request_started,
+                                 error_type=type(error).__name__)
+                            raise
+                        choice = response["choices"][0]
+                        message = choice["message"]
+                        fields = response.get("_seampact_response_fields")
+                        if fields is None:
+                            fields = dict(transport="json", fields={name: dict(
+                                chars=len(value) if isinstance(value, str) else 0,
+                                types=[type(value).__name__]) for name, value in message.items()
+                                if name in {"content", "reasoning_content", "reasoning"}})
+                        emit("model_response_received", request_index=task["model_calls"],
+                             request_elapsed_s=time.perf_counter() - request_started,
+                             finish_reason=choice.get("finish_reason"), response_fields=copy.deepcopy(fields),
+                             usage=copy.deepcopy(response.get("usage")))
+                        return response
                     try:
                         try:
                             response = invoke_model()

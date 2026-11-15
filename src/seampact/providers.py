@@ -838,6 +838,7 @@ def _stream_completion(response, on_delta, control=None):
             on_delta(content)
         return result
     content, reasoning, calls, metadata, data = [], [], {}, {}, []
+    observed_fields = {}
     finish, usage = None, None
 
     def incomplete():
@@ -861,6 +862,17 @@ def _stream_completion(response, on_delta, control=None):
             if choice.get("finish_reason") is not None:
                 finish = choice["finish_reason"]
             delta = choice.get("delta") or {}
+            # Measure compatible response fields without retaining an unknown
+            # reasoning dialect or changing what becomes visible answer text.
+            for name in ("content", "reasoning_content", "reasoning"):
+                if name in delta:
+                    value = delta[name]
+                    field = observed_fields.setdefault(name, dict(chars=0, types=[]))
+                    kind = type(value).__name__
+                    if kind not in field["types"]:
+                        field["types"].append(kind)
+                    if isinstance(value, str):
+                        field["chars"] += len(value)
             for name, parts in (("content", content), ("reasoning_content", reasoning)):
                 value = delta.get(name)
                 if value is not None:
@@ -915,7 +927,8 @@ def _stream_completion(response, on_delta, control=None):
         if len(set(ids)) != len(ids) or any(not call["id"] or not call["function"]["name"]
                                           for call in message["tool_calls"]):
             raise incomplete()
-    return dict(metadata, choices=[dict(index=0, finish_reason=finish, message=message)], usage=usage)
+    return dict(metadata, choices=[dict(index=0, finish_reason=finish, message=message)], usage=usage,
+                _seampact_response_fields=dict(transport="sse", fields=observed_fields))
 
 
 def model_request_scope(profiles, role):

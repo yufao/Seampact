@@ -8,6 +8,7 @@ from pathlib import Path
 
 from seampact.office_experiment import start_native_task
 from seampact.office_development import DEVELOPMENT_SOURCES
+from seampact.office_diagnostics import diagnostic_mode, observation_permit, validate_diagnostic_plan
 from seampact.store import now
 
 
@@ -78,6 +79,9 @@ def _read_plan(body):
     if hashlib.sha256(manifest_raw).hexdigest() != plan["manifest_sha256"]:
         raise ValueError("pilot 来源清单身份已变化")
     manifest = json.loads(manifest_raw)
+    observing = diagnostic_mode(plan) == "observe_specified"
+    if observing and any(any(key.startswith("_") for key in case) for case in manifest["cases"]):
+        raise ValueError("观察题运行清单不能声明服务器内部来源字段")
     indexed = {case["id"]: case for case in manifest["cases"]}
     for source, location in plan.get("source_manifests", {}).items():
         development_source = source in DEVELOPMENT_SOURCES
@@ -87,6 +91,8 @@ def _read_plan(body):
         if hashlib.sha256(raw).hexdigest() != location["manifest_sha256"]:
             raise ValueError("混合任务来源清单身份已变化")
         additional = json.loads(raw)
+        if observing and any(any(key.startswith("_") for key in case) for case in additional["cases"]):
+            raise ValueError("观察题运行清单不能声明服务器内部来源字段")
         if development_source:
             from seampact.office_development import grading_by_case
             references = grading_by_case(source, location, additional)
@@ -155,6 +161,7 @@ def _read_plan(body):
         raise ValueError("开发校准调度器须使用明确的规则策略")
     if type(plan.get("local_development_only", False)) is not bool:
         raise ValueError("开发限定标记须为布尔值")
+    validate_diagnostic_plan(plan, indexed)
     return identity, plan, indexed
 
 
@@ -249,6 +256,8 @@ def _handle(platform, body):
         if (not required_hooks <= roles or roles - required_hooks - optional_hooks
                 or bool(roles & self_checks) != (self_checks <= roles)):
             raise ValueError("办公比较须覆盖五种基础防御，自检两操作须同时提供")
+        if diagnostic_mode(plan) == "observe_specified" and not optional_hooks <= roles:
+            raise ValueError("观察检查须保留输入输出自检与事实检查候选")
         unit_ids = {identity for _, identity in selected}
         units = [unit for unit in eligible if unit["id"] in unit_ids]
         rag = platform.capabilities.unit(plan["rag"]["capability_id"])
@@ -314,6 +323,7 @@ def _handle(platform, body):
             learner_config=plan.get("learner_config", {}) if mode == "training" and batch == 0 else None,
             seed=plan.get("seed", 0))
         row = dict(id=run_id, protocol_sha256=identity, mode=mode, batch=batch, status="RUNNING",
+                   diagnostic_checks=diagnostic_mode(plan),
                    defense_groups=sorted(groups), defense_group_count=len(groups),
                    retrieval_group=rag["runtime_group"], total_group_count=len(groups) + 1,
                    case_ids=ids, task_ids=task_ids, arrival_waves=waves, admitted=[], started_at=now(), workload=workload,
@@ -332,6 +342,8 @@ def _handle(platform, body):
     if not row or row["protocol_sha256"] != identity:
         raise ValueError("没有匹配该冻结协议的 pilot 工作负载")
     if op == "admit":
+        if plan.get("local_development_only") and row["mode"] != "development":
+            raise ValueError("开发限定协议不允许训练、验证或评价")
         if row["status"] != "RUNNING" or len(row["admitted"]) >= len(row["case_ids"]):
             raise ValueError("该工作负载没有待接入题目")
         index = len(row["admitted"])
@@ -371,7 +383,10 @@ def _handle(platform, body):
         if "application" not in row:
             raise ValueError("旧 pilot 工作负载未冻结应用语义，不能继续接入新任务")
         application = copy.deepcopy(row["application"])
-        application.update(mode=mode, deadline_s=plan["deadline_s"])
+        application.update(mode=mode, deadline_s=plan["deadline_s"], diagnostic_checks=diagnostic_mode(plan))
+        permit = observation_permit(plan, row["mode"], case)
+        if permit is not None:
+            application["_diagnostic_observation"] = permit
         if plan.get("arrival_width", 1) > 1 and start is start_native_task and not case.get("rag_adaptation"):
             application["native_environment_only"] = True
         admission = start(platform, request, internal_task_id=task_id, pilot_config=application)

@@ -52,6 +52,10 @@ class AgentRuntimeTests(unittest.TestCase):
             return completion("hello")
         self.run_host(stream, scheduler=scheduler)
         self.assertEqual(self.task["response"], "hello")
+        receipt = next(event for event in self.events if event["kind"] == "model_response_received")
+        self.assertEqual(receipt["finish_reason"], "stop")
+        self.assertEqual(receipt["response_fields"]["fields"]["content"]["chars"], 5)
+        self.assertGreaterEqual(receipt["request_elapsed_s"], 0)
         self.assertEqual(lifecycle[-1][1]["quality"], None)
         self.assertFalse(any(event["kind"] == "hook_started" for event in self.events))
 

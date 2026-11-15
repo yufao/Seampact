@@ -12,6 +12,7 @@ from types import SimpleNamespace
 
 from seampact.agent_runtime import AgentHook
 from seampact.guard_contract import fact_check_status, self_check_allowed
+from seampact.office_diagnostics import observation_enabled
 from seampact.office_evidence import EvidenceWindow
 from seampact.office_policy import ROLE_KIND, TEXT_ARGUMENTS, applicable_subject, normalize_policy, operation
 from seampact.providers import RequestCancelled
@@ -65,6 +66,7 @@ def payload_text(event, payload, kind=None):
 
 def build_hooks(platform, task_id, config):
     mode = config["mode"]
+    observe_specified = observation_enabled(config)
     candidates = copy.deepcopy(config["guard_candidates"])
     by_role = {}
     for candidate in candidates:
@@ -138,6 +140,10 @@ def build_hooks(platform, task_id, config):
                         result["action"] = policy["outbound_finding"]
                     elif event == "before_delivery":
                         result["action"] = policy["delivery_finding"]
+                if observe_specified and ((role == "self_check_input" and event in {"input_received", "before_tool"})
+                                          or (role == "fact_check" and event in {"before_tool", "before_delivery"})):
+                    result = dict(result, action="allow", diagnostic_observation=True,
+                                  original_decision=copy.deepcopy(result))
                 return result
 
             hooks.append(AgentHook(name, event, run, required=required,
