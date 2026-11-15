@@ -12,6 +12,7 @@ import os
 from pathlib import Path, PurePosixPath
 import subprocess
 import sys
+import time
 from datetime import datetime, timezone
 
 from prepare_office_reward_sweep import DESIGNS, METRICS
@@ -121,8 +122,11 @@ def main():
     parser.add_argument("--business-container", required=True)
     parser.add_argument("--expected-commit", required=True)
     parser.add_argument("--group-limit", type=int, help="run only the first N groups of the frozen design")
+    parser.add_argument("--budget-hours", type=float, help="finish the current arrival block and its grades at the time limit")
     parser.add_argument("--url", default="http://127.0.0.1:8882")
     args = parser.parse_args()
+    if args.budget_hours is not None and (not math.isfinite(args.budget_hours) or args.budget_hours <= 0):
+        parser.error("--budget-hours must be a positive finite number")
     root = args.data_root.resolve(strict=True)
     output = args.output.resolve()
     if not output.is_relative_to(root) or output == root:
@@ -193,6 +197,9 @@ def main():
               "--business-container", args.business_container]
     common = ["--url", args.url, "--local-data-root", str(root), "--server-data-root", "/data",
               "--grader-command", json.dumps(grader)]
+    if args.budget_hours is not None:
+        state["admission_deadline"] = time.time() + args.budget_hours * 3600
+        common += ["--admission-deadline", str(state["admission_deadline"])]
     env = dict(os.environ, PYTHONUNBUFFERED="1")
     save()
     try:
@@ -212,6 +219,10 @@ def main():
             with (output / "logs" / (name + ".stdout.log")).open("x") as out, \
                     (output / "logs" / (name + ".stderr.log")).open("x") as err:
                 result = subprocess.run(command, cwd=CODE, env=env, stdout=out, stderr=err)
+            if result.returncode == 75 and (output / name / "budget-stop.json").is_file():
+                state.update(status="BUDGET_REACHED", stopped_in=name)
+                save()
+                return
             if result.returncode:
                 raise RuntimeError(f"{name} exited {result.returncode}; retained evidence, no automatic rerun")
             if name == "calibration":

@@ -201,6 +201,25 @@ class ElasticCandidateTests(unittest.TestCase):
         s.elastic_active.clear()
         self.assertEqual(s.finish_workload()["status"], "COMPLETE")
 
+    def test_budget_stop_releases_only_a_settled_prefix_and_preserves_plan(self):
+        s = self.scheduler
+        s.tasks = SimpleNamespace(active={})
+        s.workload = dict(id="run", status="RUNNING", task_ids=["a", "b"], started=["a"], finished=[],
+                          training=True, updated=False)
+        s.workload_decision_ids = []
+        s._status_locked = lambda: dict(objective={})
+        s._has_held = lambda: False
+        with self.assertRaises(ValueError):
+            s.finish_workload(admitted_prefix=("run", ["a"]))
+        s.workload["finished"].append("a")
+        with self.assertRaises(ValueError):
+            s.finish_workload()
+        with self.assertRaises(ValueError):
+            s.finish_workload(update=True, admitted_prefix=("run", ["a"]))
+        state = s.finish_workload(admitted_prefix=("run", ["a"]))
+        self.assertTrue(state["partial"])
+        self.assertEqual((state["status"], state["task_ids"], state["finished"]), ("COMPLETE", ["a", "b"], ["a"]))
+
     def test_pressure_rule_expands_only_under_real_queued_demand(self):
         first_entered, release_first, second_done = threading.Event(), threading.Event(), threading.Event()
         instances = {"first": dict(id="first", group_id="group", generation=1, state="READY", accepting=True,

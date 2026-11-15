@@ -203,7 +203,7 @@ def frozen_application(platform, plan, units, rag, series, *, project=None):
 
 
 def handle(platform, body):
-    if body.get("op") == "admit":
+    if body.get("op") in {"admit", "end_prefix"}:
         with _admission_lock:
             return _handle(platform, body)
     return _handle(platform, body)
@@ -398,6 +398,21 @@ def _handle(platform, body):
             raise ValueError("仅连续训练支持运行中的更新请求")
         result = execution.request_update(minimum_tasks=plan.get("update_after_tasks", 16))
         return dict(run_id=run_id, **result)
+    if op == "end_prefix":
+        if row["status"] == "PARTIAL":
+            return row
+        if row["mode"] not in {"development", "training", "validation_resource_rule", "validation_ppo"}:
+            raise ValueError("仅开发侧工作负载可提前收尾")
+        if not 0 < len(row["admitted"]) < len(row["case_ids"]) or row["status"] not in {"RUNNING", "DRAINING"}:
+            raise ValueError("只可结束已接入的非空、未跑满的前缀")
+        state = execution.finish_workload(admitted_prefix=(run_id, row["admitted"]))
+        row.update(status="PARTIAL" if state["status"] == "COMPLETE" else "DRAINING", workload=state)
+        if row["status"] == "PARTIAL":
+            row["finished_at"] = now()
+            series["workloads"][row["mode"] + ":" + str(row["batch"])]["status"] = "PARTIAL"
+            platform.store.save("office_pilot_series", series_key, series)
+        platform.store.save("office_pilot", run_id, row)
+        return row
     if op in {"drain", "finish"}:
         if len(row["admitted"]) != len(row["case_ids"]):
             raise ValueError("冻结清单尚未全部接入")

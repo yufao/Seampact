@@ -733,13 +733,22 @@ class CapabilityScheduler:
             self.store.save("capability_workload", workload["id"], workload)
         return copy.deepcopy(receipt)
 
-    def finish_workload(self, *, settlements=None, update=False):
+    def finish_workload(self, *, settlements=None, update=False, admitted_prefix=None):
         """Request final drain; poll until actual release, then optionally settle once."""
         with self.condition:
             if self.workload is None:
                 raise ValueError("没有明确开始的工作负载")
-            if self.tasks.active or self.queue or self.running or set(self.workload["finished"]) != set(self.workload["task_ids"]):
+            expected = self.workload["task_ids"]
+            if admitted_prefix is not None:
+                run_id, prefix = admitted_prefix
+                if (run_id != self.workload["id"] or not 0 < len(prefix) < len(expected)
+                        or expected[:len(prefix)] != prefix or set(self.workload["started"]) != set(prefix) or update):
+                    raise ValueError("仅可释放当前已接入的真实前缀")
+                expected = prefix
+            if self.tasks.active or self.queue or self.running or set(self.workload["finished"]) != set(expected):
                 raise ValueError("冻结任务清单尚未完整收尾")
+            if admitted_prefix is not None:
+                self.workload["partial"] = True
             if self.workload["status"] == "RUNNING":
                 self.workload["status"] = "DRAINING"
                 self.force_drain = True

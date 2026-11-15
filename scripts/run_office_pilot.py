@@ -137,6 +137,7 @@ def main():
     phase.add_argument("--calibration-only", action="store_true", help="collect development scales and stop before training")
     parser.add_argument("--scales-from", type=Path, help="reuse a matching frozen protocol's actual development normalization")
     parser.add_argument("--include-rule-baseline", action="store_true", help="also score the development rule baseline when reusing scales")
+    parser.add_argument("--admission-deadline", type=float, help="Unix time to stop before a new development dispatch block")
     args = parser.parse_args()
     plan = json.loads(args.protocol.read_text(encoding="utf-8"))
     if plan.get("schema") not in {"seampact.office-pilot/1", "seampact.office-comparison/1"}:
@@ -156,6 +157,13 @@ def main():
         return service_path(path, args.local_data_root, args.server_data_root)
     remote(args.output)  # Validate the mapping before admitting any task.
     args.output.mkdir(parents=True, exist_ok=False)
+    def budget_expired():
+        return args.admission_deadline is not None and time.time() >= args.admission_deadline
+
+    def end_at_budget(**progress):
+        write(args.output / "budget-stop.json", dict(deadline=args.admission_deadline, **progress))
+        raise SystemExit(75)
+
     def api(path, body=None):
         request = Request(args.url + path, data=json.dumps(body).encode("utf-8") if body is not None else None,
                           headers={"Content-Type": "application/json"})
@@ -165,6 +173,8 @@ def main():
         except HTTPError as error:
             raise RuntimeError(error.read().decode("utf-8", errors="replace")) from error
     def run(protocol, mode, batch=0):
+        if budget_expired():
+            end_at_budget(next_mode=mode, admitted=0)
         checksum = digest(protocol)
         common = dict(protocol=remote(protocol), protocol_sha256=checksum)
         result = api("/api/experiments/office/pilot", dict(common, op="start", mode=mode, batch=batch))
@@ -202,8 +212,13 @@ def main():
             print(json.dumps(dict(mode=mode, batch=batch, case=admission["case_id"], task=admission["task_id"])), flush=True)
             return admission
         stream = timed_admissions(blocks, admit)
+        block_starts = {block["indices"][0] for block in blocks}
+        stopped_at = None
         for index in range(len(result["case_ids"])):
             try:
+                if index and index in block_starts and budget_expired():
+                    stopped_at = index
+                    break
                 for future in score_futures:
                     if future.done():
                         future.result()
@@ -232,8 +247,8 @@ def main():
                     for future in score_futures:
                         future.result()
                     requested = api("/api/experiments/office/pilot", dict(common, op="update", run_id=run_id))
-                    with (args.output / (prefix + "-updates.jsonl")).open("a", encoding="utf-8") as stream:
-                        stream.write(json.dumps(dict(completed=index + 1, result=requested), ensure_ascii=False) + "\n")
+                    with (args.output / (prefix + "-updates.jsonl")).open("a", encoding="utf-8") as updates:
+                        updates.write(json.dumps(dict(completed=index + 1, result=requested), ensure_ascii=False) + "\n")
             except Exception as error:
                 stream.close()
                 write(args.output / (prefix + "-error.json"), dict(case_index=index, error=str(error), run_id=run_id))
@@ -242,7 +257,7 @@ def main():
                 raise
         stream.close()
         while True:
-            result = api("/api/experiments/office/pilot", dict(common, op="drain", run_id=run_id))
+            result = api("/api/experiments/office/pilot", dict(common, op="end_prefix" if stopped_at else "drain", run_id=run_id))
             if result["status"] != "DRAINING":
                 break
             time.sleep(2)
@@ -256,6 +271,10 @@ def main():
         else:
             for score in pending_scores:
                 grade_one(*score)
+        if stopped_at:
+            if result["status"] != "PARTIAL" or len(result["admitted"]) != stopped_at:
+                raise RuntimeError("The admitted prefix did not settle")
+            end_at_budget(mode=mode, run_id=run_id, admitted=stopped_at, planned=len(result["case_ids"]))
         result = api("/api/experiments/office/pilot", dict(common, op="finish", run_id=run_id))
         write(args.output / (prefix + "-finish.json"), result)
         if result["status"] != "COMPLETE":
@@ -279,6 +298,8 @@ def main():
     preparations = allowed_prebuild(plan, preparations, calibration_only=args.calibration_only,
                                     tuning=args.tuning, evaluation_only=args.evaluation_only)
     for index, case_id in enumerate(preparations):
+        if budget_expired():
+            end_at_budget(next_mode="prebuild", prebuilt=index)
         prepared = api("/api/experiments/office/pilot", dict(op="prebuild", protocol=remote(development),
                        protocol_sha256=digest(development), case_id=case_id))
         write(args.output / ("prebuild-" + str(index) + ".json"), prepared)
