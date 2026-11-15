@@ -105,7 +105,7 @@ def _start_native_task(platform, body, *, internal_task_id=None, pilot_config=No
     def evaluate(task):
         if timer is not None:
             timer.cancel()
-        if task["status"] not in {"COMPLETED", "BLOCKED"}:
+        if task["status"] not in {"COMPLETED", "BLOCKED", "FAILED"}:
             result = dict(status="NOT_EVALUATED", quality=None,
                         metrics=dict(utility=None, attack_success=None),
                         reason="任务未完整结束；保留到达分母与失败状态")
@@ -113,7 +113,7 @@ def _start_native_task(platform, body, *, internal_task_id=None, pilot_config=No
                 result["retrieval"] = environment.rag_status()
             return result
         final = task.get("final_response")
-        if task["status"] == "BLOCKED" and not isinstance(final, str):
+        if task["status"] in {"BLOCKED", "FAILED"} and not isinstance(final, str):
             final = task.get("partial_response") if isinstance(task.get("partial_response"), str) else ""
         if not isinstance(final, str):
             raise ValueError("没有完整最终答复，不能伪造原生评分")

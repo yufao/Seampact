@@ -1119,7 +1119,7 @@ class RealWorkerScheduler(unittest.TestCase):
         self.assertEqual(row["observation"][26:32], [0, 0, 1, 0, 0, 1])
         self.assertEqual(row["observation"][32:37], [0, 1, 0, 0, 1])
         self.assertEqual(row["observation"][37:42], [0, 1, 0, 0, 1])
-        self.assertEqual(row["observation"][-6:], [0, 1, 0, 0, 0.4, 1])
+        self.assertEqual(row["observation"][42:48], [0, 1, 0, 0, 0.4, 1])
         self.assertEqual(row["candidates"][1]["features"][19:28],
                          row["candidates"][2]["features"][19:28])
         self.assertEqual(len(row["candidates"][1]["features"]), CANDIDATE_DIM)

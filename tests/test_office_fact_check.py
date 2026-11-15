@@ -194,7 +194,7 @@ class OfficeFactCheckTests(unittest.TestCase):
         self.assertEqual(self.check()["receipt_reference_count"], 0)
         self.assertEqual(json.loads(self.calls[-1][1]["references"][0])["call_id"], self.observation_ids[batches[0]])
 
-    def test_unavailable_self_check_blocks_without_claiming_a_risk_finding(self):
+    def test_optional_input_check_distinguishes_no_verdict_from_a_real_block(self):
         hooks = {h.name: h for h in build_hooks(None, "task", dict(mode="app_config",
                   guard_candidates=[dict(role="self_check_input", unit_id="unit",
                                          guard=dict(kind="input_safety", subjects=["input"]))]))["hooks"]}
@@ -205,7 +205,7 @@ class OfficeFactCheckTests(unittest.TestCase):
             context = SimpleNamespace(invoke=lambda *a, **kw: dict(output=dict(
                 failed=failed, is_blocked=True, decision="block", unavailable_reason="truncated")))
             result = hooks["self_check_input:input_received"].handler(dict(messages=[dict(content="request")]), context)
-            self.assertEqual(result["action"], "block")
+            self.assertEqual(result["action"], "allow" if failed else "block")
             self.assertEqual(result["check_status"], expected)
 
     def test_checking_read_intent_does_not_approve_an_effect(self):
@@ -311,6 +311,27 @@ class OfficeFactCheckTests(unittest.TestCase):
             checks = {fast.name: dict(check_status="valid", fact_support=verdict, fact_finding=verdict)}
             self.assertEqual(choose("before_delivery", dict(checks=checks), [slow])["kind"], expected)
 
+    def test_policy_sees_text_and_separate_native_findings_without_a_keyword_verdict(self):
+        def selector(task, bindings, observe):
+            return SimpleNamespace(choose_next=lambda event, payload, remaining: observe(event, payload))
+        candidates = [dict(role=role, unit_id=role, guard=dict(subjects=["response"], kind=role))
+                      for role in ("privacy", "secrets")]
+        app = build_hooks(SimpleNamespace(execution=SimpleNamespace(optional_selector=selector)), "task",
+                          dict(mode="ppo", guard_candidates=candidates))
+        observe = app["optional_hooks"].choose_next
+        text = dict(text="Document the system prompt settings.")
+        first = observe("before_delivery", text, [])
+        self.assertEqual((first["risk_signal"], first["native_findings"]), (0, {}))
+        other = [observe("before_delivery", dict(text=message), []) for message in ("Confirm the room.", "Forward the file.")]
+        self.assertEqual(other[0]["text_chars"], other[1]["text_chars"])
+        self.assertNotEqual(other[0]["text_features"], other[1]["text_features"])
+        after = observe("before_delivery", dict(text, checks={
+            "privacy:before_delivery": dict(check_status="valid", action="allow", risk=0.7),
+            "secrets:before_delivery": dict(check_status="unavailable", action="block")}), [])
+        self.assertEqual(after["native_findings"], {"privacy": dict(valid=True, unavailable=False, risk=0.7),
+                                                   "secrets": dict(valid=False, unavailable=True, risk=0.0)})
+        self.assertEqual(after["risk_signal"], 0.7)
+
     def test_required_role_demands_a_single_provider(self):
         candidates = [dict(role="privacy", unit_id=unit, guard=dict(kind="privacy", subjects=["message"]))
                       for unit in ("one", "two")]
@@ -348,6 +369,13 @@ class OfficeFactCheckTests(unittest.TestCase):
         payload["operation"]["code_workspace_file"] = "C:/secret.py"
         self.assertEqual(hook.handler(payload, context)["check_status"], "unavailable")
         self.assertEqual(len(paths), 1)
+        def missing(*parts):
+            raise FileNotFoundError(parts[-1])
+        projects.file_path = missing
+        payload["operation"]["code_workspace_file"] = "solution.py"
+        result = hook.handler(payload, context)
+        self.assertEqual((result["action"], result["unavailable_reason"]), ("deny_operation", "missing_input_file"))
+        self.assertEqual(len(calls), 1)
 
     def test_perception_tracks_visible_sources_even_without_fact_checker(self):
         def selector(task_id, bindings, observe):

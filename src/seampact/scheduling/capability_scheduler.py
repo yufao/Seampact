@@ -17,18 +17,19 @@ from pathlib import Path
 from queue import Empty, SimpleQueue
 
 from seampact.capability_contract import WORKER_PROFILE, digest
-from seampact.scheduling.capability_perception import GroupTiming, FEATURE_DIM as TIMING_DIM, features as timing_features
+from seampact.scheduling.capability_perception import GroupTiming, FEATURE_DIM as TIMING_DIM, TEXT_FEATURE_DIM, features as timing_features
 from seampact.scheduling.unified_objective import ResourceLedger, TaskLedger, freeze_objective, number
 
 SCHEMA = "capability-scheduler/1"
-FEATURE_SCHEMA = "capability-event-features/8"
+FEATURE_SCHEMA = "capability-event-features/9"
 HOOK_FAMILIES = ("fact_support", "injection", "privacy", "secrets", "code_safety",
                  "input_safety", "output_safety", "sanitize")
 OPERATION_EFFECTS = ("read", "write", "send", "execute", "other")
 OPERATION_DESTINATIONS = ("local", "external", "user", "unknown")
 OPERATION_PHASES = ("input", "pending", "executed", "delivery")
 FACT_FINDINGS = ("supported", "unconfirmed", "contradiction", "unknown")
-OBSERVATION_DIM = 14 + 2 * 5 + 2 + len(OPERATION_EFFECTS) + 1 + len(OPERATION_DESTINATIONS) + 1 + len(OPERATION_PHASES) + 1 + len(FACT_FINDINGS) + 2
+OBSERVATION_DIM = (14 + 2 * 5 + 2 + len(OPERATION_EFFECTS) + 1 + len(OPERATION_DESTINATIONS) + 1
+                   + len(OPERATION_PHASES) + 1 + len(FACT_FINDINGS) + 2 + TEXT_FEATURE_DIM + 3 * len(HOOK_FAMILIES))
 CANDIDATE_DIM = 19 + len(HOOK_FAMILIES) + 1 + 2 + 4 + 2 + 6 + TIMING_DIM
 DEFAULTS = dict(schema=SCHEMA, max_in_flight=4, idle_timeout_s=60.0,
                 measurement_interval_s=1.0, retention_recheck_s=None,
@@ -265,6 +266,15 @@ class CapabilityScheduler:
             return [*[float(value == choice) for choice in choices], float(value in choices)]
         remaining = context.get("revision_remaining")
         score = context.get("support_score")
+        text_features = context.get("text_features", [0.0] * TEXT_FEATURE_DIM)
+        if len(text_features) != TEXT_FEATURE_DIM or any(not math.isfinite(x) or abs(x) > 1 for x in text_features):
+            raise ValueError("文本观测维度或取值错误")
+        findings = context.get("native_findings", {})
+        family_features = []
+        for family in HOOK_FAMILIES:
+            finding = findings.get(family, {})
+            family_features.extend((float(finding.get("valid") is True), float(finding.get("unavailable") is True),
+                                    number(finding.get("risk", 0), "native risk")))
         return [float(len(self.queue)), float(len(self.running)), float(len(self.owned)),
                 float(self._config["max_in_flight"]),
                 *[float(event == stage) for stage in ("input_received", "before_tool", "after_tool", "before_delivery")],
@@ -279,7 +289,8 @@ class CapabilityScheduler:
                 *category("operation_destination", OPERATION_DESTINATIONS),
                 *category("operation_phase", OPERATION_PHASES),
                 *[float(value in context.get("fact_findings", ())) for value in FACT_FINDINGS],
-                number(score, "support_score") if score is not None else 0.0, float(score is not None)]
+                number(score, "support_score") if score is not None else 0.0, float(score is not None),
+                *text_features, *family_features]
 
     def _features(self, item, *, now=None, monotonic_s=None, group_context=None):
         now = time.time() if now is None else now

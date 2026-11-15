@@ -38,11 +38,14 @@ def arrival_waves(plan, ids, cases):
 
 def scheduled_blocks(plan, split, ids, cases):
     """Each block shares a clock. Its admissions do not wait for earlier waves."""
-    schedule = plan.get("arrival_schedule")
+    if split == "training_calibration":
+        schedule = {split: plan["training_calibration"]["arrival_schedule"]}
+    else:
+        schedule = plan.get("arrival_schedule")
     if schedule is None:
         return [dict(indices=wave, offsets_ms=[0] * len(wave), profile="batch")
                 for wave in arrival_waves(plan, ids, cases)]
-    if not plan.get("continuous_training") or set(schedule) != set(plan["cases"]):
+    if not plan.get("continuous_training") or split != "training_calibration" and set(schedule) != set(plan["cases"]):
         raise ValueError("定时派发需要三个完整划分的连续服务协议")
     result, start = [], 0
     width = plan["arrival_width"]
@@ -171,6 +174,12 @@ def training_batches(plan):
 
 def workload_cases(plan, mode):
     """New training uses one continuous stream; historical pilots stay frozen."""
+    if mode == "training_calibration":
+        ids = plan.get("training_calibration", {}).get("case_ids", [])
+        if (not ids or len(set(ids)) != len(ids) or not set(ids) <= set(plan["cases"]["training"])
+                or set(ids).intersection(plan["cases"]["development"] + plan["cases"]["evaluation"])):
+            raise ValueError("成本校准题须全部来自训练集，且与验证、测试集互斥")
+        return [ids]
     split = "development" if mode.startswith("validation_") else mode if mode in {"training", "development"} else "evaluation"
     ids = plan["cases"][split]
     size = len(ids) if plan.get("continuous_training") or mode != "training" else plan.get("training_batch_size", 4)
@@ -242,6 +251,7 @@ def _handle(platform, body):
         return dict(case_id=case_id, corpus=corpus, result=result)
     if op == "start":
         mode, batch = body.get("mode"), body.get("batch", 0)
+        calibration = mode in {"development", "training_calibration"}
         if plan.get("local_development_only") and mode != "development":
             raise ValueError("开发限定协议不允许训练、验证或评价")
         required_hooks = {"sanitize", "injection", "privacy", "secrets", "code_scan"}
@@ -266,19 +276,27 @@ def _handle(platform, body):
         if any(unit.get("status") != "READY" or (unit.get("generation_verification") or {}).get("status") != "SUCCEEDED"
                for unit in units):
             raise ValueError("pilot 所有防御能力须先完成真实首调")
-        if rag.get("status") != "READY" or (mode != "development" and
+        if rag.get("status") != "READY" or (not calibration and
                 (rag.get("generation_verification") or {}).get("status") != "SUCCEEDED"):
             raise ValueError("检索能力须先完成固定绑定；训练和比较前还须完成真实首调")
         groups = {unit["runtime_group"] for unit in units}
         if len(groups) < 5 or rag["runtime_group"] in groups:
             raise ValueError("pilot 须固定至少五个防御库和一个独立检索库")
-        if mode != "development" and not (plan.get("development_evidence") or {}).get("application"):
+        if not calibration and not (plan.get("development_evidence") or {}).get("application"):
             raise ValueError("开发校准缺少冻结的应用候选记录，请用新版重新校准")
+        if mode == "training" and plan["schema"] == "seampact.office-comparison/1":
+            evidence = plan["development_evidence"]
+            if evidence.get("source_split") != "training" or evidence.get("case_ids") != workload_cases(plan, "training_calibration")[0]:
+                raise ValueError("PPO 训练只接受在训练题上实测的成本尺度")
+            runs = [platform.store.get("office_pilot", key) for key in evidence.get("run_ids", [])]
+            if (not runs or any(not run or run.get("mode") != "training_calibration" or run["status"] != "COMPLETE" for run in runs)
+                    or [key for run in runs for key in run["case_ids"]] != evidence["case_ids"]):
+                raise ValueError("缺少与训练集成本尺度匹配的实测运行")
         application = frozen_application(platform, plan, units, rag, series, project=project)
-        if mode not in {"development", "training", "app_config", "resource_rule", "ppo",
+        if mode not in {"development", "training_calibration", "training", "app_config", "resource_rule", "ppo",
                         "validation_app_config", "validation_resource_rule", "validation_ppo"}:
             raise ValueError("未知 pilot 工作负载模式")
-        effective_mode = mode.removeprefix("validation_")
+        effective_mode = "development" if calibration else mode.removeprefix("validation_")
         batches = training_batches(plan)
         if type(batch) is not int or not 0 <= batch < len(workload_cases(plan, mode)):
             raise ValueError("pilot 批次不正确")
@@ -298,17 +316,17 @@ def _handle(platform, body):
                                      for i in range(batches)):
             raise ValueError("训练工作负载均无真实策略更新，不能称为已训练 PPO")
         ids = workload_cases(plan, mode)[batch]
-        split = "development" if mode.startswith("validation_") else mode if mode in {"development", "training"} else "evaluation"
+        split = "development" if mode.startswith("validation_") else mode if mode in {"development", "training_calibration", "training"} else "evaluation"
         blocks = scheduled_blocks(plan, split, ids, cases)
         waves = [block["indices"] for block in blocks]
-        if mode != "development" and (plan.get("development_evidence") or {}).get("pool") != execution._pool():
+        if not calibration and (plan.get("development_evidence") or {}).get("pool") != execution._pool():
             raise ValueError("当前能力池与开发基线冻结身份不同")
         run_id = uuid.uuid4().hex
         task_ids = [uuid.uuid4().hex for _ in ids]
         config = copy.deepcopy(plan["scheduler"])
         policies = plan["policies"]
         config["policy"] = copy.deepcopy(policies["app_config" if effective_mode in {"development", "training", "app_config"} else "resource_rule"])
-        if mode == "development":
+        if calibration:
             config["objective"] = None
         if effective_mode == "ppo":
             checkpoint = series.get("checkpoint")
@@ -328,7 +346,7 @@ def _handle(platform, body):
                    retrieval_group=rag["runtime_group"], total_group_count=len(groups) + 1,
                    case_ids=ids, task_ids=task_ids, arrival_waves=waves, admitted=[], started_at=now(), workload=workload,
                    arrival_blocks=blocks, application=copy.deepcopy(application))
-        if mode == "development":
+        if calibration:
             row["development_selection"] = dict(
                 selector=plan.get("development_selector", "app_config"),
                 scheduler_policy=copy.deepcopy(config["policy"]))
@@ -363,7 +381,7 @@ def _handle(platform, body):
             request["rag"] = copy.deepcopy(plan["rag"])
             if case.get("_source") == "office_rag":
                 request["synthetic_rag"] = copy.deepcopy(location)
-        effective_mode = row["mode"].removeprefix("validation_")
+        effective_mode = "development" if row["mode"] == "training_calibration" else row["mode"].removeprefix("validation_")
         mode = (plan.get("development_selector", "app_config") if effective_mode == "development" else
                 "app_config" if effective_mode == "app_config" else
                 "ppo" if effective_mode in {"training", "ppo"} else "resource_rule")
@@ -401,7 +419,7 @@ def _handle(platform, body):
     if op == "end_prefix":
         if row["status"] == "PARTIAL":
             return row
-        if row["mode"] not in {"development", "training", "validation_resource_rule", "validation_ppo"}:
+        if row["mode"] not in {"development", "training_calibration", "training", "validation_app_config", "validation_resource_rule", "validation_ppo"}:
             raise ValueError("仅开发侧工作负载可提前收尾")
         if not 0 < len(row["admitted"]) < len(row["case_ids"]) or row["status"] not in {"RUNNING", "DRAINING"}:
             raise ValueError("只可结束已接入的非空、未跑满的前缀")
@@ -445,6 +463,7 @@ def _handle(platform, body):
                 checkpoint = Path(platform.home) / "office-pilot" / (identity + ".pt")
                 execution.policy.save(checkpoint)
                 series["checkpoint"] = dict(path=str(checkpoint), sha256=hashlib.sha256(checkpoint.read_bytes()).hexdigest())
+                row["checkpoint"] = copy.deepcopy(series["checkpoint"])
         row.update(status="COMPLETE", workload=state, finished_at=now())
         key = row["mode"] + ":" + str(row["batch"])
         actual = bool((state.get("update") or {}).get("updated") or

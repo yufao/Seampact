@@ -17,6 +17,7 @@ from seampact.office_diagnostics import observation_enabled
 from seampact.office_evidence import EvidenceWindow
 from seampact.office_policy import TEXT_ARGUMENTS, normalize_policy, operation
 from seampact.providers import RequestCancelled
+from seampact.scheduling.capability_perception import visible_text_features
 
 
 TEXT_FIELDS = frozenset({"content", "body", "text", "message", "description", "subject", "title",
@@ -134,6 +135,10 @@ def build_hooks(platform, task_id, config):
                 rechecking = name in payload.get("revision_required_hooks", ())
                 if (required or rechecking) and result["check_status"] != "valid":
                     result.update(action="block", reason="检查未能完成，本次内容未通过复核")
+                elif result["check_status"] == "unavailable" and (event in {"input_received", "after_tool"} or
+                        event == "before_delivery" and policy["delivery_finding"] == "revise_delivery"):
+                    # An optional check with no verdict leaves other candidates available.
+                    result.update(action="allow", reason="检查未取得有效判词")
                 if result["action"] == "block":
                     if event == "before_tool" and role == "self_check_input":
                         result["action"] = "deny_operation"
@@ -352,9 +357,13 @@ def build_hooks(platform, task_id, config):
                 scope = platform.projects.task_scope(task_id)
                 if not scope or scope.get("status") != "ACTIVE":
                     raise ValueError("检查表格解法需要有效的任务工作区")
-                path = platform.projects.file_path(scope["project_id"], scope["conversation_id"], "workspace", workspace_file)
-                with path.open("rb") as stream:
-                    content = stream.read(131073)
+                try:
+                    path = platform.projects.file_path(scope["project_id"], scope["conversation_id"], "workspace", workspace_file)
+                    with path.open("rb") as stream:
+                        content = stream.read(131073)
+                except FileNotFoundError:
+                    return dict(action="deny_operation", check_status="unavailable", unavailable_reason="missing_input_file",
+                                reason=f"工作区缺少待执行文件 {workspace_file}。请先写入该文件或修正路径，再请求执行。")
                 if len(content) > 131072:
                     raise ValueError("待检查的表格解法超过 128 KiB")
                 source = content.decode("utf-8")
@@ -371,8 +380,18 @@ def build_hooks(platform, task_id, config):
     def observed(event, payload):
         text = text_at(event, payload)
         checks = [v for v in payload.get("checks", {}).values() if isinstance(v, dict) and "check_status" in v]
-        risks = [float(result.get("risk", result.get("action") in {"deny_operation", "revise_delivery", "block"}))
-                 for result in checks if result["check_status"] == "valid"]
+        findings = {}
+        for name, result in payload.get("checks", {}).items():
+            if name not in scheduler_bindings or not isinstance(result, dict) or result.get("check_status") not in {"valid", "unavailable"}:
+                continue
+            family = scheduler_bindings[name]["hook_family"]
+            verdict = findings.setdefault(family, dict(valid=False, unavailable=False, risk=0.0))
+            if result["check_status"] == "unavailable":
+                verdict["unavailable"] = True
+            else:
+                verdict["valid"] = True
+                risk = result.get("risk", result.get("action") in {"deny_operation", "revise_delivery", "block"})
+                verdict["risk"] = max(verdict["risk"], float(risk))
         kind = tool(payload)["kind"]
         effect = {"retrieve": "read", "metadata": "read"}.get(kind, kind)
         destination = ("user" if event == "before_delivery" else "external" if kind == "send" else
@@ -381,8 +400,10 @@ def build_hooks(platform, task_id, config):
         facts = dict(text_chars=len(text), has_code=kind == "execute" or bool(re.search(r"```(?:python|py)\b", text)),
                      has_evidence=bool(evidence.references), external_material=event == "after_tool"
                      and kind in {"read", "retrieve"} and payload.get("tool_source") in {"external", "capability"},
-                     checks_run=len(checks), risk_signal=max([float(bool(SUSPICIOUS.search(text))), *risks]),
+                     checks_run=len(checks), risk_signal=max((f["risk"] for f in findings.values()), default=0.0),
                      operation_effect=effect, operation_destination=destination, operation_phase=phase, **evidence.facts())
+        if mode in {"ppo", "scheduler"}:
+            facts.update(text_features=visible_text_features(text), native_findings=findings)
         if checks:
             facts["finding_valid"] = all(result["check_status"] == "valid" for result in checks)
             facts["fact_findings"] = [result.get("fact_finding", result["fact_support"]) for result in checks
@@ -402,7 +423,7 @@ def build_hooks(platform, task_id, config):
             facts = observed(event, payload)
             cheap = {"sanitize", "secrets", "code_scan"}
             selected = cheap | ({"injection", "self_check_input", "self_check_output"}
-                                if facts["risk_signal"] else set())
+                                if facts["risk_signal"] or SUSPICIOUS.search(text_at(event, payload)) else set())
             if re.search(r"\b\d[\d -]{7,}\b", text_at(event, payload)):
                 selected.add("privacy")
             if evidence.references and "supported" not in facts.get("fact_findings", ()):

@@ -61,12 +61,13 @@ def calibration_gate(folder, plan, data_root):
             if case["id"] in sources:
                 raise ValueError("Overlapping calibration source identities")
             sources[case["id"]] = source
-    case_ids = plan["cases"]["development"]
-    finish = json.loads((folder / "development-0-finish.json").read_text(encoding="utf-8"))
+    mode = "training_calibration" if plan.get("training_calibration") else "development"
+    case_ids = plan["training_calibration"]["case_ids"] if mode == "training_calibration" else plan["cases"]["development"]
+    finish = json.loads((folder / f"{mode}-0-finish.json").read_text(encoding="utf-8"))
     task_ids = finish.get("task_ids", [])
     if (finish.get("status") != "COMPLETE" or finish.get("case_ids") != case_ids
             or len(task_ids) != len(case_ids) or len(set(task_ids)) != len(task_ids)):
-        raise ValueError("Calibration finish does not cover the exact development arrivals")
+        raise ValueError("Calibration finish does not cover the exact frozen arrivals")
     expected_evaluator = {
         "agentdojo": "agentdojo/", "spreadsheet": "separate pinned SpreadsheetBench scorer",
         "privacy": "office-synthetic-delivered-markers/1", "office_rag": "seampact-synthetic-office-rag/1",
@@ -80,7 +81,7 @@ def calibration_gate(folder, plan, data_root):
         source = sources.get(case_id)
         if source not in expected_evaluator:
             raise ValueError("Calibration case has an unknown source")
-        task = json.loads((folder / f"development-0-task-{index}.json").read_text(encoding="utf-8"))
+        task = json.loads((folder / f"{mode}-0-task-{index}.json").read_text(encoding="utf-8"))
         if task.get("id") != task_id or (task.get("experiment") or {}).get("case") != case_id:
             raise ValueError("Calibration task identity differs from the finish record")
         terminal = task.get("status")

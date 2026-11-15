@@ -1,7 +1,24 @@
-"""Causal, session-local timing evidence for each frozen capability group."""
+"""Causal observations from visible text and measured instance timings."""
 
 import math
+import zlib
 from collections import deque
+
+TEXT_FEATURE_DIM = 64
+
+
+def visible_text_features(text):
+    """Signed character-trigram counts, with no fitted vocabulary or risk keywords."""
+    bins = [0.0] * TEXT_FEATURE_DIM
+    # Bound work at every decision. Do not form trigrams across the omitted middle.
+    parts = (text,) if len(text) <= 2048 else (text[:1024], text[-1024:])
+    for part in parts:
+        sample = ' ' + ' '.join(part.casefold().split()) + ' '
+        for index in range(len(sample) - 2):
+            key = zlib.crc32(sample[index:index + 3].encode('utf-8', errors='replace'))
+            bins[key % TEXT_FEATURE_DIM] += -1 if key >> 31 else 1
+    norm = math.sqrt(sum(value * value for value in bins))
+    return [value / norm for value in bins] if norm else bins
 
 SCHEMA = "capability-group-perception/1"
 ARRIVAL_WINDOW_S = 30.0

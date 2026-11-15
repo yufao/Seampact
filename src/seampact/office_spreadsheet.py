@@ -282,7 +282,8 @@ def start_spreadsheet_task(platform, body, *, internal_task_id=None, pilot_confi
     system_prompt = (SYSTEM_PROMPT + "\n\nComplete this original SpreadsheetBench office workbook task.\n"
         "The only visible original input is /data/" + namespace + "/" + inputs[0]["name"] +
         ". Inspect it using run_python in the ordinary isolated execution environment. "
-        "Write /workspace/solution.py as a self-contained reusable Python program. It must read input_path=sys.argv[1], "
+        'Use write_file with path="solution.py" to write a self-contained reusable Python program. '
+        'Its path inside run_python is /workspace/solution.py. It must read input_path=sys.argv[1], '
         "write output_path=sys.argv[2], and implement the requested manipulation for arbitrary values and row counts. "
         "Use run_python to test this program on the visible first workbook. Do not hard-code output values. "
         "Finally call submit_spreadsheet_solution exactly once. That freezes your script and replays the identical bytes "

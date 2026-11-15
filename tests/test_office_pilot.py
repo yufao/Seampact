@@ -55,6 +55,19 @@ class PilotChecks(unittest.TestCase):
         self.assertEqual(allowed_prebuild(plan, cases, tuning=True), ["train", "dev"])
         self.assertEqual(allowed_prebuild(plan, cases, evaluation_only=True), ["held"])
 
+    def test_training_costs_and_prebuilt_corpora_are_confined_to_training(self):
+        plan = dict(cases=dict(training=["t1", "t2"], development=["v"], evaluation=["x"]),
+                    training_calibration=dict(case_ids=["t2"]))
+        candidates = ["x", "t1", "v", "t2"]
+        self.assertEqual(workload_cases(plan, "training_calibration"), [["t2"]])
+        self.assertEqual(allowed_prebuild(plan, candidates, calibration_only=True), ["t2"])
+        self.assertEqual(allowed_prebuild(plan, candidates, training_only=True), ["t1", "t2"])
+        self.assertEqual(allowed_prebuild(plan, candidates, validation_only=True), ["v"])
+        for wrong in ("v", "x"):
+            plan["training_calibration"]["case_ids"] = ["t1", wrong]
+            with self.assertRaisesRegex(ValueError, "训练集"):
+                workload_cases(plan, "training_calibration")
+
     def test_development_only_protocol_cannot_start_or_prebuild_other_splits(self):
         plan = dict(local_development_only=True, cases={"development": ["dev"]})
         store = SimpleNamespace(get=lambda *_: None)

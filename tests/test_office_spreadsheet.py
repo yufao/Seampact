@@ -88,6 +88,7 @@ class SpreadsheetPreparationTests(unittest.TestCase):
         self.assertTrue(runtime["system_prompt"].startswith(SYSTEM_PROMPT + "\n\n"))
         self.assertIn("/data/spreadsheetbench/" + "c" * 32 + "/1_toy_input.xlsx", runtime["system_prompt"])
         self.assertIn("Finally call submit_spreadsheet_solution exactly once", runtime["system_prompt"])
+        self.assertIn('write_file with path="solution.py"', runtime["system_prompt"])
         self.assertNotIn(instruction, runtime["system_prompt"])
         self.assertEqual(runtime["max_model_turns"], 15)
         guarded = []
