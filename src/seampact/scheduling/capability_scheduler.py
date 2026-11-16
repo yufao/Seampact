@@ -555,7 +555,7 @@ class CapabilityScheduler:
         return select
 
     def start_workload(self, workload_id, task_ids, *, training=False, fresh=True, learner_config=None, seed=0,
-                       continuous=False):
+                       continuous=False, resume_checkpoint=None, reward_denominator=None):
         """Explicit fresh training or frozen inference; no reward or task labels are invented."""
         with self.condition:
             if (not isinstance(workload_id, str) or not workload_id or not isinstance(task_ids, (list, tuple))
@@ -564,6 +564,11 @@ class CapabilityScheduler:
                 raise ValueError("工作负载需要唯一身份及非空、无重复的任务清单")
             if type(continuous) is not bool:
                 raise ValueError("continuous 须为布尔值")
+            if reward_denominator is not None and (not training or not continuous or
+                    type(reward_denominator) is not int or reward_denominator < len(task_ids)):
+                raise ValueError("连续训练的奖励分母须覆盖本段题目")
+            if resume_checkpoint and not (training and fresh and continuous):
+                raise ValueError("仅连续训练可从已结算的检查点恢复")
             if self.store and self.store.get("capability_workload", workload_id):
                 raise ValueError("工作负载身份已使用")
             self._resource_summary()
@@ -575,6 +580,11 @@ class CapabilityScheduler:
                 from seampact.scheduling.capability_ppo import CandidatePPO
                 selected = CandidatePPO(policy_config_id(self._config), self._config["objective"],
                                         config=learner_config, seed=seed, training=True)
+                if resume_checkpoint:
+                    checkpoint = Path(resume_checkpoint["path"])
+                    if hashlib.sha256(checkpoint.read_bytes()).hexdigest() != resume_checkpoint["sha256"]:
+                        raise ValueError("续训检查点身份已变化")
+                    selected.load(checkpoint, optimizer=True)
             elif training:
                 selected = self.policy
                 if (not getattr(selected, "training", False) or
@@ -592,6 +602,7 @@ class CapabilityScheduler:
                 learner_config=copy.deepcopy(learner_config), seed=seed, fresh=fresh,
                 continuous=continuous, updates=[], updated_tasks=[], pending_update=None)
             if continuous and training:
+                self.workload["reward_denominator"] = reward_denominator or len(task_ids)
                 self.resources.enable_intervals()
             if self.store:
                 self.store.save("capability_workload", workload_id, self.workload)
@@ -672,7 +683,7 @@ class CapabilityScheduler:
             return dict(updated=False, reason=reason)
         decisions = self._workload_decisions(self.interval_decision_offset)
         rewards, prefix = [0.0] * len(decisions), 0.0
-        normalizer = len(workload["task_ids"])
+        normalizer = workload.get("reward_denominator", len(workload["task_ids"]))
         weights, scales = objective["weights"], objective["scales"]
         def credit(value, timestamp, clock):
             nonlocal prefix
@@ -714,7 +725,8 @@ class CapabilityScheduler:
                        session=self.session, interval_id=interval_id, utility=prefix + sum(rewards),
                        normalizer=normalizer, complete=final)
         if final and not math.isclose(sum(item["utility"] for item in workload["updates"]) + summary["utility"],
-                                      workload["summary"]["utility"], rel_tol=1e-7, abs_tol=1e-9):
+                                      workload["summary"]["utility"] * workload["summary"]["denominator"] / normalizer,
+                                      rel_tol=1e-7, abs_tol=1e-9):
             raise ValueError("连续区间效用之和与整个工作负载不一致，拒绝更新")
         settlements = dict(before_first=prefix, after_decisions=rewards)
         previous_version = self.policy.learner.policy_version
@@ -753,7 +765,8 @@ class CapabilityScheduler:
             if admitted_prefix is not None:
                 run_id, prefix = admitted_prefix
                 if (run_id != self.workload["id"] or not 0 < len(prefix) < len(expected)
-                        or expected[:len(prefix)] != prefix or set(self.workload["started"]) != set(prefix) or update):
+                        or expected[:len(prefix)] != prefix or set(self.workload["started"]) != set(prefix)
+                        or update and not (self.workload["training"] and self.workload.get("continuous"))):
                     raise ValueError("仅可释放当前已接入的真实前缀")
                 expected = prefix
             if self.tasks.active or self.queue or self.running or set(self.workload["finished"]) != set(expected):

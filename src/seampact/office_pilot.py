@@ -212,7 +212,7 @@ def frozen_application(platform, plan, units, rag, series, *, project=None):
 
 
 def handle(platform, body):
-    if body.get("op") in {"admit", "end_prefix"}:
+    if body.get("op") in {"start", "resume", "admit", "end_prefix", "finish"}:
         with _admission_lock:
             return _handle(platform, body)
     return _handle(platform, body)
@@ -249,7 +249,7 @@ def _handle(platform, body):
         result = invoke(platform, dict(unit_id=rag["capability_id"], project_id=plan["project_id"],
             input=dict(query="office reference document", mode="dense", top_k=3, rerank=False)))
         return dict(case_id=case_id, corpus=corpus, result=result)
-    if op == "start":
+    if op in {"start", "resume"}:
         mode, batch = body.get("mode"), body.get("batch", 0)
         calibration = mode in {"development", "training_calibration"}
         if plan.get("local_development_only") and mode != "development":
@@ -301,7 +301,12 @@ def _handle(platform, body):
         if type(batch) is not int or not 0 <= batch < len(workload_cases(plan, mode)):
             raise ValueError("pilot 批次不正确")
         key = mode + ":" + str(batch)
-        if key in series["workloads"]:
+        previous = series["workloads"].get(key)
+        resume = op == "resume"
+        if resume and (not previous or previous["status"] != "PAUSED" or mode != "training"
+                       or not plan.get("continuous_training")):
+            raise ValueError("续训需要同一冻结协议下已保存的安全暂停点")
+        if previous and not resume:
             raise ValueError("该冻结 pilot 工作负载已有记录，不重复运行")
         if batch > 0:
             prior = series["workloads"].get(mode + ":" + str(batch - 1))
@@ -318,6 +323,14 @@ def _handle(platform, body):
         ids = workload_cases(plan, mode)[batch]
         split = "development" if mode.startswith("validation_") else mode if mode in {"development", "training_calibration", "training"} else "evaluation"
         blocks = scheduled_blocks(plan, split, ids, cases)
+        full_size = len(ids)
+        offset = previous["next_index"] if resume else 0
+        if resume:
+            if offset not in {block["indices"][0] for block in blocks}:
+                raise ValueError("恢复位置不在原始派发段边界")
+            ids = ids[offset:]
+            blocks = [dict(block, indices=[i-offset for i in block["indices"]]) for block in blocks
+                      if block["indices"][0] >= offset]
         waves = [block["indices"] for block in blocks]
         if not calibration and (plan.get("development_evidence") or {}).get("pool") != execution._pool():
             raise ValueError("当前能力池与开发基线冻结身份不同")
@@ -339,13 +352,15 @@ def _handle(platform, body):
         workload = execution.start_workload(run_id, task_ids, training=mode == "training", fresh=batch == 0,
             continuous=bool(plan.get("continuous_training") and mode == "training"),
             learner_config=plan.get("learner_config", {}) if mode == "training" and batch == 0 else None,
-            seed=plan.get("seed", 0))
+            seed=plan.get("seed", 0), resume_checkpoint=previous["checkpoint"] if resume else None,
+            reward_denominator=full_size if mode == "training" and plan.get("continuous_training") else None)
         row = dict(id=run_id, protocol_sha256=identity, mode=mode, batch=batch, status="RUNNING",
                    diagnostic_checks=diagnostic_mode(plan),
                    defense_groups=sorted(groups), defense_group_count=len(groups),
                    retrieval_group=rag["runtime_group"], total_group_count=len(groups) + 1,
                    case_ids=ids, task_ids=task_ids, arrival_waves=waves, admitted=[], started_at=now(), workload=workload,
-                   arrival_blocks=blocks, application=copy.deepcopy(application))
+                   arrival_blocks=blocks, application=copy.deepcopy(application),
+                   start_index=offset, previous_segments=previous["segments"] if resume else [])
         if calibration:
             row["development_selection"] = dict(
                 selector=plan.get("development_selector", "app_config"),
@@ -359,6 +374,8 @@ def _handle(platform, body):
     row = platform.store.get("office_pilot", run_id)
     if not row or row["protocol_sha256"] != identity:
         raise ValueError("没有匹配该冻结协议的 pilot 工作负载")
+    if op == "record":
+        return row
     if op == "admit":
         if plan.get("local_development_only") and row["mode"] != "development":
             raise ValueError("开发限定协议不允许训练、验证或评价")
@@ -417,17 +434,34 @@ def _handle(platform, body):
         result = execution.request_update(minimum_tasks=plan.get("update_after_tasks", 16))
         return dict(run_id=run_id, **result)
     if op == "end_prefix":
-        if row["status"] == "PARTIAL":
+        if row["status"] in {"PARTIAL", "PAUSED", "UNSETTLED"}:
             return row
         if row["mode"] not in {"development", "training_calibration", "training", "validation_app_config", "validation_resource_rule", "validation_ppo"}:
             raise ValueError("仅开发侧工作负载可提前收尾")
         if not 0 < len(row["admitted"]) < len(row["case_ids"]) or row["status"] not in {"RUNNING", "DRAINING"}:
             raise ValueError("只可结束已接入的非空、未跑满的前缀")
+        training_pause = row["mode"] == "training" and plan.get("continuous_training")
+        if training_pause and len(row["admitted"]) not in {b["indices"][0] for b in row["arrival_blocks"]}:
+            raise ValueError("续训暂停须在完整派发段之间")
         state = execution.finish_workload(admitted_prefix=(run_id, row["admitted"]))
         row.update(status="PARTIAL" if state["status"] == "COMPLETE" else "DRAINING", workload=state)
         if row["status"] == "PARTIAL":
             row["finished_at"] = now()
-            series["workloads"][row["mode"] + ":" + str(row["batch"])]["status"] = "PARTIAL"
+            key = row["mode"] + ":" + str(row["batch"])
+            if training_pause and state["summary"].get("training_ready"):
+                if not state.get("updated"):
+                    state = execution.finish_workload(update=True, admitted_prefix=(run_id, row["admitted"]))
+                path = Path(platform.home) / "office-pilot" / (run_id + ".pt")
+                execution.policy.save(path)
+                checkpoint = dict(path=str(path), sha256=hashlib.sha256(path.read_bytes()).hexdigest())
+                row.update(status="PAUSED", workload=state, checkpoint=checkpoint,
+                           next_index=row.get("start_index", 0) + len(row["admitted"]))
+                series["workloads"][key] = dict(id=run_id, status="PAUSED", checkpoint=checkpoint,
+                    next_index=row["next_index"], segments=[*row.get("previous_segments", []), run_id])
+            else:
+                if training_pause:
+                    row.update(status="UNSETTLED", error=state["summary"].get("reason"))
+                series["workloads"][key]["status"] = row["status"]
             platform.store.save("office_pilot_series", series_key, series)
         platform.store.save("office_pilot", run_id, row)
         return row
@@ -468,6 +502,9 @@ def _handle(platform, body):
         key = row["mode"] + ":" + str(row["batch"])
         actual = bool((state.get("update") or {}).get("updated") or
                       any(item.get("updated") for item in state.get("updates", [])))
+        if row.get("previous_segments") and not actual:
+            actual = any(any(update.get("updated") for update in
+                platform.store.get("office_pilot", segment)["workload"]["updates"]) for segment in row["previous_segments"])
         series["workloads"][key] = dict(id=run_id, status="COMPLETE", updated=bool(state.get("updated")),
                                        update=state.get("update"), actual_updates=actual)
         platform.store.save("office_pilot", run_id, row)

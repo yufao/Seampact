@@ -144,12 +144,16 @@ def main():
     phase.add_argument("--calibration-only", action="store_true", help="measure cost scales and stop before training")
     parser.add_argument("--scales-from", type=Path, help="reuse cost measurements from the matching frozen protocol")
     parser.add_argument("--include-rule-baseline", action="store_true", help="also score the development rule baseline when reusing scales")
-    parser.add_argument("--admission-deadline", type=float, help="Unix time to stop before a new development dispatch block")
+    parser.add_argument("--admission-deadline", type=float, help="Unix time to finish at the next dispatch block boundary")
+    parser.add_argument("--resume-training", action="store_true", help="resume a safely paused training protocol into a new output directory")
     args = parser.parse_args()
     plan = json.loads(args.protocol.read_text(encoding="utf-8"))
     if plan.get("schema") not in {"seampact.office-pilot/1", "seampact.office-comparison/1"}:
         raise ValueError("Unsupported pilot protocol")
     frozen_inference = args.evaluation_only or args.validation_only
+    if args.resume_training and (not args.training_only or args.scales_from or not plan.get("development_evidence")
+                                 or not plan.get("continuous_training")):
+        raise ValueError("Resume needs --training-only and the original frozen training protocol")
     normalization = "training_calibration" if "training_calibration" in plan else "development"
     if args.training_only and normalization != "training_calibration":
         raise ValueError("Training requires scales estimated exclusively on the training split")
@@ -188,7 +192,8 @@ def main():
             end_at_budget(next_mode=mode, admitted=0)
         checksum = digest(protocol)
         common = dict(protocol=remote(protocol), protocol_sha256=checksum)
-        result = api("/api/experiments/office/pilot", dict(common, op="start", mode=mode, batch=batch))
+        result = api("/api/experiments/office/pilot", dict(common,
+            op="resume" if mode == "training" and args.resume_training else "start", mode=mode, batch=batch))
         run_id = result["id"]
         prefix = mode + "-" + str(batch)
         write(args.output / (prefix + "-start.json"), result)
@@ -264,9 +269,13 @@ def main():
                 stream.close()
                 write(args.output / (prefix + "-error.json"), dict(case_index=index, error=str(error), run_id=run_id))
                 if scoring is not None:
-                    scoring.shutdown(wait=True, cancel_futures=True)
+                    scoring.shutdown(wait=True)
                 raise
         stream.close()
+        if stopped_at and continuous and scoring is not None:
+            scoring.shutdown(wait=True)
+            for future in score_futures:
+                future.result()
         while True:
             result = api("/api/experiments/office/pilot", dict(common, op="end_prefix" if stopped_at else "drain", run_id=run_id))
             if result["status"] != "DRAINING":
@@ -283,9 +292,11 @@ def main():
             for score in pending_scores:
                 grade_one(*score)
         if stopped_at:
-            if result["status"] != "PARTIAL" or len(result["admitted"]) != stopped_at:
+            if result["status"] != ("PAUSED" if continuous else "PARTIAL") or len(result["admitted"]) != stopped_at:
                 raise RuntimeError("The admitted prefix did not settle")
-            end_at_budget(mode=mode, run_id=run_id, admitted=stopped_at, planned=len(result["case_ids"]))
+            end_at_budget(mode=mode, run_id=run_id, admitted=stopped_at, next_index=result.get("next_index"),
+                          checkpoint=result.get("checkpoint"), frozen_protocol=str(protocol),
+                          planned=len(plan["cases"]["training"]) if continuous else len(result["case_ids"]))
         result = api("/api/experiments/office/pilot", dict(common, op="finish", run_id=run_id))
         write(args.output / (prefix + "-finish.json"), result)
         if result["status"] != "COMPLETE":
@@ -296,7 +307,7 @@ def main():
     write(args.output / "initial-runtime.json", dict(models=state["models"],
         capabilities=state["capability_packages"], code_execution=state["code_execution"]))
     development = args.protocol if frozen_inference else args.output / "development-protocol.json"
-    if not frozen_inference:
+    if not frozen_inference and not args.resume_training:
         write(development, plan)
     prebuild = plan.get("prebuild", [])
     legacy = plan["schema"] == "seampact.office-pilot/1"
@@ -340,11 +351,14 @@ def main():
         preparations = allowed_prebuild(plan, preparations, calibration_only=args.calibration_only,
                                         tuning=args.tuning, evaluation_only=args.evaluation_only,
                                         training_only=args.training_only, validation_only=args.validation_only)
-    prepare_indexes(development, preparations)
+    if not args.resume_training:
+        prepare_indexes(development, preparations)
     if frozen_inference:
         final = args.protocol
     else:
-        if shared is not None:
+        if args.resume_training:
+            pass  # The original protocol already contains the measured training-only scales.
+        elif shared is not None:
             plan = shared
         else:
             if not baselines:
@@ -379,8 +393,9 @@ def main():
                 run_ids=[row["id"] for row in baselines],
                 observed_totals=observed, denominator=n, scales=scales, zero_fallbacks=zero_fallbacks,
                 pool=baseline["workload"]["pool"], application=baseline["application"])
-        final = args.output / "frozen-pilot-protocol.json"
-        write(final, plan)
+        final = args.protocol if args.resume_training else args.output / "frozen-pilot-protocol.json"
+        if not args.resume_training:
+            write(final, plan)
         if args.calibration_only:
             evidence = plan["development_evidence"]
             print(f"Cost calibration finished on {evidence['denominator']} {evidence['source_split']} cases.", flush=True)
@@ -389,9 +404,15 @@ def main():
         for batch in range(batches):
             trained = run(final, "training", batch)
         if args.training_only:
+            segments = [api("/api/experiments/office/pilot", dict(op="record", protocol=remote(final),
+                protocol_sha256=digest(final), run_id=run_id)) for run_id in trained.get("previous_segments", [])]
+            observed = [case for part in [*segments, trained] for case in part["case_ids"][:len(part["admitted"])]]
+            if plan.get("continuous_training") and observed != plan["cases"]["training"]:
+                raise RuntimeError("Training records do not cover the frozen sequence exactly once")
             write(args.output / "training-summary.json", dict(status=trained["status"],
                   tasks=len(plan["cases"]["training"]), checkpoint=trained["checkpoint"],
-                  metrics=trained["workload"]["summary"], frozen_protocol=str(final)))
+                  metrics=combined_summary([*segments, trained]) if segments else trained["workload"]["summary"],
+                  segment_ids=[part["id"] for part in [*segments, trained]], frozen_protocol=str(final)))
             return
     if normalization == "training_calibration" and not frozen_inference:
         prepare_indexes(final, allowed_prebuild(plan, prebuild, validation_only=args.tuning,
