@@ -229,12 +229,27 @@ def main():
             return admission
         stream = timed_admissions(blocks, admit)
         block_starts = {block["indices"][0] for block in blocks}
+        update_after = plan.get("update_after_tasks", 16)
+        last_requested = 0
         stopped_at = None
         for index in range(len(result["case_ids"])):
             try:
                 if index and index in block_starts and budget_expired():
                     stopped_at = index
                     break
+                if continuous and index in block_starts and index - last_requested >= update_after:
+                    # All business in the previous block has finished. Wait for its
+                    # native scores before the generator starts the next block's clock.
+                    for future in score_futures:
+                        future.result()
+                    requested = api("/api/experiments/office/pilot", dict(common, op="update", run_id=run_id))
+                    with (args.output / (prefix + "-updates.jsonl")).open("a", encoding="utf-8") as updates:
+                        updates.write(json.dumps(dict(completed=index, result=requested), ensure_ascii=False) + "\n")
+                    if requested.get("pending"):
+                        last_requested = index
+                    if budget_expired():
+                        stopped_at = index
+                        break
                 for future in score_futures:
                     if future.done():
                         future.result()
@@ -256,15 +271,6 @@ def main():
                     pending_scores.append((index, admission["task_id"], folder))
                     if scoring is not None:
                         score_futures.append(scoring.submit(grade_one, index, admission["task_id"], folder))
-                # Slow independent scoring does not hold back new business
-                # arrivals. Keep collecting under the current policy until the
-                # completed prefix is scored, then request its next-choice update.
-                if continuous and index + 1 < len(result["case_ids"]) and all(future.done() for future in score_futures):
-                    for future in score_futures:
-                        future.result()
-                    requested = api("/api/experiments/office/pilot", dict(common, op="update", run_id=run_id))
-                    with (args.output / (prefix + "-updates.jsonl")).open("a", encoding="utf-8") as updates:
-                        updates.write(json.dumps(dict(completed=index + 1, result=requested), ensure_ascii=False) + "\n")
             except Exception as error:
                 stream.close()
                 write(args.output / (prefix + "-error.json"), dict(case_index=index, error=str(error), run_id=run_id))
