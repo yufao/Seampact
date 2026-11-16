@@ -112,6 +112,10 @@ def release_workers(output, database, url):
             with urlopen(req, timeout=180) as response:
                 json.load(response)
             _, after, _ = inspect("container", container)
+            if after in {"running", "paused", "restarting"} and row.get("released") is True and handle.get("container_id") == container:
+                # The platform already recorded release, so it has no live instance left to drain.
+                switch("container", container, "stop")
+                _, after, _ = inspect("container", container)
             if after in {"created", "exited", "dead"}:
                 subprocess.run([*docker(), "rm", "--", container], check=True)
             elif after != "missing":
