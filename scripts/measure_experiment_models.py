@@ -65,6 +65,10 @@ def summarize(samples, workload):
             field = metric.replace("_byte_s", "_bytes")
             covered = area = 0.0
             for left, right in zip(samples, samples[1:]):
+                # A monitor restart leaves an unknown interval between files.
+                # Keep that interval uncovered even when the files are close in time.
+                if left.get("_source") != right.get("_source"):
+                    continue
                 t0, t1 = left["at_s"], right["at_s"]
                 a, b = max(t0, start), min(t1, end)
                 v0, v1 = left[role][field], right[role][field]
@@ -86,11 +90,49 @@ def summarize(samples, workload):
                 byte_seconds=scopes, endpoint_coverage_s=coverage, endpoint_observed_byte_seconds=observed)
 
 
+def option_value(argv, option):
+    for index, value in enumerate(argv):
+        if value == option:
+            if index + 1 >= len(argv):
+                raise ValueError(f"{option} needs a value")
+            return argv[index + 1]
+        if value.startswith(option + "="):
+            return value.split("=", 1)[1]
+    return None
+
+
+def matching_attach(output, run_id):
+    matches = []
+    for folder in output.glob("attach-*"):
+        preflight = folder / "attach-preflight.json"
+        if preflight.is_file() and json.loads(preflight.read_bytes()).get("run_id") == run_id:
+            matches.append(folder)
+    if len(matches) != 1:
+        raise ValueError(f"Expected one attach folder for live run {run_id}; found {len(matches)}")
+    return matches[0]
+
+
+def read_samples(paths):
+    samples = []
+    seen = set()
+    for source_id, path in enumerate(paths):
+        if path in seen or not path.is_file():
+            continue
+        seen.add(path)
+        for line in path.read_text(encoding="utf-8").splitlines():
+            sample_row = json.loads(line)
+            sample_row["_source"] = source_id
+            samples.append(sample_row)
+    return sorted(samples, key=lambda row: row["at_s"])
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("output", type=Path, help="fresh pilot output directory created by the wrapped command")
     parser.add_argument("--business-unit", required=True)
     parser.add_argument("--guard-unit", required=True)
+    parser.add_argument("--attached-run", type=Path,
+                        help="original RUN directory whose endpoint samples should be combined with this attach attempt")
     parser.add_argument("command", nargs="+")
     args = parser.parse_args()
     groups = {role: unit_cgroup(unit) for role, unit in (("business", args.business_unit), ("guard", args.guard_unit))}
@@ -114,16 +156,37 @@ def main():
             stopped.set()
             thread.join()
             record()
-    samples = [json.loads(line) for line in path.read_text().splitlines()]
+    attach_run_id = None
+    attachment = None
+    sample_paths = [path]
+    workload_dirs = [args.output]
+    if args.attached_run:
+        attach_run_id = option_value(args.command, "--attach-training")
+        if not attach_run_id:
+            raise ValueError("--attached-run requires the wrapped command's --attach-training RUN_ID")
+        attachment = matching_attach(args.attached_run, attach_run_id)
+        original_samples = args.attached_run.parent / (args.attached_run.name + "-endpoint-samples.jsonl")
+        sample_paths.insert(0, original_samples)
+        workload_dirs = [attachment]
+    samples = read_samples(sample_paths)
     sessions = {}
-    for file in sorted([*args.output.glob("*-drain.json"), *args.output.glob("*-finish.json")]):
-        workload = json.loads(file.read_bytes()).get("workload", {})
-        if workload.get("summary"):
-            sessions[workload["session"]] = summarize(samples, workload)
+    for folder in workload_dirs:
+        files = sorted([*folder.glob("*-drain.json"), *folder.glob("*-finish.json")])
+        for file in files:
+            result = json.loads(file.read_bytes())
+            if attach_run_id and result.get("id") != attach_run_id:
+                continue
+            workload = result.get("workload", {})
+            if workload.get("summary"):
+                sessions[workload["session"]] = summarize(samples, workload)
     report = dict(scope="Managed capability workers plus the two named model service cgroups; host, tools, graders and proxies excluded.",
         units=dict(business=args.business_unit, guard=args.guard_unit), interval_s=INTERVAL,
         gpu_source="NVML compute processes with stable host cgroup membership before and after sampling",
         missing="Incomplete observed intervals are null", sessions=list(sessions.values()))
+    if args.attached_run:
+        report.update(attached_run=str(args.attached_run.resolve()), attached_run_id=attach_run_id,
+                      attachment=str(attachment.resolve()), sample_files=[str(item.resolve()) for item in sample_paths
+                                                                          if item.is_file()])
     (path.parent/(args.output.name+"-resource-scopes.json")).write_text(json.dumps(report, indent=2)+"\n")
     return code
 

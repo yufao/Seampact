@@ -6,10 +6,13 @@ unknown measurements or scores stop PPO training instead of being imputed.
 """
 import argparse
 from concurrent.futures import Future, ThreadPoolExecutor
+from contextlib import closing
 import copy
 import hashlib
+import http.client
 import json
 from pathlib import Path
+import socket
 import subprocess
 import sys
 import threading
@@ -20,6 +23,88 @@ from urllib.request import Request, urlopen
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from seampact.office_pilot import workload_cases
+
+
+MODEL_WAIT_TIMEOUT_S = 300.0
+MODEL_WAIT_POLL_S = 2.0
+MODEL_PROBE_TIMEOUT_S = 3.0
+
+
+class UnixHTTPConnection(http.client.HTTPConnection):
+    """Minimal HTTP client for a model service bound to a Unix socket."""
+    def __init__(self, socket_path, timeout):
+        super().__init__("localhost", timeout=timeout)
+        self.socket_path = str(socket_path)
+
+    def connect(self):
+        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.sock.settimeout(self.timeout)
+        self.sock.connect(self.socket_path)
+
+
+def probe_model_socket(socket_path, timeout):
+    try:
+        with closing(UnixHTTPConnection(socket_path, timeout)) as connection:
+            connection.request("GET", "/health")
+            response = connection.getresponse()
+            status = response.status
+            response.read(4096)
+        return dict(socket=str(socket_path), ready=status == 200, http_status=status)
+    except (OSError, http.client.HTTPException, TimeoutError, ValueError):
+        return dict(socket=str(socket_path), ready=False, reason="unavailable")
+
+
+def wait_for_model_sockets(sockets, *, log_path, block_start, admission_deadline):
+    """Wait for every configured endpoint, never starting or restarting a service."""
+    started = time.time()
+    # Honor the run's existing admission budget in full. Without one, bound a
+    # standalone wait by the same five-minute startup window used by the model owner.
+    wait_deadline = admission_deadline if admission_deadline is not None else started + MODEL_WAIT_TIMEOUT_S
+
+    def observe():
+        rows = []
+        for path in sockets:
+            remaining = wait_deadline - time.time()
+            if remaining <= 0:
+                rows.append(dict(socket=str(path), ready=False, reason="not_checked_before_deadline"))
+            else:
+                rows.append(probe_model_socket(path, min(MODEL_PROBE_TIMEOUT_S, remaining)))
+        return rows
+
+    def record(event, **fields):
+        with log_path.open("a", encoding="utf-8", buffering=1) as stream:
+            stream.write(json.dumps(dict(event=event, at_unix_s=time.time(),
+                block_start_index=block_start, sockets=[str(path) for path in sockets], **fields),
+                ensure_ascii=False) + "\n")
+
+    statuses = observe()
+    if all(row["ready"] for row in statuses):
+        status = ("admission_deadline" if admission_deadline is not None
+                  and time.time() >= admission_deadline else "ready")
+        record("ready", status=status, wait_s=0.0, probes=statuses, restart_performed=False)
+        return dict(status=status, wait_s=0.0, probes=statuses)
+
+    record("wait_start", probes=statuses, restart_performed=False)
+    while True:
+        now = time.time()
+        if admission_deadline is not None and now >= admission_deadline:
+            status = "admission_deadline"
+            break
+        if now >= wait_deadline:
+            status = "timeout"
+            break
+        time.sleep(min(MODEL_WAIT_POLL_S, wait_deadline - now))
+        statuses = observe()
+        if all(row["ready"] for row in statuses):
+            status = ("admission_deadline" if admission_deadline is not None
+                      and time.time() >= admission_deadline else "ready")
+            break
+
+    waited = max(0.0, time.time() - started)
+    record("wait_end", status=status, wait_s=waited, probes=statuses,
+           recovery_required=status == "timeout", restart_performed=False)
+    return dict(status=status, wait_s=waited, probes=statuses,
+                recovery_required=status == "timeout", restart_performed=False)
 
 
 def write(path, value):
@@ -146,6 +231,8 @@ def main():
     parser.add_argument("--scales-from", type=Path, help="reuse cost measurements from the matching frozen protocol")
     parser.add_argument("--include-rule-baseline", action="store_true", help="also score the development rule baseline when reusing scales")
     parser.add_argument("--admission-deadline", type=float, help="Unix time to finish at the next dispatch block boundary")
+    parser.add_argument("--wait-model-socket", type=Path, action="append", metavar="SOCKET",
+                        help="repeatable Unix socket whose /health endpoint must be ready before each training dispatch block")
     parser.add_argument("--resume-training", action="store_true", help="resume a safely paused training protocol into a new output directory")
     parser.add_argument("--attach-training", metavar="RUN_ID", help="continue an existing live continuous training run after its admitted prefix is settled")
     args = parser.parse_args()
@@ -159,6 +246,10 @@ def main():
     if args.attach_training and (not args.training_only or args.resume_training or args.scales_from
                                  or not plan.get("development_evidence") or not plan.get("continuous_training")):
         raise ValueError("Attach needs --training-only, the original frozen protocol, and no resume or scale reuse")
+    if args.wait_model_socket and (not args.training_only or not plan.get("continuous_training")):
+        raise ValueError("--wait-model-socket requires --training-only with continuous training")
+    if args.wait_model_socket:
+        args.wait_model_socket = list(dict.fromkeys(args.wait_model_socket))
     normalization = "training_calibration" if "training_calibration" in plan else "development"
     if args.training_only and normalization != "training_calibration":
         raise ValueError("Training requires scales estimated exclusively on the training split")
@@ -198,17 +289,39 @@ def main():
             raise RuntimeError(error.read().decode("utf-8", errors="replace")) from error
     def run(protocol, mode, batch=0):
         if budget_expired():
-            end_at_budget(next_mode=mode, admitted=0)
+            end_at_budget(next_mode=mode, admitted=0, stop_reason="admission_deadline")
         checksum = digest(protocol)
         common = dict(protocol=remote(protocol), protocol_sha256=checksum)
         if args.attach_training:
             result = api("/api/experiments/office/pilot", dict(common, op="record", run_id=args.attach_training))
             batch = result["batch"]
         else:
+            result = None
+        prefix = mode + "-" + str(batch)
+        model_wait_log = args.output / (prefix + "-model-waits.jsonl")
+
+        def wait_models(block_start):
+            return wait_for_model_sockets(args.wait_model_socket, log_path=model_wait_log,
+                block_start=block_start, admission_deadline=args.admission_deadline)
+
+        if args.wait_model_socket and not args.attach_training:
+            # Gate before creating/resuming the server-side workload so an
+            # unavailable service cannot leave an empty RUNNING segment.
+            waiting = wait_models(0)
+            if waiting["status"] != "ready":
+                reason = ("admission_deadline" if waiting["status"] == "admission_deadline"
+                          else "model_unavailable_timeout")
+                write(args.output / "model-wait-stop.json", dict(mode=mode, batch=batch, run_id=None,
+                    next_index=0, stop_reason=reason, recovery_required=waiting.get("recovery_required", False),
+                    restart_performed=False, model_wait=waiting))
+                end_at_budget(next_mode=mode, admitted=0, next_index=0, stop_reason=reason,
+                    recovery_required=waiting.get("recovery_required", False), restart_performed=False,
+                    model_wait=waiting)
+
+        if result is None:
             result = api("/api/experiments/office/pilot", dict(common,
                 op="resume" if mode == "training" and args.resume_training else "start", mode=mode, batch=batch))
         run_id = result["id"]
-        prefix = mode + "-" + str(batch)
         write(args.output / (prefix + "-start.json"), result)
         def confirm_workspace(task_id, index):
             from office_task_workspace import ensure_workspace_finished
@@ -236,6 +349,9 @@ def main():
         blocks = result.get("arrival_blocks") or [dict(indices=wave, offsets_ms=[0] * len(wave),
                                                        profile="batch") for wave in waves]
         start_index = len(result["admitted"]) if args.attach_training else 0
+        stopped_at = None
+        stop_reason = None
+        model_wait_stop = None
         if args.attach_training:
             workload = result.get("workload") or {}
             original_cases = workload_cases(plan, "training")[batch]
@@ -286,6 +402,22 @@ def main():
             blocks = [block for block in blocks if block["indices"][0] >= start_index]
             write(args.output / "attach-preflight.json", dict(run_id=run_id, admitted=start_index,
                   session=live["session"], config_id=live["config_id"], pool=pool))
+            if args.wait_model_socket:
+                waiting = wait_models(start_index)
+                if waiting["status"] != "ready":
+                    stop_reason = ("admission_deadline" if waiting["status"] == "admission_deadline"
+                                   else "model_unavailable_timeout")
+                    model_wait_stop = dict(mode=mode, batch=batch, run_id=run_id, next_index=start_index,
+                        admitted=start_index, stop_reason=stop_reason,
+                        recovery_required=waiting.get("recovery_required", False),
+                        restart_performed=False, model_wait=waiting)
+                    if start_index:
+                        stopped_at = start_index
+                    else:
+                        write(args.output / "model-wait-stop.json", model_wait_stop)
+                        end_at_budget(mode=mode, batch=batch, run_id=run_id, admitted=0, next_index=0,
+                            stop_reason=stop_reason, recovery_required=model_wait_stop["recovery_required"],
+                            restart_performed=False, model_wait=waiting)
         def admit(index, timing):
             for future in score_futures.copy():
                 if future.done():
@@ -301,12 +433,27 @@ def main():
         block_starts = {block["indices"][0] for block in blocks}
         update_after = plan.get("update_after_tasks", 16)
         last_requested = 0
-        stopped_at = None
         for index in range(start_index, len(result["case_ids"])):
             try:
+                if stopped_at is not None:
+                    break
                 if index and index in block_starts and budget_expired():
                     stopped_at = index
+                    stop_reason = "admission_deadline"
                     break
+                if (args.wait_model_socket and index in block_starts and index != start_index):
+                    # This gate is before timed_admissions starts the block, so
+                    # the frozen offsets inside each block remain unchanged.
+                    waiting = wait_models(index)
+                    if waiting["status"] != "ready":
+                        stopped_at = index
+                        stop_reason = ("admission_deadline" if waiting["status"] == "admission_deadline"
+                                       else "model_unavailable_timeout")
+                        model_wait_stop = dict(mode=mode, batch=batch, run_id=run_id, next_index=index,
+                            admitted=index, stop_reason=stop_reason,
+                            recovery_required=waiting.get("recovery_required", False),
+                            restart_performed=False, model_wait=waiting)
+                        break
                 if continuous and index in block_starts and index - last_requested >= update_after:
                     # All business in the previous block has finished. Wait for its
                     # native scores before the generator starts the next block's clock.
@@ -369,11 +516,18 @@ def main():
             for score in pending_scores:
                 grade_one(*score)
         if stopped_at:
+            if model_wait_stop:
+                model_wait_stop.update(pilot_status=result.get("status"), admitted=len(result.get("admitted", [])))
+                write(args.output / "model-wait-stop.json", model_wait_stop)
             if result["status"] != ("PAUSED" if continuous else "PARTIAL") or len(result["admitted"]) != stopped_at:
                 raise RuntimeError("The admitted prefix did not settle")
             end_at_budget(mode=mode, run_id=run_id, admitted=stopped_at, next_index=result.get("next_index"),
                           checkpoint=result.get("checkpoint"), frozen_protocol=str(protocol),
-                          planned=len(plan["cases"]["training"]) if continuous else len(result["case_ids"]))
+                          planned=len(plan["cases"]["training"]) if continuous else len(result["case_ids"]),
+                          stop_reason=stop_reason or "admission_deadline",
+                          recovery_required=bool(model_wait_stop and model_wait_stop.get("recovery_required")),
+                          restart_performed=False if model_wait_stop else None,
+                          model_wait=model_wait_stop.get("model_wait") if model_wait_stop else None)
         result = api("/api/experiments/office/pilot", dict(common, op="finish", run_id=run_id))
         write(args.output / (prefix + "-finish.json"), result)
         if result["status"] != "COMPLETE":
