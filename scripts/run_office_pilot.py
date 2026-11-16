@@ -14,6 +14,7 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
@@ -146,6 +147,7 @@ def main():
     parser.add_argument("--include-rule-baseline", action="store_true", help="also score the development rule baseline when reusing scales")
     parser.add_argument("--admission-deadline", type=float, help="Unix time to finish at the next dispatch block boundary")
     parser.add_argument("--resume-training", action="store_true", help="resume a safely paused training protocol into a new output directory")
+    parser.add_argument("--attach-training", metavar="RUN_ID", help="continue an existing live continuous training run after its admitted prefix is settled")
     args = parser.parse_args()
     plan = json.loads(args.protocol.read_text(encoding="utf-8"))
     if plan.get("schema") not in {"seampact.office-pilot/1", "seampact.office-comparison/1"}:
@@ -154,6 +156,9 @@ def main():
     if args.resume_training and (not args.training_only or args.scales_from or not plan.get("development_evidence")
                                  or not plan.get("continuous_training")):
         raise ValueError("Resume needs --training-only and the original frozen training protocol")
+    if args.attach_training and (not args.training_only or args.resume_training or args.scales_from
+                                 or not plan.get("development_evidence") or not plan.get("continuous_training")):
+        raise ValueError("Attach needs --training-only, the original frozen protocol, and no resume or scale reuse")
     normalization = "training_calibration" if "training_calibration" in plan else "development"
     if args.training_only and normalization != "training_calibration":
         raise ValueError("Training requires scales estimated exclusively on the training split")
@@ -171,6 +176,10 @@ def main():
     def remote(path):
         return service_path(path, args.local_data_root, args.server_data_root)
     remote(args.output)  # Validate the mapping before admitting any task.
+    if args.attach_training:
+        # A separate attempt directory keeps every original receipt and error.
+        args.output.mkdir(parents=True, exist_ok=True)
+        args.output = args.output / ("attach-" + uuid.uuid4().hex)
     args.output.mkdir(parents=True, exist_ok=False)
     def budget_expired():
         return args.admission_deadline is not None and time.time() >= args.admission_deadline
@@ -192,11 +201,21 @@ def main():
             end_at_budget(next_mode=mode, admitted=0)
         checksum = digest(protocol)
         common = dict(protocol=remote(protocol), protocol_sha256=checksum)
-        result = api("/api/experiments/office/pilot", dict(common,
-            op="resume" if mode == "training" and args.resume_training else "start", mode=mode, batch=batch))
+        if args.attach_training:
+            result = api("/api/experiments/office/pilot", dict(common, op="record", run_id=args.attach_training))
+            batch = result["batch"]
+        else:
+            result = api("/api/experiments/office/pilot", dict(common,
+                op="resume" if mode == "training" and args.resume_training else "start", mode=mode, batch=batch))
         run_id = result["id"]
         prefix = mode + "-" + str(batch)
         write(args.output / (prefix + "-start.json"), result)
+        def confirm_workspace(task_id, index):
+            from office_task_workspace import ensure_workspace_finished
+            def evidence(event):
+                with (args.output / (prefix + "-workspace-" + str(index) + ".jsonl")).open("a", encoding="utf-8") as out:
+                    out.write(json.dumps(event, ensure_ascii=False) + "\n")
+            return ensure_workspace_finished(api, task_id, evidence=evidence)
         pending_scores = []
         continuous = mode == "training" and plan.get("continuous_training")
         scoring = ThreadPoolExecutor(max_workers=1) if continuous and grader is not None else None
@@ -216,6 +235,57 @@ def main():
         waves = result.get("arrival_waves") or [[i] for i in range(len(result["case_ids"]))]
         blocks = result.get("arrival_blocks") or [dict(indices=wave, offsets_ms=[0] * len(wave),
                                                        profile="batch") for wave in waves]
+        start_index = len(result["admitted"]) if args.attach_training else 0
+        if args.attach_training:
+            workload = result.get("workload") or {}
+            original_cases = workload_cases(plan, "training")[batch]
+            expected = original_cases[result.get("start_index", 0):]
+            if (result.get("id") != args.attach_training or result.get("protocol_sha256") != checksum
+                    or result.get("mode") != "training" or result.get("status") != "RUNNING"
+                    or result["case_ids"] != expected or len(result["task_ids"]) != len(expected)
+                    or len(set(result["task_ids"])) != len(expected)
+                    or result["admitted"] != result["task_ids"][:start_index]
+                    or not workload.get("training") or not workload.get("continuous")
+                    or workload.get("id") != result["id"] or workload.get("task_ids") != result["task_ids"]):
+                raise ValueError("Existing run does not match the frozen continuous training sequence")
+            flat = [index for block in blocks for index in block["indices"]]
+            if flat != list(range(len(expected))) or start_index not in {0, len(expected), *(b["indices"][0] for b in blocks)}:
+                raise ValueError("Existing admissions are not a complete frozen dispatch block prefix")
+            state = api("/api/state")
+            live = state["scheduler"]["execution"]
+            from seampact.scheduling.capability_scheduler import freeze_config
+            frozen_config = copy.deepcopy(plan["scheduler"])
+            frozen_config["policy"] = copy.deepcopy(plan["policies"]["app_config"])
+            frozen_config = freeze_config(frozen_config, verify_policy=False)
+            pool = {group["id"]: dict(package_digest=group["package_digest"],
+                        contract_digest=group["contract"]["digest"], installation_id=group["installation_id"])
+                    for group in state["runtime_groups"]
+                    if group.get("kind") == "capability-package" and not group.get("detached")}
+            objective = live["objective"]
+            raw = objective["raw"]
+            if (live.get("session") != workload.get("session") or live.get("config") != frozen_config
+                    or live.get("policy_config_id") != workload.get("policy_config_id")
+                    or live.get("policy") != workload.get("policy") or live.get("policy_error")
+                    or pool != workload.get("pool") or pool != plan["development_evidence"].get("pool")
+                    or objective.get("denominator") != start_index or raw.get("finished") != start_index
+                    or raw.get("quality_known") != start_index or live.get("active_tasks")
+                    or live.get("queued_calls") or live.get("running_calls")):
+                raise ValueError("Live scheduler, frozen pool, or settled task ledger does not match the run")
+            for index, task_id in enumerate(result["admitted"]):
+                task = api("/api/tasks/" + task_id)
+                if task.get("status") not in {"RUNNING", "CANCELLING"} and task.get("workspace_status") != "FINISHED":
+                    task = confirm_workspace(task_id, index)
+                settled = task.get("objective_result") or {}
+                if (task.get("id") != task_id or task.get("status") in {"RUNNING", "CANCELLING"}
+                        or task.get("workspace_status") != "FINISHED" or settled.get("session") != live["session"]
+                        or settled.get("config_id") != live.get("config_id") or settled.get("quality") is None):
+                    raise ValueError("Admitted task %s is not fully released and scored; settle the prefix first" % index)
+            latest = api("/api/experiments/office/pilot", dict(common, op="record", run_id=run_id))
+            if latest.get("status") != "RUNNING" or latest.get("admitted") != result["admitted"]:
+                raise ValueError("Admissions changed during attach; stop other dispatchers and retry")
+            blocks = [block for block in blocks if block["indices"][0] >= start_index]
+            write(args.output / "attach-preflight.json", dict(run_id=run_id, admitted=start_index,
+                  session=live["session"], config_id=live["config_id"], pool=pool))
         def admit(index, timing):
             for future in score_futures.copy():
                 if future.done():
@@ -232,7 +302,7 @@ def main():
         update_after = plan.get("update_after_tasks", 16)
         last_requested = 0
         stopped_at = None
-        for index in range(len(result["case_ids"])):
+        for index in range(start_index, len(result["case_ids"])):
             try:
                 if index and index in block_starts and budget_expired():
                     stopped_at = index
@@ -261,7 +331,8 @@ def main():
                     time.sleep(2)
                 write(args.output / (prefix + "-task-" + str(index) + ".json"), task)
                 if task.get("workspace_status") != "FINISHED":
-                    raise RuntimeError("Task resources have unresolved ownership; the recorded task is retained")
+                    task = confirm_workspace(admission["task_id"], index)
+                    write(args.output / (prefix + "-task-" + str(index) + ".json"), task)
                 if (task.get("evaluation") or {}).get("source_revision") and "outputs" in task["evaluation"]:
                     from run_office_spreadsheet import collect
                     folder = args.output / (prefix + "-spreadsheet-" + str(index))
@@ -308,6 +379,18 @@ def main():
         if result["status"] != "COMPLETE":
             raise RuntimeError("Workload did not settle: " + str(result.get("error")))
         return result
+
+    if args.attach_training:
+        trained = run(args.protocol, "training")
+        segments = [api("/api/experiments/office/pilot", dict(op="record", protocol=remote(args.protocol),
+                    protocol_sha256=digest(args.protocol), run_id=identity)) for identity in trained.get("previous_segments", [])]
+        observed = [case for part in [*segments, trained] for case in part["case_ids"][:len(part["admitted"])]]
+        if observed != plan["cases"]["training"]:
+            raise RuntimeError("Training records do not cover the frozen sequence exactly once")
+        write(args.output / "training-summary.json", dict(status=trained["status"], tasks=len(observed),
+              checkpoint=trained["checkpoint"], metrics=combined_summary([*segments, trained]) if segments else trained["workload"]["summary"],
+              segment_ids=[part["id"] for part in [*segments, trained]], frozen_protocol=str(args.protocol)))
+        return
 
     state = api("/api/state")
     write(args.output / "initial-runtime.json", dict(models=state["models"],
