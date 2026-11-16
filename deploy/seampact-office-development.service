@@ -1,6 +1,7 @@
 [Unit]
 Description=SeamPact frozen development comparison
-After=network-online.target
+Requires=seampact-experiment-models.service
+After=network-online.target seampact-experiment-models.service
 
 [Service]
 Type=exec

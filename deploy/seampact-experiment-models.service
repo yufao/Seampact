@@ -1,0 +1,15 @@
+[Unit]
+Description=Dedicated model endpoints for the current user's experiments
+StopWhenUnneeded=yes
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+EnvironmentFile=-%h/.config/seampact/experiment-models.env
+StateDirectory=seampact-experiment-models
+StateDirectoryMode=0700
+UMask=0077
+ExecStart=/usr/bin/python3 %h/.local/lib/seampact/server_experiment.py acquire
+ExecStopPost=/usr/bin/python3 %h/.local/lib/seampact/server_experiment.py release
+TimeoutStartSec=6min
+TimeoutStopSec=infinity
