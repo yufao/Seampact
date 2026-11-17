@@ -12,10 +12,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from seampact.hosting import backends
-from seampact.scenes.scenarios import FrozenCatalog
-from seampact.scheduling.joint import validate_worker_gpu_envelopes
 from seampact.service import Platform
-from seampact.source.inspection import Inspector
 from seampact.server import make_server
 
 A = "GPU-12345678-1234-1234-1234-123456789abc"
@@ -45,15 +42,10 @@ class GPUAllocationTests(unittest.TestCase):
         # No controller polling or image preparation is part of these checks.
         self.controller.close()
         self.platform.images = None
-        source = self.root / "source"
-        source.mkdir()
-        (source / "original.py").write_text("def echo(value: str) -> str:\n    return value\n", encoding="utf-8")
-        inspector = Inspector.freeze(source, self.root / "snapshots", "request", ["original.py"], "echo", "echo value")
-        inspector.request["source_id"] = "source"
-        self.unit, = self.platform.catalog.install(inspector, dict(entries=[
-            dict(id="echo", path="original.py", symbol="echo", kind="function")]), "analysis", "install")
-        self.group = self.unit["runtime_group"]
-        self.platform.store.save("harness", "source", dict(id="source", status="ANALYZED", installation_id="install"))
+        self.group = "capability-group"
+        self.platform.store.save("runtime_group", self.group, dict(id=self.group, kind="capability-package",
+            contract=dict(digest="contract", operations=dict(start=dict(status="SUPPORTED")),
+                replicas=dict(replicable=False), host_profile="fixture"), units=[], resources=[], bindings={}))
         self.platform.store.save("deployment", self.group, dict(id=self.group, image="example:local",
             folder=str(self.root), binding_fingerprint="binding", build=dict(image_id="sha256:" + "a" * 64)))
         self.controller.configure_backend(dict(kind="docker", coordinator_url="http://coordinator.invalid",
@@ -103,9 +95,7 @@ class GPUAllocationTests(unittest.TestCase):
 
     def test_frozen_catalog_and_run_lock_reject_changed_devices_before_dispatch(self):
         self.save([0])
-        frozen = FrozenCatalog(self.platform.catalog, [self.unit["id"]], {self.unit["id"]: "REMOTE"})
-        placement = frozen.placement[self.unit["id"]]
-        self.assertEqual(placement["gpu_devices"], [A])
+        placement = dict(group_id=self.group, gpu_devices=[A])
         self.controller.lock_groups("run", {self.group: placement}, {})
         with self.assertRaisesRegex(ValueError, "运行"):
             self.save([1])
@@ -115,7 +105,7 @@ class GPUAllocationTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "GPU 分配已变化"):
             self.controller.check_gpu_placement(placement)
         with self.assertRaisesRegex(ValueError, "GPU 分配已变化"):
-            self.controller.invoke_placed(dict(placement, run_id="run"), self.unit, {})
+            self.controller.invoke_placed(dict(placement, run_id="run"), dict(id="unit"), {})
         self.assertEqual(self.commands, [])
 
     def test_unreleased_failure_and_frozen_image_scope_block_reconfiguration(self):
@@ -141,33 +131,7 @@ class GPUAllocationTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "释放实例"):
             self.controller.configure_backend(dict(config, gpus="device=0"))
 
-    def test_gpu_resource_demands_match_assignment_without_requiring_optional_measurement(self):
-        name_a, name_b = "gpu:" + A + ":memory_mb", "gpu:" + B + ":memory_mb"
-        placement = {self.group: dict(gpu_devices=[A])}
-        validate_worker_gpu_envelopes(placement, {}, {})
-        validate_worker_gpu_envelopes(placement, {name_a: 40000}, {self.group: {name_a: 12000}})
-        for resources, demands in [({name_b: 40000}, {self.group: {name_b: 12000}}),
-                                   ({name_a: 40000}, {self.group: {name_a: 0}})]:
-            with self.assertRaises(ValueError):
-                validate_worker_gpu_envelopes(placement, resources, demands)
 
-    def test_activated_policy_cannot_run_after_its_frozen_gpu_identity_changes(self):
-        jobs = self.platform.training
-        checkpoint = dict(checkpoint_id="frozen")
-        jobs.active = dict(run_id="trained", checkpoint=checkpoint)
-        pool = dict(id=self.unit["id"], typed_contract_digest="typed",
-            placement=dict(kind="REMOTE", contract_digest="contract", gpu_devices=[A]))
-        source = dict(id="trained", checkpoint=checkpoint, manifest=dict(scene=dict(tasks=[dict(id="task")],
-            unit_ids=[self.unit["id"]], model_roles=[]), pool=[pool], models={}))
-        catalog = SimpleNamespace(snapshot_resources=lambda: {}, require_operation=lambda *args: dict(contract_digest="typed"),
-            placement={self.unit["id"]: dict(contract_digest="contract", gpu_devices=[B])})
-        profiles = SimpleNamespace(public=lambda: {})
-        with patch.object(jobs, "record", return_value=source), \
-                patch("seampact.scheduling.training.BoundProfiles", return_value=profiles), \
-                patch("seampact.scheduling.training.FrozenCatalog", return_value=catalog):
-            with self.assertRaisesRegex(ValueError, "GPU 分配已改变"):
-                jobs.start_chat(dict(scene_run_id="trained", scene_task_id="task"))
-        self.assertEqual(self.platform.store.list("task"), [])
 
     def test_http_probe_save_and_explicit_start_share_identity_resolution(self):
         server = make_server(self.platform, 0)

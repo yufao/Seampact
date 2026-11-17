@@ -232,8 +232,7 @@ def make_server(platform, port=8880, host="127.0.0.1", public_port=None):
                     "/api/analyze-update", "/api/analysis/resume", "/api/analysis/cancel",
                     "/api/analysis/revisions", "/api/analysis/revisions/save", "/api/analysis/revisions/check",
                     "/api/analysis/revisions/refine", "/api/analysis/revisions/install", "/api/analysis/revisions/feedback",
-                    "/api/harnesses/configure", "/api/harnesses/delete", "/api/plans", "/api/analysis/import",
-                    "/api/scheduler/config", "/api/scheduler/runs", "/api/scheduler/runs/stop", "/api/scheduler/activate"}
+                    "/api/harnesses/configure", "/api/harnesses/delete", "/api/plans", "/api/analysis/import"}
                 if path in retired:
                     return self.send(410, dict(error="此旧执行入口已停用；请使用仓库生成、能力包和普通 Agent 入口。历史记录仍可读取。"))
                 if path == "/api/projects":
@@ -396,15 +395,6 @@ def make_server(platform, port=8880, host="127.0.0.1", public_port=None):
                     result = platform.chat.delete_conversation(body["conversation_id"])
                 elif path == "/api/chats/restore":
                     result = platform.chat.restore_conversation(body["conversation_id"])
-                elif path == "/api/scheduler/config":
-                    result = platform.training.configure(body)
-                elif path == "/api/scheduler/runs":
-                    result = platform.training.start(body)
-                elif path == "/api/scheduler/runs/stop":
-                    result = (platform.training.stop(body["run_id"], after_windows=body["after_windows"])
-                              if "after_windows" in body else platform.training.stop(body["run_id"]))
-                elif path == "/api/scheduler/activate":
-                    result = platform.training.activate(body["run_id"])
                 elif path == "/api/analysis/export":
                     result = platform.export_analysis(body["analysis_id"])
                 elif path == "/api/analysis/import":

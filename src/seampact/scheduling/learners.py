@@ -70,11 +70,13 @@ class Learner:
         self.algorithm = algorithm
         self.observation_dim, self.candidate_dim = observation_dim, candidate_dim
         self.config = default_config(algorithm)
-        unknown = set(config or {}) - set(self.config)
+        optional = {"value_components"} if algorithm == "ppo" else set()
+        unknown = set(config or {}) - set(self.config) - optional
         if unknown:
             raise ValueError("unknown learner settings: " + ", ".join(sorted(unknown)))
         self.config.update(copy.deepcopy(config or {}))
         self._validate_config()
+        self.value_components = tuple(self.config.get("value_components", ()))
         try:
             import torch
             from torch import nn
@@ -105,6 +107,13 @@ class Learner:
         if not isinstance(widths, (list, tuple)) or not widths or any(type(x) is not int or x < 1 for x in widths):
             raise ValueError("hidden_sizes must contain positive integers")
         cfg["hidden_sizes"] = list(widths)
+        if "value_components" in cfg:
+            components = cfg["value_components"]
+            if (not isinstance(components, (list, tuple)) or not components
+                    or any(not isinstance(term, str) or not term.isidentifier() for term in components)
+                    or len(set(components)) != len(components)):
+                raise ValueError("value_components must contain distinct component names")
+            cfg["value_components"] = list(components)
         positive_ints = ("batch_size", "replay_capacity", "learning_starts", "gradient_steps",
                          "epsilon_decay_steps", "target_update_interval", "rollout_steps", "epochs")
         for key in positive_ints:
@@ -142,8 +151,9 @@ class Learner:
             self.optimizers["q"] = self.torch.optim.Adam(self.networks["q"].parameters(), lr=rate)
         elif self.algorithm == "ppo":
             self.networks["actor"] = self._mlp(width)
-            self.networks["value"] = self._mlp(width)
-            parameters = list(self.networks["actor"].parameters()) + list(self.networks["value"].parameters())
+            for name in self.value_network_names:
+                self.networks[name] = self._mlp(width)
+            parameters = [parameter for network in self.networks.values() for parameter in network.parameters()]
             self.optimizers["policy"] = self.torch.optim.Adam(parameters, lr=rate)
         else:
             for name in ("actor", "q1", "q2"):
@@ -184,10 +194,15 @@ class Learner:
         expanded = states.unsqueeze(1).expand(-1, candidates.shape[1], -1)
         return self.networks[name](self.torch.cat((expanded, candidates), dim=-1)).squeeze(-1)
 
-    def _values(self, states, candidates, masks):
+    @property
+    def value_network_names(self):
+        return ["value_" + term for term in self.value_components] if self.value_components else ["value"]
+
+    def _values(self, states, candidates, masks, component=None):
         weights = masks.unsqueeze(-1).to(candidates.dtype)
         pooled = (candidates * weights).sum(dim=1) / weights.sum(dim=1).clamp_min(1)
-        return self.networks["value"](self.torch.cat((states, pooled), dim=-1)).squeeze(-1)
+        name = "value_" + component if component is not None else "value"
+        return self.networks[name](self.torch.cat((states, pooled), dim=-1)).squeeze(-1)
 
     def _distribution(self, logits, masks):
         # Finite masking also handles terminal rows with no next legal action.
@@ -221,16 +236,32 @@ class Learner:
             greedy = int(probabilities[0].argmax().item())
             index = (int(torch.multinomial(probabilities[0], 1, generator=self.generator).item()) if training
                      else greedy)
-            value = (self._values(states, features, masks)[0] if self.algorithm == "ppo" else
-                     (probabilities * (torch.minimum(self._scores("q1", states, features),
-                                                     self._scores("q2", states, features)) -
-                                       self.config["temperature"] * log_probs)).sum(dim=-1)[0])
-            return dict(index=index, log_prob=float(log_probs[0, index].item()), value=float(value.item()),
+            component_values = ({term: float(self._values(states, features, masks, term)[0].item())
+                                 for term in self.value_components} if self.value_components else {})
+            if self.algorithm == "ppo":
+                value = (component_values[self.value_components[0]] if component_values else
+                         float(self._values(states, features, masks)[0].item()))
+            else:
+                value = float((probabilities * (torch.minimum(self._scores("q1", states, features),
+                    self._scores("q2", states, features)) - self.config["temperature"] * log_probs)).sum(dim=-1)[0].item())
+            result = dict(index=index, log_prob=float(log_probs[0, index].item()), value=value,
                         policy_version=self.policy_version,
                         diagnostics=dict(score_kind="action_probability", greedy_index=greedy, explored=index != greedy,
                             scores=[float(probabilities[0, i].item()) if allowed else None for i, allowed in enumerate(legal)]))
+            if component_values:
+                result["component_values"] = component_values
+            return result
 
     def observe(self, transition):
+        row = self.validate_transition(transition)
+        if self.algorithm == "ppo":
+            self.rollout.append(row)
+        else:
+            self.replay.append(row)
+        self.steps += 1
+
+    def validate_transition(self, transition):
+        """Validate without consuming any part of an on-policy transaction."""
         row = copy.deepcopy(transition)
         state, candidates, legal = self._decision(row.get("state"), row.get("candidates"), row.get("legal"))
         index = row.get("index")
@@ -254,10 +285,14 @@ class Learner:
                 raise ValueError("PPO only accepts the current policy's fresh rollout")
             row["old_log_prob"] = _finite(row.get("old_log_prob"), "old_log_prob")
             row["value"] = _finite(row.get("value"), "value")
-            self.rollout.append(row)
-        else:
-            self.replay.append(row)
-        self.steps += 1
+            if self.value_components:
+                for field in ("component_rewards", "component_values", "component_weights"):
+                    values = row.get(field)
+                    if not isinstance(values, dict) or set(values) != set(self.value_components):
+                        raise ValueError(field + " must include every value component")
+                    row[field] = {term: _finite(values[term], field + "." + term)
+                                  for term in self.value_components}
+        return row
 
     def _transition_batch(self, rows):
         current = self._batch([(row["state"], row["candidates"], row["legal"]) for row in rows])
@@ -345,6 +380,8 @@ class Learner:
                     entropy=float(-(probs.detach() * logs.detach()).sum(dim=1).mean().item()), temperature=alpha)
 
     def _update_ppo(self):
+        if self.value_components:
+            return self._update_component_ppo()
         torch = self.torch
         rows = self.rollout
         current, following, actions, rewards, bootstrap = self._transition_batch(rows)
@@ -402,6 +439,79 @@ class Learner:
         self.rollout = []
         self.policy_version += 1
         return {key: sum(row[key] for row in stats) / len(stats) for key in stats[0]}
+
+    def _update_component_ppo(self):
+        """Fit fixed component returns, composing advantages only for the actor."""
+        torch, rows = self.torch, self.rollout
+        current, following, actions, _, bootstrap = self._transition_batch(rows)
+        states, candidates, masks = current
+        weights = rows[0]["component_weights"]
+        if any(row["component_weights"] != weights for row in rows):
+            raise ValueError("PPO component weights must stay frozen throughout a rollout")
+        block_normalizers = {row.get("block_normalizer") for row in rows}
+        if len(block_normalizers) != 1:
+            raise ValueError("PPO rollout must use one frozen block normalizer")
+        normalizer = block_normalizers.pop()
+        objective_scale = 1.0 if normalizer is None else len(rows) / _finite(normalizer, "block_normalizer")
+        if objective_scale <= 0:
+            raise ValueError("block_normalizer must be positive")
+        advantages, returns = {}, {}
+        for term in self.value_components:
+            with torch.no_grad():
+                next_values = self._values(*following, component=term)
+            old_values = torch.tensor([row["component_values"][term] for row in rows],
+                                      dtype=torch.float32, device=self.device)
+            rewards = torch.tensor([row["component_rewards"][term] for row in rows],
+                                   dtype=torch.float32, device=self.device)
+            component_advantages = torch.zeros_like(rewards)
+            future = 0.0
+            for index in reversed(range(len(rows))):
+                row = rows[index]
+                continuous = not row["terminated"] and not row["truncated"] and index + 1 < len(rows)
+                if continuous:
+                    next_row = rows[index + 1]
+                    continuous = (row.get("episode_id") == next_row.get("episode_id") and
+                                  row["next_state"] == next_row["state"] and
+                                  row["next_candidates"] == next_row["candidates"] and
+                                  row["next_legal"] == next_row["legal"])
+                delta = rewards[index] + self.config["gamma"] * bootstrap[index] * next_values[index] - old_values[index]
+                future = delta + self.config["gamma"] * self.config["gae_lambda"] * future * float(continuous)
+                component_advantages[index] = future
+            advantages[term] = component_advantages
+            returns[term] = component_advantages + old_values
+        composed = sum(weights[term] * advantages[term] for term in self.value_components)
+        diagnostics = {"advantage_mean_" + term: float(advantages[term].mean().item()) for term in self.value_components}
+        diagnostics["composed_advantage_mean"] = float(composed.mean().item())
+        if len(rows) > 1:
+            composed = (composed - composed.mean()) / composed.std(unbiased=False).clamp_min(1e-8)
+        old_logs = torch.tensor([row["old_log_prob"] for row in rows], dtype=torch.float32, device=self.device)
+        stats = []
+        for _ in range(self.config["epochs"]):
+            order = torch.randperm(len(rows), generator=self.generator, device=self.device)
+            for start in range(0, len(rows), self.config["batch_size"]):
+                selection = order[start:start + self.config["batch_size"]]
+                batch_states, batch_candidates, batch_masks = states[selection], candidates[selection], masks[selection]
+                probabilities, log_probs = self._distribution(self._scores("actor", batch_states, batch_candidates), batch_masks)
+                selected_logs = log_probs.gather(1, actions[selection].unsqueeze(1)).squeeze(1)
+                ratio = (selected_logs - old_logs[selection]).exp()
+                direct = ratio * composed[selection]
+                clipped = ratio.clamp(1 - self.config["clip_ratio"], 1 + self.config["clip_ratio"]) * composed[selection]
+                policy_loss = -torch.minimum(direct, clipped).mean() * objective_scale
+                losses = {term: torch.nn.functional.mse_loss(
+                    self._values(batch_states, batch_candidates, batch_masks, term), returns[term][selection])
+                    for term in self.value_components}
+                value_loss = sum(losses.values()) / len(losses)
+                entropy = -(probabilities * log_probs).sum(dim=1).mean()
+                loss = policy_loss + self.config["value_coefficient"] * value_loss - self.config["entropy_coefficient"] * entropy
+                self._step("policy", loss, list(self.networks.values()))
+                self.updates += 1
+                stats.append(dict(policy_loss=float(policy_loss.item()), value_loss=float(value_loss.item()),
+                    entropy=float(entropy.item()), approximate_kl=float((old_logs[selection] - selected_logs).mean().item()),
+                    clip_fraction=float(((ratio - 1).abs() > self.config["clip_ratio"]).float().mean().item()),
+                    **{"value_loss_" + term: float(component_loss.item()) for term, component_loss in losses.items()}))
+        self.rollout = []
+        self.policy_version += 1
+        return dict({key: sum(row[key] for row in stats) / len(stats) for key in stats[0]}, **diagnostics)
 
     def snapshot(self):
         return dict(algorithm=self.algorithm, observation_dim=self.observation_dim, candidate_dim=self.candidate_dim,

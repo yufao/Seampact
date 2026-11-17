@@ -179,9 +179,9 @@ def _read_plan(body):
     if not isinstance(plan.get("bindings", {}), dict) or not isinstance(plan.get("scheduler"), dict):
         raise ValueError("pilot 调度配置或指定检查格式不正确")
     selector = plan.get("development_selector", "app_config")
-    if selector not in {"app_config", "scheduler"}:
+    if selector not in {"app_config", "scheduler", "resource_rule"}:
         raise ValueError("开发校准的检查选择方式无效")
-    if selector == "scheduler" and (plan.get("policies", {}).get("app_config") or {}).get("kind") != "rule":
+    if selector in {"scheduler", "resource_rule"} and (plan.get("policies", {}).get("app_config") or {}).get("kind") != "rule":
         raise ValueError("开发校准调度器须使用明确的规则策略")
     if type(plan.get("local_development_only", False)) is not bool:
         raise ValueError("开发限定标记须为布尔值")
@@ -323,7 +323,8 @@ def _handle(platform, body):
         return dict(case_id=case_id, corpus=corpus, result=result)
     if op in {"start", "resume"}:
         mode, batch = body.get("mode"), body.get("batch", 0)
-        if "execution_timeout_s" in plan and mode not in {"development", "training_calibration", "training"}:
+        if ("execution_timeout_s" in plan and mode not in {"development", "training_calibration", "training"}
+                and not mode.startswith("validation_")):
             raise ValueError("独立执行时限仅用于开发诊断或训练")
         if plan.get("benign_training_only") and mode not in {"training", "training_calibration"}:
             raise ValueError("该良性训练协议不开放其他数据划分")
@@ -365,7 +366,8 @@ def _handle(platform, body):
             source = evidence.get("objective_scale_source") or {}
             calibration_plan = plan
             if source:
-                if source.get("kind") != "completed_parent_objective":
+                source_kind = source.get("kind")
+                if source_kind not in {"completed_parent_objective", "completed_training_calibration"}:
                     raise ValueError("未知目标尺度来源")
                 raw = Path(source["protocol"]).read_bytes()
                 source_sha = hashlib.sha256(raw).hexdigest()
@@ -373,8 +375,9 @@ def _handle(platform, body):
                     raise ValueError("父尺度协议身份不符")
                 calibration_plan = json.loads(raw)
                 source_series = platform.store.get("office_pilot_series", source_sha) or {}
-                if source_series.get("workloads", {}).get("training:0", {}).get("status") != "COMPLETE":
-                    raise ValueError("目标尺度来源的父训练尚未完成")
+                if (source_kind == "completed_parent_objective"
+                        and source_series.get("workloads", {}).get("training:0", {}).get("status") != "COMPLETE"):
+                    raise ValueError("目标尺度来源的实测工作负载尚未完成")
                 from seampact.scheduling.unified_objective import freeze_objective
                 source_objective = freeze_objective(calibration_plan["scheduler"]["objective"])
                 target_objective = freeze_objective(plan["scheduler"]["objective"])
@@ -386,6 +389,15 @@ def _handle(platform, body):
                             {"objective_scale_source", "reused_from_protocol_sha256"}}
                 if stripped != calibration_plan.get("development_evidence"):
                     raise ValueError("复用的父校准证据与原协议不一致")
+                if source_kind == "completed_training_calibration":
+                    _, _, source_cases = _read_plan(dict(protocol=source["protocol"], protocol_sha256=source_sha))
+                    def family(case):
+                        return case.get("_source", "agentdojo"), case.get("suite"), case["family_id"]
+                    calibration_families = {family(source_cases[key]) for key in evidence.get("case_ids", [])}
+                    if calibration_families.intersection(family(cases[key]) for key in plan["cases"]["training"]):
+                        raise ValueError("独立训练校准与策略训练的题目家族须互斥")
+                    if evidence.get("scales") != target_objective["scales"]:
+                        raise ValueError("独立训练校准的实测尺度与目标不一致")
             if evidence.get("source_split") != "training" or evidence.get("case_ids") != workload_cases(calibration_plan, "training_calibration")[0]:
                 raise ValueError("PPO 训练只接受在训练题上实测的成本尺度")
             runs = [platform.store.get("office_pilot", key) for key in evidence.get("run_ids", [])]

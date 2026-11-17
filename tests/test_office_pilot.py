@@ -102,6 +102,73 @@ class PilotChecks(unittest.TestCase):
         self.assertEqual(result["task_id"], "task")
         self.assertEqual(records[("office_pilot", "run")]["admitted"], ["task"])
 
+    def test_resource_rule_calibration_routes_the_application_heuristic(self):
+        case = dict(id="risk-case", _source="privacy")
+        plan = dict(project_id="project", deadline_s=None, development_selector="resource_rule",
+                    manifest="manifest.json", manifest_sha256="digest", execution_timeout_s=None)
+        row = dict(id="run", protocol_sha256="identity", mode="training_calibration", status="RUNNING",
+                   case_ids=[case["id"]], task_ids=["task"], admitted=[], application={})
+        records = {("office_pilot", "run"): row}
+        store = SimpleNamespace(get=lambda kind, key: records.get((kind, key)),
+                                save=lambda kind, key, value: records.__setitem__((kind, key), value))
+        def start(_platform, _request, *, internal_task_id, pilot_config):
+            self.assertEqual(pilot_config["mode"], "resource_rule")
+            self.assertIsNone(pilot_config["deadline_s"])
+            return dict(task_id=internal_task_id)
+        with patch("seampact.office_pilot._read_plan", return_value=("identity", plan, {case["id"]: case})), \
+             patch("seampact.office_privacy.start_privacy_task", side_effect=start):
+            handle(SimpleNamespace(store=store, execution=object()), dict(op="admit", run_id="run"))
+
+    def test_disjoint_measured_training_calibration_checks_actual_run_not_output_protocol_series(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            roles = ["sanitize", "injection", "privacy", "secrets", "code_scan"]
+            units = [dict(id=role, runtime_group=role, status="READY", generation_verification=dict(status="SUCCEEDED"))
+                     for role in roles]
+            rag = dict(id="rag", runtime_group="rag", status="READY", generation_verification=dict(status="SUCCEEDED"))
+            objective = dict(weights=dict(quality=1, delivery=0, latency=.1, ram=0, vram=0, api=0),
+                scales=dict(latency_s=10, ram_byte_s=1, vram_byte_s=1, api_tokens=1),
+                quality_evaluator="native", deadline_s=None, resource_source="measured")
+            evidence = dict(protocol_sha256="actual-calibration-input-sha", run_ids=["baseline-run"],
+                source_split="training", case_ids=["baseline"], application={}, scales=objective["scales"])
+            source_plan = dict(scheduler=dict(objective=objective), development_evidence=evidence,
+                training_calibration=dict(case_ids=["baseline"]), cases=dict(training=["baseline"], development=["dev"], evaluation=["test"]))
+            source = Path(tmp)/"frozen-calibration.json"
+            source.write_text(json.dumps(source_plan), encoding="utf-8")
+            origin = dict(kind="completed_training_calibration", protocol=str(source),
+                          protocol_sha256=hashlib.sha256(source.read_bytes()).hexdigest(), scales=objective["scales"])
+            plan = dict(schema="seampact.office-comparison/1", project_id="project", rag=dict(capability_id="rag"),
+                scheduler=dict(objective=objective), policies=dict(app_config=dict(kind="rule")),
+                cases=dict(training=["train"], development=["dev"], evaluation=["test"]),
+                development_evidence=dict(evidence, objective_scale_source=origin))
+            record = dict(mode="training_calibration", status="COMPLETE", protocol_sha256=evidence["protocol_sha256"], case_ids=["baseline"])
+            records = {("office_pilot", "baseline-run"): record}
+            store = SimpleNamespace(get=lambda kind, key: records.get((kind, key)))
+            execution = SimpleNamespace(_pool=lambda: None, configure=Mock(side_effect=RuntimeError("reached configuration")))
+            project = dict(guard_candidates=[dict(role=role, unit_id=role) for role in roles], enabled_group_ids=["rag"])
+            platform = SimpleNamespace(store=store, execution=execution,
+                project_applications=SimpleNamespace(snapshot=lambda *_: (project, units)),
+                capabilities=SimpleNamespace(public=lambda: [], unit=lambda _: rag))
+            cases = dict(train=dict(family_id="training-family"), baseline=dict(family_id="calibration-family"))
+            def read_plan(body):
+                return (origin["protocol_sha256"], source_plan, cases) if body.get("protocol") == str(source) else ("target", plan, cases)
+            with patch("seampact.office_pilot._read_plan", side_effect=read_plan), \
+                 patch("seampact.office_pilot.frozen_application", return_value={}):
+                # No series exists for frozen-calibration.json: the measured run belongs to its input protocol.
+                evidence["application"] = {"guard_candidates": []}
+                plan["development_evidence"]["application"] = evidence["application"]
+                source_plan["development_evidence"]["application"] = evidence["application"]
+                source.write_text(json.dumps(source_plan), encoding="utf-8")
+                origin["protocol_sha256"] = hashlib.sha256(source.read_bytes()).hexdigest()
+                with self.assertRaisesRegex(RuntimeError, "reached configuration"):
+                    handle(platform, dict(op="start", mode="training"))
+                cases["train"]["family_id"] = "calibration-family"
+                with self.assertRaisesRegex(ValueError, "家族须互斥"):
+                    handle(platform, dict(op="start", mode="training"))
+                cases["train"]["family_id"] = "training-family"
+                record["status"] = "RUNNING"
+                with self.assertRaisesRegex(ValueError, "实测运行"):
+                    handle(platform, dict(op="start", mode="training"))
+
     def test_unsettled_training_finish_synchronizes_series_and_preserves_checkpoints_on_retry(self):
         with tempfile.TemporaryDirectory() as tmp:
             checkpoint = Path(tmp) / "retained.pt"

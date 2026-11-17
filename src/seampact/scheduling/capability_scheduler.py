@@ -564,6 +564,8 @@ class CapabilityScheduler:
                 raise ValueError("工作负载需要唯一身份及非空、无重复的任务清单")
             if type(continuous) is not bool:
                 raise ValueError("continuous 须为布尔值")
+            if training and self._config["objective"] and self._config["objective"].get("pareto") and not continuous:
+                raise ValueError("帕累托训练须使用连续分项结算，不能使用旧标量结算入口")
             if reward_denominator is not None and (not training or not continuous or
                     type(reward_denominator) is not int or reward_denominator < len(task_ids)):
                 raise ValueError("连续训练的奖励分母须覆盖本段题目")
@@ -693,24 +695,34 @@ class CapabilityScheduler:
         rewards, prefix = [0.0] * len(decisions), 0.0
         normalizer = workload.get("reward_denominator", len(workload["task_ids"]))
         weights, scales = objective["weights"], objective["scales"]
-        def credit(value, timestamp, clock):
+        pareto = objective.get("pareto")
+        component_terms = ("quality", "latency", "ram", "vram", "api") if pareto else ()
+        components = {key: dict(before_first=0.0, after_decisions=[0.0] * len(decisions))
+                      for key in component_terms}
+        def credit(value, timestamp, clock, term=None):
             nonlocal prefix
             index = bisect_right([decision[clock] for decision in decisions], timestamp) - 1
+            if term in components:
+                if index < 0:
+                    components[term]["before_first"] += value
+                else:
+                    components[term]["after_decisions"][index] += value
+            value *= weights[term] * (1 if term == "quality" else -1) if term else 1
             if index < 0:
                 prefix += value
             else:
                 rewards[index] += value
         for row in rows:
             tokens = row["metrics"].get("api_tokens")
-            if tokens is None and weights["api"]:
+            if tokens is None and (weights["api"] or "api" in component_terms):
                 if final:
                     raise ValueError("启用的 API token 计量缺失")
                 workload["pending_update"]["blocked"] = "启用的 API token 计量缺失"
                 return dict(updated=False, reason="启用的 API token 计量缺失")
-            value = (weights["quality"] * row["quality"] - weights["delivery"] * int(not row["delivered"])
-                     - weights["latency"] * row["latency_s"] / scales["latency_s"]
-                     - weights["api"] * (tokens or 0) / scales["api_tokens"]) / normalizer
-            credit(value, row["finished_s"], "monotonic_s")
+            for term, value in dict(quality=row["quality"], delivery=int(not row["delivered"]),
+                                    latency=row["latency_s"] / scales["latency_s"],
+                                    api=(tokens or 0) / scales["api_tokens"]).items():
+                credit(value / normalizer, row["finished_s"], "monotonic_s", term)
         for piece in measured["pieces"]:
             boundaries = [piece["start_s"], *[decision["at"] for decision in decisions
                 if piece["start_s"] < decision["at"] < piece["end_s"]], piece["end_s"]]
@@ -726,13 +738,35 @@ class CapabilityScheduler:
                         raise ValueError(reason)
                     workload["pending_update"]["blocked"] = reason
                     return dict(updated=False, reason=reason)
-                value = -weights[metric.removesuffix("_byte_s")] * amount / scales[metric] / normalizer
-                credit(value, left, "at")
+                credit(amount / scales[metric] / normalizer, left, "at", metric.removesuffix("_byte_s"))
+        scalarization = None
+        if pareto:
+            prepared = self.policy.interval_weights(components, normalizer, len(rows))
+            coefficients, scalarization = prepared["weights"], prepared["receipt"]
+            def compose(position):
+                values = {key: item["before_first"] if position is None else item["after_decisions"][position]
+                          for key, item in components.items()}
+                return coefficients["quality"] * values["quality"] - sum(
+                    coefficients[key] * values[key] for key in component_terms if key != "quality")
+            prefix = compose(None)
+            rewards = [compose(index) for index in range(len(decisions))]
         interval_id = str(len(workload["updates"]) + 1)
         summary = dict(training_ready=True, objective_id=digest(objective), policy_config_id=self.policy_config_id,
                        session=self.session, interval_id=interval_id, utility=prefix + sum(rewards),
                        normalizer=normalizer, complete=final)
-        if final and not math.isclose(sum(item["utility"] for item in workload["updates"]) + summary["utility"],
+        if pareto:
+            summary.update(component_settlements=components, completed_tasks=len(rows),
+                           optimization_weights=coefficients, scalarization=scalarization)
+            if final:
+                for key, value in components.items():
+                    total = value["before_first"] + sum(value["after_decisions"])
+                    total += sum(item["component_settlements"][key]["before_first"]
+                                 + sum(item["component_settlements"][key]["after_decisions"])
+                                 for item in workload["updates"])
+                    expected = workload["summary"]["components"][key] * workload["summary"]["denominator"] / normalizer
+                    if not math.isclose(total, expected, rel_tol=1e-7, abs_tol=1e-9):
+                        raise ValueError("连续区间分项之和与完整工作负载不一致，拒绝更新: " + key)
+        if final and not pareto and not math.isclose(sum(item["utility"] for item in workload["updates"]) + summary["utility"],
                                       workload["summary"]["utility"] * workload["summary"]["denominator"] / normalizer,
                                       rel_tol=1e-7, abs_tol=1e-9):
             raise ValueError("连续区间效用之和与整个工作负载不一致，拒绝更新")
@@ -745,6 +779,10 @@ class CapabilityScheduler:
                        decision_ids=[decision["id"] for decision in decisions],
                        bootstrap=copy.deepcopy(bootstrap), previous_policy_version=previous_version,
                        policy_version=self.policy.learner.policy_version)
+        if pareto:
+            receipt.update(component_settlements=components, completed_tasks=len(rows),
+                           optimization_weights=coefficients, scalarization=result.get("scalarization", scalarization),
+                           utility_kind="local_chain_rule_surrogate")
         self.resource_cutoffs = measured["cutoffs"]
         self.resources.commit_settlement(self.resource_cutoffs)
         self.interval_decision_offset += len(decisions)

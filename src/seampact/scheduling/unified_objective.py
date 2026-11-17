@@ -29,7 +29,7 @@ def freeze_objective(value):
         return None
     value = copy.deepcopy(value)
     required = {"weights", "scales", "quality_evaluator", "deadline_s", "resource_source"}
-    if not isinstance(value, dict) or set(value) - required - {"schema"} or not required <= set(value):
+    if not isinstance(value, dict) or set(value) - required - {"schema", "pareto"} or not required <= set(value):
         raise ValueError("统一目标须明确 weights、scales、quality_evaluator、deadline_s、resource_source")
     if value.get("schema", SCHEMA) != SCHEMA:
         raise ValueError("旧目标格式不能用于能力调度")
@@ -43,7 +43,22 @@ def freeze_objective(value):
         raise ValueError("须声明任务质量评价器的冻结身份及归一化规则")
     if value["resource_source"] not in {"measured", "reserved"}:
         raise ValueError("resource_source 须为 measured 或 reserved，不能混用")
-    value["deadline_s"] = number(value["deadline_s"], "deadline_s", positive=True)
+    if value["deadline_s"] is not None:
+        value["deadline_s"] = number(value["deadline_s"], "deadline_s", positive=True)
+    if "pareto" in value:
+        pareto = value["pareto"]
+        if not isinstance(pareto, dict) or set(pareto) != {"preference", "smoothing"}:
+            raise ValueError("帕累托目标须明确搜索方向 preference 与平滑参数 smoothing")
+        preference = pareto["preference"]
+        dimensions = ("quality", "latency", "ram", "vram", "api")
+        if not isinstance(preference, dict) or set(preference) != set(dimensions):
+            raise ValueError("帕累托方向须包括质量、时延、RAM、VRAM、token五项")
+        pareto["preference"] = {key: number(preference[key], key + " preference", positive=True) for key in dimensions}
+        if not math.isclose(sum(pareto["preference"].values()), 1.0, rel_tol=0, abs_tol=1e-9):
+            raise ValueError("帕累托搜索方向各项之和须为1")
+        pareto["smoothing"] = number(pareto["smoothing"], "smoothing", positive=True)
+        if any(value["weights"][key] != preference.get(key, 0) for key in TERMS):
+            raise ValueError("帕累托 weights 仅作为搜索方向的线性参照，须与 preference 相同，delivery 为0")
     value["schema"] = SCHEMA
     return value
 
@@ -141,7 +156,8 @@ class TaskLedger:
                       latency=raw["latency_s"] if complete else None,
                       ram=costs.get("ram_byte_s"), vram=costs.get("vram_byte_s"), api=raw["api_tokens"])
         if not complete or any(value is None for key, value in values.items()
-                               if key != "api" or self.objective["weights"]["api"] > 0):
+                               if key != "api" or self.objective["weights"]["api"] > 0
+                               or "pareto" in self.objective):
             result["reason"] = "未完成任务、质量、资源或启用的 API token 计量缺失；未知项不补零，不能训练"
             return result
         scale = self.objective["scales"]
@@ -150,10 +166,15 @@ class TaskLedger:
                           ram=values["ram"] / n / scale["ram_byte_s"],
                           vram=values["vram"] / n / scale["vram_byte_s"],
                           api=values["api"] / n / scale["api_tokens"] if values["api"] is not None else None)
+        result["components"] = normalized
         result["contributions"] = {key: 0.0 if self.objective["weights"][key] == 0 else
                                    normalized[key] * self.objective["weights"][key] *
                                    (1 if key == "quality" else -1) for key in TERMS}
         result.update(utility=sum(result["contributions"].values()), training_ready=True, reason=None)
+        if "pareto" in self.objective:
+            # A changing multiplier has no single workload-wide scalar reward.
+            # Keep this static reference explicitly separate from rollout utility.
+            result["utility_kind"] = "pareto_linear_reference"
         return result
 
 

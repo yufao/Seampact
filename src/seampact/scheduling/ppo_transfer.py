@@ -56,7 +56,8 @@ def transfer(policy, spec):
         raise ValueError('Parent checkpoint changed during loading')
     parent_identity = dict(schema=CHECKPOINT, config_id=spec['parent_config_id'],
                            objective_id=spec['parent_objective_id'], feature_schema=FEATURE_SCHEMA)
-    if payload.get('checkpoint_metadata') != parent_identity:
+    metadata = payload.get('checkpoint_metadata') or {}
+    if {key: value for key, value in metadata.items() if key != 'pareto_state'} != parent_identity:
         raise ValueError('Parent checkpoint metadata differs from the completed source protocol')
     if (payload.get('format_version') != 1 or payload.get('algorithm') != 'ppo'
             or payload.get('observation_dim') != OBSERVATION_DIM or payload.get('candidate_dim') != CANDIDATE_DIM
@@ -81,4 +82,5 @@ def transfer(policy, spec):
         raise ValueError('Parent checkpoint changed during transfer')
     return dict(mode=spec['mode'], parent_sha256=before, parent_identity=copy.deepcopy(parent_identity),
                 semantic_sources=copy.deepcopy(spec['semantic_sources']),
-                transferred=('actor,value,optimizer,counters,rng' if spec['mode']=='full' else 'actor only'))
+                transferred=('actor,critics,optimizer,counters,rng,scalarization' if spec['mode']=='full' and policy.pareto
+                             else 'actor,value,optimizer,counters,rng' if spec['mode']=='full' else 'actor only'))

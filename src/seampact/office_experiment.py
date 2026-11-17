@@ -99,6 +99,7 @@ def _start_native_task(platform, body, *, internal_task_id=None, pilot_config=No
     timeout = protocol["timeout_s"]
     if type(maximum) is not int or not 1 <= maximum <= 100 or not 0 < timeout <= 7200:
         raise ValueError("冻结协议缺少合理的模型轮数与任务时限")
+    deadline = pilot_config["deadline_s"] if pilot_config is not None and "deadline_s" in pilot_config else timeout
     def evaluate(task):
         if task["status"] not in {"COMPLETED", "BLOCKED", "FAILED"}:
             result = dict(status="NOT_EVALUATED", quality=None,
@@ -143,7 +144,7 @@ def _start_native_task(platform, body, *, internal_task_id=None, pilot_config=No
     else:
         arm, scope = "project_policy", "configured project policy"
     return platform.chat.start(
-        dict(project_id=body["project_id"], deadline_s=timeout,
+        dict(project_id=body["project_id"], deadline_s=deadline,
              **({"execution_timeout_s": pilot_config["execution_timeout_s"]} if pilot_config is not None and "execution_timeout_s" in pilot_config else {}),
              messages=[dict(role="user", content=environment.prompt)]),
         runtime_options=options, on_event=event, internal_task_id=internal_task_id,

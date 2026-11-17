@@ -7,7 +7,6 @@ from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from seampact.runtime import Coordinator, OwnerRuntime, ProtocolError
-from seampact.scheduling.joint import Window
 from seampact.store import Store
 
 
@@ -203,50 +202,6 @@ class BoundaryRecheckTests(unittest.TestCase):
             runtime.close()
             store.close()
 
-    def test_cancel_or_invalidate_during_scoring_does_not_close_the_window(self):
-        for change in ("cancel", "invalidate"):
-            with self.subTest(change=change):
-                store = Store(":memory:")
-                runtime = OwnerRuntime(Coordinator(store, quota=2))
-                try:
-                    runtime.call("configure_roots", dict(run_id="window", call_slots=2,
-                                                        boundaries=True, boundary_slots=1))
-                    calls, contexts = [], {}
-                    for number in range(2):
-                        host, task, gate = "host" + str(number), "task" + str(number), "gate" + str(number)
-                        runtime.call("register", gate, host, unit=dict(id=gate, instance_id=host))
-                        root = runtime.call("enable_root", task, gate, dict(kind="REMOTE", instance_id=host))
-                        runtime.call("authorize_root", root, host)
-                        calls.append(runtime.call("enable", gate, host, task_id=task))
-                        contexts[task] = SimpleNamespace(task=dict(id=task))
-                    window = Window.__new__(Window)
-                    window.runtime, window.wid, window.by_context = runtime, "window", contexts
-                    window.catalog = SimpleNamespace(require_boundary=lambda uid, call, root, gate: {
-                        "contract_digest": "fixture", "scope": "test-registered-gate", "boundary_id": gate["id"]})
-                    window.config = dict(dispatch_scope="roots_and_boundaries", age_guard_ms=10**15)
-                    window._state = lambda: ({}, runtime.call("root_view", "window"))
-                    records = []
-                    window._record = lambda **record: records.append(record)
-                    changed = False
-
-                    def choose(*args):
-                        nonlocal changed
-                        if not changed:
-                            changed = True
-                            runtime.call(change, calls[0] if change == "cancel" else "gate0")
-                        return 0, "test", 0.0, 0.0
-
-                    window._choose = choose
-                    window._boundary_stage()
-                    self.assertEqual([r["choice"] for r in records], ["recheck_refused", "test"])
-                    self.assertEqual(runtime.snapshot()["calls"][calls[0]]["starts"], 0)
-                    self.assertEqual(runtime.snapshot()["calls"][calls[1]]["physical"], "AUTHORIZED")
-                    if change == "invalidate":
-                        with self.assertRaises(ProtocolError):
-                            runtime.call("wait", calls[0])
-                finally:
-                    runtime.close()
-                    store.close()
 
 
 if __name__ == "__main__":

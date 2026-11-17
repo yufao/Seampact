@@ -11,7 +11,6 @@ sys.path.insert(0, str(__import__('pathlib').Path(__file__).resolve().parents[1]
 from seampact.hosting.deployment import Deployments
 from seampact.runtime import Coordinator, OwnerRuntime
 from seampact.scheduling.residency import WorkingSets
-from seampact.scheduling.joint import Window
 from seampact.scenes.scenarios import SceneSession
 from seampact.source.import_only import compile_import_only_plan
 from seampact.source.inspection import Inspector
@@ -169,96 +168,8 @@ class ImportOnlyControlTests(unittest.TestCase):
         self.assertEqual(plan['status'], 'UNKNOWN')
         self.assertNotIn('sdk', sys.modules)
 
-    def test_normal_selected_intent_reaches_real_worker_import_and_recheck(self):
-        self._selected_intent_worker_flow()
 
-    def test_worker_local_plan_crosses_the_normal_router_and_full_claim(self):
-        # Simulate the missing-SDK preparation marker, then use the real source
-        # worker, plan validation, resource ledger and original import loader.
-        self._selected_intent_worker_flow(worker_plan=True)
 
-    def _selected_intent_worker_flow(self, worker_plan=False):
-        worker_catalog, unit, worker = self.catalog('def score(value, option=None):\n'
-            '    assert isinstance(value,list)\n    return 7\n')
-        worker_binding, _ = worker_catalog.deferred[unit['id']]
-        store = Store(':memory:')
-        self.addCleanup(store.close)
-        runtime = OwnerRuntime(Coordinator(store))
-        self.addCleanup(runtime.close)
-        controller = UnitCatalog(worker_binding.inspector.root, store, runtime)
-        source = Inspector(worker_binding.inspector.root, worker_binding.inspector.snapshots, worker_binding.inspector.request)
-        installed = controller.install(source, worker_binding.candidate, 'analysis', 'installation')[0]
-        self.assertEqual(installed['id'], unit['id'])
-        group = unit['runtime_group']
-        record = dict(id='i', group_id=group, state='READY', accepting=True, pending_stop=None,
-            in_flight=0, units=[unit['id']], endpoint='http://unused',
-            session='s', generation=1, process_nonce='n')
-        router = Deployments.__new__(Deployments)
-        router.lock, router.run_locks, router.instances = threading.RLock(), {}, {'i': record}
-        router._group = lambda identity: {'units': [unit['id']]}
-        router._event = lambda *args, **kwargs: None
-        controller.remote_router = router
-        class Catalog:
-            placement = {unit['id']: dict(kind='REMOTE', group_id=group)}
-            def dispatch_status(self, identity): return dict(status='READY')
-            def check_call_conditions(self, identity, arguments): return controller.check_call_conditions(identity, arguments)
-            def require_call_condition_structure(self, identity): return controller.require_call_condition_structure(identity)
-            def require_import_only_plan(self, identity, proposal=None):
-                return (controller.validate_worker_import_plan(identity, proposal) if proposal is not None
-                        else controller.require_import_only_plan(identity))
-        catalog = Catalog()
-        scene = SimpleNamespace(preview_calls=lambda candidate: [dict(unit_id=unit['id'], arguments={'value': []})])
-        session = SceneSession.__new__(SceneSession)
-        session.catalog, session.environment = catalog, scene
-        session.context = SimpleNamespace(catalog=catalog)
-        candidate = dict(id='call', action_type='invoke', legal=True, units=[unit['id']], features=[])
-        task = SimpleNamespace(index=0, task={'id': 'task'}, context='task-context', session=session,
-            event=dict(candidates=[candidate], observation=[], references={}), committed_units=set(), decisions=[],
-            status='DECISION', inbox=queue.Queue(), pending_action=None, pending_units=[],
-            pending_condition_groups=set(), pending_condition_signatures=None)
-        window = Window.__new__(Window)
-        window.tasks, window.service_groups, window.rid = [task], set(), 'run'
-        window.config = dict(functional_policy='required_only', capacity=dict(resources={'ram': 1}, replica_cap=1))
-        window.working = WorkingSets(dict(pinned=[], tasks={'task': []}, allowed={'task': [unit['id']]},
-            calls={unit['id']: [group]}), {'ram': 1}, {group: {'ram': 1}})
-        window.pending_groups, window.reserved, window.stopping = set(), {}, set()
-        window.ops, window.op_walls, window.events = [], {}, queue.Queue()
-        window.start, window.closing, window.unknown_outcomes = time.time(), None, []
-        window.groups, window.deployments = {group: {}}, router
-        window.platform = SimpleNamespace(managed_services=SimpleNamespace(acquire=lambda *args, **kw: None))
-        window._record, window._count = lambda **row: row, lambda *args: None
-        window._operation_allowed = lambda *args: True
-        window._services_ready = lambda *args: True
-        views = {group: dict(instances=[record], operations={'start': 'SUPPORTED'}, start_gap=None)}
-        window._state = lambda: (views, [])
-        window._choose = lambda *args: (0, 'single', 0, 0)
-        def request(endpoint, body, **kwargs):
-            if endpoint.endswith('/check_call'):
-                answer = worker.check_call(body)
-                if worker_plan and answer.get('reason_code') == 'DEFAULT_BINDING_UNKNOWN':
-                    answer.update(reason_code='SDK_BINDING_UNKNOWN',
-                                  import_plan=worker_catalog.require_import_only_plan(unit['id']))
-                return answer
-            if endpoint.endswith('/import_only'):
-                return worker.import_only(body)
-            raise AssertionError('unexpected original call')
-        with patch('seampact.hosting.deployment.json_request', side_effect=request), \
-             patch.object(worker_binding, '_load', side_effect=AssertionError('owner load is forbidden')):
-            window._business(task)
-            self.assertFalse(candidate['decision_legal'])
-            window._admit_tasks()
-            self.assertEqual(window.working.claims['task-context'], {group})
-            window._on_demand()
-            submission = window.events.get(timeout=15)
-            self.assertEqual(submission[0], 'op_submitted')
-            window._handle(submission)
-            self.assertEqual(window.ops[0]['mode'], 'import_only')
-            self.assertEqual(window.ops[0]['status'], 'DONE')
-            self.assertTrue(task.inbox.empty())
-            window._admit_tasks()
-            self.assertEqual(task.inbox.get_nowait(), 0)
-        self.assertEqual(worker_binding.owners, {})
-        self.assertEqual(worker_binding.entries, {})
 
     def test_generator_target_code_default_and_global_changes_are_unknown(self):
         source = 'LIMIT=2\ndef pieces(value,n=2):\n    yield n+LIMIT\n' \

@@ -251,6 +251,10 @@ def main():
     phase.add_argument("--evaluation-only", action="store_true", help="use this already-trained frozen protocol/checkpoint; no retraining")
     phase.add_argument("--calibration-only", action="store_true", help="measure cost scales and stop before training")
     parser.add_argument("--scales-from", type=Path, help="reuse cost measurements from the matching frozen protocol")
+    parser.add_argument("--frozen-training-calibration", action="store_true",
+                        help="train from the plan's verified completed, disjoint training calibration without dispatching it again")
+    parser.add_argument("--validation-arm", choices=["ppo", "resource_rule", "app_config"],
+                        help="run one frozen validation arm instead of all three")
     parser.add_argument("--reuse-parent-objective", type=Path,
                         help="for full parent transfer only: verify the parent protocol and retain its objective and scales")
     parser.add_argument("--include-rule-baseline", action="store_true", help="also score the development rule baseline when reusing scales")
@@ -284,6 +288,14 @@ def main():
                 or plan.get("resource_source") != parent_objective["resource_source"]):
             raise ValueError("Full transfer requires the explicitly unchanged parent objective")
     frozen_inference = args.evaluation_only or args.validation_only
+    if args.validation_arm and not args.validation_only:
+        raise ValueError("--validation-arm requires --validation-only")
+    if args.frozen_training_calibration:
+        source = (plan.get("development_evidence") or {}).get("objective_scale_source") or {}
+        if (not args.training_only or args.scales_from or args.reuse_parent_objective or args.resume_training
+                or args.attach_training or source.get("kind") != "completed_training_calibration"
+                or not plan["scheduler"].get("objective")):
+            raise ValueError("Frozen training calibration requires a new training-only run and its explicit measured source")
     if args.resume_training and (not args.training_only or args.scales_from or not plan.get("development_evidence")
                                  or not plan.get("continuous_training")):
         raise ValueError("Resume needs --training-only and the original frozen training protocol")
@@ -707,6 +719,8 @@ def main():
                 protocol=parent["protocol"], protocol_sha256=parent["protocol_sha256"],
                 scales=copy.deepcopy(parent_objective["scales"]))
             plan["development_evidence"] = evidence
+        elif args.frozen_training_calibration:
+            pass  # The server verifies the completed calibration and every frozen source identity before training.
         elif shared is not None:
             plan = shared
         else:
@@ -771,7 +785,8 @@ def main():
              ("validation_app_config", "validation_resource_rule", "validation_ppo") if "training_calibration" in plan else
              ("validation_resource_rule", "validation_ppo")) if args.tuning else ("app_config", "resource_rule", "ppo")
     if args.validation_only:
-        modes = ("validation_ppo", "validation_resource_rule", "validation_app_config")
+        modes = ("validation_" + args.validation_arm,) if args.validation_arm else (
+            "validation_ppo", "validation_resource_rule", "validation_app_config")
     for mode in modes:
         workloads = [run(final, mode, batch) for batch in range(len(workload_cases(plan, mode)))]
         task_records, case_ids = [], []
