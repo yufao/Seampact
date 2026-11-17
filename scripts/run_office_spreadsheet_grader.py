@@ -4,7 +4,11 @@ import hashlib
 import json
 from pathlib import Path
 import subprocess
+import sys
 import time
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
+from seampact.spreadsheet_evidence import infrastructure_error_resolved
 
 def sha(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
@@ -46,7 +50,8 @@ def main():
             source = mount.get('Source')
             if source and (grading.is_relative_to(Path(source).resolve()) or Path(source).resolve().is_relative_to(grading)):
                 raise ValueError('Grading answers are visible to the business container')
-        if (collection.get('execution_infrastructure_error') or task.get('workspace_status')!='FINISHED'
+        if (((collection.get('execution_infrastructure_error') or (task.get('evaluation') or {}).get('execution_infrastructure_error'))
+                and not infrastructure_error_resolved(task)) or task.get('workspace_status')!='FINISHED'
                 or collection.get('status')=='COLLECTION_TIMEOUT'):
             result = dict(case_id=collection['case_id'],task_id=task['id'],status='UNKNOWN_INFRASTRUCTURE',
                           cases=[None]*3,soft=None,hard=None)

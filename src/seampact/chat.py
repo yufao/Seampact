@@ -72,6 +72,7 @@ class ChatJobs:
         self._start_lock = projects.lock if projects is not None else threading.RLock()
         self._workspace_controller = uuid.uuid4().hex
         self._controls, self._threads = {}, {}
+        self._workspace_reconcile_lock = threading.Lock()
         self._stream_condition = threading.Condition()
         self._streams = {}
         self.closed = False
@@ -395,10 +396,19 @@ class ChatJobs:
                 self._stream_event(task["id"], kind, data={name: details.get(name) for name in ("call_id", "unit_id", "instance_id", "kind")})
             else:
                 self._stream_event(task["id"], kind, data=value)
+        deadline_timer = None
         try:
+            if task.get("deadline_s") is not None:
+                deadline_at = control.start_deadline(task["deadline_s"])
+                deadline_timer = threading.Timer(max(0, deadline_at - time.monotonic()),
+                                                 self.cancel, args=(task["id"],))
+                deadline_timer.daemon = True
+                deadline_timer.start()
             host.run(task, messages, bound, on_event=event, control=control,
                      prior_wire=prior_wire, prior_context=prior_context)
         finally:
+            if deadline_timer is not None:
+                deadline_timer.cancel()
             router = getattr(catalog, "router", None)
             try:
                 if self.projects is not None:
@@ -538,6 +548,44 @@ class ChatJobs:
                 if any(identity in leases for leases in manager.leases.values()):
                     return False
         return True
+
+    def reconcile_task_workspace(self, body):
+        """Recheck exactly one terminal task without reconciling its neighbors."""
+        if not isinstance(body, dict) or set(body) != {"task_id", "project_id", "conversation_id"}:
+            raise ValueError("需要指定任务、项目和会话身份")
+        identity, project_id, conversation_id = (body[key] for key in ("task_id", "project_id", "conversation_id"))
+        if any(not isinstance(value, str) or not value for value in (identity, project_id, conversation_id)):
+            raise ValueError("任务、项目和会话身份无效")
+        if self.projects is None:
+            raise ValueError("项目工作区不可用")
+        terminal = {"COMPLETED", "BLOCKED", "FAILED", "INTERRUPTED", "CANCELLED", "CANCELED",
+                    "TIMEOUT", "TIMED_OUT", "STOPPED"}
+        with self._workspace_reconcile_lock:
+            with self.projects.lock:
+                task = self.store.get("task", identity)
+                lease = self.projects.task_scope(identity)
+                session = self.projects.session(conversation_id)
+                scope = (task or {}).get("workspace") or {}
+                if (not task or task.get("id") != identity or task.get("project_id") != project_id
+                        or task.get("conversation_id") != conversation_id
+                        or any(scope.get(key) != body[key] for key in body)
+                        or not lease or any(lease.get(key) != body[key] for key in body)
+                        or not session or session.get("project_id") != project_id):
+                    raise ValueError("任务、项目和会话归属不一致")
+                if task.get("status") not in terminal:
+                    raise ValueError("只能核对已终结的任务")
+                # The worker removes itself from _threads just before returning;
+                # enumerate also closes that short gap before actual thread exit.
+                worker = self._threads.get(identity)
+                if (worker is not None and worker.is_alive()) or any(
+                        thread.name == "seampact-agent-" + identity[:8] and thread.is_alive()
+                        for thread in threading.enumerate()):
+                    raise ValueError("原任务线程尚未退出")
+                if task.get("workspace_status") == "FINISHED" and lease.get("status") == "FINISHED":
+                    return dict(task_id=identity, workspace_status="FINISHED")
+            # This can wait for runtime calls: do not hold the project lock.
+            self._finish_project_scope(task, self.catalog, self.profiles)
+            return dict(task_id=identity, workspace_status=task.get("workspace_status", "UNKNOWN"))
 
     def reconcile_project_leases(self, project_id):
         """Release retained scopes only after their worker ended and calls drained."""

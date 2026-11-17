@@ -72,6 +72,20 @@ class ChatContextTests(unittest.TestCase):
         return dict(id=identity, conversation_id=conversation, status="RUNNING", phase="conversation",
                     messages=[dict(role="user", content="question")], model_calls=0, usage=[], calls=[])
 
+    def test_configured_deadline_cancels_a_running_business_task(self):
+        task = self.task()
+        task["deadline_s"] = 0.05
+        self.store.save("task", task["id"], task)
+
+        def run_until_cancelled(task, messages, bound, *, control, **kwargs):
+            self.assertTrue(control.cancelled.wait(2))
+            task["status"] = "CANCELLED"
+
+        with patch("seampact.chat.AgentRuntime.run", side_effect=run_until_cancelled):
+            self.jobs._run(task, task["messages"], Bound(), Catalog())
+        self.assertEqual(task["status"], "CANCELLED")
+        self.assertNotIn(task["id"], self.jobs._controls)
+
     def test_tool_result_is_archived_and_reused_without_executing_again(self):
         request_bodies = []
         responses = [

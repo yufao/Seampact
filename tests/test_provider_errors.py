@@ -9,7 +9,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
-from seampact.providers import ProviderError, Transport
+from seampact.providers import ProviderError, RequestCancelled, RequestControl, Transport
 
 
 class ProviderErrorChecks(unittest.TestCase):
@@ -69,6 +69,46 @@ class ProviderErrorChecks(unittest.TestCase):
                 Transport().send('https://example.invalid')
         self.assertEqual(result.exception.kind, 'response_incomplete')
         self.assertIsNone(result.exception.diagnostic)
+
+    def test_task_deadline_sets_remaining_timeout_and_legacy_default(self):
+        from types import SimpleNamespace
+        clock = [100.0]
+        with patch('seampact.providers.time', SimpleNamespace(monotonic=lambda: clock[0])):
+            control = RequestControl(deadline_at=1000.0)
+            with patch('urllib.request.build_opener') as opener:
+                opener.return_value.open.side_effect = lambda *a, **kw: io.BytesIO(b'{}')
+                Transport().send('https://example.invalid', control=control)
+                self.assertEqual(opener.return_value.open.call_args.kwargs['timeout'], 900)
+                clock[0] = 350.0
+                Transport().send('https://example.invalid', control=control)
+                self.assertEqual(opener.return_value.open.call_args.kwargs['timeout'], 650)
+                Transport().send('https://example.invalid')
+                self.assertEqual(opener.return_value.open.call_args.kwargs['timeout'], 600)
+                clock[0] = 1000.0
+                with self.assertRaises(RequestCancelled):
+                    Transport().send('https://example.invalid', control=control)
+                self.assertEqual(opener.return_value.open.call_count, 3)
+
+    def test_read_error_after_cancellation_is_not_a_transport_failure(self):
+        for error in (AttributeError('closed'), OSError('closed')):
+            with self.subTest(error=type(error).__name__):
+                control = RequestControl()
+                class ClosedResponse(io.BytesIO):
+                    def readline(self, *args):
+                        control.cancelled.set()
+                        raise error
+                with patch('urllib.request.build_opener') as opener:
+                    opener.return_value.open.return_value = ClosedResponse()
+                    with self.assertRaises(RequestCancelled):
+                        Transport().stream('https://example.invalid', '', {}, lambda value: None, control=control)
+                    self.assertEqual(opener.return_value.open.call_count, 1)
+
+        with patch('urllib.request.build_opener') as opener:
+            opener.return_value.open.side_effect = AttributeError('other')
+            with self.assertRaises(ProviderError) as result:
+                Transport().send('https://example.invalid', control=RequestControl())
+            self.assertNotIsInstance(result.exception, RequestCancelled)
+            self.assertEqual(result.exception.kind, 'invalid_response')
 
 
 if __name__ == '__main__':

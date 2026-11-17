@@ -7,7 +7,7 @@ import threading
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
@@ -98,6 +98,60 @@ class PilotChecks(unittest.TestCase):
             result = handle(platform, dict(op="admit", run_id="run"))
         self.assertEqual(result["task_id"], "task")
         self.assertEqual(records[("office_pilot", "run")]["admitted"], ["task"])
+
+    def test_unsettled_training_finish_synchronizes_series_and_preserves_checkpoints_on_retry(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            checkpoint = Path(tmp) / "retained.pt"
+            checkpoint.write_bytes(b"retained checkpoint")
+            receipt = dict(path=str(checkpoint), sha256=hashlib.sha256(checkpoint.read_bytes()).hexdigest())
+            for history in ("running", "missing_entry", "missing_series"):
+                with self.subTest(history=history):
+                    row = dict(id="run", protocol_sha256="identity", mode="training", batch=0,
+                               status="RUNNING", case_ids=["case"], admitted=["task"], checkpoint=receipt)
+                    entry = dict(id="run", status="RUNNING", checkpoint=receipt, actual_updates=True)
+                    series = dict(id="identity", workloads={}, checkpoint=receipt)
+                    if history == "running":
+                        series["workloads"]["training:0"] = entry
+                    records = {("office_pilot", "run"): copy.deepcopy(row)}
+                    if history != "missing_series":
+                        records[("office_pilot_series", "identity")] = copy.deepcopy(series)
+                    store = SimpleNamespace(get=lambda kind, key: copy.deepcopy(records.get((kind, key))),
+                        save=lambda kind, key, value: records.__setitem__((kind, key), copy.deepcopy(value)))
+                    state = dict(status="COMPLETE", updated=False, updates=[],
+                                 summary=dict(training_ready=False, reason="missing API token receipt"))
+                    execution = SimpleNamespace(finish_workload=Mock(return_value=state),
+                                                policy=SimpleNamespace(save=Mock()))
+                    platform = SimpleNamespace(store=store, execution=execution)
+                    with patch("seampact.office_pilot._read_plan", return_value=("identity", {}, {})):
+                        for _ in range(2):
+                            self.assertEqual(handle(platform, dict(op="finish", run_id="run"))["status"], "UNSETTLED")
+                    saved = records[("office_pilot_series", "identity")]
+                    current = saved["workloads"]["training:0"]
+                    self.assertEqual((current["id"], current["status"]), ("run", "UNSETTLED"))
+                    if history == "running":
+                        self.assertEqual(current["checkpoint"], receipt)
+                        self.assertTrue(current["actual_updates"])
+                    if history != "missing_series":
+                        self.assertEqual(saved["checkpoint"], receipt)
+                    self.assertEqual(records[("office_pilot", "run")]["checkpoint"], receipt)
+                    self.assertEqual(checkpoint.read_bytes(), b"retained checkpoint")
+                    self.assertEqual(execution.finish_workload.call_args_list, [unittest.mock.call(), unittest.mock.call()])
+                    execution.policy.save.assert_not_called()
+
+    def test_unsettled_training_retry_does_not_replace_another_series_run(self):
+        series = dict(id="identity", workloads={"training:0": dict(id="newer-run", status="PAUSED",
+                                                                  checkpoint=dict(path="newer.pt", sha256="verified"))})
+        row = dict(id="run", protocol_sha256="identity", mode="training", batch=0,
+                   status="UNSETTLED", case_ids=["case"], admitted=["task"])
+        records = {("office_pilot", "run"): row, ("office_pilot_series", "identity"): copy.deepcopy(series)}
+        store = SimpleNamespace(get=lambda kind, key: copy.deepcopy(records.get((kind, key))),
+            save=lambda kind, key, value: records.__setitem__((kind, key), copy.deepcopy(value)))
+        execution = SimpleNamespace(finish_workload=lambda: dict(status="COMPLETE",
+                                     summary=dict(training_ready=False, reason="missing API token receipt")))
+        with patch("seampact.office_pilot._read_plan", return_value=("identity", {}, {})):
+            result = handle(SimpleNamespace(store=store, execution=execution), dict(op="finish", run_id="run"))
+        self.assertEqual(result["status"], "UNSETTLED")
+        self.assertEqual(records[("office_pilot_series", "identity")], series)
 
     def test_frozen_policy_and_semantic_guard_stay_identical_across_arms(self):
         guard = dict(id="p", entry_id="new_source_entry", tool_name="guard_tool", runtime_group="g",

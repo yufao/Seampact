@@ -102,6 +102,47 @@ class DockerPythonExecutor:
         except (KeyError, TypeError, OSError, json.JSONDecodeError) as exc:
             raise ValueError("无法核实隔离执行的 Docker 宿主路径") from exc
 
+    def _verified_created(self, name, mounts):
+        """Confirm the timed-out create produced exactly our unstarted container.
+
+        Absence, daemon errors and partial/mismatching receipts remain unknown:
+        the original create request may still complete after this inspection.
+        """
+        try:
+            image = self._command("image", "inspect", "--format", "{{.Id}}", self.image)
+            actual_image = image.stdout.decode("ascii").strip()
+            if image.returncode or not re.fullmatch(r"sha256:[0-9a-f]{64}", actual_image):
+                return False
+            result = self._command("inspect", name)
+            if result.returncode:
+                return False
+            rows = json.loads(result.stdout)
+            if not isinstance(rows, list) or len(rows) != 1:
+                return False
+            row = rows[0]
+            state, config, host = row["State"], row["Config"], row["HostConfig"]
+            actual_mounts = {(m["Type"], m["Source"], m["Destination"], m["RW"]) for m in row["Mounts"]}
+            expected_mounts = {("bind", m["source"], m["target"], not m["read_only"]) for m in mounts}
+            tmpfs = host.get("Tmpfs") or {}
+            options = set(tmpfs.get("/tmp", "").split(","))
+            security = set(host.get("SecurityOpt") or [])
+            return (row.get("Name") == "/" + name and row.get("Image") == actual_image
+                    and state.get("Status") == "created" and state.get("Running") is False
+                    and state.get("Pid") == 0 and state.get("StartedAt") == "0001-01-01T00:00:00Z"
+                    and config.get("Cmd") == ["python", "-I", "-"] and config.get("OpenStdin") is True
+                    and config.get("WorkingDir") == "/workspace"
+                    and host.get("NetworkMode") == "none" and host.get("ReadonlyRootfs") is True
+                    and host.get("Privileged") is False and not host.get("CapAdd")
+                    and set(host.get("CapDrop") or []) == {"ALL"}
+                    and security in ({"no-new-privileges"}, {"no-new-privileges=true"})
+                    and host.get("NanoCpus") == 1000000000 and host.get("Memory") == 512 * 1024 * 1024
+                    and host.get("PidsLimit") == 64 and (host.get("LogConfig") or {}).get("Type") == "none"
+                    and set(tmpfs) == {"/tmp"} and options == {"rw", "nosuid", "nodev", "noexec", "size=64m"}
+                    and len(row["Mounts"]) == len(mounts) == len(expected_mounts)
+                    and actual_mounts == expected_mounts)
+        except (ValueError, KeyError, TypeError, UnicodeError, AttributeError):
+            return False
+
     def is_drained(self, task):
         for call in task.get("python_calls", []):
             if call.get("stopped") is True:
@@ -162,15 +203,23 @@ class DockerPythonExecutor:
                     "--cap-drop", "ALL", "--security-opt", "no-new-privileges", "--cpus", "1",
                     "--memory", "512m", "--pids-limit", "64", "--log-driver", "none",
                     "--tmpfs", "/tmp:rw,nosuid,nodev,noexec,size=64m", "--workdir", "/workspace"]
-            for mount in self._mount_sources(mounts):
+            daemon_mounts = self._mount_sources(mounts)
+            for mount in daemon_mounts:
                 args += ["--mount", "type=bind,src=" + mount["source"] + ",dst=" + mount["target"] +
                          (",readonly" if mount["read_only"] else "")]
             args += [self.image, "python", "-I", "-"]
             record["create_uncertain"] = True
             emit("python_execution", call_id=call_id, status="CREATING")
-            created = self._command(*args)
+            try:
+                created = self._command(*args)
+            except ValueError:
+                if not self._verified_created(name, daemon_mounts):
+                    raise
+                record["create_recovered"] = "verified_unstarted_container"
+                emit("python_execution", call_id=call_id, status="CREATE_RECOVERED")
+                created = None
             record["create_uncertain"] = False
-            if created.returncode:
+            if created is not None and created.returncode:
                 record["create_error"] = _create_failure(created)
                 raise ValueError("无法创建隔离 Python 容器")
             control.check()
@@ -231,11 +280,16 @@ class DockerPythonExecutor:
             raise
         finally:
             try:
-                if self._running(name) is True:
-                    self._command("kill", name)
-                record["stopped"] = not record.get("create_uncertain") and self._running(name) is False
-                if record["stopped"]:
-                    self._command("rm", "-f", name)
+                if record.get("create_uncertain"):
+                    # A name without a verified create receipt is not authority
+                    # to kill or remove a possibly unrelated container.
+                    record["stopped"] = False
+                else:
+                    if self._running(name) is True:
+                        self._command("kill", name)
+                    record["stopped"] = self._running(name) is False
+                    if record["stopped"]:
+                        self._command("rm", "-f", name)
             except ValueError:
                 record["stopped"] = False
             emit("python_execution", call_id=call_id, status=record["status"], stopped=record["stopped"])

@@ -555,7 +555,7 @@ class CapabilityScheduler:
         return select
 
     def start_workload(self, workload_id, task_ids, *, training=False, fresh=True, learner_config=None, seed=0,
-                       continuous=False, resume_checkpoint=None, reward_denominator=None):
+                       continuous=False, resume_checkpoint=None, reward_denominator=None, parent_checkpoint=None):
         """Explicit fresh training or frozen inference; no reward or task labels are invented."""
         with self.condition:
             if (not isinstance(workload_id, str) or not workload_id or not isinstance(task_ids, (list, tuple))
@@ -569,6 +569,8 @@ class CapabilityScheduler:
                 raise ValueError("连续训练的奖励分母须覆盖本段题目")
             if resume_checkpoint and not (training and fresh and continuous):
                 raise ValueError("仅连续训练可从已结算的检查点恢复")
+            if parent_checkpoint and (resume_checkpoint or not (training and fresh and continuous)):
+                raise ValueError("父检查点迁移仅用于全新连续训练，不能与续训混用")
             if self.store and self.store.get("capability_workload", workload_id):
                 raise ValueError("工作负载身份已使用")
             self._resource_summary()
@@ -576,6 +578,7 @@ class CapabilityScheduler:
                 raise ValueError("当前任务或实例尚未收尾，不能开始冻结工作负载")
             if self.workload and self.workload["status"] in {"RUNNING", "DRAINING"}:
                 raise ValueError("上一个工作负载尚未结束")
+            parent_transfer = None
             if training and fresh:
                 from seampact.scheduling.capability_ppo import CandidatePPO
                 selected = CandidatePPO(policy_config_id(self._config), self._config["objective"],
@@ -585,6 +588,9 @@ class CapabilityScheduler:
                     if hashlib.sha256(checkpoint.read_bytes()).hexdigest() != resume_checkpoint["sha256"]:
                         raise ValueError("续训检查点身份已变化")
                     selected.load(checkpoint, optimizer=True)
+                if parent_checkpoint:
+                    from seampact.scheduling.ppo_transfer import transfer
+                    parent_transfer = transfer(selected, parent_checkpoint)
             elif training:
                 selected = self.policy
                 if (not getattr(selected, "training", False) or
@@ -601,6 +607,8 @@ class CapabilityScheduler:
                 policy=type(selected).__name__, policy_config_id=self.policy_config_id,
                 learner_config=copy.deepcopy(learner_config), seed=seed, fresh=fresh,
                 continuous=continuous, updates=[], updated_tasks=[], pending_update=None)
+            if parent_transfer:
+                self.workload["parent_transfer"] = parent_transfer
             if continuous and training:
                 self.workload["reward_denominator"] = reward_denominator or len(task_ids)
                 self.resources.enable_intervals()

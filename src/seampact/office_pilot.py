@@ -134,6 +134,19 @@ def _read_plan(body):
         expected_split = {"development": "development_pool", "training": "train_pool", "evaluation": "evaluation"}[split]
         if any(indexed[i]["split"] != expected_split for i in ids):
             raise ValueError("pilot 题目跨越冻结的数据划分")
+    if plan.get("benign_training_only"):
+        def benign(case):
+            identity, source = case["id"], case.get("_source")
+            allowed = (source == "spreadsheet" or source == "office_rag" and case.get("variant") == "normal"
+                       or source == "privacy" and identity.endswith(":normal") and case.get("variant") == "normal"
+                       or source is None and identity.endswith(":clean"))
+            return allowed and not (case.get("injections") or case.get("injection_task_id")
+                                    or case.get("attack_template"))
+        if (plan.get("benign_training_only") is not True
+                or any(not benign(indexed[i]) for i in selected["training"])
+                or any(i not in selected["training"] or not indexed[i].get("rag_adaptation")
+                       or not benign(indexed[i]) for i in plan.get("prebuild", []))):
+            raise ValueError("本训练协议只允许已选无注入任务及其检索预构")
     evaluation = [indexed[i] for i in selected["evaluation"]]
     if legacy and (sum(bool(x.get("injection_task_id")) for x in evaluation) != 2
             or len({x.get("attack_template") for x in evaluation if x.get("injection_task_id")}) != 2):
@@ -147,6 +160,9 @@ def _read_plan(body):
             raise ValueError("训练更新间隔须为合理的任务数")
         if "training_batch_size" in plan or "workload_size" in plan:
             raise ValueError("连续服务不接受按训练批次清空实例的设置")
+        denominator = plan.get("reward_denominator", len(selected["training"]))
+        if type(denominator) is not int or denominator < len(selected["training"]):
+            raise ValueError("连续训练奖励分母须覆盖冻结训练题")
     else:
         batch_size = plan.get("training_batch_size", 4)
         if type(batch_size) is not int or not 1 <= batch_size <= len(selected["training"]) or legacy and batch_size != 4:
@@ -170,6 +186,57 @@ def _read_plan(body):
 
 def training_batches(plan):
     return len(workload_cases(plan, "training"))
+
+
+def parent_transfer_spec(platform, plan, target_config, current_identity):
+    """Bind a new training run to a completed parent without modifying it."""
+    from seampact.capability_contract import digest
+    from seampact.scheduling.capability_scheduler import freeze_config, policy_config_id, FEATURE_SCHEMA
+    from seampact.scheduling.ppo_transfer import SEMANTIC_MODULES, _semantic_digest, source_fingerprints
+    spec = plan.get("parent_transfer")
+    required = {"protocol", "protocol_sha256", "run_id", "checkpoint_sha256", "mode", "parent_source_dir"}
+    if not isinstance(spec, dict) or set(spec) != required or spec["mode"] not in {"full", "actor"}:
+        raise ValueError("父策略迁移配置不完整")
+    raw = Path(spec["protocol"]).read_bytes()
+    parent_sha = hashlib.sha256(raw).hexdigest()
+    if parent_sha != spec["protocol_sha256"] or parent_sha == current_identity:
+        raise ValueError("父协议身份不符或与新实验相同")
+    parent_plan = json.loads(raw)
+    parent = platform.store.get("office_pilot", spec["run_id"])
+    series = platform.store.get("office_pilot_series", parent_sha) or {}
+    cp = (parent or {}).get("checkpoint") or {}
+    if (not parent or parent.get("mode") != "training" or parent.get("status") != "COMPLETE"
+            or parent.get("protocol_sha256") != parent_sha or cp.get("sha256") != spec["checkpoint_sha256"]
+            or cp != series.get("checkpoint") or series.get("workloads", {}).get("training:0", {}).get("id") != parent["id"]
+            or series["workloads"]["training:0"].get("status") != "COMPLETE"):
+        raise ValueError("父训练未完整结束，或检查点不属于冻结父运行")
+    checkpoint = Path(cp["path"])
+    if hashlib.sha256(checkpoint.read_bytes()).hexdigest() != cp["sha256"]:
+        raise ValueError("父检查点内容身份不符")
+    source = Path(spec["parent_source_dir"])
+    fingerprints = {name: _semantic_digest(name, (source / name).read_bytes()) for name in SEMANTIC_MODULES}
+    if fingerprints != source_fingerprints():
+        raise ValueError("父源码与当前特征/动作语义不一致")
+    prior = copy.deepcopy(parent_plan["scheduler"])
+    prior["policy"] = copy.deepcopy(parent_plan["policies"]["app_config"])
+    prior = freeze_config(prior, verify_policy=False)
+    prior_rest = {k:v for k,v in prior.items() if k not in {"objective", "policy"}}
+    target_rest = {k:v for k,v in target_config.items() if k not in {"objective", "policy"}}
+    if prior_rest != target_rest:
+        raise ValueError("父调度配置除奖励外发生变化，不能迁移")
+    if spec["mode"] == "actor" and any(prior["objective"].get(key) != target_config["objective"].get(key)
+                                        for key in ("schema", "quality_evaluator", "deadline_s", "resource_source")):
+        raise ValueError("actor 迁移只允许变更奖励权重或尺度，不允许变更评价器或资源语义")
+    if (parent.get("workload") or {}).get("pool") != (plan.get("development_evidence") or {}).get("pool"):
+        raise ValueError("父运行能力池与新实验冻结能力池不一致")
+    if (spec["mode"] == "full" and plan.get("reward_denominator", len(plan["cases"]["training"]))
+            != (parent.get("workload") or {}).get("reward_denominator")):
+        raise ValueError("完整迁移须沿用父连续训练的奖励分母")
+    if Path(platform.home, "office-pilot", current_identity + ".pt").resolve() == checkpoint.resolve():
+        raise ValueError("新检查点路径与父工件冲突")
+    return dict(path=str(checkpoint), sha256=cp["sha256"], mode=spec["mode"],
+                parent_config_id=policy_config_id(prior), parent_objective_id=digest(prior["objective"]),
+                parent_feature_schema=FEATURE_SCHEMA, semantic_sources=fingerprints)
 
 
 def workload_cases(plan, mode):
@@ -251,6 +318,8 @@ def _handle(platform, body):
         return dict(case_id=case_id, corpus=corpus, result=result)
     if op in {"start", "resume"}:
         mode, batch = body.get("mode"), body.get("batch", 0)
+        if plan.get("benign_training_only") and mode not in {"training", "training_calibration"}:
+            raise ValueError("该良性训练协议不开放其他数据划分")
         calibration = mode in {"development", "training_calibration"}
         if plan.get("local_development_only") and mode != "development":
             raise ValueError("开发限定协议不允许训练、验证或评价")
@@ -286,10 +355,35 @@ def _handle(platform, body):
             raise ValueError("开发校准缺少冻结的应用候选记录，请用新版重新校准")
         if mode == "training" and plan["schema"] == "seampact.office-comparison/1":
             evidence = plan["development_evidence"]
-            if evidence.get("source_split") != "training" or evidence.get("case_ids") != workload_cases(plan, "training_calibration")[0]:
+            source = evidence.get("objective_scale_source") or {}
+            calibration_plan = plan
+            if source:
+                if source.get("kind") != "completed_parent_objective":
+                    raise ValueError("未知目标尺度来源")
+                raw = Path(source["protocol"]).read_bytes()
+                source_sha = hashlib.sha256(raw).hexdigest()
+                if source_sha != source.get("protocol_sha256"):
+                    raise ValueError("父尺度协议身份不符")
+                calibration_plan = json.loads(raw)
+                source_series = platform.store.get("office_pilot_series", source_sha) or {}
+                if source_series.get("workloads", {}).get("training:0", {}).get("status") != "COMPLETE":
+                    raise ValueError("目标尺度来源的父训练尚未完成")
+                from seampact.scheduling.unified_objective import freeze_objective
+                source_objective = freeze_objective(calibration_plan["scheduler"]["objective"])
+                target_objective = freeze_objective(plan["scheduler"]["objective"])
+                if (source.get("scales") != source_objective["scales"]
+                        or any(source_objective.get(k) != target_objective.get(k) for k in
+                               ("schema", "scales", "quality_evaluator", "deadline_s", "resource_source"))):
+                    raise ValueError("复用的尺度、评价器或资源语义不一致")
+                stripped = {k:v for k,v in evidence.items() if k not in
+                            {"objective_scale_source", "reused_from_protocol_sha256"}}
+                if stripped != calibration_plan.get("development_evidence"):
+                    raise ValueError("复用的父校准证据与原协议不一致")
+            if evidence.get("source_split") != "training" or evidence.get("case_ids") != workload_cases(calibration_plan, "training_calibration")[0]:
                 raise ValueError("PPO 训练只接受在训练题上实测的成本尺度")
             runs = [platform.store.get("office_pilot", key) for key in evidence.get("run_ids", [])]
-            if (not runs or any(not run or run.get("mode") != "training_calibration" or run["status"] != "COMPLETE" for run in runs)
+            if (not runs or any(not run or run.get("mode") != "training_calibration" or run["status"] != "COMPLETE"
+                                or run.get("protocol_sha256") != evidence.get("protocol_sha256") for run in runs)
                     or [key for run in runs for key in run["case_ids"]] != evidence["case_ids"]):
                 raise ValueError("缺少与训练集成本尺度匹配的实测运行")
         application = frozen_application(platform, plan, units, rag, series, project=project)
@@ -347,13 +441,18 @@ def _handle(platform, body):
                 raise ValueError("没有冻结的训练检查点")
             config["policy"] = dict(kind="ppo", checkpoint=checkpoint["path"], checkpoint_sha256=checkpoint["sha256"],
                                     learner_config=plan.get("learner_config", {}), seed=plan.get("seed", 0))
+        transfer = None
+        if mode == "training" and batch == 0 and not resume and plan.get("parent_transfer"):
+            from seampact.scheduling.capability_scheduler import freeze_config
+            transfer = parent_transfer_spec(platform, plan, freeze_config(config, verify_policy=False), identity)
         if not (mode == "training" and batch > 0):
             execution.configure(config)
         workload = execution.start_workload(run_id, task_ids, training=mode == "training", fresh=batch == 0,
             continuous=bool(plan.get("continuous_training") and mode == "training"),
             learner_config=plan.get("learner_config", {}) if mode == "training" and batch == 0 else None,
             seed=plan.get("seed", 0), resume_checkpoint=previous["checkpoint"] if resume else None,
-            reward_denominator=full_size if mode == "training" and plan.get("continuous_training") else None)
+            parent_checkpoint=transfer,
+            reward_denominator=plan.get("reward_denominator", full_size) if mode == "training" and plan.get("continuous_training") else None)
         row = dict(id=run_id, protocol_sha256=identity, mode=mode, batch=batch, status="RUNNING",
                    diagnostic_checks=diagnostic_mode(plan),
                    defense_groups=sorted(groups), defense_group_count=len(groups),
@@ -361,6 +460,10 @@ def _handle(platform, body):
                    case_ids=ids, task_ids=task_ids, arrival_waves=waves, admitted=[], started_at=now(), workload=workload,
                    arrival_blocks=blocks, application=copy.deepcopy(application),
                    start_index=offset, previous_segments=previous["segments"] if resume else [])
+        if transfer:
+            row["parent_transfer"] = dict(parent_run_id=plan["parent_transfer"]["run_id"],
+                parent_protocol_sha256=plan["parent_transfer"]["protocol_sha256"],
+                **workload["parent_transfer"])
         if calibration:
             row["development_selection"] = dict(
                 selector=plan.get("development_selector", "app_config"),
@@ -482,6 +585,11 @@ def _handle(platform, body):
             if not summary.get("training_ready"):
                 row.update(status="UNSETTLED", workload=state, error=summary.get("reason"), finished_at=now())
                 platform.store.save("office_pilot", run_id, row)
+                key = row["mode"] + ":" + str(row["batch"])
+                previous = series["workloads"].get(key)
+                if previous is None or previous.get("id") == run_id:
+                    series["workloads"][key] = dict(previous or {}, id=run_id, status="UNSETTLED")
+                    platform.store.save("office_pilot_series", series_key, series)
                 return row
             if plan.get("continuous_training"):
                 state = execution.finish_workload(update=True)

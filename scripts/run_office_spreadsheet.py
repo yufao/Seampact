@@ -18,6 +18,7 @@ from urllib.error import HTTPError, URLError
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 from seampact.office_spreadsheet import load_case, SCHEMA, FEEDBACK_SCHEMA, SOURCE_REVISION
+from seampact.spreadsheet_evidence import infrastructure_error_resolved
 
 
 def sha(raw):
@@ -224,7 +225,8 @@ def grade(args):
         raise ValueError("The grading subset differs from the source of the admitted runtime manifest")
     binding = dict(outputs=task["evaluation"]["outputs"], manifest_sha256=task["experiment"]["manifest_sha256"],
                    original_manifest_sha256=task["experiment"]["original_manifest_sha256"])
-    if (collection.get("execution_infrastructure_error") or task.get("workspace_status") != "FINISHED"
+    if (((collection.get("execution_infrastructure_error") or (task.get("evaluation") or {}).get("execution_infrastructure_error"))
+            and not infrastructure_error_resolved(task)) or task.get("workspace_status") != "FINISHED"
             or collection.get("status") == "COLLECTION_TIMEOUT"):
         result = dict(case_id=collection["case_id"], task_id=task["id"], status="UNKNOWN_INFRASTRUCTURE",
                       cases=[None, None, None], soft=None, hard=None, quality=None,

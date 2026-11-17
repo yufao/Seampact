@@ -14,6 +14,7 @@ import socket
 import ssl
 import stat
 import threading
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -93,6 +94,10 @@ def capability_metadata(value):
         for name in ("max_output_tokens", "context_length", "context_window"):
             if type(item.get(name)) is int and item[name] > 0:
                 result[name] = item[name]
+        # vLLM reports the running engine's total sequence capacity in /models.
+        served_window = item.get("max_model_len")
+        if type(served_window) is int and served_window > 0:
+            result["context_window"] = served_window
         return result
     raw_models = value.get("models")
     models = [item for item in (model(item) for item in (raw_models if isinstance(raw_models, list) else []))
@@ -569,16 +574,23 @@ class Profiles:
             self.save_credential(dict(connection_id=connection_id, action="save", value=key))
 
     def discover(self, identity, transport=None):
-        profile = self.profile(identity)
-        data = (transport or Transport()).send(profile["base_url"] + "/models", self.key(identity))
+        with self.lock:
+            profile = self.profile(identity)
+            key = self.key(profile["connection_id"])
+        data = (transport or Transport()).send(profile["base_url"] + "/models", key)
         models = data.get("data", [])
         if not isinstance(models, list):
             raise ValueError("provider models response must contain an array")
+        return self.record_model_list(profile, models)
+
+    def record_model_list(self, profile, models):
         match = next((model for model in models if isinstance(model, dict) and model.get("id") == profile["model"]), None)
         capabilities = capability_metadata(dict(checked_at=now(), models=models, selected=match))
         with self.lock:
-            self.connections[self._connection_id(identity)]["capabilities"] = capabilities
-            self._save()
+            current = self.connections.get(profile["connection_id"])
+            if current and (current["revision"], current["config_digest"]) == (profile["revision"], profile["config_digest"]):
+                current["capabilities"] = capabilities
+                self._save()
         return capabilities
 
     def profile(self, identity):
@@ -666,15 +678,31 @@ class RequestCancelled(ProviderError):
 
 class RequestControl:
     """Per-request transport observation and best-effort connection cancellation."""
-    def __init__(self):
+    def __init__(self, *, deadline_at=None, on_deadline=None):
         self.cancelled = threading.Event()
         self.received = False
         self.response = None
         self.lock = threading.Lock()
+        self.deadline_at = deadline_at
+        self.on_deadline = on_deadline
 
     def check(self):
+        if self.deadline_at is not None and time.monotonic() >= self.deadline_at:
+            if self.on_deadline is not None:
+                self.on_deadline()
+            raise RequestCancelled()
         if self.cancelled.is_set():
             raise RequestCancelled()
+
+    def timeout(self):
+        self.check()
+        if self.deadline_at is None:
+            return 600
+        remaining = self.deadline_at - time.monotonic()
+        if remaining <= 0:
+            self.check()
+            raise RequestCancelled()
+        return remaining
 
     def progress(self, data):
         if data:
@@ -784,7 +812,8 @@ class Transport:
         try:
             if control is not None:
                 control.check()
-            with urllib.request.build_opener(NoRedirect).open(request, timeout=600) as response:
+            timeout = control.timeout() if control is not None else 600
+            with urllib.request.build_opener(NoRedirect).open(request, timeout=timeout) as response:
                 if control is not None:
                     control.attach(response)
                 if on_delta:
@@ -794,12 +823,18 @@ class Transport:
                     control.progress(True)
                 return result
         except urllib.error.HTTPError as error:
+            if control is not None:
+                control.check()
             diagnostic, reason = _http_diagnostic(error)
         except (http.client.IncompleteRead, http.client.RemoteDisconnected) as error:
+            if control is not None:
+                control.check()
             raise ProviderError(
                 f"provider response/{type(error).__name__}：模型响应接收中断，本次响应未完整取得",
                 kind="response_incomplete") from None
         except urllib.error.URLError as error:
+            if control is not None:
+                control.check()
             reason = error.reason
             if isinstance(reason, socket.gaierror):
                 category = "DNS"
@@ -817,6 +852,8 @@ class Transport:
                 detail = f" (errno={reason.errno})"
             raise ProviderError(f"provider transport/{category}{detail}", kind="transport") from None
         except (OSError, ValueError, TypeError, KeyError, AttributeError) as error:
+            if control is not None:
+                control.check()
             raise ProviderError(f"provider transport/{type(error).__name__}",
                                 kind="transport" if isinstance(error, OSError) else "invalid_response") from None
         # Raise outside the handler so the original HTTPError and body are not

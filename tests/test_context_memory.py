@@ -118,6 +118,43 @@ class ContextMemoryChecks(unittest.TestCase):
             self.assertNotIn('context_management',body)
             self.assertEqual(body['max_tokens'],1024)
 
+    def test_discovery_uses_served_vllm_window_and_keeps_output_optional(self):
+        import tempfile
+        from unittest.mock import MagicMock, Mock, patch
+        from seampact.providers import Profiles
+        from seampact.resources import ResourceRegistry
+
+        transport = Mock()
+        transport.send.return_value = dict(data=[dict(id='office', max_model_len=102528)])
+        with tempfile.TemporaryDirectory() as root:
+            profiles = Profiles(Path(root))
+            connection = profiles.save_connection(dict(name='business', base_url='https://example.invalid/v1',
+                model='office', auth=dict(mode='none')))
+            profiles.discover(connection['id'], transport)
+            profile = profiles.profile(connection['id'])
+            status = context_status(profile, [])
+            self.assertEqual((status['context_window'], status['window_basis']), (102528, 'provider_metadata'))
+            self.assertIsNone(status['requested_output_tokens'])
+            self.assertNotIn('max_tokens', completion_body(profile, []))
+            profile.update(declared_context_window=65536, parameters=dict(max_completion_tokens=8192))
+            status = context_status(profile, [])
+            self.assertEqual((status['context_window'], status['available_input_tokens']), (65536, 57344))
+            self.assertEqual(completion_body(profile, [])['max_completion_tokens'], 8192)
+
+            # The named connection's normal check refreshes the window after an engine restart.
+            response = MagicMock(status=200)
+            response.read.return_value = json.dumps(dict(data=[dict(id='office', max_model_len=262144)])).encode()
+            response.__enter__.return_value = response
+            registry = ResourceRegistry(root, self.store, profiles)
+            with patch('seampact.resources.urllib.request.build_opener') as opener:
+                opener.return_value.open.return_value = response
+                checked = registry.check_connection(connection['id'])
+            self.assertTrue(checked['model_in_list'])
+            self.assertEqual(context_status(profiles.profile(connection['id']), [])['context_window'], 262144)
+            profiles.save_connection(dict(id=connection['id'], model='replacement'))
+            profiles.record_model_list(profile, transport.send.return_value['data'])
+            self.assertIsNone(context_status(profiles.profile(connection['id']), [])['context_window'])
+
     def test_interrupted_summary_keeps_archive_and_unknown_usage_event(self):
         events=[]
         def interrupted(*args):

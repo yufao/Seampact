@@ -16,6 +16,7 @@ import uuid
 
 from seampact.agent_runtime import AgentHook, SYSTEM_PROMPT
 from seampact.project_spaces import _checked
+from seampact.spreadsheet_evidence import infrastructure_error_resolved
 
 SCHEMA = "seampact.office-spreadsheet-runtime/1"
 SUBSET_SCHEMA = "seampact.office-spreadsheetbench-v1-subset.v1"
@@ -67,7 +68,8 @@ def apply_native_score(platform, body):
             raise ValueError("Feedback includes an output absent from final delivery")
         if any(row["sha256"] is None and cases[i] is True for i, row in enumerate(outputs)):
             raise ValueError("A missing delivery cannot pass native scoring")
-        if evaluation.get("execution_infrastructure_error") and any(value is not None for value in cases):
+        if (evaluation.get("execution_infrastructure_error") and any(value is not None for value in cases)
+                and not infrastructure_error_resolved(task)):
             raise ValueError("Infrastructure failure cannot produce known scores")
         prior = evaluation.get("native_feedback")
         if prior and prior["evidence_id"] != evidence_id and prior.get("quality") is not None:
@@ -148,6 +150,7 @@ class SpreadsheetTask:
         self.task = self.scope = self.control = self.emit = None
         self.frozen = False
         self.infrastructure_error = None
+        self.infrastructure_error_source = None
         self.files, self.replays = [], []
         self.solution_sha256 = None
         self.files_attached = False
@@ -157,11 +160,26 @@ class SpreadsheetTask:
         if self.frozen:
             raise ValueError("The submitted solution is frozen; no further model execution is allowed")
         self.task, self.scope, self.control, self.emit = task, dict(scope), control, emit
+        argument_bytes = json.dumps(dict(code=code, timeout_s=timeout_s), sort_keys=True,
+                                    separators=(',', ':'), ensure_ascii=False).encode('utf-8')
+        attempt = dict(arguments_sha256=sha(argument_bytes), scope={key: scope.get(key) for key in
+                       ('project_id', 'conversation_id', 'task_id')}, image=getattr(self.executor, 'image', None))
+        task.setdefault('spreadsheet_execution_attempts', []).append(attempt)
+        before = len(task.get('python_calls', []))
         try:
-            return self.executor.run(projects, scope, code, timeout_s, control=control, task=task, emit=emit)
+            result = self.executor.run(projects, scope, code, timeout_s, control=control, task=task, emit=emit)
         except Exception as error:
             self.infrastructure_error = type(error).__name__
+            self.infrastructure_error_source = 'development'
+            attempt.update(status='ERROR', error_type=type(error).__name__)
             raise
+        else:
+            attempt.update(status='RETURNED', result_status=result.get('status'), exit_code=result.get('exit_code'))
+            return result
+        finally:
+            calls = task.get('python_calls', [])
+            if len(calls) == before + 1:
+                attempt['python_call_id'] = calls[-1].get('call_id')
 
     def gate(self, payload, context):
         if self.frozen:
@@ -225,6 +243,7 @@ class SpreadsheetTask:
                                            task=self.task, emit=self.emit)
             except Exception as error:
                 self.infrastructure_error = type(error).__name__
+                self.infrastructure_error_source = 'replay'
                 raise
             row = dict(index=index, input_sha256=original["sha256"], solution_sha256=self.solution_sha256,
                        status=result["status"], exit_code=result["exit_code"],
@@ -263,6 +282,7 @@ class SpreadsheetTask:
                     source_revision=SOURCE_REVISION, solution_sha256=self.solution_sha256,
                     delivered_solution=self.solution_sha256 in delivered, outputs=outputs,
                     execution_infrastructure_error=self.infrastructure_error,
+                    execution_infrastructure_error_source=self.infrastructure_error_source,
                     scope="Only final delivered artifact identities are eligible for the separate native scorer; missing outputs remain failures.")
 
 

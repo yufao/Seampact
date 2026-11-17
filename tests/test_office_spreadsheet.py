@@ -1,6 +1,7 @@
 """Synthetic preparation and replay wiring; no model or generated-code execution."""
 
 import hashlib
+import copy
 import json
 from pathlib import Path
 import sys
@@ -18,6 +19,7 @@ from seampact.office_spreadsheet import (SpreadsheetTask, SCHEMA, SOURCE_REVISIO
 from seampact.project_spaces import ProjectSpaces
 from seampact.store import Store
 from seampact.agent_runtime import RunControl, SYSTEM_PROMPT
+from seampact.spreadsheet_evidence import completed_delivered_replays, recovered_development_errors
 from run_office_spreadsheet import prepare, build_feedback
 from score_office_spreadsheet import score
 
@@ -225,6 +227,100 @@ class SpreadsheetPreparationTests(unittest.TestCase):
         (delivered / "replay-2.xlsx").write_bytes(b"altered")
         with self.assertRaisesRegex(ValueError, "bytes differ"):
             build_feedback(self.root)
+
+    def test_previous_development_error_requires_complete_matching_replay_evidence(self):
+        task_id, solution = 'd' * 32, 'e' * 64
+        outputs = [dict(index=i, sha256=hashlib.sha256(str(i).encode()).hexdigest()) for i in (1, 2, 3)]
+        artifacts = [dict(name=f'{i}_toy_output.xlsx', replay_index=i, sha256=outputs[i-1]['sha256'],
+                          solution_sha256=solution) for i in (1, 2, 3)]
+        replays = [dict(index=i, input_sha256=hashlib.sha256(f'input-{i}'.encode()).hexdigest(),
+                        solution_sha256=solution, status='COMPLETED', exit_code=0, output=artifacts[i-1])
+                   for i in (1, 2, 3)]
+        experiment = dict(case=self.case['id'], manifest_sha256='a'*64, original_manifest_sha256='b'*64)
+        task = dict(id=task_id, project_id='default', status='COMPLETED', workspace_status='FINISHED',
+                    experiment=experiment, files=[dict(name='solution.py', sha256=solution), *artifacts],
+                    python_calls=[dict(status='FAILED', error='earlier infrastructure failure')],
+                    spreadsheet_replay=dict(task_id=task_id, project_id='default', case_id=self.case['id'],
+                                            status='REPLAYED', solution_sha256=solution, replays=replays),
+                    evaluation=dict(source_revision=SOURCE_REVISION, solution_sha256=solution,
+                                    delivered_solution=True, outputs=outputs, quality=None,
+                                    execution_infrastructure_error='ValueError'))
+        self.assertTrue(completed_delivered_replays(task))
+        for mutate in (
+            lambda t: t['spreadsheet_replay']['replays'][1].update(status='FAILED'),
+            lambda t: t['spreadsheet_replay']['replays'][1].update(exit_code=1),
+            lambda t: t['spreadsheet_replay']['replays'][1].update(index=1),
+            lambda t: t['spreadsheet_replay']['replays'][1]['output'].update(sha256='f'*64),
+            lambda t: t['files'].pop(),
+            lambda t: t.update(workspace_status='UNKNOWN'),
+            lambda t: t['spreadsheet_replay'].update(task_id='wrong'),
+        ):
+            altered = copy.deepcopy(task)
+            mutate(altered)
+            self.assertFalse(completed_delivered_replays(altered))
+        scheduler = SimpleNamespace(condition=threading.RLock(), workload=dict(task_ids=[task_id]),
+                                    settle_quality=lambda identity, **kw: dict(quality=kw['quality']))
+        platform = SimpleNamespace(store=self.store, execution=scheduler)
+        feedback = dict(schema=FEEDBACK_SCHEMA, task_id=task_id, case_id=self.case['id'],
+                        manifest_sha256='a'*64, original_manifest_sha256='b'*64, outputs=outputs,
+                        source_revision=SOURCE_REVISION, cases=[True, False, True], hard=False, soft=2/3)
+        incomplete = copy.deepcopy(task)
+        incomplete['spreadsheet_replay']['replays'][1]['status'] = 'FAILED'
+        self.store.save('task', task_id, incomplete)
+        with self.assertRaisesRegex(ValueError, 'Infrastructure failure'):
+            apply_native_score(platform, feedback)
+        self.store.save('task', task_id, task)
+        self.assertIs(apply_native_score(platform, feedback)['quality'], False)
+        saved = self.store.get('task', task_id)
+        self.assertEqual(saved['evaluation']['execution_infrastructure_error'], 'ValueError')
+        self.assertEqual(saved['python_calls'], task['python_calls'])
+
+    def test_recovered_development_error_needs_identical_success_and_released_calls(self):
+        task_id = 'c' * 32
+        scope = dict(project_id='default', conversation_id='session', task_id=task_id)
+        task = dict(id=task_id, project_id='default', conversation_id='session', status='FAILED',
+                    workspace_status='FINISHED', experiment=dict(case=self.case['id'],
+                    manifest_sha256='a'*64, original_manifest_sha256='b'*64), files=[])
+        def execute(projects, scope, code, timeout_s, *, control, task, emit):
+            n = len(task.setdefault('python_calls', []))
+            task['python_calls'].append(dict(call_id='python-' + str(n), stopped=True, create_uncertain=False,
+                                             status='FAILED' if n == 0 else 'COMPLETED'))
+            if n == 0:
+                raise ValueError('transient execution failure')
+            return dict(status='COMPLETED', exit_code=0, stdout='', stderr='')
+        platform = SimpleNamespace(code_execution=SimpleNamespace(run=execute, image='sha256:' + 'f'*64))
+        environment = SpreadsheetTask(platform, task_id, 'default', self.case, self.inputs, 'source')
+        with self.assertRaises(ValueError):
+            environment.run(self.projects, scope, 'print(42)', 30, control=RunControl(), task=task, emit=lambda *a, **k: None)
+        environment.run(self.projects, scope, 'print(42)', 30, control=RunControl(), task=task, emit=lambda *a, **k: None)
+        task['evaluation'] = environment.evaluate(task)
+        self.assertTrue(recovered_development_errors(task))
+        for mutate in (
+            lambda t: t['spreadsheet_execution_attempts'][1].update(arguments_sha256='1'*64),
+            lambda t: t['spreadsheet_execution_attempts'][1].update(exit_code=1),
+            lambda t: t['spreadsheet_execution_attempts'][1].update(image='fake'),
+            lambda t: t['spreadsheet_execution_attempts'][0].pop('python_call_id'),
+            lambda t: t['spreadsheet_execution_attempts'][1]['scope'].update(conversation_id='different'),
+            lambda t: t['python_calls'][0].update(stopped=False),
+            lambda t: t['python_calls'][0].update(create_uncertain=True),
+            lambda t: t['evaluation'].update(execution_infrastructure_error_source='replay'),
+            lambda t: t.update(workspace_status='UNKNOWN'),
+        ):
+            altered = copy.deepcopy(task)
+            mutate(altered)
+            self.assertFalse(recovered_development_errors(altered))
+        scheduler = SimpleNamespace(condition=threading.RLock(), workload=dict(task_ids=[task_id]),
+                                    settle_quality=lambda identity, **kw: dict(quality=kw['quality']))
+        platform = SimpleNamespace(store=self.store, execution=scheduler)
+        feedback = dict(schema=FEEDBACK_SCHEMA, task_id=task_id, case_id=self.case['id'],
+                        manifest_sha256='a'*64, original_manifest_sha256='b'*64,
+                        outputs=[dict(index=i, sha256=None) for i in (1, 2, 3)],
+                        source_revision=SOURCE_REVISION, cases=[False]*3, hard=False, soft=0.0)
+        self.store.save('task', task_id, task)
+        self.assertIs(apply_native_score(platform, feedback)['quality'], False)
+        saved = self.store.get('task', task_id)
+        self.assertEqual(saved['evaluation']['execution_infrastructure_error'], 'ValueError')
+        self.assertEqual(saved['spreadsheet_execution_attempts'], task['spreadsheet_execution_attempts'])
 
 
 if __name__ == "__main__":

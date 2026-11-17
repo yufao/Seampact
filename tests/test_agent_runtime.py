@@ -3,10 +3,12 @@ import copy
 import json
 import sys
 import tempfile
+import time
 import unittest
 from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from seampact.agent_runtime import AgentHook, AgentRuntime, RunControl, model_connection
@@ -82,6 +84,48 @@ class AgentRuntimeTests(unittest.TestCase):
         self.assertEqual(self.task["files"], [file])
         self.assertEqual(self.task["calls"], [{"call_id": "real-call", "unit_id": "capability-id"}])
         self.assertEqual(len(bodies), 2)
+
+    def test_model_turns_share_one_task_deadline(self):
+        self.task['deadline_s'] = 900
+        self.catalog.tools = lambda: [dict(type='function', function=dict(name='read', parameters=dict(type='object')))]
+        self.catalog.name_to_id = lambda name: 'capability-id'
+        clock = [100.0]
+        waits, deadlines = [], []
+        def stream(url, key, body, delta, *, control):
+            waits.append(control.timeout())
+            deadlines.append(control.deadline_at)
+            if len(waits) == 1:
+                clock[0] = 350.0
+                return completion(calls=[dict(id='c', type='function', function=dict(name='read', arguments='{}'))])
+            delta('done')
+            return completion('done')
+        runtime_time = SimpleNamespace(monotonic=lambda: clock[0], perf_counter=time.perf_counter)
+        provider_time = SimpleNamespace(monotonic=lambda: clock[0])
+        with patch('seampact.agent_runtime.time', runtime_time), patch('seampact.providers.time', provider_time):
+            self.run_host(stream, dispatch=lambda *a, **kw: dict(output='read'))
+        self.assertEqual(waits, [900, 650])
+        self.assertEqual(deadlines, [1000, 1000])
+        self.assertEqual(self.task['status'], 'COMPLETED')
+
+    def test_cancelled_socket_error_keeps_unknown_usage_and_stop(self):
+        from seampact.providers import Transport
+        control = RunControl()
+        class CancelledResponse:
+            def __enter__(self): return self
+            def __exit__(self, *args): pass
+            def close(self): pass
+            def readline(self):
+                control.cancel()
+                raise AttributeError('connection closed')
+        host = AgentRuntime(self.store, self.catalog, transport=Transport())
+        with patch('urllib.request.build_opener') as opener:
+            opener.return_value.open.return_value = CancelledResponse()
+            host.run(self.task, self.messages, self.profiles, on_event=self.events.append, control=control)
+            self.assertEqual(opener.return_value.open.call_count, 1)
+        self.assertEqual(self.task['status'], 'CANCELLED')
+        self.assertEqual(self.task['usage'], [None])
+        self.assertIsNone(self.task['api_usage']['tokens'])
+        self.assertEqual(self.task['cancel']['model_stop'], 'UNKNOWN')
 
     def test_read_only_request_never_offers_effects_or_unknown_tools_after_read(self):
         self.task["tool_access"] = "read_only"

@@ -242,6 +242,8 @@ def make_server(platform, port=8880, host="127.0.0.1", public_port=None):
                     result = platform.project_applications.configure(body.get("project_id", "default"), body)
                 elif path == "/api/projects/cleanup":
                     result = platform.cleanup_project(body)
+                elif path == "/api/tasks/workspace/reconcile":
+                    result = platform.chat.reconcile_task_workspace(body)
                 elif path == "/api/projects/archive":
                     result = platform.projects.archive(body.get("project_id", "default"))
                 elif path == "/api/project-files/delete":

@@ -3555,11 +3555,31 @@ async function resourceAction(button, endpoint, body, message) {
   finally { button.disabled = false; }
 }
 
+function outputTokenChoice(profile) {
+  return profile?.declared_max_output_tokens ?? profile?.parameters?.max_completion_tokens ?? profile?.parameters?.max_tokens ?? null;
+}
+
+function applyOutputTokenChoice(body, input, previous) {
+  const limit = input.value === '' ? null : Number(input.value);
+  const original = outputTokenChoice(previous);
+  body.max_output_tokens = limit === original ? (previous?.declared_max_output_tokens ?? null) : limit;
+  if (limit === original) return;
+  const parameters = {...(body.parameters ?? previous?.parameters)};
+  for (const key of ['max_tokens', 'max_completion_tokens']) {
+    // Keep a previously configured wire field in sync when only the numeric control changed.
+    if (parameters[key] === undefined || parameters[key] !== previous?.parameters?.[key]) continue;
+    if (limit === null) delete parameters[key];
+    else parameters[key] = limit;
+    body.parameters = parameters;
+  }
+}
+
 function editConnection(connection) {
   const form = $('connection-form');
   form.elements.id.value = resourceId(connection) || '';
   for (const field of ['name', 'base_url', 'model', 'service_version']) form.elements[field].value = connection[field] || '';
   form.elements.context_window.value = connection.declared_context_window ?? '';
+  form.elements.max_output_tokens.value = outputTokenChoice(connection) ?? '';
   form.elements.context_management.checked = connection.context_management !== false;
   form.elements.protocol.value = connection.protocol || 'openai-compatible';
   form.elements.resource_kind.value = connection.resource_kind || 'borrowed';
@@ -3887,7 +3907,7 @@ function hydrateModels() {
     if (!form.dataset.hydrated) {
       form.elements.base_url.value = profile?.base_url || '';
       form.elements.model.value = profile?.model || '';
-      form.elements.max_output_tokens.value = profile?.declared_max_output_tokens ?? '';
+      form.elements.max_output_tokens.value = outputTokenChoice(profile) ?? '';
       form.elements.context_window.value = profile?.declared_context_window ?? '';
       form.elements.context_management.checked = profile?.context_management !== false;
       form.elements.service_version.value = profile?.service_version || '';
@@ -3928,7 +3948,7 @@ async function saveModel(event) {
   const button = form.querySelector('button[type="submit"]');
   const status = form.querySelector('.form-status');
   const body = {role: form.dataset.role, base_url: form.elements.base_url.value.trim(), model: form.elements.model.value.trim()};
-  body.max_output_tokens = form.elements.max_output_tokens.value ? Number(form.elements.max_output_tokens.value) : null;
+  applyOutputTokenChoice(body, form.elements.max_output_tokens, state.models?.[form.dataset.role]);
   body.context_window = form.elements.context_window.value ? Number(form.elements.context_window.value) : null;
   body.context_management = form.elements.context_management.checked;
   body.service_version = form.elements.service_version.value.trim() || null;
@@ -3992,11 +4012,12 @@ async function saveConnection(event) {
       capabilities: [...form.querySelectorAll('[name="capability"]:checked')].map(input => input.value),
       auth: {mode: form.elements.auth_mode.value}};
     body.resource_kind = form.elements.resource_kind.value;
+    const previous = entries(resourceState().connections).find(item => resourceId(item) === form.elements.id.value);
+    applyOutputTokenChoice(body, form.elements.max_output_tokens, previous);
     if (body.resource_kind === 'managed') body.managed_service_id = form.elements.managed_service_id.value;
     if (form.elements.id.value) body.id = form.elements.id.value;
     if (body.auth.mode === 'environment') body.auth.env = form.elements.auth_env.value.trim();
     if (body.auth.mode === 'saved') {
-      const previous = entries(resourceState().connections).find(item => resourceId(item) === body.id);
       if (previous?.base_url === body.base_url && previous.auth?.credential_ref) body.auth.credential_ref = previous.auth.credential_ref;
     }
     const result = await api('/api/connections', body);

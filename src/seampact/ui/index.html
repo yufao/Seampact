@@ -123,6 +123,7 @@
       <section class="config-section" data-config-section="models">
         <h2>模型角色</h2><p class="form-note">先在“服务连接”中登记 API，再分配给对话和仓库分析。教师配置保留给明确要求评分的任务。</p>
         <div class="config-section-actions"><a class="secondary-button" href="/configuration?section=services">管理服务连接</a></div>
+        <datalist id="output-token-options"><option value="4096"></option><option value="8192"></option><option value="32768"></option></datalist>
         <div class="model-grid">
           <form id="chat-model-form" class="model-form" data-role="chat">
             <h4>对话模型</h4><p class="form-note">支持本地部署 API 与云端 API。</p><p id="chat-model-readiness" class="form-note">正在读取配置。</p>
@@ -130,8 +131,8 @@
             <label>接口地址<input name="base_url" type="url" placeholder="http://localhost:8000/v1" required></label>
             <label>模型 ID<input name="model" type="text" placeholder="填写部署或提供方的模型 ID" required></label>
             <label>API Key<input name="api_key" type="password" autocomplete="new-password" placeholder="本地可留空；同一接口留空保持已有密钥"></label>
-            <label>最大输出 token（可选）<input name="max_output_tokens" type="number" min="1" step="1" placeholder="按模型能力填写"></label>
-            <label>上下文窗口 token（可选）<input name="context_window" type="number" min="1" step="1" placeholder="未知可留空"></label><label class="context-switch"><input name="context_management" type="checkbox" checked> 自动整理上下文（对话与分析）</label>
+            <label>单次输出上限 token（含思考）<input name="max_output_tokens" type="number" min="1" step="1" list="output-token-options" placeholder="选择、自填或留空采用服务设置"></label>
+            <label>总上下文 token（输入与输出合计）<input name="context_window" type="number" min="1" step="1" placeholder="留空采用检查连接时报告的窗口"></label><label class="context-switch"><input name="context_management" type="checkbox" checked> 自动整理上下文（对话与分析）</label>
             <label>服务／模型版本（可选）<input name="service_version" type="text" placeholder="填可核对版本；未知可留空"></label>
             <div class="form-actions"><button class="secondary-button save-role-credential" type="button">单独保存凭据</button><button class="primary-button" type="submit">保存对话配置</button><span class="form-status" role="status"></span></div>
           </form>
@@ -141,8 +142,8 @@
             <label>接口地址<input name="base_url" type="url" placeholder="https://提供方地址/v1" required></label>
             <label>模型 ID<input name="model" type="text" placeholder="填写分析模型 ID" required></label>
             <label>API Key<input name="api_key" type="password" autocomplete="new-password" placeholder="无鉴权可留空；已有密钥留空保持"></label>
-            <label>最大输出 token（可选）<input name="max_output_tokens" type="number" min="1" step="1" placeholder="按模型能力填写"></label>
-            <label>上下文窗口 token（可选）<input name="context_window" type="number" min="1" step="1" placeholder="未知可留空"></label><label class="context-switch"><input name="context_management" type="checkbox" checked> 自动整理上下文（对话与分析）</label>
+            <label>单次输出上限 token（含思考）<input name="max_output_tokens" type="number" min="1" step="1" list="output-token-options" placeholder="选择、自填或留空采用服务设置"></label>
+            <label>总上下文 token（输入与输出合计）<input name="context_window" type="number" min="1" step="1" placeholder="留空采用检查连接时报告的窗口"></label><label class="context-switch"><input name="context_management" type="checkbox" checked> 自动整理上下文（对话与分析）</label>
             <label>服务／模型版本（可选）<input name="service_version" type="text" placeholder="填可核对版本；未知可留空"></label>
             <div class="form-actions"><button class="secondary-button save-role-credential" type="button">单独保存凭据</button><button class="primary-button" type="submit">保存分析配置</button><span class="form-status" role="status"></span></div>
           </form>
@@ -152,8 +153,8 @@
             <label>接口地址<input name="base_url" type="url" placeholder="https://提供方地址/v1" required></label>
             <label>模型 ID<input name="model" type="text" placeholder="填写教师模型 ID" required></label>
             <label>API Key<input name="api_key" type="password" autocomplete="new-password" placeholder="本地可留空；同一接口留空保持已有密钥"></label>
-            <label>最大输出 token（可选）<input name="max_output_tokens" type="number" min="1" step="1" placeholder="按模型能力填写"></label>
-            <label>上下文窗口 token（可选）<input name="context_window" type="number" min="1" step="1" placeholder="未知可留空"></label><label class="context-switch"><input name="context_management" type="checkbox" checked> 自动整理上下文（对话与分析）</label>
+            <label>单次输出上限 token（含思考）<input name="max_output_tokens" type="number" min="1" step="1" list="output-token-options" placeholder="选择、自填或留空采用服务设置"></label>
+            <label>总上下文 token（输入与输出合计）<input name="context_window" type="number" min="1" step="1" placeholder="留空采用检查连接时报告的窗口"></label><label class="context-switch"><input name="context_management" type="checkbox" checked> 自动整理上下文（对话与分析）</label>
             <label>服务／模型版本（可选）<input name="service_version" type="text" placeholder="填可核对版本；未知可留空"></label>
             <div class="form-actions"><button class="secondary-button save-role-credential" type="button">单独保存凭据</button><button class="primary-button" type="submit">保存教师配置</button><span class="form-status" role="status"></span></div>
           </form>
@@ -174,7 +175,8 @@
           <p class="form-note">云端和借用连接需已有可用服务；平台管理服务可先登记规格，再由调度器准备。如果只有权重文件，请先<a href="/configuration?section=weights">登记权重路径</a>。</p>
           <label>服务地址<input name="base_url" type="url" required placeholder="http://服务器地址:8000/v1"></label>
           <div class="optional-grid"><label>模型 ID（原服务需要时填写）<input name="model"></label><label>可核对服务／模型版本<input name="service_version" placeholder="未知可留空"></label></div>
-          <div class="optional-grid"><label>上下文窗口 token（可选）<input name="context_window" type="number" min="1" step="1" placeholder="未知可留空"></label><label class="context-switch"><input name="context_management" type="checkbox" checked> 自动整理上下文（对话与分析）</label></div>
+          <div class="optional-grid"><label>总上下文 token（输入与输出合计）<input name="context_window" type="number" min="1" step="1" placeholder="留空采用检查连接时报告的窗口"></label><label>单次输出上限 token（含思考）<input name="max_output_tokens" type="number" min="1" step="1" list="output-token-options" placeholder="选择、自填或留空采用服务设置"></label></div>
+          <label class="context-switch"><input name="context_management" type="checkbox" checked> 自动整理上下文（对话与分析）</label>
           <fieldset class="capability-options"><legend>服务声明能力（实际操作另行核对）</legend><label><input type="checkbox" name="capability" value="text"> 文本</label><label><input type="checkbox" name="capability" value="image"> 图像</label><label><input type="checkbox" name="capability" value="embedding"> Embedding</label><label><input type="checkbox" name="capability" value="retrieval"> 检索</label></fieldset>
           <label>非敏感参数（JSON 对象）<textarea name="parameters" rows="3" spellcheck="false">{}</textarea></label>
           <p class="form-note">按提供方官方文档填写生成参数，例如 {"reasoning_effort":"max","thinking":{"type":"enabled"}}。文本、图像能力调用及平台对话／分析／教师请求会携带这些参数；保留 model、messages、tools 等平台请求字段，不在这里填写。向量接口只使用其支持的参数；Harness 原库按已核对的映射读取参数。</p>

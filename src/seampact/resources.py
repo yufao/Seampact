@@ -502,9 +502,9 @@ class ResourceRegistry:
                         models = data.get("data") if isinstance(data, dict) else None
                         if not isinstance(models, list):
                             raise ValueError("invalid_models_response")
-                        result.update(models_count=len(models), model_in_list=(any(
-                            isinstance(item, dict) and item.get("id") == profile.get("model")
-                            for item in models) if profile.get("model") else None),
+                        capabilities = self.profiles.record_model_list(profile, models)
+                        result.update(models_count=len(models),
+                            model_in_list=(capabilities["selected"] is not None if profile.get("model") else None),
                             status="models_list_accessible")
             except urllib.error.HTTPError as error:
                 result.update(http_status=error.code, accessible=True,

@@ -199,19 +199,41 @@ def combined_summary(workloads):
 def reuse_calibration(plan, previous, previous_sha):
     def comparable(value):
         value = copy.deepcopy(value)
-        for key in ("objective_weights", "reward_sweep", "development_evidence"):
+        for key in ("objective_weights", "reward_sweep", "development_evidence", "parent_transfer"):
             value.pop(key, None)
         value["scheduler"]["objective"] = None
         return value
     if comparable(plan) != comparable(previous):
         raise ValueError("Shared calibration requires the same data, order, seed, capabilities and runtime settings")
     objective, evidence = previous["scheduler"].get("objective"), previous.get("development_evidence")
-    if not objective or not evidence or objective["scales"] != evidence.get("scales") or not evidence.get("pool"):
+    origin = (evidence or {}).get("objective_scale_source") or {}
+    matching_scales = objective and (objective["scales"] == (evidence or {}).get("scales")
+        or origin.get("kind") == "completed_parent_objective" and origin.get("scales") == objective["scales"])
+    if not objective or not evidence or not matching_scales or not evidence.get("pool"):
         raise ValueError("Shared calibration needs a real frozen development result")
     result = copy.deepcopy(plan)
     result["scheduler"]["objective"] = dict(copy.deepcopy(objective), weights=copy.deepcopy(plan["objective_weights"]))
     result["development_evidence"] = dict(copy.deepcopy(evidence), reused_from_protocol_sha256=previous_sha)
     return result
+
+
+def missing_api_usage(tasks, case_ids, start_index=0):
+    """Inspect finalized objective ledgers; unknown is never treated as zero."""
+    missing = []
+    for index, task in enumerate(tasks, start_index):
+        objective = task.get("objective_result") or {}
+        if (task.get("status") in {"RUNNING", "CANCELLING"}
+                or task.get("workspace_status") != "FINISHED"
+                or objective.get("quality") is None
+                or "api_tokens" not in (objective.get("metrics") or {})):
+            raise RuntimeError("Task %s has no finalized objective ledger" % index)
+        if objective["metrics"]["api_tokens"] is None:
+            usage = task.get("api_usage") or {}
+            missing.append(dict(index=index, case_id=case_ids[index], task_id=task["id"],
+                unknown_requests=usage.get("unknown_requests"),
+                unreported_capability_calls=usage.get("unreported_capability_calls"),
+                observed_tokens=usage.get("observed_tokens")))
+    return missing
 
 
 def main():
@@ -229,16 +251,38 @@ def main():
     phase.add_argument("--evaluation-only", action="store_true", help="use this already-trained frozen protocol/checkpoint; no retraining")
     phase.add_argument("--calibration-only", action="store_true", help="measure cost scales and stop before training")
     parser.add_argument("--scales-from", type=Path, help="reuse cost measurements from the matching frozen protocol")
+    parser.add_argument("--reuse-parent-objective", type=Path,
+                        help="for full parent transfer only: verify the parent protocol and retain its objective and scales")
     parser.add_argument("--include-rule-baseline", action="store_true", help="also score the development rule baseline when reusing scales")
     parser.add_argument("--admission-deadline", type=float, help="Unix time to finish at the next dispatch block boundary")
     parser.add_argument("--wait-model-socket", type=Path, action="append", metavar="SOCKET",
                         help="repeatable Unix socket whose /health endpoint must be ready before each training dispatch block")
     parser.add_argument("--resume-training", action="store_true", help="resume a safely paused training protocol into a new output directory")
     parser.add_argument("--attach-training", metavar="RUN_ID", help="continue an existing live continuous training run after its admitted prefix is settled")
+    parser.add_argument("--stop-on-missing-api-usage", action="store_true",
+                        help="stop continuous training at a completed dispatch block if API accounting is missing")
     args = parser.parse_args()
     plan = json.loads(args.protocol.read_text(encoding="utf-8"))
     if plan.get("schema") not in {"seampact.office-pilot/1", "seampact.office-comparison/1"}:
         raise ValueError("Unsupported pilot protocol")
+    parent_objective = None
+    if args.reuse_parent_objective:
+        parent = plan.get("parent_transfer") or {}
+        if (not args.training_only or args.resume_training or args.attach_training or args.scales_from
+                or parent.get("mode") != "full"):
+            raise ValueError("Parent objective reuse is limited to a new full-transfer training run")
+        if digest(args.reuse_parent_objective) != parent.get("protocol_sha256"):
+            raise ValueError("Parent objective protocol checksum differs")
+        from seampact.scheduling.unified_objective import freeze_objective
+        parent_plan = json.loads(args.reuse_parent_objective.read_text(encoding="utf-8"))
+        parent_objective = freeze_objective(parent_plan["scheduler"]["objective"])
+        target_objective = freeze_objective(plan["scheduler"].get("objective"))
+        if (parent_objective is None or target_objective != parent_objective
+                or plan.get("objective_weights") != parent_objective["weights"]
+                or plan.get("quality_evaluator") != parent_objective["quality_evaluator"]
+                or plan.get("deadline_s") != parent_objective["deadline_s"]
+                or plan.get("resource_source") != parent_objective["resource_source"]):
+            raise ValueError("Full transfer requires the explicitly unchanged parent objective")
     frozen_inference = args.evaluation_only or args.validation_only
     if args.resume_training and (not args.training_only or args.scales_from or not plan.get("development_evidence")
                                  or not plan.get("continuous_training")):
@@ -317,6 +361,8 @@ def main():
                 end_at_budget(next_mode=mode, admitted=0, next_index=0, stop_reason=reason,
                     recovery_required=waiting.get("recovery_required", False), restart_performed=False,
                     model_wait=waiting)
+            if budget_expired():
+                end_at_budget(next_mode=mode, admitted=0, next_index=0, stop_reason="admission_deadline")
 
         if result is None:
             result = api("/api/experiments/office/pilot", dict(common,
@@ -352,6 +398,19 @@ def main():
         stopped_at = None
         stop_reason = None
         model_wait_stop = None
+        api_gap = []
+        checked_through = 0
+        check_api = bool(args.stop_on_missing_api_usage and args.training_only and continuous
+                         and (plan.get("scheduler", {}).get("objective") or {}).get("weights", {}).get("api", 0) > 0)
+        def inspect_api(start, end):
+            for future in score_futures:
+                future.result()
+            tasks = []
+            for n in range(start, end):
+                task = api("/api/tasks/" + result["task_ids"][n])
+                tasks.append(task)
+                write(args.output / (prefix + "-task-" + str(n) + ".json"), task)
+            return missing_api_usage(tasks, result["case_ids"], start)
         if args.attach_training:
             workload = result.get("workload") or {}
             original_cases = workload_cases(plan, "training")[batch]
@@ -402,7 +461,13 @@ def main():
             blocks = [block for block in blocks if block["indices"][0] >= start_index]
             write(args.output / "attach-preflight.json", dict(run_id=run_id, admitted=start_index,
                   session=live["session"], config_id=live["config_id"], pool=pool))
-            if args.wait_model_socket:
+            if check_api and start_index:
+                api_gap = inspect_api(0, start_index)
+                checked_through = start_index
+                if api_gap and start_index < len(result["case_ids"]):
+                    stopped_at = start_index
+                    stop_reason = "missing_api_usage"
+            if args.wait_model_socket and not api_gap:
                 waiting = wait_models(start_index)
                 if waiting["status"] != "ready":
                     stop_reason = ("admission_deadline" if waiting["status"] == "admission_deadline"
@@ -437,10 +502,13 @@ def main():
             try:
                 if stopped_at is not None:
                     break
-                if index and index in block_starts and budget_expired():
-                    stopped_at = index
-                    stop_reason = "admission_deadline"
-                    break
+                if check_api and index in block_starts and index > checked_through:
+                    api_gap = inspect_api(checked_through, index)
+                    checked_through = index
+                    if api_gap:
+                        stopped_at = index
+                        stop_reason = "missing_api_usage"
+                        break
                 if (args.wait_model_socket and index in block_starts and index != start_index):
                     # This gate is before timed_admissions starts the block, so
                     # the frozen offsets inside each block remain unchanged.
@@ -470,6 +538,13 @@ def main():
                 for future in score_futures:
                     if future.done():
                         future.result()
+                if index in block_starts and budget_expired():
+                    stop_reason = "admission_deadline"
+                    if index == 0 and start_index == 0:
+                        end_at_budget(mode=mode, batch=batch, run_id=run_id, admitted=0, next_index=0,
+                            stop_reason=stop_reason, empty_prefix=True)
+                    stopped_at = index
+                    break
                 _, admission = next(stream)
                 while True:
                     task = api("/api/tasks/" + admission["task_id"])
@@ -496,6 +571,8 @@ def main():
                     scoring.shutdown(wait=True)
                 raise
         stream.close()
+        if check_api and stopped_at is None and checked_through < len(result["case_ids"]):
+            api_gap = inspect_api(checked_through, len(result["case_ids"]))
         if stopped_at and continuous and scoring is not None:
             scoring.shutdown(wait=True)
             for future in score_futures:
@@ -515,6 +592,15 @@ def main():
         else:
             for score in pending_scores:
                 grade_one(*score)
+        if api_gap and stopped_at:
+            receipt = dict(status=result.get("status"), run_id=run_id, reason="missing_api_usage",
+                admitted=len(result.get("admitted", [])),
+                next_index=result.get("start_index", 0) + len(result.get("admitted", [])),
+                affected_cases=api_gap, pilot_error=result.get("error"))
+            write(args.output / (prefix + "-missing-api-usage.json"), receipt)
+            if result.get("status") != "UNSETTLED":
+                raise RuntimeError("Missing API usage detected, but prefix did not settle as UNSETTLED")
+            raise RuntimeError("Training stopped: finalized API token accounting is missing")
         if stopped_at:
             if model_wait_stop:
                 model_wait_stop.update(pilot_status=result.get("status"), admitted=len(result.get("admitted", [])))
@@ -530,6 +616,13 @@ def main():
                           model_wait=model_wait_stop.get("model_wait") if model_wait_stop else None)
         result = api("/api/experiments/office/pilot", dict(common, op="finish", run_id=run_id))
         write(args.output / (prefix + "-finish.json"), result)
+        if api_gap:
+            write(args.output / (prefix + "-missing-api-usage.json"), dict(
+                status=result.get("status"), run_id=run_id, reason="missing_api_usage",
+                admitted=len(result.get("admitted", [])),
+                next_index=result.get("start_index", 0) + len(result.get("admitted", [])),
+                affected_cases=api_gap, pilot_error=result.get("error")))
+            raise RuntimeError("Training stopped: finalized API token accounting is missing")
         if result["status"] != "COMPLETE":
             raise RuntimeError("Workload did not settle: " + str(result.get("error")))
         return result
@@ -601,6 +694,19 @@ def main():
     else:
         if args.resume_training:
             pass  # The original protocol already contains the measured training-only scales.
+        elif parent_objective is not None:
+            # Reuse the parent's already completed calibration evidence; this
+            # does not dispatch its historical cases in the new experiment.
+            evidence = copy.deepcopy(parent_plan.get("development_evidence") or {})
+            if (evidence.get("source_split") != "training" or not evidence.get("run_ids")
+                    or not evidence.get("pool") or evidence.get("scales") != parent_objective["scales"]):
+                raise ValueError("Completed parent lacks matching training calibration evidence")
+            plan = copy.deepcopy(plan)
+            plan["scheduler"]["objective"] = copy.deepcopy(parent_objective)
+            evidence["objective_scale_source"] = dict(kind="completed_parent_objective",
+                protocol=parent["protocol"], protocol_sha256=parent["protocol_sha256"],
+                scales=copy.deepcopy(parent_objective["scales"]))
+            plan["development_evidence"] = evidence
         elif shared is not None:
             plan = shared
         else:

@@ -28,13 +28,19 @@ def _size(messages, tools=None):
     return len(raw), unknown
 
 
-def context_status(profile, messages, tools=None, usage=None):
+def context_limits(profile):
     selected = (profile.get('capabilities') or {}).get('selected') or {}
     window = profile.get('declared_context_window') or selected.get('context_window') or selected.get('context_length')
     window = window if type(window) is int and window > 0 else None
     params = profile.get('parameters') or {}
-    output = params.get('max_completion_tokens', params.get('max_tokens', profile.get('declared_max_output_tokens') or selected.get('max_output_tokens')))
+    default_output = profile.get('declared_max_output_tokens') or profile.get('max_output_tokens') or selected.get('max_output_tokens')
+    output = params.get('max_completion_tokens', params.get('max_tokens', default_output))
     output = output if type(output) is int and output > 0 else None
+    return window, output
+
+
+def context_status(profile, messages, tools=None, usage=None):
+    window, output = context_limits(profile)
     size, unknown = _size(messages, tools)
     actual = (usage or {}).get('prompt_tokens', (usage or {}).get('input_tokens'))
     actual = actual if type(actual) is int and actual >= 0 else None

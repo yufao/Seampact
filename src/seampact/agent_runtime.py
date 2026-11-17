@@ -15,7 +15,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 
 from seampact.api_accounting import private_receipt, summarize as summarize_api_usage
-from seampact.context_memory import ContextMemory
+from seampact.context_memory import ContextMemory, context_limits
 from seampact.pi_runtime import PiHost
 from seampact.providers import RequestCancelled, RequestControl, Transport, completion_body
 from seampact.store import now
@@ -112,7 +112,17 @@ class RunControl:
         self.lock = threading.RLock()
         self.request = None
         self.calls = {}
+        self.deadline_at = None
         self.state = dict(requested=False, delivery_stopped=False, model_stop="NOT_REQUESTED", tools={})
+
+    def start_deadline(self, seconds):
+        with self.lock:
+            if seconds is not None and self.deadline_at is None:
+                self.deadline_at = time.monotonic() + seconds
+            return self.deadline_at
+
+    def model_request(self):
+        return RequestControl(deadline_at=self.deadline_at, on_deadline=self.cancel)
 
     def check(self):
         if self.cancelled.is_set():
@@ -280,6 +290,7 @@ class AgentRuntime:
         observation and must not be rendered as delivered content.
         """
         control = control or RunControl()
+        control.start_deadline(task.get("deadline_s"))
         persist = persist or (lambda value: self.store.save("task", value["id"], value))
         task.setdefault("model_calls", 0)
         task.setdefault("usage", [])
@@ -523,7 +534,7 @@ class AgentRuntime:
             task["usage"].append(None)
             save()
             with connection() as (profile, key):
-                request = RequestControl()
+                request = control.model_request()
                 control.attach_request(request)
                 options = {"control": request} if "control" in inspect.signature(self.transport.send).parameters else {}
                 try:
@@ -660,7 +671,7 @@ class AgentRuntime:
                 with connection() as (bound_profile, key):
                     body = completion_body(bound_profile, request, offered)
                     url = bound_profile["base_url"].rstrip("/") + "/chat/completions"
-                    request_control = RequestControl()
+                    request_control = control.model_request()
                     control.attach_request(request_control)
                     def invoke_model(stream=True, include_usage=True):
                         control.check()
@@ -918,9 +929,9 @@ class AgentRuntime:
                 emit("host_ready", host=task["host"])
                 save()
 
+            window, output_limit = context_limits(profile)
             outcome = PiHost().run(dict(messages=copy.deepcopy(active), tools=available_tools(),
-                model=dict(id=profile["model"], contextWindow=profile.get("declared_context_window", 0),
-                           maxTokens=profile.get("max_output_tokens", 0))),
+                model=dict(id=profile["model"], contextWindow=window or 0, maxTokens=output_limit or 0)),
                 context=prepare_context, model=model_callback, tool=tool_callback,
                 event=pi_event, control=control, identity=host_identity)
             active = copy.deepcopy(outcome["context_messages"])

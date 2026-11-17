@@ -145,6 +145,63 @@ class IsolatedExecutionTests(unittest.TestCase):
                          dict(exit_code=1, reason="Docker bind source path does not exist"))
         self.assertNotIn("/private/token", str(task))
 
+    def test_timed_out_create_only_recovers_exact_unstarted_container(self):
+        image = "sha256:" + "a" * 64
+        mounts = Projects().container_mounts("t")
+        receipt = dict(Name="/seampact-python-" + "b" * 32, Image=image,
+            State=dict(Status="created", Running=False, Pid=0, StartedAt="0001-01-01T00:00:00Z"),
+            Config=dict(Cmd=["python", "-I", "-"], OpenStdin=True, WorkingDir="/workspace"),
+            HostConfig=dict(NetworkMode="none", ReadonlyRootfs=True, Privileged=False, CapDrop=["ALL"],
+                SecurityOpt=["no-new-privileges"], NanoCpus=1000000000, Memory=512 * 1024 * 1024,
+                PidsLimit=64, LogConfig=dict(Type="none"),
+                Tmpfs={"/tmp": "rw,nosuid,nodev,noexec,size=64m"}),
+            Mounts=[dict(Type="bind", Source=m["source"], Destination=m["target"], RW=not m["read_only"])
+                    for m in mounts])
+        def command(*args, **kwargs):
+            raw = image.encode() if args[:2] == ("image", "inspect") else json.dumps([receipt]).encode()
+            return SimpleNamespace(returncode=0, stdout=raw, stderr=b"")
+        self.executor._command = command
+        name = receipt["Name"][1:]
+        self.assertTrue(self.executor._verified_created(name, mounts))
+        for change in (
+                lambda x: x["State"].update(Status="running"),
+                lambda x: x["State"].update(StartedAt="2026-01-01T00:00:00Z"),
+                lambda x: x["Mounts"][1].update(Source="/another/session"),
+                lambda x: x["HostConfig"].update(NetworkMode="bridge"),
+                lambda x: x.update(Image="sha256:" + "b" * 64)):
+            saved = json.loads(json.dumps(receipt))
+            change(receipt)
+            self.assertFalse(self.executor._verified_created(name, mounts))
+            receipt.clear()
+            receipt.update(saved)
+
+    def test_create_timeout_verified_receipt_continues_and_unknown_never_starts(self):
+        for verified in (True, False):
+            with self.subTest(verified=verified):
+                task, commands = {}, []
+                def command(*args, **kwargs):
+                    commands.append(args)
+                    if args[0] == "create":
+                        raise ValueError("create timed out")
+                    return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+                self.executor._command = command
+                with patch.object(self.executor, "_mount_sources", side_effect=lambda rows: rows), \
+                     patch.object(self.executor, "_verified_created", return_value=verified), \
+                     patch("seampact.isolated_execution.subprocess.Popen", return_value=FakeProcess()) as start:
+                    if verified:
+                        self.executor.run(Projects(), self.scope, "print(1)", 5,
+                            control=RunControl(), task=task, emit=lambda *a, **k: None)
+                        self.assertTrue(task["python_calls"][0]["stopped"])
+                        self.assertEqual(task["python_calls"][0]["create_recovered"], "verified_unstarted_container")
+                        start.assert_called_once()
+                    else:
+                        with self.assertRaisesRegex(RuntimeError, "状态未确认"):
+                            self.executor.run(Projects(), self.scope, "print(1)", 5,
+                                control=RunControl(), task=task, emit=lambda *a, **k: None)
+                        start.assert_not_called()
+                        self.assertTrue(task["python_calls"][0]["create_uncertain"])
+                        self.assertFalse(any(args[0] in {"kill", "rm"} for args in commands))
+
 
 if __name__ == "__main__":
     unittest.main()

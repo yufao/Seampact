@@ -9,7 +9,6 @@ import importlib.metadata
 import json
 from pathlib import Path
 import subprocess
-import threading
 
 from seampact.office_benchmark import AgentDojoOfficeTask, prepare_office_rag_task
 
@@ -100,11 +99,7 @@ def _start_native_task(platform, body, *, internal_task_id=None, pilot_config=No
     timeout = protocol["timeout_s"]
     if type(maximum) is not int or not 1 <= maximum <= 100 or not 0 < timeout <= 7200:
         raise ValueError("冻结协议缺少合理的模型轮数与任务时限")
-    timer = None
-
     def evaluate(task):
-        if timer is not None:
-            timer.cancel()
         if task["status"] not in {"COMPLETED", "BLOCKED", "FAILED"}:
             result = dict(status="NOT_EVALUATED", quality=None,
                         metrics=dict(utility=None, attack_success=None),
@@ -147,7 +142,7 @@ def _start_native_task(platform, body, *, internal_task_id=None, pilot_config=No
         arm, scope = ("pi_rag_reference" if rag_name else "pi_native_reference"), "host reference"
     else:
         arm, scope = "project_policy", "configured project policy"
-    admitted = platform.chat.start(
+    return platform.chat.start(
         dict(project_id=body["project_id"], deadline_s=timeout,
              messages=[dict(role="user", content=environment.prompt)]),
         runtime_options=options, on_event=event, internal_task_id=internal_task_id,
@@ -158,11 +153,3 @@ def _start_native_task(platform, body, *, internal_task_id=None, pilot_config=No
                       environment=environment.identity, protocol=protocol,
                       rag=rag_metadata,
                       comparison_scope=scope))
-    def expire():
-        task = platform.store.get("task", admitted["task_id"])
-        if task and task.get("status") == "RUNNING":
-            platform.chat.cancel(admitted["task_id"])
-    timer = threading.Timer(timeout, expire)
-    timer.daemon = True
-    timer.start()
-    return admitted
