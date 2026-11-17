@@ -12,7 +12,7 @@ from contextlib import nullcontext
 
 from seampact.providers import FrozenProfiles, Transport
 from seampact.store import now
-from seampact.agent_runtime import AgentRuntime, RunControl
+from seampact.agent_runtime import AgentRuntime, RunControl, execution_budget
 from seampact.scenes.evaluation_evidence import passive_numpy_value, PassiveEvidenceGap
 
 
@@ -267,6 +267,10 @@ class ChatJobs:
         if deadline is not None and (type(deadline) not in (int, float) or
                 not math.isfinite(deadline) or deadline <= 0):
             raise ValueError("任务时限需要有限正数")
+        execution_timeout = body.get("execution_timeout_s")
+        if execution_timeout is not None and (type(execution_timeout) not in (int, float) or
+                not math.isfinite(execution_timeout) or execution_timeout <= 0):
+            raise ValueError("执行时限需要有限正数或 null")
         bound = FrozenProfiles(self.profiles)
         profile = bound.role_profile("chat")
         if not profile.get("base_url") or not profile.get("model"):
@@ -335,6 +339,8 @@ class ChatJobs:
             task["experiment"] = copy.deepcopy(metadata)
         if deadline is not None:
             task["deadline_s"] = float(deadline)
+        if "execution_timeout_s" in body:
+            task["execution_timeout_s"] = float(execution_timeout) if execution_timeout is not None else None
         if self.projects is not None:
             task["project_id"] = project_id
             task["workspace_controller"] = self._workspace_controller
@@ -398,8 +404,9 @@ class ChatJobs:
                 self._stream_event(task["id"], kind, data=value)
         deadline_timer = None
         try:
-            if task.get("deadline_s") is not None:
-                deadline_at = control.start_deadline(task["deadline_s"])
+            timeout, unlimited = execution_budget(task)
+            deadline_at = control.start_deadline(timeout, unlimited=unlimited)
+            if deadline_at is not None:
                 deadline_timer = threading.Timer(max(0, deadline_at - time.monotonic()),
                                                  self.cancel, args=(task["id"],))
                 deadline_timer.daemon = True

@@ -144,6 +144,7 @@ def _start_native_task(platform, body, *, internal_task_id=None, pilot_config=No
         arm, scope = "project_policy", "configured project policy"
     return platform.chat.start(
         dict(project_id=body["project_id"], deadline_s=timeout,
+             **({"execution_timeout_s": pilot_config["execution_timeout_s"]} if pilot_config is not None and "execution_timeout_s" in pilot_config else {}),
              messages=[dict(role="user", content=environment.prompt)]),
         runtime_options=options, on_event=event, internal_task_id=internal_task_id,
         capability_snapshot=capability_snapshot,

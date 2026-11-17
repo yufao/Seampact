@@ -57,7 +57,8 @@ def start_development_task(platform, body, *, internal_task_id, pilot_config):
     prompt = inputs["request"] + "\nTask files in the data area: " + ", ".join(files)
     with platform.deployments.lock, platform.projects.lock:
         return platform.chat.start(
-            dict(project_id=project_id, messages=[dict(role="user", content=prompt)], deadline_s=pilot_config["deadline_s"]),
+            dict(project_id=project_id, messages=[dict(role="user", content=prompt)], deadline_s=pilot_config["deadline_s"],
+                 **({"execution_timeout_s": pilot_config["execution_timeout_s"]} if "execution_timeout_s" in pilot_config else {})),
             runtime_options=options, input_files=files, internal_task_id=internal_task_id,
             capability_snapshot=platform.capabilities.public(), apply_project_application=False,
             metadata=dict(arm=pilot_config["mode"], case=case["id"], family_id=case["family_id"],

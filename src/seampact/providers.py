@@ -15,6 +15,7 @@ import ssl
 import stat
 import threading
 import time
+import uuid
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -678,13 +679,21 @@ class RequestCancelled(ProviderError):
 
 class RequestControl:
     """Per-request transport observation and best-effort connection cancellation."""
-    def __init__(self, *, deadline_at=None, on_deadline=None):
+    def __init__(self, *, deadline_at=None, on_deadline=None, unlimited=False):
         self.cancelled = threading.Event()
         self.received = False
         self.response = None
         self.lock = threading.Lock()
         self.deadline_at = deadline_at
         self.on_deadline = on_deadline
+        self.unlimited = unlimited
+        self.request_id = None
+        self.usage_receipt_url = None
+
+    def begin_request(self):
+        self.request_id = 'seampact-' + uuid.uuid4().hex
+        self.usage_receipt_url = None
+        return self.request_id
 
     def check(self):
         if self.deadline_at is not None and time.monotonic() >= self.deadline_at:
@@ -697,7 +706,7 @@ class RequestControl:
     def timeout(self):
         self.check()
         if self.deadline_at is None:
-            return 600
+            return None if self.unlimited else 600
         remaining = self.deadline_at - time.monotonic()
         if remaining <= 0:
             self.check()
@@ -786,6 +795,29 @@ def _http_diagnostic(error):
 
 
 class Transport:
+    def recover_usage(self, control):
+        """Accept only an exact terminal receipt advertised by this response."""
+        if control is None or not control.usage_receipt_url or not control.request_id:
+            return None
+        class NoRedirect(urllib.request.HTTPRedirectHandler):
+            def redirect_request(self, req, fp, code, msg, hdrs, newurl):
+                return None
+        try:
+            request = urllib.request.Request(control.usage_receipt_url, headers={'Accept':'application/json'})
+            with urllib.request.build_opener(NoRedirect).open(request, timeout=3) as response:
+                receipt = json.load(response)
+            usage = receipt.get('usage') or {}
+            fields = ('prompt_tokens','completion_tokens','total_tokens')
+            if (receipt.get('schema') != 'seampact.local_model_usage.v1'
+                    or receipt.get('request_id') != control.request_id
+                    or receipt.get('status') != 'completed' or receipt.get('final_usage_complete') is not True
+                    or any(type(usage.get(k)) is not int or usage[k] < 0 for k in fields)
+                    or usage['prompt_tokens']+usage['completion_tokens'] != usage['total_tokens']):
+                return None
+            return {key:usage[key] for key in fields}
+        except (OSError, ValueError, TypeError, AttributeError, KeyError, urllib.error.URLError):
+            return None
+
     def send(self, url, key="", body=None, *, control=None):
         return self._send(url, key, body, control=control)
 
@@ -800,6 +832,8 @@ class Transport:
 
     def _send(self, url, key, body, on_delta=None, control=None):
         headers = {"Accept": "text/event-stream, application/json" if on_delta else "application/json"}
+        if control is not None:
+            headers['X-Request-Id'] = control.request_id or control.begin_request()
         if key:
             headers["Authorization"] = "Bearer " + key
         if body is not None:
@@ -815,6 +849,10 @@ class Transport:
             timeout = control.timeout() if control is not None else 600
             with urllib.request.build_opener(NoRedirect).open(request, timeout=timeout) as response:
                 if control is not None:
+                    advertised = getattr(response, 'headers', {}).get('X-Seampact-Usage-Receipt')
+                    if advertised == '/seampact/usage/' + control.request_id:
+                        origin = urlsplit(url)
+                        control.usage_receipt_url = origin.scheme+'://'+origin.netloc+advertised
                     control.attach(response)
                 if on_delta:
                     return _stream_completion(response, on_delta, control=control)

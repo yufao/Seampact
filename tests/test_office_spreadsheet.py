@@ -80,8 +80,12 @@ class SpreadsheetPreparationTests(unittest.TestCase):
         body = dict(manifest="unused", manifest_sha256="a" * 64, case_id=case["id"], project_id="default")
         with patch("seampact.office_spreadsheet.load_case", return_value=(case, self.inputs)):
             request, options = start_spreadsheet_task(platform, body, internal_task_id="c" * 32,
-                pilot_config=dict(mode="app_config", guard_candidates=[dict(role="injection", unit_id="scanner",
+                pilot_config=dict(mode="app_config", deadline_s=900, execution_timeout_s=None,
+                                  guard_candidates=[dict(role="injection", unit_id="scanner",
                                   guard=dict(kind="injection", subjects=["input"]))]))
+        self.assertEqual(request["deadline_s"], 900)
+        self.assertIn("execution_timeout_s", request)
+        self.assertIsNone(request["execution_timeout_s"])
         user_text = request["messages"][0]["content"]
         runtime = options["runtime_options"]
         self.assertIn(instruction, user_text)

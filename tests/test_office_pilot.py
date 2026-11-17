@@ -82,7 +82,7 @@ class PilotChecks(unittest.TestCase):
     def test_development_admission_routes_opted_in_checks_to_scheduler(self):
         case = dict(id="office-case", _source="privacy")
         plan = dict(project_id="project", deadline_s=30, development_selector="scheduler",
-                    manifest="manifest.json", manifest_sha256="digest")
+                    manifest="manifest.json", manifest_sha256="digest", execution_timeout_s=None)
         row = dict(id="run", protocol_sha256="identity", mode="development", status="RUNNING",
                    case_ids=[case["id"]], task_ids=["task"], admitted=[], application={})
         records = {("office_pilot", "run"): row}
@@ -91,6 +91,9 @@ class PilotChecks(unittest.TestCase):
         platform = SimpleNamespace(store=store, execution=object())
         def start(_platform, request, *, internal_task_id, pilot_config):
             self.assertEqual(pilot_config["mode"], "scheduler")
+            self.assertEqual(pilot_config["deadline_s"], 30)
+            self.assertIn("execution_timeout_s", pilot_config)
+            self.assertIsNone(pilot_config["execution_timeout_s"])
             self.assertEqual(internal_task_id, "task")
             return dict(task_id=internal_task_id)
         with patch("seampact.office_pilot._read_plan", return_value=("identity", plan, {case["id"]: case})), \

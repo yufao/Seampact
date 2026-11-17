@@ -322,7 +322,8 @@ def start_spreadsheet_task(platform, body, *, internal_task_id=None, pilot_confi
         options.update(application, hooks=hooks + application["hooks"])
     with platform.deployments.lock, platform.projects.lock:
         return platform.chat.start(dict(project_id=body["project_id"], messages=[dict(role="user", content=prompt)],
-                                        deadline_s=pilot_config.get("deadline_s", 1200) if pilot_config is not None else 1200),
+                                        deadline_s=pilot_config.get("deadline_s", 1200) if pilot_config is not None else 1200,
+                                        **({"execution_timeout_s": pilot_config["execution_timeout_s"]} if pilot_config is not None and "execution_timeout_s" in pilot_config else {})),
             runtime_options=options, input_files={namespace + "/" + inputs[0]["name"]: inputs[0]["data"]},
             metadata=dict(arm=pilot_config["mode"] if pilot_config else "spreadsheetbench_pi_frozen_replay", case=case["id"], source_revision=SOURCE_REVISION,
                           manifest_sha256=body["manifest_sha256"], family_id=case["family_id"],

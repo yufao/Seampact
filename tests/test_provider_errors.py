@@ -110,6 +110,31 @@ class ProviderErrorChecks(unittest.TestCase):
             self.assertNotIsInstance(result.exception, RequestCancelled)
             self.assertEqual(result.exception.kind, 'invalid_response')
 
+    def test_explicit_unlimited_has_no_timeout_and_legacy_control_keeps_600(self):
+        with patch('urllib.request.build_opener') as opener:
+            opener.return_value.open.side_effect = lambda *a, **kw: io.BytesIO(b'{}')
+            unlimited = RequestControl(unlimited=True)
+            Transport().send('http://example.invalid',control=unlimited)
+            self.assertIsNone(opener.return_value.open.call_args.kwargs['timeout'])
+            request = opener.return_value.open.call_args.args[0]
+            self.assertEqual(request.get_header('X-request-id'),unlimited.request_id)
+            Transport().send('http://example.invalid',control=RequestControl())
+            self.assertEqual(opener.return_value.open.call_args.kwargs['timeout'],600)
+
+    def test_partial_server_receipt_cannot_supply_complete_usage(self):
+        control = RequestControl();control.begin_request()
+        control.usage_receipt_url = 'http://example.invalid/seampact/usage/'+control.request_id
+        receipt = dict(schema='seampact.local_model_usage.v1',request_id=control.request_id,
+                       status='partial',final_usage_complete=False,
+                       usage=dict(prompt_tokens=4,completion_tokens=3,total_tokens=7))
+        with patch('urllib.request.build_opener') as opener:
+            opener.return_value.open.side_effect = lambda *a, **kw: io.BytesIO(json.dumps(receipt).encode())
+            self.assertIsNone(Transport().recover_usage(control))
+            receipt.update(status='completed',final_usage_complete=True)
+            self.assertEqual(Transport().recover_usage(control),receipt['usage'])
+            receipt['request_id'] = 'different'
+            self.assertIsNone(Transport().recover_usage(control))
+
 
 if __name__ == '__main__':
     unittest.main()

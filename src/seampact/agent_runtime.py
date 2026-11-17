@@ -105,6 +105,12 @@ class HookContext:
     control: object
 
 
+def execution_budget(task):
+    """Return the execution timeout and whether an explicit unlimited run was requested."""
+    unlimited = "execution_timeout_s" in task and task["execution_timeout_s"] is None
+    return task.get("execution_timeout_s", task.get("deadline_s")), unlimited
+
+
 class RunControl:
     """Cancellation requests and observed outcomes, never an assumed remote stop."""
     def __init__(self):
@@ -113,16 +119,18 @@ class RunControl:
         self.request = None
         self.calls = {}
         self.deadline_at = None
+        self.unlimited_execution = False
         self.state = dict(requested=False, delivery_stopped=False, model_stop="NOT_REQUESTED", tools={})
 
-    def start_deadline(self, seconds):
+    def start_deadline(self, seconds, *, unlimited=False):
         with self.lock:
+            self.unlimited_execution = unlimited
             if seconds is not None and self.deadline_at is None:
                 self.deadline_at = time.monotonic() + seconds
             return self.deadline_at
 
     def model_request(self):
-        return RequestControl(deadline_at=self.deadline_at, on_deadline=self.cancel)
+        return RequestControl(deadline_at=self.deadline_at, on_deadline=self.cancel, unlimited=self.unlimited_execution)
 
     def check(self):
         if self.cancelled.is_set():
@@ -290,7 +298,8 @@ class AgentRuntime:
         observation and must not be rendered as delivered content.
         """
         control = control or RunControl()
-        control.start_deadline(task.get("deadline_s"))
+        timeout, unlimited = execution_budget(task)
+        control.start_deadline(timeout, unlimited=unlimited)
         persist = persist or (lambda value: self.store.save("task", value["id"], value))
         task.setdefault("model_calls", 0)
         task.setdefault("usage", [])
@@ -678,7 +687,8 @@ class AgentRuntime:
                         task["model_calls"] += 1
                         task["usage"].append(None)
                         save()
-                        emit("model_started", request_index=task["model_calls"], stream=stream)
+                        request_id = request_control.begin_request()
+                        emit("model_started", request_index=task["model_calls"], stream=stream, request_id=request_id)
                         request_started = time.perf_counter()
                         try:
                             if not stream:
@@ -693,7 +703,15 @@ class AgentRuntime:
                                     options["control"] = request_control
                                 response = self.transport.stream(url, key, body, delta, **options)
                         except Exception as error:
+                            recover = getattr(self.transport, 'recover_usage', None)
+                            recovered = recover(request_control) if recover is not None else None
+                            if recovered is not None:
+                                task['usage'][-1] = recovered
+                                emit('model_usage_recovered', request_index=task['model_calls'],
+                                     request_id=request_id, usage=copy.deepcopy(recovered),
+                                     provenance='completed_server_receipt')
                             emit("model_request_failed", request_index=task["model_calls"],
+                                 request_id=request_id,
                                  request_elapsed_s=time.perf_counter() - request_started,
                                  error_type=type(error).__name__)
                             raise
@@ -706,6 +724,7 @@ class AgentRuntime:
                                 types=[type(value).__name__]) for name, value in message.items()
                                 if name in {"content", "reasoning_content", "reasoning"}})
                         emit("model_response_received", request_index=task["model_calls"],
+                             request_id=request_id, provider_request_id=response.get('id'),
                              request_elapsed_s=time.perf_counter() - request_started,
                              finish_reason=choice.get("finish_reason"), response_fields=copy.deepcopy(fields),
                              usage=copy.deepcopy(response.get("usage")))

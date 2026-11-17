@@ -86,6 +86,26 @@ class ChatContextTests(unittest.TestCase):
         self.assertEqual(task["status"], "CANCELLED")
         self.assertNotIn(task["id"], self.jobs._controls)
 
+    def test_execution_budget_is_independent_of_evaluation_deadline(self):
+        for execution_timeout, evaluation_deadline, should_cancel in ((None, 0.05, False), (0.05, 900, True)):
+            with self.subTest(execution_timeout=execution_timeout):
+                task = self.task(identity="task-" + str(execution_timeout))
+                task.update(deadline_s=evaluation_deadline, execution_timeout_s=execution_timeout)
+                self.store.save("task", task["id"], task)
+
+                def observe_control(task, messages, bound, *, control, **kwargs):
+                    self.assertEqual(control.cancelled.wait(0.2), should_cancel)
+                    request = control.model_request()
+                    if execution_timeout is None:
+                        self.assertIsNone(request.timeout())
+                        self.assertIsNone(request.deadline_at)
+                    task["status"] = "CANCELLED" if should_cancel else "COMPLETED"
+
+                with patch("seampact.chat.AgentRuntime.run", side_effect=observe_control):
+                    self.jobs._run(task, task["messages"], Bound(), Catalog())
+                self.assertEqual(task["deadline_s"], evaluation_deadline)
+                self.assertNotIn(task["id"], self.jobs._controls)
+
     def test_tool_result_is_archived_and_reused_without_executing_again(self):
         request_bodies = []
         responses = [

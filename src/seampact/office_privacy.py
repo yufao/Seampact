@@ -229,7 +229,8 @@ def start_privacy_task(platform, body, *, internal_task_id=None, pilot_config=No
     # Prepare readonly input and admit atomically in the controller/store order.
     with platform.deployments.lock, platform.projects.lock:
         return platform.chat.start(dict(project_id=project_id, messages=[dict(role="user", content=prompt)],
-                                        deadline_s=pilot_config.get("deadline_s") if pilot_config else None),
+                                        deadline_s=pilot_config.get("deadline_s") if pilot_config else None,
+                                        **({"execution_timeout_s": pilot_config["execution_timeout_s"]} if pilot_config is not None and "execution_timeout_s" in pilot_config else {})),
             runtime_options=options, input_files={
                 source_path: json.dumps(case["agent_input"]["documents"], ensure_ascii=False).encode("utf-8")},
             metadata=dict(arm=pilot_config["mode"] if pilot_config else "office_privacy_demo" if body.get("demo") else "office_privacy_synthetic",

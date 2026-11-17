@@ -2,6 +2,7 @@
 import copy
 import hashlib
 import json
+import math
 import threading
 import uuid
 from pathlib import Path
@@ -75,6 +76,10 @@ def _read_plan(body):
     if identity != body["protocol_sha256"]:
         raise ValueError("pilot 协议内容身份已变化")
     plan = json.loads(raw)
+    if "execution_timeout_s" in plan:
+        timeout = plan["execution_timeout_s"]
+        if timeout is not None and (type(timeout) not in (int, float) or not math.isfinite(timeout) or timeout <= 0):
+            raise ValueError("执行时限需要有限正数或 null")
     legacy = plan.get("schema") == "seampact.office-pilot/1"
     if plan.get("schema") not in {"seampact.office-pilot/1", "seampact.office-comparison/1"}:
         raise ValueError("pilot 协议格式不正确")
@@ -318,6 +323,8 @@ def _handle(platform, body):
         return dict(case_id=case_id, corpus=corpus, result=result)
     if op in {"start", "resume"}:
         mode, batch = body.get("mode"), body.get("batch", 0)
+        if "execution_timeout_s" in plan and mode not in {"development", "training_calibration", "training"}:
+            raise ValueError("独立执行时限仅用于开发诊断或训练")
         if plan.get("benign_training_only") and mode not in {"training", "training_calibration"}:
             raise ValueError("该良性训练协议不开放其他数据划分")
         calibration = mode in {"development", "training_calibration"}
@@ -522,6 +529,8 @@ def _handle(platform, body):
             raise ValueError("旧 pilot 工作负载未冻结应用语义，不能继续接入新任务")
         application = copy.deepcopy(row["application"])
         application.update(mode=mode, deadline_s=plan["deadline_s"], diagnostic_checks=diagnostic_mode(plan))
+        if "execution_timeout_s" in plan:
+            application["execution_timeout_s"] = plan["execution_timeout_s"]
         permit = observation_permit(plan, row["mode"], case)
         if permit is not None:
             application["_diagnostic_observation"] = permit
