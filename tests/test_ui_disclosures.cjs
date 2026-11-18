@@ -41,7 +41,7 @@ function load() {
     document: {createElement: tag => new Element(tag), createTextNode: text => { const item = new Element('span'); item.textContent = text; return item; }, getElementById: id => roots[id] || Object.values(roots).flatMap(descendants).find(item => item.id === id),
       querySelector: selector => selector === '.observer-scroll' ? roots.scroller : roots.config},
     inspectPage: true, inspectView: 'analyses', inspectQuery: new URLSearchParams(), state: {}, taskDeleteBusy: false,
-    olderTasks: [], olderTasksCursor: undefined, olderTasksBusy: false,
+    olderTasks: [], olderTasksCursor: undefined, olderTasksBusy: false, inspectedTask: null,
     detailStates: new Map(), renderedSections: new Map(), capabilityDrafts: new Map(),
     deploymentPreparation: new Map(), deploymentDrafts: new Map(), deploymentSubmitting: new Set(), analysisSubmitting: new Set(), sourceUpdating: new Set(), sourceUpdateOptions: new Map(),
     revisionSelected: new Map(), revisionVersions: new Map(), revisionBusy: new Set(), revisionErrors: new Map(),
@@ -52,6 +52,7 @@ function load() {
     resourceState: () => ({}), harnessDependencies: () => {}, sourceEnvironment: () => {},
     renderRevisionWorkspace: (card, harness, job) => { const target = new Element('section'); target.id = 'analysis-revision-' + job.id; card.append(target); },
     renderDeploymentBackend: () => {}, renderInstance: () => {}, environmentEvidence: () => {},
+    deploymentButton: (group, action, route, label) => { const button = new Element('button'); button.textContent = label; return button; },
     renderGpuAllocationControls: () => {}, renderServiceGpuAllocations: () => {},
     analysisProgress: () => new Element('div'), analysisClassification: () => null,
     analysisResultSummary: () => null, preprocessingSummary: () => null, analysisNextSteps: () => null,
@@ -62,7 +63,9 @@ function load() {
   const names = ['textValue', 'node', 'selectedSource', 'detailKey', 'disclosureScope', 'compactText', 'disclosure', 'foldCard',
     'revealSection', 'renderSection', 'statusClass', 'statusLabel', 'pill', 'latency', 'visibleUnits', 'visibleTasks',
     'analysisOperationLabel', 'sourceIdentity', 'renderAnalyses', 'renderHarnesses', 'runtimeGroupIdentity', 'runtimeGroupError',
-    'runtimeGroupActive', 'renderDeployments', 'renderUnits', 'taskRecordFinished', 'deleteTaskRecords', 'renderTasks', 'refreshRevisionDetails', 'revisionAction', 'analysisNextSteps'];
+    'runtimeGroupActive', 'heldInstance', 'renderDeployments', 'renderUnits', 'policyDate', 'taskDisplayName',
+    'projectDisplayName', 'taskRecordFinished', 'deleteTaskRecords', 'renderTasks', 'refreshRevisionDetails',
+    'revisionAction', 'analysisNextSteps', 'empty', 'detailValue', 'generationPhase', 'generationAction'];
   for (const name of names) {
     if (name === 'node') {
       vm.runInContext(source.slice(source.indexOf('const node ='), source.indexOf('\nconst messages =')), context); continue;
@@ -77,6 +80,12 @@ function load() {
 }
 function state() {
   return {harnesses: [{id: 'a', name: '来源甲', status: 'ANALYZED', analysis_id: 'new'}, {id: 'b', name: '来源乙', status: 'ANALYZED'}],
+    generations: [{id: 'done', source_id: 'a', status: 'AVAILABLE', phase: 'ready', started_at: '2026-11-02',
+      group_id: 'rg-hash-one', first_call: {status: 'SUCCEEDED'}},
+    {id: 'failed', source_id: 'a', status: 'FAILED', phase: 'failed', started_at: '2026-11-01', error: '原始失败原因'}],
+    capabilities: [{id: 'u', name: '文档检查', source_id: 'a', runtime_group: 'rg-hash-one', package: '办公文档',
+      availability: {status: 'READY'}, parameters: {type: 'object'}}],
+    capability_packages: [{group_id: 'rg-hash-one', name: '办公文档'}, {group_id: 'rg-hash-two', name: '办公检索'}],
     analyses: [{id: 'new', harness_id: 'a', source_version: 'v1', status: 'COMPLETED', started_at: '2026-11-02',
       submitted: {candidate: {entries: [{id: 'run', symbol: 'detect', description: '检测图像真伪'}]}}},
       {id: 'old', harness_id: 'a', status: 'FAILED', started_at: '2026-11-01', error: '原始失败原因'}], units: [],
@@ -121,37 +130,38 @@ test('cancelling task cleanup sends nothing and a rejected cleanup keeps records
   assert.equal(calls, 1); assert.equal(c.state.tasks.length, 1);
   assert.equal(c.taskDeleteBusy, false); assert.equal(notice, '调用仍在收尾');
 });
-test('source update option survives refresh per source and is disabled during analysis', () => {
+test('source list prepares only idle, attached repositories', async () => {
   const {context: c, roots} = load();
   c.state = state();
-  c.state.harnesses[0].revision_ref = 'fixture-topic';
+  c.state.harnesses.push({id: 'archived', name: '已移除来源', status: 'DETACHED'});
+  c.state.generations[0].status = 'RUNNING';
   c.renderHarnesses();
-  let inputs = roots['harness-list'].querySelectorAll('input');
-  assert.equal(inputs.length, 2);
-  assert.equal(inputs[0].title, '检查引用：fixture-topic');
-  assert.equal(inputs[1].title, '检查默认分支');
-  inputs[0].checked = true; inputs[0].onchange();
-  c.renderHarnesses();
-  inputs = roots['harness-list'].querySelectorAll('input');
-  assert.equal(inputs[0].checked, true);
-  assert.equal(inputs[1].checked, false);
-  c.state.analyses.push({id: 'update', harness_id: 'a', kind: 'SOURCE_UPDATE_ANALYSIS', status: 'RUNNING'});
-  c.renderHarnesses();
-  inputs = roots['harness-list'].querySelectorAll('input');
-  assert.equal(inputs[0].checked, true);
-  assert.equal(inputs[0].disabled, true);
-  assert.equal(inputs[1].disabled, false);
+  const root = roots['harness-list'];
+  const archived = root.querySelector('details');
+  assert.equal(archived.open, false);
+  assert.match(archived.textContent, /已移除来源/);
+  const actions = root.querySelectorAll('button');
+  assert.equal(actions.length, 1);
+  assert.match(actions[0].parentElement.textContent, /来源乙/);
+  c.refresh = async () => {};
+  const calls = [];
+  c.api = async (url, body) => calls.push([url, body.source_id]);
+  await actions[0].onclick();
+  assert.deepEqual(calls, [['/api/generations', 'b']]);
 });
-test('source update operation displays installation result and retained version reason', () => {
+test('generation shows the failure reason and permits retry only before availability', async () => {
   const {context: c, roots} = load();
   c.state = state();
-  c.state.analyses.unshift({id: 'update', harness_id: 'a', kind: 'SOURCE_UPDATE_ANALYSIS', status: 'COMPLETED',
-    update_installation: {status: 'NOT_INSTALLED', reason: '锁忙'}});
   c.renderAnalyses();
-  assert.match(roots['analysis-list'].textContent, /新版本未安装，原版本保留。原因：锁忙/);
-  c.state.analyses[0].update_installation = {status: 'INSTALLED', analysis_id: 'installed'};
-  c.renderAnalyses();
-  assert.match(roots['analysis-list'].textContent, /新版本已安装；各入口的检查和运行状态请查看分析结果/);
+  const [ready, failed] = roots['analysis-list'].children;
+  assert.match(ready.textContent, /能力已可用/);
+  assert.doesNotMatch(ready.textContent, /重新准备/);
+  assert.match(failed.textContent, /原始失败原因/);
+  c.refresh = async () => {};
+  const calls = [];
+  c.api = async (url, body) => calls.push([url, body.source_id]);
+  await failed.querySelectorAll('button').find(item => item.textContent === '重新准备').onclick();
+  assert.deepEqual(calls, [['/api/generations', 'a']]);
 });
 test('detail becoming busy after snapshot does not accept stale data and retries', async () => {
   const {context: c} = load();
@@ -169,47 +179,34 @@ test('detail becoming busy after snapshot does not accept stale data and retries
   assert.equal(calls, 2);
   assert.equal(accepted, 1);
 });
-test('all-source operations stay compact, keep errors/actions, and preserve expansion across status changes', () => {
+test('generation evidence stays expanded through refresh and source filtering', () => {
   const {context: c, roots} = load(); c.state = state();
   const render = () => c.renderSection('analyses', c.state, c.renderAnalyses, ['analysis-list']);
-  const sources = () => roots['analysis-list'].children.filter(item => (item.className || '').includes('source-disclosure'));
-  const records = () => sources().flatMap(source => source.children.filter(item => item.tagName === 'DETAILS'));
+  c.state.generations.push({id: 'waiting', source_id: 'b', phase: 'preparing', status: 'RUNNING'});
   render();
-  assert.equal(sources().length, 2); assert.ok(sources().every(source => !source.open));
-  assert.match(sources()[0].children[0].textContent, /来源甲.*2 次操作/);
-  assert.match(sources()[1].children[0].textContent, /来源乙.*0 次操作/);
-  let operations = records();
-  assert.equal(operations.length, 3); assert.ok(operations.every(item => !item.open));
-  const failed = operations.find(item => item.textContent.includes('原始失败原因'));
-  assert.match(failed.children[0].textContent, /失败.*历史记录.*原始失败原因/);
-  assert.ok(descendants(failed).some(item => item.tagName === 'BUTTON'));
-  sources()[0].open = true; operations[0].open = true;
-  operations[0].querySelector('details').open = true;
-  c.state.analyses[0].status = 'RUNNING'; c.state.analyses[0].pipeline_stage = 'analysis'; render();
-  operations = records();
-  assert.equal(sources()[0].open, true); assert.equal(sources()[1].open, false);
-  assert.equal(operations[0].open, true); assert.equal(operations[1].open, false);
-  assert.equal(operations[0].querySelector('details').open, true);
-  assert.match(operations[0].children[0].textContent, /入口与拆分/);
-  c.inspectQuery.set('harness', 'a'); c.renderAnalyses();
-  assert.equal(sources().length, 1); assert.equal(sources()[0].open, true);
-  operations = records();
-  assert.equal(operations[0].open, true); assert.equal(operations[1].open, false);
-  const revision = descendants(operations[1]).find(item => item.id === 'analysis-revision-old');
-  sources()[0].open = false; operations[1].open = false;
-  c.revealSection(revision);
-  assert.equal(sources()[0].open, true); assert.equal(operations[1].open, true); assert.equal(revision.scrolled, true);
+  const root = roots['analysis-list'];
+  const firstCall = () => root.children.find(item => item.dataset.itemId === 'done').querySelector('details');
+  assert.equal(root.children.length, 3);
+  assert.equal(firstCall().open, false);
+  firstCall().open = true;
+  c.state.generations[0].first_call = {status: 'SUCCEEDED', calls: 1};
+  c.inspectQuery.set('harness', 'a'); render();
+  assert.equal(root.children.length, 2);
+  assert.equal(firstCall().open, true);
+  assert.doesNotMatch(root.textContent, /来源乙/);
 });
-test('deployment groups belong to their source and use original purpose/symbol with IDs retained', () => {
+test('deployment groups show installed package names and keep internal IDs in diagnostics', () => {
   const {context: c, roots} = load(); c.state = state(); c.renderDeployments();
-  const sources = roots['deployment-list'].children.filter(item => (item.className || '').includes('source-disclosure'));
-  assert.equal(sources.length, 2); assert.ok(sources.every(item => !item.open));
-  const first = sources[0].children.find(item => item.tagName === 'DETAILS');
-  assert.match(first.children[0].textContent, /来源甲 · detect.*检测图像真伪.*rg-hash-one/);
-  assert.doesNotMatch(sources[0].textContent, /rg-hash-two/);
+  const groups = () => roots['deployment-list'].children.filter(item => item.dataset.detailKey?.includes('/capability-package/'));
+  assert.equal(groups().length, 2);
+  assert.match(groups()[0].children[0].textContent, /办公文档.*来源甲/);
+  assert.doesNotMatch(groups()[0].children[0].textContent, /rg-hash-one/);
+  const diagnostics = groups()[0].querySelector('details');
+  assert.equal(diagnostics.open, false);
+  assert.match(diagnostics.textContent, /rg-hash-one/);
   c.inspectQuery.set('harness', 'a'); c.renderDeployments();
-  const selected = roots['deployment-list'].children.find(item => (item.className || '').includes('source-disclosure'));
-  assert.equal(selected.open, true); assert.equal(selected.children.find(item => item.tagName === 'DETAILS').open, true);
+  assert.equal(groups().length, 1);
+  assert.equal(groups()[0].open, true);
   assert.equal(c.runtimeGroupError({artifact: {build: {status: 'BUILT', reason: '成功说明'}}}), null);
   c.state.analyses.push({id: 'other-revision', harness_id: 'a', source_version: 'v1',
     submitted: {candidate: {entries: [{id: 'run', symbol: 'unrelated_name', description: '其他修订用途'}]}}});
@@ -217,34 +214,26 @@ test('deployment groups belong to their source and use original purpose/symbol w
   assert.match(identity.title, /detect/); assert.doesNotMatch(identity.title, /unrelated_name/);
   assert.equal(identity.purpose, '检测图像真伪');
 });
-test('deep links reveal every ancestor, and capability edits survive polling while source groups stay collapsed', () => {
+test('capability deep links reveal the record and nested interface details', () => {
   const {context: c, roots} = load(); c.state = state();
-  c.state.units = [{id: 'u', entry_id: 'run', name: '图像检测', source_id: 'a', status: 'READY', capability: {goal: 'old'}}];
+  c.inspectQuery = new URLSearchParams({unit: 'u'});
   c.renderUnits();
-  const sourceGroup = roots['unit-list'].children.find(item => item.tagName === 'DETAILS');
-  assert.equal(sourceGroup.open, false);
-  let textarea = descendants(sourceGroup).find(item => item.tagName === 'TEXTAREA');
-  textarea.value = '{"goal":"未保存编辑"}'; textarea.oninput(); c.renderUnits();
-  textarea = descendants(roots['unit-list']).find(item => item.tagName === 'TEXTAREA');
-  assert.equal(textarea.value, '{"goal":"未保存编辑"}');
-  c.revealSection(textarea);
-  for (let item = textarea.parentElement; item; item = item.parentElement) if (item.tagName === 'DETAILS') assert.equal(item.open, true);
-  assert.equal(textarea.scrolled, true);
+  const record = roots['unit-list'].children[0];
+  const detail = record.querySelector('details');
+  const schema = detail.querySelector('pre');
+  assert.equal(record.open, false);
+  c.revealSection(schema);
+  assert.equal(record.open, true);
+  assert.equal(detail.open, true);
+  assert.equal(schema.scrolled, true);
 });
-test('registered sources without groups stay visible with pending-environment reasons and analysis links', () => {
+test('a selected source with no deployment links to its preparation progress', () => {
   const {context: c, roots} = load(); c.state = state();
-  c.state.harnesses.push({id: 'pending', name: '待重检来源', status: 'ANALYZED', environment_pending_recheck: true,
-    target_runtime: {status: 'NOT_PREPARED', reason: '目标解释器需要准备'}});
-  c.state.harnesses.push({id: 'new', name: '新来源', status: 'REGISTERED'});
-  c.renderDeployments();
-  const pending = roots['deployment-list'].children.find(item => item.dataset.detailKey?.endsWith('/deployment-source/pending'));
-  assert.equal(pending.open, false);
-  assert.match(pending.children[0].textContent, /待重新核对环境 · 当前无可部署运行组.*目标解释器需要准备/);
-  assert.ok(descendants(pending).some(item => item.href === '/inspect?view=analyses&harness=pending'));
-  assert.match(roots['deployment-list'].textContent, /新来源尚无运行组/);
+  c.state.harnesses.push({id: 'pending', name: '待准备来源', status: 'REGISTERED'});
   c.inspectQuery.set('harness', 'pending'); c.renderDeployments();
-  const selected = roots['deployment-list'].children.find(item => item.tagName === 'DETAILS');
-  assert.equal(selected.open, true); assert.match(selected.textContent, /待重新核对环境/);
+  const root = roots['deployment-list'];
+  assert.match(root.textContent, /仓库准备完成后/);
+  assert.equal(root.querySelector('a').href, '/inspect?view=analyses&harness=pending');
 });
 test('pending source observation skips detail reads and repeated revision actions, then resumes reads and controls', async () => {
   const {context: c} = load(); c.state = state();

@@ -303,13 +303,28 @@ class Learner:
                                       device=self.device)
         return current, following, actions, rewards, bootstrap
 
-    def _step(self, name, loss, networks):
+    def _step(self, name, loss, networks, *, diagnostics=False):
         optimizer = self.optimizers[name]
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
         parameters = [parameter for network in networks for parameter in network.parameters()]
-        self.torch.nn.utils.clip_grad_norm_(parameters, self.config["max_grad_norm"])
+        def norms(stage):
+            result = {}
+            for key, network in self.networks.items():
+                if not any(network is item for item in networks):
+                    continue
+                gradients = [parameter.grad.detach().norm(2) for parameter in network.parameters()
+                             if parameter.grad is not None]
+                result["gradient_norm_" + stage + "_" + key] = (
+                    float(self.torch.stack(gradients).norm(2).item()) if gradients else 0.0)
+            return result
+        measured = norms("before_clip") if diagnostics else {}
+        total = self.torch.nn.utils.clip_grad_norm_(parameters, self.config["max_grad_norm"])
+        if diagnostics:
+            measured["gradient_norm_before_clip_total"] = float(total.item())
+            measured.update(norms("after_clip"))
         optimizer.step()
+        return measured
 
     def update(self, force=False):
         if self.algorithm == "ppo":
@@ -441,7 +456,12 @@ class Learner:
         return {key: sum(row[key] for row in stats) / len(stats) for key in stats[0]}
 
     def _update_component_ppo(self):
-        """Fit fixed component returns, composing advantages only for the actor."""
+        """Fit fixed returns and compose only actor advantages.
+
+        Value/advantage diagnostics describe the collected rollout before this
+        update. Gradient norms describe the actual combined loss, averaged over
+        optimizer minibatches before and after the existing global clip.
+        """
         torch, rows = self.torch, self.rollout
         current, following, actions, _, bootstrap = self._transition_batch(rows)
         states, candidates, masks = current
@@ -481,7 +501,18 @@ class Learner:
             returns[term] = component_advantages + old_values
         composed = sum(weights[term] * advantages[term] for term in self.value_components)
         diagnostics = {"advantage_mean_" + term: float(advantages[term].mean().item()) for term in self.value_components}
+        for term in self.value_components:
+            old_values = torch.tensor([row["component_values"][term] for row in rows],
+                                      dtype=torch.float32, device=self.device)
+            diagnostics.update({"advantage_std_" + term: float(advantages[term].std(unbiased=False).item()),
+                                "value_mean_" + term: float(old_values.mean().item()),
+                                "value_std_" + term: float(old_values.std(unbiased=False).item()),
+                                "return_mean_" + term: float(returns[term].mean().item()),
+                                "return_std_" + term: float(returns[term].std(unbiased=False).item()),
+                                "weighted_advantage_mean_" + term: float((weights[term] * advantages[term]).mean().item()),
+                                "weighted_advantage_rms_" + term: float((weights[term] * advantages[term]).square().mean().sqrt().item())})
         diagnostics["composed_advantage_mean"] = float(composed.mean().item())
+        diagnostics["composed_advantage_std"] = float(composed.std(unbiased=False).item())
         if len(rows) > 1:
             composed = (composed - composed.mean()) / composed.std(unbiased=False).clamp_min(1e-8)
         old_logs = torch.tensor([row["old_log_prob"] for row in rows], dtype=torch.float32, device=self.device)
@@ -503,12 +534,13 @@ class Learner:
                 value_loss = sum(losses.values()) / len(losses)
                 entropy = -(probabilities * log_probs).sum(dim=1).mean()
                 loss = policy_loss + self.config["value_coefficient"] * value_loss - self.config["entropy_coefficient"] * entropy
-                self._step("policy", loss, list(self.networks.values()))
+                gradient_stats = self._step("policy", loss, list(self.networks.values()), diagnostics=True)
                 self.updates += 1
                 stats.append(dict(policy_loss=float(policy_loss.item()), value_loss=float(value_loss.item()),
                     entropy=float(entropy.item()), approximate_kl=float((old_logs[selection] - selected_logs).mean().item()),
                     clip_fraction=float(((ratio - 1).abs() > self.config["clip_ratio"]).float().mean().item()),
-                    **{"value_loss_" + term: float(component_loss.item()) for term, component_loss in losses.items()}))
+                    **{"value_loss_" + term: float(component_loss.item()) for term, component_loss in losses.items()},
+                    **gradient_stats))
         self.rollout = []
         self.policy_version += 1
         return dict({key: sum(row[key] for row in stats) / len(stats) for key in stats[0]}, **diagnostics)

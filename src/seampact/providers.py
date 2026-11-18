@@ -5,6 +5,7 @@ import copy
 import ctypes
 import hashlib
 import http.client
+import io
 import itertools
 import json
 import os
@@ -21,6 +22,7 @@ import urllib.request
 from pathlib import Path
 from urllib.parse import urlsplit
 
+from seampact.api_accounting import token_count
 from seampact.store import now
 
 PRESETS = {
@@ -509,9 +511,22 @@ class Profiles:
             self._save()
             return self._public(connection_id)
 
-    def select_role(self, role, connection_id):
+    def select_role(self, role, connection_id, *, expected_current=None):
         self.role_identity(role)
         with self.lock:
+            if expected_current is not None:
+                fields = {"connection_id", "config_digest", "revision"}
+                if (not isinstance(expected_current, dict) or set(expected_current) != fields
+                        or any(not isinstance(expected_current.get(key), str) or not expected_current[key]
+                               for key in ("connection_id", "config_digest"))
+                        or type(expected_current.get("revision")) is not int or expected_current["revision"] < 0):
+                    raise ValueError("expected_current 需要 connection_id、config_digest 和非负整数 revision")
+                current_id = self._connection_id(role)
+                current = self.connections[current_id]
+                identity = dict(connection_id=current_id, config_digest=current.get("config_digest"),
+                                revision=current.get("revision"))
+                if identity != expected_current:
+                    raise ValueError("模型角色或连接配置已被修改，本次未切换；请刷新后重试")
             selected = self._connection_id(connection_id)
             connection = self.connections[selected]
             if connection["protocol"] != "openai-compatible" or not connection.get("model"):
@@ -682,8 +697,8 @@ class RequestControl:
     def __init__(self, *, deadline_at=None, on_deadline=None, unlimited=False):
         self.cancelled = threading.Event()
         self.received = False
-        self.response = None
-        self.lock = threading.Lock()
+        self.accepted = False
+        self.response_usage = None
         self.deadline_at = deadline_at
         self.on_deadline = on_deadline
         self.unlimited = unlimited
@@ -693,6 +708,8 @@ class RequestControl:
     def begin_request(self):
         self.request_id = 'seampact-' + uuid.uuid4().hex
         self.usage_receipt_url = None
+        self.received = self.accepted = False
+        self.response_usage = None
         return self.request_id
 
     def check(self):
@@ -718,23 +735,85 @@ class RequestControl:
             self.received = True
         self.check()
 
-    def attach(self, response):
-        with self.lock:
-            self.response = response
-        self.check()
+    def record_response_usage(self, usage):
+        if token_count(usage) is not None:
+            self.response_usage = copy.deepcopy(usage)
 
     def cancel(self):
         self.cancelled.set()
-        with self.lock:
-            response = self.response
-        if response is not None:
-            # Closing a client connection is not an engine cancellation receipt.
-            def close():
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, hdrs, newurl):
+        return None
+
+
+class _CancellableReader(io.RawIOBase):
+    def __init__(self, connected, reference, control):
+        self.connected, self.reference, self.control = connected, reference, control
+
+    def readable(self):
+        return True
+
+    def readinto(self, output):
+        # A short socket wait lets an idle connection see cancellation. Handle
+        # that wait here so a timeout never invalidates HTTPResponse's buffer.
+        timeout = self.connected.gettimeout()
+        deadline = None if timeout is None else time.monotonic() + timeout
+        try:
+            while True:
+                self.control.check()
+                remaining = 0.2 if deadline is None else deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("provider socket read timed out")
+                self.connected.settimeout(min(0.2, remaining))
                 try:
-                    response.close()
-                except (OSError, ValueError):
-                    pass
-            threading.Thread(target=close, daemon=True, name="seampact-model-disconnect").start()
+                    return self.connected.recv_into(output)
+                except TimeoutError:
+                    continue
+        finally:
+            self.connected.settimeout(timeout)
+
+    def close(self):
+        if not self.closed:
+            try:
+                self.reference.close()
+            finally:
+                super().close()
+
+
+def _provider_opener(control):
+    if control is None:
+        return urllib.request.build_opener(_NoRedirect)
+
+    def tracked(connection_type, host, **options):
+        connection = connection_type(host, **options)
+        original_connect = connection.connect
+
+        def connect():
+            control.check()
+            original_connect()
+            control.check()
+
+        class CancellableResponse(http.client.HTTPResponse):
+            def __init__(self, connected, *args, **kwargs):
+                super().__init__(connected, *args, **kwargs)
+                self.fp = io.BufferedReader(_CancellableReader(connected, self.fp, control))
+
+        connection.connect = connect
+        connection.response_class = CancellableResponse
+        return connection
+
+    class HTTPHandler(urllib.request.HTTPHandler):
+        def http_open(self, request):
+            return self.do_open(lambda host, **options: tracked(http.client.HTTPConnection, host, **options), request)
+
+    class HTTPSHandler(urllib.request.HTTPSHandler):
+        def https_open(self, request):
+            return self.do_open(lambda host, **options: tracked(http.client.HTTPSConnection, host, **options), request,
+                                context=self._context)
+
+    return urllib.request.build_opener(_NoRedirect, HTTPHandler(), HTTPSHandler())
 
 
 def _http_diagnostic(error):
@@ -799,12 +878,9 @@ class Transport:
         """Accept only an exact terminal receipt advertised by this response."""
         if control is None or not control.usage_receipt_url or not control.request_id:
             return None
-        class NoRedirect(urllib.request.HTTPRedirectHandler):
-            def redirect_request(self, req, fp, code, msg, hdrs, newurl):
-                return None
         try:
             request = urllib.request.Request(control.usage_receipt_url, headers={'Accept':'application/json'})
-            with urllib.request.build_opener(NoRedirect).open(request, timeout=3) as response:
+            with _provider_opener(None).open(request, timeout=3) as response:
                 receipt = json.load(response)
             usage = receipt.get('usage') or {}
             fields = ('prompt_tokens','completion_tokens','total_tokens')
@@ -840,30 +916,32 @@ class Transport:
             headers["Content-Type"] = "application/json"
         request = urllib.request.Request(url, headers=headers,
             data=json.dumps(body, ensure_ascii=False).encode() if body is not None else None)
-        class NoRedirect(urllib.request.HTTPRedirectHandler):
-            def redirect_request(self, req, fp, code, msg, hdrs, newurl):
-                return None
         try:
             if control is not None:
                 control.check()
             timeout = control.timeout() if control is not None else 600
-            with urllib.request.build_opener(NoRedirect).open(request, timeout=timeout) as response:
+            with _provider_opener(control).open(request, timeout=timeout) as response:
                 if control is not None:
+                    control.accepted = True
                     advertised = getattr(response, 'headers', {}).get('X-Seampact-Usage-Receipt')
                     if advertised == '/seampact/usage/' + control.request_id:
                         origin = urlsplit(url)
                         control.usage_receipt_url = origin.scheme+'://'+origin.netloc+advertised
-                    control.attach(response)
+                    control.check()
                 if on_delta:
                     return _stream_completion(response, on_delta, control=control)
                 result = json.load(response)
                 if control is not None:
+                    if isinstance(result, dict) and not result.get("error"):
+                        control.record_response_usage(result.get("usage"))
                     control.progress(True)
                 return result
         except urllib.error.HTTPError as error:
             if control is not None:
                 control.check()
             diagnostic, reason = _http_diagnostic(error)
+            if control is not None:
+                control.check()
         except (http.client.IncompleteRead, http.client.RemoteDisconnected) as error:
             if control is not None:
                 control.check()
@@ -908,6 +986,8 @@ def _stream_completion(response, on_delta, control=None):
     # Some compatible endpoints ignore stream=True and return a single JSON body.
     if first.lstrip().startswith(b"{"):
         result = json.loads(first + response.read())
+        if control is not None and isinstance(result, dict) and not result.get("error"):
+            control.record_response_usage(result.get("usage"))
         content = result["choices"][0]["message"].get("content")
         if isinstance(content, str) and content:
             on_delta(content)
@@ -929,13 +1009,18 @@ def _stream_completion(response, on_delta, control=None):
         for name in ("id", "model", "created", "system_fingerprint"):
             if name in chunk:
                 metadata[name] = chunk[name]
-        if chunk.get("usage") is not None:
+        choices = chunk.get("choices", [])
+        if not isinstance(choices, list) or len(choices) > 1:
+            raise incomplete()
+        if choices and (not isinstance(choices[0], dict) or choices[0].get("index", 0) != 0):
+            raise incomplete()
+        if choices and choices[0].get("finish_reason") is not None:
+            finish = choices[0]["finish_reason"]
+        if finish is not None and isinstance(chunk.get("usage"), dict):
             usage = chunk["usage"]
-        for choice in chunk.get("choices", []):
-            if choice.get("index", 0) != 0:
-                raise ValueError("multiple streamed choices")
-            if choice.get("finish_reason") is not None:
-                finish = choice["finish_reason"]
+            if control is not None:
+                control.record_response_usage(usage)
+        for choice in choices:
             delta = choice.get("delta") or {}
             # Measure compatible response fields without retaining an unknown
             # reasoning dialect or changing what becomes visible answer text.
@@ -989,7 +1074,9 @@ def _stream_completion(response, on_delta, control=None):
             data.append(line[5:].lstrip(" "))
     if data and not done:
         consume("\n".join(data))
-    if finish is None:
+    if control is not None:
+        control.check()
+    if finish is None or (finish == "tool_calls" and not calls):
         raise incomplete()
     message = dict(role="assistant", content="".join(content) if content else None)
     if reasoning:
@@ -999,8 +1086,8 @@ def _stream_completion(response, on_delta, control=None):
             function=dict(name="".join(call["name"]), arguments="".join(call["arguments"])))
             for _, call in sorted(calls.items())]
         ids = [call["id"] for call in message["tool_calls"]]
-        if len(set(ids)) != len(ids) or any(not call["id"] or not call["function"]["name"]
-                                          for call in message["tool_calls"]):
+        if finish in {"stop", "tool_calls"} and (len(set(ids)) != len(ids) or
+                any(not call["id"] or not call["function"]["name"] for call in message["tool_calls"])):
             raise incomplete()
     return dict(metadata, choices=[dict(index=0, finish_reason=finish, message=message)], usage=usage,
                 _seampact_response_fields=dict(transport="sse", fields=observed_fields))

@@ -233,7 +233,7 @@ class ChatJobs:
         return dict(restored=self.conversation(identity)["id"])
 
     def start(self, body, *, runtime_options=None, on_event=None, metadata=None, internal_task_id=None,
-              capability_snapshot=None, apply_project_application=True, input_files=None):
+              capability_snapshot=None, apply_project_application=True, input_files=None, expected_model=None):
         # Dynamic availability may wait for the coordinator, whose journal
         # uses the store lock. Read it before entering project admission.
         capability_snapshot = (self.catalog.public() if capability_snapshot is None else capability_snapshot)
@@ -246,10 +246,11 @@ class ChatJobs:
         with deployment_lock if deployment_lock is not None else nullcontext(), self._start_lock:
             return self._start(body, runtime_options=runtime_options, on_event=on_event, metadata=metadata,
                                internal_task_id=internal_task_id, capability_snapshot=capability_snapshot,
-                               apply_project_application=apply_project_application, input_files=input_files)
+                               apply_project_application=apply_project_application, input_files=input_files,
+                               expected_model=expected_model)
 
     def _start(self, body, *, runtime_options=None, on_event=None, metadata=None, internal_task_id=None,
-               capability_snapshot, apply_project_application=True, input_files=None):
+               capability_snapshot, apply_project_application=True, input_files=None, expected_model=None):
         messages = body.get("messages")
         if not isinstance(messages, list) or not messages:
             raise ValueError("请提交完整对话消息")
@@ -273,6 +274,9 @@ class ChatJobs:
             raise ValueError("执行时限需要有限正数或 null")
         bound = FrozenProfiles(self.profiles)
         profile = bound.role_profile("chat")
+        if expected_model is not None and expected_model != {
+                key: profile.get(key) for key in ("connection_id", "config_digest", "revision", "model")}:
+            raise ValueError("任务创建时的业务模型与冻结协议不一致")
         if not profile.get("base_url") or not profile.get("model"):
             raise ValueError("请先配置对话模型地址与型号")
         bound.role_key("chat")
@@ -308,6 +312,19 @@ class ChatJobs:
             latest = self._latest(conversation_id)
             prior_wire = latest.get("wire_messages")
             prior_context = latest.get("context_messages")
+            error = latest.get("error")
+            if (prior_wire and prior_wire[-1].get("role") == "assistant" and "incomplete_model_message" not in latest
+                    and latest.get("status") in {"FAILED", "CANCELLED"}
+                    and isinstance(error, str) and error.startswith("模型响应未完成：")):
+                # Older tasks stored an unfinished completion as their last
+                # message. Use its finish receipt to omit it at continuation.
+                last_result = next((event for event in reversed(latest.get("events") or [])
+                                    if event.get("kind") == "model_response_received"), {})
+                finish = last_result.get("finish_reason")
+                if finish not in {None, "stop", "tool_calls"} and error == "模型响应未完成：" + str(finish):
+                    if prior_context and prior_context[-1] == prior_wire[-1]:
+                        prior_context = prior_context[:-1]
+                    prior_wire = prior_wire[:-1]
             if (latest.get("models") or {}).get("chat") == bound.public().get("chat"):
                 prior_calibration = latest.get("context_calibration")
         if internal_task_id is not None:

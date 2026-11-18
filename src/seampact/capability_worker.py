@@ -181,11 +181,14 @@ class CapabilityWorker:
                 values[identity] = value
                 secrets.append(value)
             else:
+                auth_mode = binding.get("auth_mode", "required" if binding.get("api_key_env") else None)
+                if auth_mode == "none" and binding.get("api_key_env"):
+                    raise WorkerError("资源 " + identity + " 的无需鉴权声明与凭据绑定冲突")
                 key = os.environ.get(binding["api_key_env"], "") if binding.get("api_key_env") else ""
-                if binding.get("api_key_env") and not key:
+                if (binding.get("api_key_env") or auth_mode == "required") and not key:
                     raise WorkerError("资源 " + identity + " 的服务凭据未传入实例环境")
                 values[identity] = dict(base_url=binding["base_url"], model=binding.get("model"), api_key=key,
-                                        parameters=copy.deepcopy(binding.get("parameters") or {}))
+                                        parameters=copy.deepcopy(binding.get("parameters") or {}), auth_mode=auth_mode)
                 if key:
                     secrets.append(key)
         self.secrets = secrets

@@ -1,5 +1,58 @@
 """Provider-reported token accounting; absent receipts never imply zero cost."""
 
+import math
+
+
+PROGRESS_RECORD_LIMIT = 128
+_PHASES = {"starting", "waiting_response", "waiting_stream_with_usage", "waiting_stream_without_usage_options",
+           "waiting_nonstream_fallback", "receiving", "response_completed", "failed_partial_text_not_returned",
+           "unknown"}
+_ERROR_TYPES = {"TimeoutError", "APITimeoutError", "ReadTimeout", "ConnectTimeout", "WriteTimeout", "PoolTimeout",
+                "APIConnectionError", "ConnectionError", "ConnectError", "ReadError", "WriteError",
+                "RemoteProtocolError", "APIStatusError", "BadRequestError", "AuthenticationError",
+                "PermissionDeniedError", "NotFoundError", "RateLimitError", "InternalServerError",
+                "UnprocessableEntityError", "ValueError", "TypeError", "RuntimeError", "CancelledError",
+                "KeyboardInterrupt", "unknown"}
+_ERROR_KINDS = {"timeout", "transport", "http_status", "protocol", "cancelled", "unknown"}
+_FINISH_REASONS = {"stop", "length", "tool_calls", "content_filter", "function_call", "error", "other", "unknown"}
+
+
+def _private_diagnostics(data):
+    """Only bounded-vocabulary failure labels and finite elapsed times."""
+    result = {}
+    for key in ("elapsed_s", "elapsed_ms"):
+        value = data.get(key)
+        if type(value) in (int, float) and math.isfinite(value) and value >= 0:
+            result[key] = value
+    for key, allowed in (("phase", _PHASES), ("finish_reason", _FINISH_REASONS),
+                         ("timeout_source", {"connection_explicit", "sdk_default", "unknown"})):
+        value = data.get(key)
+        if isinstance(value, str):
+            result[key] = value if value in allowed else "unknown"
+    error = data.get("error") if isinstance(data.get("error"), dict) else {}
+    error_type = data.get("error_type", error.get("type"))
+    if isinstance(error_type, str):
+        result["error_type"] = error_type if error_type in _ERROR_TYPES else "unknown"
+    kind = data.get("error_kind")
+    if isinstance(kind, str):
+        result["error_kind"] = kind if kind in _ERROR_KINDS else "unknown"
+    elif "error_type" in result:
+        result["error_kind"] = ("timeout" if "Timeout" in result["error_type"] else "unknown")
+    return result
+
+
+def private_progress(data):
+    """Progress is separate from usage: no text, request IDs or token estimates."""
+    data = data if isinstance(data, dict) else {}
+    result = _private_diagnostics(data)
+    for key in ("request_index", "transport_attempt", "received_chunks", "generated_characters", "reasoning_characters",
+                "completed_lines", "unique_nonempty_completed_lines", "repeated_nonempty_completed_lines",
+                "max_line_occurrences", "pending_line_characters", "progress_emit_errors"):
+        value = data.get(key)
+        if type(value) is int and value >= 0:
+            result[key] = value
+    return result
+
 
 def receipt_usage(data):
     """Read the two per-request event formats without inferring missing usage."""
@@ -48,6 +101,18 @@ def private_receipt(data):
     for key in ("effective_max_tokens", "visible_output_chars"):
         if type(data.get(key)) is int and data[key] >= 0:
             result[key] = data[key]
+    result.update(_private_diagnostics(data))
+    temperature = data.get("effective_temperature", data.get("temperature"))
+    if type(temperature) in (int, float) and 0 <= temperature <= 2 and math.isfinite(temperature):
+        result["effective_temperature"] = temperature
+        sources = {"service.parameters.temperature": "connection_explicit",
+                   "service.parameters.extra_body.temperature": "connection_explicit",
+                   "connection_explicit": "connection_explicit",
+                   "upstream_triplet_default": "upstream_triplet_default",
+                   "upstream.RailsConfig.lowest_temperature": "upstream_rail_default",
+                   "upstream_rail_default": "upstream_rail_default", "service_default": "service_default"}
+        source = data.get("temperature_source")
+        result["temperature_source"] = sources.get(source, "unknown") if isinstance(source, str) else "unknown"
     return result
 
 

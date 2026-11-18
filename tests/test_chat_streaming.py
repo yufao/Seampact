@@ -1,4 +1,5 @@
 """Offline checks for incremental content, complete tools and failed partials."""
+import http.client
 import io
 import json
 import sys
@@ -92,6 +93,12 @@ class ProviderStreamingTests(unittest.TestCase):
             self.assertEqual(raised.exception.kind, "response_incomplete")
             self.assertEqual(visible, ["partial"])
 
+    def test_length_retains_partial_arguments_even_before_the_provider_assigns_a_call_id(self):
+        raw = frame({"tool_calls": [dict(index=0, function=dict(arguments="{"))]}, "length")
+        result = self.request(raw, [])
+        self.assertEqual(result["choices"][0]["finish_reason"], "length")
+        self.assertEqual(result["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"], "{")
+
     def test_single_json_response_is_accepted_without_retry(self):
         visible = []
         result = self.request(json.dumps(completion("single JSON")).encode(), visible)
@@ -179,6 +186,28 @@ class ChatStreamingTests(unittest.TestCase):
         self.assertIsNone(self.task["response"])
         self.assertEqual(self.jobs.conversation("conversation")["messages"], self.task["messages"])
         self.assertFalse(any(m["role"] == "assistant" for m in self.task["wire_messages"]))
+
+    def test_terminal_usage_survives_disconnection_while_reading_stream_end(self):
+        raw = frame({"content": "received"}, "stop")
+        usage = dict(prompt_tokens=5, completion_tokens=3, total_tokens=8)
+        raw += b"data: " + json.dumps(dict(choices=[], usage=usage)).encode() + b"\n\n"
+
+        class DisconnectedResponse(io.BytesIO):
+            def __iter__(self):
+                while line := self.readline():
+                    yield line
+                raise http.client.IncompleteRead(b"")
+
+        with patch("urllib.request.build_opener") as opener:
+            opener.return_value.open.return_value = DisconnectedResponse(raw)
+            self.run_task()
+            self.assertEqual(opener.return_value.open.call_count, 1)
+        self.assertEqual(self.task["status"], "FAILED")
+        self.assertEqual(self.task["partial_response"], "received")
+        self.assertEqual(self.task["usage"], [usage])
+        self.assertEqual(self.task["api_usage"]["tokens"], 8)
+        recovered = next(event for event in self.task["events"] if event["kind"] == "model_usage_recovered")
+        self.assertEqual(recovered["provenance"], "terminal_response_usage")
 
     def test_only_explicit_rejection_can_fallback_once(self):
         self.jobs.transport.stream = lambda *args: (_ for _ in ()).throw(

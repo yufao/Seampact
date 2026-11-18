@@ -10,7 +10,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from seampact.agent_runtime import RunControl
-from seampact.isolated_execution import DockerPythonExecutor, _daemon_path
+from seampact.isolated_execution import DockerPythonExecutor, _daemon_path, mount_source_identity
 from seampact.providers import RequestCancelled
 from seampact.workspace_tools import WorkspaceTools
 
@@ -59,7 +59,8 @@ class IsolatedExecutionTests(unittest.TestCase):
             commands.append(args)
             return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
         self.executor._command = command
-        with patch("seampact.isolated_execution.subprocess.Popen", FakeProcess):
+        with patch("seampact.isolated_execution.subprocess.Popen", FakeProcess), \
+             patch.object(self.executor, "_created_receipt", return_value=dict(image=self.executor.image)):
             result = self.executor.run(Projects(), self.scope, "print(42)", 5,
                 control=RunControl(), task=task, emit=lambda *a, **k: None)
         create = next(args for args in commands if args[0] == "create")
@@ -70,6 +71,8 @@ class IsolatedExecutionTests(unittest.TestCase):
         self.assertNotIn("print(42)", create)
         self.assertEqual(result["stdout"], "42\n")
         self.assertTrue(task["python_calls"][0]["stopped"])
+        self.assertEqual(task["python_calls"][0]["isolation_receipt"]["scope"], self.scope)
+        self.assertEqual(task["python_calls"][0]["isolation_receipt"]["requested_mounts"], Projects().container_mounts('t'))
 
     def test_unknown_container_state_retains_lease(self):
         task = dict(python_calls=[dict(container="seampact-python-" + "a" * 32, stopped=False)])
@@ -148,7 +151,7 @@ class IsolatedExecutionTests(unittest.TestCase):
     def test_timed_out_create_only_recovers_exact_unstarted_container(self):
         image = "sha256:" + "a" * 64
         mounts = Projects().container_mounts("t")
-        receipt = dict(Name="/seampact-python-" + "b" * 32, Image=image,
+        receipt = dict(Id="d" * 64, Name="/seampact-python-" + "b" * 32, Image=image,
             State=dict(Status="created", Running=False, Pid=0, StartedAt="0001-01-01T00:00:00Z"),
             Config=dict(Cmd=["python", "-I", "-"], OpenStdin=True, WorkingDir="/workspace"),
             HostConfig=dict(NetworkMode="none", ReadonlyRootfs=True, Privileged=False, CapDrop=["ALL"],
@@ -163,6 +166,11 @@ class IsolatedExecutionTests(unittest.TestCase):
         self.executor._command = command
         name = receipt["Name"][1:]
         self.assertTrue(self.executor._verified_created(name, mounts))
+        receipt['Config']['Env'] = ['PRIVATE_TEST_CREDENTIAL=do-not-retain']
+        verified = self.executor._created_receipt(name, mounts)
+        self.assertNotIn('PRIVATE_TEST_CREDENTIAL', json.dumps(verified))
+        self.assertEqual(verified['image'], image)
+        self.assertEqual(verified['container_id'], 'd' * 64)
         for change in (
                 lambda x: x["State"].update(Status="running"),
                 lambda x: x["State"].update(StartedAt="2026-01-01T00:00:00Z"),
@@ -187,6 +195,7 @@ class IsolatedExecutionTests(unittest.TestCase):
                 self.executor._command = command
                 with patch.object(self.executor, "_mount_sources", side_effect=lambda rows: rows), \
                      patch.object(self.executor, "_verified_created", return_value=verified), \
+                     patch.object(self.executor, "_created_receipt", return_value=dict(image=self.executor.image) if verified else None), \
                      patch("seampact.isolated_execution.subprocess.Popen", return_value=FakeProcess()) as start:
                     if verified:
                         self.executor.run(Projects(), self.scope, "print(1)", 5,
@@ -201,6 +210,28 @@ class IsolatedExecutionTests(unittest.TestCase):
                         start.assert_not_called()
                         self.assertTrue(task["python_calls"][0]["create_uncertain"])
                         self.assertFalse(any(args[0] in {"kill", "rm"} for args in commands))
+
+    def test_normal_create_never_starts_without_verified_actual_isolation(self):
+        task = {}
+        self.executor._command = lambda *a, **k: SimpleNamespace(returncode=0, stdout=b'', stderr=b'')
+        with patch.object(self.executor, '_created_receipt', return_value=None), \
+             patch('seampact.isolated_execution.subprocess.Popen') as start:
+            with self.assertRaisesRegex(ValueError, '无法核实隔离'):
+                self.executor.run(Projects(), self.scope, 'print(1)', 5,
+                                  control=RunControl(), task=task, emit=lambda *a, **k: None)
+        start.assert_not_called()
+        self.assertNotIn('isolation_receipt', task['python_calls'][0])
+        self.assertTrue(task['python_calls'][0]['stopped'])
+
+    def test_windows_docker_desktop_mount_identity_is_exact(self):
+        expected = mount_source_identity('C:\\office\\projects\\p\\data')
+        self.assertEqual(expected, mount_source_identity('/run/desktop/mnt/host/c/office/projects/p/data'))
+        self.assertEqual(expected, mount_source_identity('/host_mnt/c/office/projects/p/data'))
+        self.assertNotEqual(expected, mount_source_identity('/run/desktop/mnt/host/d/office/projects/p/data'))
+        self.assertNotEqual(expected, mount_source_identity('/unrelated/office/projects/p/data'))
+        for value in ('relative/path', 'C:\\office\\..\\grading', '/office/../grading'):
+            with self.assertRaises(ValueError):
+                mount_source_identity(value)
 
 
 if __name__ == "__main__":

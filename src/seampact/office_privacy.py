@@ -207,6 +207,7 @@ class SimulatedOfficeTask:
 def start_privacy_task(platform, body, *, internal_task_id=None, pilot_config=None):
     """Explicit demo/evaluation admission through the ordinary project host."""
     import uuid
+    from seampact.agent_runtime import model_turn_limit
     if not isinstance(body, dict) or set(body) - {"case_id", "project_id", "demo"}:
         raise ValueError("合成办公任务只接收题目标识、项目和演示选择")
     if "demo" in body and type(body["demo"]) is not bool:
@@ -219,7 +220,8 @@ def start_privacy_task(platform, body, *, internal_task_id=None, pilot_config=No
     environment = SimulatedOfficeTask(platform, case, project_id, task_id)
     capabilities = platform.capabilities.public()
     options = dict(external_tools=environment.tool_specs(), external_execute=environment.execute,
-                   evaluator=environment.evaluate, max_model_turns=15,
+                   evaluator=environment.evaluate,
+                   max_model_turns=model_turn_limit((pilot_config or {}).get("max_model_turns")),
                    allowed_capabilities=[], allowed_workspace_tools=["list_files", "read_file", "write_file"])
     if pilot_config is not None:
         from seampact.office_application import build_hooks
@@ -231,7 +233,7 @@ def start_privacy_task(platform, body, *, internal_task_id=None, pilot_config=No
         return platform.chat.start(dict(project_id=project_id, messages=[dict(role="user", content=prompt)],
                                         deadline_s=pilot_config.get("deadline_s") if pilot_config else None,
                                         **({"execution_timeout_s": pilot_config["execution_timeout_s"]} if pilot_config is not None and "execution_timeout_s" in pilot_config else {})),
-            runtime_options=options, input_files={
+            runtime_options=options, expected_model=(pilot_config or {}).get("business_model"), input_files={
                 source_path: json.dumps(case["agent_input"]["documents"], ensure_ascii=False).encode("utf-8")},
             metadata=dict(arm=pilot_config["mode"] if pilot_config else "office_privacy_demo" if body.get("demo") else "office_privacy_synthetic",
                           case=case["id"], family_id=case["family_id"], transport="simulated_only",

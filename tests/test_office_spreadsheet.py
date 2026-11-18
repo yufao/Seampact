@@ -96,7 +96,7 @@ class SpreadsheetPreparationTests(unittest.TestCase):
         self.assertIn("Finally call submit_spreadsheet_solution exactly once", runtime["system_prompt"])
         self.assertIn('write_file with path="solution.py"', runtime["system_prompt"])
         self.assertNotIn(instruction, runtime["system_prompt"])
-        self.assertEqual(runtime["max_model_turns"], 15)
+        self.assertIsNone(runtime["max_model_turns"])
         guarded = []
         context = SimpleNamespace(invoke=lambda unit, arguments: guarded.append(arguments["prompt"]) or
                                   dict(output=dict(valid=False, risk_score=1.0)))

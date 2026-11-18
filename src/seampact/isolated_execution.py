@@ -2,7 +2,7 @@
 
 import json
 import os
-from pathlib import Path, PurePosixPath
+from pathlib import Path, PurePosixPath, PureWindowsPath
 import re
 import subprocess
 import threading
@@ -13,6 +13,34 @@ from .providers import RequestCancelled
 
 _IMAGE = re.compile(r"(?:sha256:[0-9a-f]{64}|[^\s@]+@sha256:[0-9a-f]{64})\Z")
 _MAX_OUTPUT = 65536
+ISOLATION_RECEIPT = "seampact.python-isolation-receipt/1"
+_SANDBOX_FIELDS = ("NetworkMode", "ReadonlyRootfs", "Privileged", "CapAdd", "CapDrop", "SecurityOpt",
+                   "NanoCpus", "Memory", "PidsLimit", "LogConfig", "Tmpfs")
+_INSPECT_CREATED = ('{"Id":{{json .Id}},"Name":{{json .Name}},"Image":{{json .Image}},'
+    '"State":{{json .State}},"Config":{"Cmd":{{json .Config.Cmd}},'
+    '"OpenStdin":{{json .Config.OpenStdin}},"WorkingDir":{{json .Config.WorkingDir}}},"HostConfig":{' +
+    ','.join('"' + key + '":{{json .HostConfig.' + key + '}}' for key in _SANDBOX_FIELDS) +
+    '},"Mounts":{{json .Mounts}}}')
+
+
+def mount_source_identity(value):
+    """Compare native Windows binds with Docker Desktop's explicit host mapping."""
+    if not isinstance(value, str) or not value:
+        raise ValueError("Docker mount source must be an absolute path")
+    windows = PureWindowsPath(value)
+    if re.fullmatch(r"[A-Za-z]:", windows.drive) and windows.is_absolute():
+        if ".." in windows.parts:
+            raise ValueError("Docker mount source cannot traverse parents")
+        return ("windows", windows.drive[0].lower(), *(part.casefold() for part in windows.parts[1:]))
+    path = PurePosixPath(value)
+    if not path.is_absolute() or ".." in path.parts:
+        raise ValueError("Docker mount source must be an absolute path")
+    for prefix in (PurePosixPath("/run/desktop/mnt/host"), PurePosixPath("/host_mnt")):
+        if path.is_relative_to(prefix):
+            parts = path.relative_to(prefix).parts
+            if parts and re.fullmatch(r"[A-Za-z]", parts[0]):
+                return ("windows", parts[0].lower(), *(part.casefold() for part in parts[1:]))
+    return ("posix", *path.parts[1:])
 
 
 def _create_failure(result):
@@ -102,8 +130,8 @@ class DockerPythonExecutor:
         except (KeyError, TypeError, OSError, json.JSONDecodeError) as exc:
             raise ValueError("无法核实隔离执行的 Docker 宿主路径") from exc
 
-    def _verified_created(self, name, mounts):
-        """Confirm the timed-out create produced exactly our unstarted container.
+    def _created_receipt(self, name, mounts):
+        """Inspect the exact unstarted container, retaining no environment values.
 
         Absence, daemon errors and partial/mismatching receipts remain unknown:
         the original create request may still complete after this inspection.
@@ -112,21 +140,24 @@ class DockerPythonExecutor:
             image = self._command("image", "inspect", "--format", "{{.Id}}", self.image)
             actual_image = image.stdout.decode("ascii").strip()
             if image.returncode or not re.fullmatch(r"sha256:[0-9a-f]{64}", actual_image):
-                return False
-            result = self._command("inspect", name)
+                return None
+            result = self._command("inspect", "--format", _INSPECT_CREATED, name)
             if result.returncode:
-                return False
+                return None
             rows = json.loads(result.stdout)
+            if isinstance(rows, dict):
+                rows = [rows]
             if not isinstance(rows, list) or len(rows) != 1:
-                return False
+                return None
             row = rows[0]
             state, config, host = row["State"], row["Config"], row["HostConfig"]
-            actual_mounts = {(m["Type"], m["Source"], m["Destination"], m["RW"]) for m in row["Mounts"]}
-            expected_mounts = {("bind", m["source"], m["target"], not m["read_only"]) for m in mounts}
+            actual_mounts = {(m["Type"], mount_source_identity(m["Source"]), m["Destination"], m["RW"]) for m in row["Mounts"]}
+            expected_mounts = {("bind", mount_source_identity(m["source"]), m["target"], not m["read_only"]) for m in mounts}
             tmpfs = host.get("Tmpfs") or {}
             options = set(tmpfs.get("/tmp", "").split(","))
             security = set(host.get("SecurityOpt") or [])
-            return (row.get("Name") == "/" + name and row.get("Image") == actual_image
+            valid = (row.get("Name") == "/" + name and row.get("Image") == actual_image
+                    and isinstance(row.get("Id"), str) and re.fullmatch(r"[0-9a-f]{64}", row["Id"])
                     and state.get("Status") == "created" and state.get("Running") is False
                     and state.get("Pid") == 0 and state.get("StartedAt") == "0001-01-01T00:00:00Z"
                     and config.get("Cmd") == ["python", "-I", "-"] and config.get("OpenStdin") is True
@@ -140,8 +171,17 @@ class DockerPythonExecutor:
                     and set(tmpfs) == {"/tmp"} and options == {"rw", "nosuid", "nodev", "noexec", "size=64m"}
                     and len(row["Mounts"]) == len(mounts) == len(expected_mounts)
                     and actual_mounts == expected_mounts)
+            if not valid:
+                return None
+            return dict(schema=ISOLATION_RECEIPT, verified_before_start=True, container_id=row["Id"],
+                container_name=name, image=actual_image, command=config["Cmd"], working_directory=config["WorkingDir"],
+                mounts=[{key: mount[key] for key in ("Type", "Source", "Destination", "RW")} for mount in row["Mounts"]],
+                sandbox={key: host.get(key) for key in _SANDBOX_FIELDS})
         except (ValueError, KeyError, TypeError, UnicodeError, AttributeError):
-            return False
+            return None
+
+    def _verified_created(self, name, mounts):
+        return self._created_receipt(name, mounts) is not None
 
     def is_drained(self, task):
         for call in task.get("python_calls", []):
@@ -223,6 +263,13 @@ class DockerPythonExecutor:
                 record["create_error"] = _create_failure(created)
                 raise ValueError("无法创建隔离 Python 容器")
             control.check()
+            receipt = self._created_receipt(name, daemon_mounts)
+            if receipt is None:
+                raise ValueError("无法核实隔离 Python 容器的实际镜像、挂载与执行限制")
+            receipt.update(scope={key: scope[key] for key in ("project_id", "conversation_id", "task_id")},
+                requested_mounts=[dict(mount) for mount in mounts], daemon_mounts=[dict(mount) for mount in daemon_mounts])
+            record["isolation_receipt"] = receipt
+            emit("python_execution", call_id=call_id, status="ISOLATION_VERIFIED")
             proc = subprocess.Popen([self.docker, "start", "--attach", "--interactive", name],
                                     stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             output = [bytearray(), bytearray()]

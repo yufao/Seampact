@@ -133,11 +133,13 @@ def build_hooks(platform, task_id, config):
                                   error_type=type(error).__name__)
                 result.setdefault("check_status", "valid")
                 rechecking = name in payload.get("revision_required_hooks", ())
+                unavailable_verdict = None
                 if (required or rechecking) and result["check_status"] != "valid":
                     result.update(action="block", reason="检查未能完成，本次内容未通过复核")
                 elif result["check_status"] == "unavailable" and (event in {"input_received", "after_tool"} or
                         event == "before_delivery" and policy["delivery_finding"] == "revise_delivery"):
                     # An optional check with no verdict leaves other candidates available.
+                    unavailable_verdict = dict(result)
                     result.update(action="allow", reason="检查未取得有效判词")
                 if result["action"] == "block":
                     if event == "before_tool" and role == "self_check_input":
@@ -149,7 +151,7 @@ def build_hooks(platform, task_id, config):
                 if observe_specified and ((role == "self_check_input" and event in {"input_received", "before_tool"})
                                           or (role == "fact_check" and event in {"before_tool", "before_delivery"})):
                     result = dict(result, action="allow", diagnostic_observation=True,
-                                  original_decision=copy.deepcopy(result))
+                                  original_decision=copy.deepcopy(unavailable_verdict or result))
                 return result
 
             hooks.append(AgentHook(name, event, run, required=required,

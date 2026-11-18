@@ -22,6 +22,8 @@ from seampact.hosting.images import Images
 from seampact.observability.monitoring import ResourceMonitor
 from seampact.scheduling.capability_scheduler import CapabilityScheduler
 from seampact.run_history import RunHistory
+from seampact.policy_versions import PolicyVersions
+from seampact.policy_training import PolicyTraining
 from seampact.project_spaces import ProjectSpaces
 from seampact.project_applications import ProjectApplications
 from seampact.isolated_execution import DockerPythonExecutor
@@ -63,6 +65,8 @@ class Platform:
                              code_execution=self.code_execution, applications=self.project_applications)
         # Historical runs are readable, but no old trainer or source checker starts.
         self.training = RunHistory(self.home, self.store)
+        self.policy_versions = PolicyVersions(self)
+        self.policy_training = PolicyTraining(self, self.policy_versions)
         self.monitor = ResourceMonitor(self)
 
     def state(self):
@@ -91,7 +95,7 @@ class Platform:
             deployment_backend=self.deployments.backend(), image_retention=self.images.snapshot(),
             runtime_controller=self.deployments.controller_state(),
             scheduler=dict(status="RUNNING", policy="capability/1", execution=self.execution.status(),
-                           research=self.training.snapshot(), active=[], waiting=[]))
+                           research=self.training.snapshot(), policies=self.policy_versions.snapshot(), active=[], waiting=[]))
 
     def _with_calls(self, tasks):
         # Completed tasks are cold records; do not rebuild them through a live coordinator.
@@ -158,8 +162,30 @@ class Platform:
                 action="skip" if event["kind"] == "hook_skipped" else action,
                 fact_support=result.get("fact_support") if isinstance(result, dict) else None,
                 reason=result.get("reason") if isinstance(result, dict) and action == "block" else None))
+        with self.store.lock:
+            records = self.store.db.execute("""SELECT data FROM documents WHERE kind='capability_decision'
+                AND json_extract(data,'$.task_id')=? ORDER BY rowid DESC LIMIT 300""", (identity,)).fetchall()
+        decisions = []
+        for record in reversed(records):
+            item = json.loads(record[0])
+            candidates, selection = item.get("candidates") or [], item.get("selection") or {}
+            index = selection.get("index")
+            selected = candidates[index] if type(index) is int and 0 <= index < len(candidates) else {}
+            decisions.append(dict(id=item["id"], at=item.get("at"), event=item.get("event"),
+                selected={key: selected.get(key) for key in ("kind", "hook", "group_id", "instance_id", "unit_id")
+                          if selected.get(key) is not None}, candidates_count=len(candidates),
+                policy_version=item.get("policy_version"), sequence=item.get("sequence")))
+        objective = task.get("objective_result") or {}
+        tokens = (objective.get("metrics") or {}).get("api_tokens")
+        if tokens is None:
+            tokens = (task.get("api_usage") or {}).get("tokens")
         return dict(task_id=identity, project_id=task.get("project_id"), status=task["status"],
-                    calls=calls, instances=list(instances.values()), checks=checks)
+            policy_version=task.get("policy_version") or (task.get("execution") or {}).get("policy_version"),
+            decisions=decisions, decisions_truncated=len(records) == 300,
+            metrics=dict(quality=objective.get("quality"), delivered=objective.get("delivered"),
+                latency_s=objective.get("latency_s"), api_tokens=tokens,
+                ram_byte_s=None, vram_byte_s=None, resource_scope="shared-instance-lifetimes-reported-separately"),
+            calls=calls, instances=list(instances.values()), checks=checks)
 
 
     def delete_tasks(self, body):
@@ -289,6 +315,9 @@ class Platform:
         return value
 
     def close(self):
+        if getattr(self, "policy_training", None):
+            self.policy_training.request_shutdown()
+            self.policy_training.close()
         self.generation.close()
         self.chat.close()
         self.execution.close()

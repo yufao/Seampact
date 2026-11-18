@@ -14,7 +14,7 @@ import re
 import time
 import uuid
 
-from seampact.agent_runtime import AgentHook, SYSTEM_PROMPT
+from seampact.agent_runtime import AgentHook, SYSTEM_PROMPT, model_turn_limit
 from seampact.project_spaces import _checked
 from seampact.spreadsheet_evidence import infrastructure_error_resolved
 
@@ -315,7 +315,8 @@ def start_spreadsheet_task(platform, body, *, internal_task_id=None, pilot_confi
     options = dict(code_execution=environment, external_tools=environment.tools(), external_execute=environment.submit,
                    hooks=hooks, allowed_capabilities=[], system_prompt=system_prompt,
                    allowed_workspace_tools=["list_files", "read_file", "write_file", "run_python"],
-                   max_model_turns=15, evaluator=environment.evaluate)
+                   max_model_turns=model_turn_limit((pilot_config or {}).get("max_model_turns")),
+                   evaluator=environment.evaluate)
     if pilot_config is not None:
         from seampact.office_application import build_hooks
         application = build_hooks(platform, identity, pilot_config)
@@ -324,7 +325,8 @@ def start_spreadsheet_task(platform, body, *, internal_task_id=None, pilot_confi
         return platform.chat.start(dict(project_id=body["project_id"], messages=[dict(role="user", content=prompt)],
                                         deadline_s=pilot_config.get("deadline_s", 1200) if pilot_config is not None else 1200,
                                         **({"execution_timeout_s": pilot_config["execution_timeout_s"]} if pilot_config is not None and "execution_timeout_s" in pilot_config else {})),
-            runtime_options=options, input_files={namespace + "/" + inputs[0]["name"]: inputs[0]["data"]},
+            runtime_options=options, expected_model=(pilot_config or {}).get("business_model"),
+            input_files={namespace + "/" + inputs[0]["name"]: inputs[0]["data"]},
             metadata=dict(arm=pilot_config["mode"] if pilot_config else "spreadsheetbench_pi_frozen_replay", case=case["id"], source_revision=SOURCE_REVISION,
                           manifest_sha256=body["manifest_sha256"], family_id=case["family_id"],
                           original_manifest_sha256=case["original_manifest_sha256"],

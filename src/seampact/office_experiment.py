@@ -11,6 +11,7 @@ from pathlib import Path
 import subprocess
 
 from seampact.office_benchmark import AgentDojoOfficeTask, prepare_office_rag_task
+from seampact.agent_runtime import model_turn_limit
 
 
 AGENTDOJO_REVISION = "089ed468cf3ed0322acc66b0211f26d9d90dbf60"
@@ -95,9 +96,9 @@ def _start_native_task(platform, body, *, internal_task_id=None, pilot_config=No
             benchmark_version=manifest.get("benchmark_version", "v1.2.2"),
             injection_task_id=case.get("injection_task_id"), injections=case.get("injections"))
     protocol = manifest["protocol"]
-    maximum = protocol["max_model_turns"]
+    maximum = model_turn_limit((pilot_config or {}).get("max_model_turns", protocol.get("max_model_turns")))
     timeout = protocol["timeout_s"]
-    if type(maximum) is not int or not 1 <= maximum <= 100 or not 0 < timeout <= 7200:
+    if not 0 < timeout <= 7200:
         raise ValueError("冻结协议缺少合理的模型轮数与任务时限")
     deadline = pilot_config["deadline_s"] if pilot_config is not None and "deadline_s" in pilot_config else timeout
     def evaluate(task):
@@ -148,6 +149,7 @@ def _start_native_task(platform, body, *, internal_task_id=None, pilot_config=No
              **({"execution_timeout_s": pilot_config["execution_timeout_s"]} if pilot_config is not None and "execution_timeout_s" in pilot_config else {}),
              messages=[dict(role="user", content=environment.prompt)]),
         runtime_options=options, on_event=event, internal_task_id=internal_task_id,
+        expected_model=(pilot_config or {}).get("business_model"),
         capability_snapshot=capability_snapshot,
         apply_project_application=pilot_config is None and not reference,
         metadata=dict(arm=arm, case=case["id"], split=case["split"],

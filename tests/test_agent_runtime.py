@@ -314,7 +314,7 @@ class AgentRuntimeTests(unittest.TestCase):
                 delta("unverified draft")
                 return completion("unverified draft")
             self.assertEqual(body.get("tools", []), [])
-            self.assertEqual(body["messages"][-1]["role"], "system")
+            self.assertEqual(body["messages"][-1]["role"], "user")
             self.assertIn("Use only supported facts.", body["messages"][-1]["content"])
             self.assertEqual(len([message for message in body["messages"] if message.get("tool_call_id") == "create-once"]), 1)
             delta("supported answer")
@@ -336,7 +336,7 @@ class AgentRuntimeTests(unittest.TestCase):
         self.assertEqual(contexts[-1]["tool_messages"][0]["content"],
                          next(item["content"] for item in bodies[-1]["messages"]
                               if item.get("tool_call_id") == "create-once"))
-        self.assertFalse(any(item["role"] == "system" and "Use only supported facts." in item["content"]
+        self.assertFalse(any("Use only supported facts." in (item.get("content") or "")
                              for item in self.task["wire_messages"]))
         self.assertEqual(self.task["delivery_revision"]["withheld_messages"][0]["content"], "unverified draft")
 
@@ -446,7 +446,7 @@ class AgentRuntimeTests(unittest.TestCase):
                 privacy_texts.append(arguments["text"])
                 return dict(output=dict(findings=[dict(entity_type="US_SSN")] if "123-45-6789" in arguments["text"] else []))
             fact_arguments.append(copy.deepcopy(arguments))
-            label = "Neutral" if "999" in arguments["answer"] else "Entailment"
+            label = "Contradiction" if "999" in arguments["answer"] else "Entailment"
             return dict(output=dict(status="ok", claim_count=1, claims=[dict(
                 claim_text="private extracted claim", label=label,
                 labels_by_reference=[label] * len(arguments["references"]))]))
@@ -486,7 +486,7 @@ class AgentRuntimeTests(unittest.TestCase):
                 result = completion("Revenue was 999. Email sent.")
             else:
                 self.assertEqual(body.get("tools", []), [])
-                self.assertEqual(body["messages"][-1]["role"], "system")
+                self.assertEqual(body["messages"][-1]["role"], "user")
                 delta("Revenue was 100. Email sent.")
                 result = completion("Revenue was 100. Email sent.")
             result["usage"] = dict(total_tokens=10)
@@ -564,6 +564,52 @@ class AgentRuntimeTests(unittest.TestCase):
                          dict(prompt_tokens=3, completion_tokens=2))
         self.assertEqual(self.task["capability_usage"][0]["model_usage"][0]["data"]["finish_reasons"], ["length"])
         self.assertTrue(self.task["capability_usage"][0]["model_usage"][0]["data"]["empty_content"])
+
+    def test_private_progress_is_bounded_filtered_and_separate_from_usage(self):
+        from seampact.api_accounting import PROGRESS_RECORD_LIMIT
+        def dispatch(unit, args, **options):
+            for index in range(PROGRESS_RECORD_LIMIT + 2):
+                options["on_event"](dict(kind="model_progress", call_id="c", data=dict(
+                    generated_characters=index, completed_lines=3, elapsed_s=1.5, phase="receiving",
+                    error_type="APITimeoutError", error_kind="timeout", timeout_source="sdk_default",
+                    finish_reason="stop", question="PRIVATE_QUESTION", claim="PRIVATE_CLAIM",
+                    api_key="PRIVATE_CREDENTIAL", message="PRIVATE_MESSAGE", completion_tokens=999)))
+            options["on_event"](dict(kind="model_usage", call_id="c", data=dict(
+                usage_received=True, input_tokens=3, output_tokens=2, elapsed_s=620.36,
+                error=dict(type="APITimeoutError", message="PRIVATE_ERROR"), timeout_source="sdk_default")))
+            return dict(output="ok", call=dict(call_id="c"))
+        def check(payload, context):
+            context.invoke("fact", {}, private_events=True)
+            return dict(action="allow", fact_support="unknown")
+        def stream(url, key, body, delta):
+            delta("answer")
+            return dict(completion("answer"), usage=dict(total_tokens=7))
+        self.run_host(stream, hooks=[AgentHook("fact", "before_delivery", check, mode="complete")], dispatch=dispatch)
+        self.assertEqual(len(self.task["capability_progress"]), PROGRESS_RECORD_LIMIT)
+        self.assertEqual(self.task["capability_progress_dropped"], 2)
+        self.assertEqual(self.task["capability_progress"][-1]["data"]["generated_characters"], PROGRESS_RECORD_LIMIT + 1)
+        usage = self.task["capability_usage"][0]["model_usage"]
+        self.assertEqual(len(usage), 1)
+        self.assertEqual(usage[0]["data"]["error_type"], "APITimeoutError")
+        self.assertEqual(usage[0]["data"]["error_kind"], "timeout")
+        self.assertEqual(usage[0]["data"]["elapsed_s"], 620.36)
+        self.assertEqual(self.task["api_usage"]["tokens"], 12)
+        self.assertEqual(self.task["api_usage"]["capability_requests"], 1)
+        self.assertFalse(any(e["kind"] == "capability_event" and e.get("event", {}).get("kind") == "model_progress"
+                             for e in self.task["events"]))
+        self.assertNotIn("PRIVATE_", json.dumps([self.task, self.events]))
+
+    def test_private_diagnostic_labels_cannot_carry_arbitrary_strings(self):
+        from seampact.api_accounting import private_progress, private_receipt
+        data = dict(phase="PRIVATE_PHASE", error_type="PRIVATE_TYPE", error_kind="PRIVATE_KIND",
+                    finish_reason="PRIVATE_REASON", timeout_source="PRIVATE_URL", generated_characters=True,
+                    completed_lines=-1, elapsed_s=float("inf"), elapsed_ms=float("nan"),
+                    text="PRIVATE_TEXT", error=dict(message="PRIVATE_ERROR"), total_tokens=999)
+        progress = private_progress(data)
+        self.assertTrue(all(value == "unknown" for value in progress.values()))
+        self.assertNotIn("PRIVATE_", json.dumps(private_receipt(data)))
+        self.assertEqual(private_receipt(dict(usage_received=False, elapsed_s=2,
+                         error=dict(type="ReadTimeout", message="PRIVATE")))["error_type"], "ReadTimeout")
 
     def test_internal_tool_plan_is_kept_for_model_but_only_final_answer_is_delivered(self):
         bodies, checked, observed = [], [], []
@@ -779,6 +825,34 @@ class AgentRuntimeTests(unittest.TestCase):
         self.assertEqual(self.task["evaluation"]["status"], "UNKNOWN")
         self.assertIsNone(finished[-1]["quality"])
 
+    def test_default_uncapped_runtime_completes_beyond_40_turns(self):
+        requests, effects = [], []
+        external = dict(type="function", function=dict(name="effect", parameters=dict(type="object")))
+        def stream(*args):
+            requests.append(1)
+            if len(requests) <= 40:
+                return completion(calls=[dict(id="call-" + str(len(requests)),
+                    function=dict(name="effect", arguments="{}"))])
+            return completion("done")
+        self.assertIsNone(AgentRuntime(self.store, self.catalog).max_model_turns)
+        self.run_host(stream, external_tools=[external],
+                      external_execute=lambda *a, **kw: effects.append(1) or dict(content="completed"))
+        self.assertEqual(self.task["status"], "COMPLETED")
+        self.assertEqual(self.task["response"], "done")
+        self.assertEqual((len(requests), len(effects)), (41, 40))
+        self.assertIsNone(self.task["model_progress"]["max_model_turns"])
+        self.assertEqual(self.task["model_progress"]["model_turns"], 41)
+        self.assertIsNone(self.task["generation_termination"])
+
+    def test_model_turn_limit_only_accepts_positive_integer_or_explicit_none(self):
+        from seampact.agent_runtime import model_turn_limit
+        self.assertIsNone(model_turn_limit(None))
+        self.assertEqual(model_turn_limit(2), 2)
+        self.assertEqual(AgentRuntime(self.store, self.catalog, max_model_turns=40).max_model_turns, 40)
+        for invalid in (False, True, 0, -1, 1.5, "15", [], {}, float("nan")):
+            with self.subTest(value=invalid), self.assertRaisesRegex(ValueError, "max_model_turns"):
+                AgentRuntime(self.store, self.catalog, max_model_turns=invalid)
+
     def test_model_turn_limit_stops_without_replaying_effects(self):
         requests, effects = [], []
         external = dict(type="function", function=dict(name="effect", parameters=dict(type="object")))
@@ -790,6 +864,60 @@ class AgentRuntimeTests(unittest.TestCase):
         self.assertEqual(self.task["status"], "FAILED")
         self.assertEqual(requests, [1])
         self.assertEqual(effects, [1])
+        self.assertEqual(self.task["model_progress"]["model_turns"], 1)
+        self.assertEqual(self.task["model_progress"]["successful_tool_receipts"], 1)
+        self.assertEqual(self.task["generation_termination"]["kind"], "model_turn_limit")
+        self.assertFalse(self.task["generation_termination"]["recovery_attempted"])
+
+    def test_length_keeps_usage_and_partial_proposal_without_executing_or_replaying_effects(self):
+        requests, effects = [], []
+        external = dict(type="function", function=dict(name="effect", parameters=dict(type="object")))
+        def stream(url, key, body, delta):
+            requests.append(body)
+            call = dict(id="complete" if len(requests) == 1 else "partial", function=dict(
+                name="effect", arguments="{}" if len(requests) == 1 else '{"incomplete":'))
+            response = completion(calls=[call])
+            response["usage"] = dict(prompt_tokens=3, completion_tokens=2, total_tokens=5)
+            if len(requests) == 2:
+                delta("unfinished answer")
+                response["choices"][0]["finish_reason"] = "length"
+            return response
+        self.run_host(stream, external_tools=[external],
+            external_execute=lambda *a, **kw: effects.append(1) or dict(content="effect completed"),
+            hooks=[AgentHook("delivery", "before_delivery", lambda *a: None, mode="complete")])
+        self.assertEqual(self.task["status"], "FAILED")
+        self.assertEqual(self.task["error"], "模型响应未完成：length")
+        self.assertEqual(len(requests), 2)
+        self.assertEqual(effects, [1])
+        self.assertEqual(self.task["api_usage"]["tokens"], 10)
+        self.assertEqual(self.task["generation_termination"]["kind"], "provider_length")
+        self.assertEqual(self.task["generation_termination"]["tool_proposals"], 1)
+        self.assertFalse(self.task["generation_termination"]["recovery_attempted"])
+        self.assertEqual(self.task["model_progress"]["successful_tool_receipts"], 1)
+        self.assertEqual(self.task["incomplete_model_message"]["tool_calls"][0]["function"]["arguments"], '{"incomplete":')
+        for history in (self.task["wire_messages"], self.task["context_messages"]):
+            self.assertEqual([call["id"] for message in history for call in message.get("tool_calls", [])], ["complete"])
+            self.assertEqual([message["tool_call_id"] for message in history if message["role"] == "tool"], ["complete"])
+        self.assertFalse(any(event["kind"] in {"delta", "file"} for event in self.events))
+
+    def test_repeated_proposals_with_new_call_ids_are_evidence_not_an_implicit_retry_policy(self):
+        requests, effects = [], []
+        external = dict(type="function", function=dict(name="effect", parameters=dict(type="object")))
+        def stream(*args):
+            requests.append(1)
+            return completion(calls=[dict(id="call-" + str(len(requests)),
+                function=dict(name="effect", arguments="{}"))])
+        self.run_host(stream, external_tools=[external], max_model_turns=3,
+            external_execute=lambda *a, **kw: effects.append(1) or dict(content="completed"))
+        self.assertEqual(self.task["status"], "FAILED")
+        self.assertEqual(len(requests), 3)
+        self.assertEqual(effects, [1, 1, 1])
+        progress = self.task["model_progress"]
+        self.assertEqual(progress["model_turns"], 3)
+        self.assertEqual(progress["repeated_responses"], 2)
+        self.assertEqual(progress["consecutive_identical_responses"], 3)
+        self.assertEqual(progress["successful_tool_receipts"], 3)
+        self.assertEqual(self.task["generation_termination"]["kind"], "model_turn_limit")
 
     def test_managed_model_uses_dependency_readiness_and_real_request_leases(self):
         operations = []

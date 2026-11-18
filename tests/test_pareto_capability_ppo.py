@@ -15,6 +15,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from seampact.scheduling.capability_ppo import COMPONENTS, CandidatePPO
 from seampact.scheduling.capability_scheduler import CANDIDATE_DIM, FEATURE_SCHEMA, OBSERVATION_DIM
 from seampact.scheduling.ppo_transfer import source_fingerprints, transfer
+from seampact.scheduling.unified_objective import freeze_objective
 
 SETTINGS = dict(hidden_sizes=[4], epochs=1, batch_size=4, entropy_coefficient=0)
 
@@ -101,6 +102,76 @@ class ParetoPPO(unittest.TestCase):
         self.assertEqual(policy.coefficient_version, 1)
         self.assertEqual(result["scalarization"], policy.last_scalarization)
         self.assertEqual(result["scalarization"]["coefficient_version"], 1)
+        for term in COMPONENTS:
+            self.assertEqual(result["value_mean_" + term], 3 if term == "quality" else 5)
+            self.assertTrue(math.isfinite(result["advantage_std_" + term]))
+            self.assertTrue(math.isfinite(result["return_mean_" + term]))
+            self.assertTrue(math.isfinite(result["gradient_norm_before_clip_value_" + term]))
+            self.assertGreaterEqual(result["gradient_norm_before_clip_value_" + term], 0)
+        self.assertAlmostEqual(result["weighted_advantage_mean_latency"],
+                               -2 * summary["optimization_weights"]["latency"])
+        self.assertTrue(math.isfinite(result["gradient_norm_before_clip_actor"]))
+        self.assertGreaterEqual(result["coefficient_diagnostics"]["effective_dimensions"], 1)
+
+    def fixed_objective(self):
+        value = objective()
+        value["pareto"].update(mode="fixed_calibrated", calibration=dict(
+            normalized_means=dict(quality=.5, latency=2, ram=3, vram=0, api=4), source_id="sha256:" + "a" * 64))
+        return value
+
+    def test_fixed_calibration_derivative_is_frozen_across_updates_and_resume(self):
+        value = self.fixed_objective()
+        policy = CandidatePPO("config", value, config=SETTINGS, seed=7, training=True)
+        components = {term: dict(before_first=mean, after_decisions=[])
+                      for term, mean in value["pareto"]["calibration"]["normalized_means"].items()}
+        expected = self.policy().interval_weights(components, 1, 1)["weights"]
+        self.assertEqual(policy.coefficients, expected)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "fixed.pt"
+            # Initial fixed state is already calibrated; it is not the direction vector.
+            policy.save(path)
+            initial = CandidatePPO("config", value, config=SETTINGS, seed=7, training=True)
+            initial.load(path, optimizer=True)
+            self.assertEqual(initial.snapshot(), policy.snapshot())
+            for identity, values in [("one", dict(quality=[.5], api=[0])),
+                                     ("two", dict(quality=[0], ram=[100]))]:
+                decision = self.decision(policy)
+                settlements, summary = self.interval(policy, [decision], values, identity)
+                self.assertEqual(summary["optimization_weights"], expected)
+                result = policy.update_interval([decision], settlements, summary, final=True)
+                self.assertEqual(policy.coefficients, expected)
+                self.assertEqual(result["coefficient_diagnostics"]["mode"], "fixed_calibrated")
+                self.assertEqual(result["scalarization"]["calibration"], value["pareto"]["calibration"])
+            self.assertEqual(policy.coefficient_version, 2)
+            self.assertEqual(set(policy.learner.networks), {"actor", *("value_" + term for term in COMPONENTS)})
+            policy.save(path)
+            resumed = CandidatePPO("config", value, config=SETTINGS, seed=7, training=True)
+            resumed.load(path, optimizer=True)
+            self.assertEqual(resumed.snapshot(), policy.snapshot())
+            with self.assertRaisesRegex(ValueError, "同一"):
+                self.policy().load(path)
+            payload = policy.learner.torch.load(path, weights_only=True)
+            payload["checkpoint_metadata"]["pareto_state"]["last_scalarization"]["calibration"]["source_id"] = "sha256:" + "b" * 64
+            policy.learner.torch.save(payload, path)
+            with self.assertRaisesRegex(ValueError, "校准身份"):
+                resumed.load(path, optimizer=True)
+
+    def test_gradient_diagnostics_do_not_change_training(self):
+        measured, silent = self.policy(), self.policy()
+        for policy in (measured, silent):
+            decisions = [self.decision(policy), self.decision(policy, 1)]
+            settlements, summary = self.interval(policy, decisions, dict(quality=[0, .5], ram=[1, 2]))
+            if policy is silent:
+                step = policy.learner._step
+                with patch.object(policy.learner, "_step", side_effect=lambda name, loss, networks, **kw:
+                                  step(name, loss, networks)):
+                    policy.update_interval(decisions, settlements, summary, final=True)
+            else:
+                policy.update_interval(decisions, settlements, summary, final=True)
+        for name, network in measured.learner.networks.items():
+            for key, tensor in network.state_dict().items():
+                self.assertTrue(measured.learner.torch.equal(tensor, silent.learner.networks[name].state_dict()[key]))
+        self.assertTrue(measured.learner.torch.equal(measured.learner.generator.get_state(), silent.learner.generator.get_state()))
 
     def test_invalid_component_or_receipt_is_transactional_and_old_state_rejected(self):
         policy = self.policy()

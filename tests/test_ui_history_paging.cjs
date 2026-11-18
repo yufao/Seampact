@@ -97,10 +97,11 @@ function taskHarness() {
   const count = element('span');
   const notices = [];
   const calls = [];
-  const context = load(['visibleTasks', 'taskRecordFinished', 'loadOlderTasks', 'deleteTaskRecords', 'renderTasks'], {
+  const context = load(['visibleTasks', 'policyDate', 'taskDisplayName', 'projectDisplayName', 'taskRecordFinished',
+    'loadInspectedTask', 'loadOlderTasks', 'deleteTaskRecords', 'renderTasks'], {
     state: {tasks: [], analyses: [], units: []},
     olderTasks: [], olderTasksCursor: undefined, olderTasksBusy: false, taskDeleteBusy: false,
-    inspectPage: false, inspectQuery: {get() { return null; }},
+    inspectPage: true, inspectView: 'tasks', inspectedTask: null, inspectQuery: {get() { return null; }},
     terminalStatuses: new Set(['COMPLETED', 'SUCCEEDED', 'FAILED', 'CANCELLED', 'INTERRUPTED']),
     selectedSource: () => '',
     $: id => id === 'task-list' ? root : count,
@@ -133,6 +134,39 @@ test('visibleTasks keeps state.tasks ahead of older pages and drops duplicate id
   c.state = {tasks: [{id: 'a', calls: [{unit: {source_id: 'src'}}]}], analyses: [], units: []};
   c.olderTasks = [{id: 'b', calls: []}, {id: 'c', calls: [{unit: {source_id: 'src'}}]}];
   assert.deepEqual(Array.from(c.visibleTasks(), task => task.id), ['a', 'c']);
+});
+
+test('opening a task from a strategy record reads just that task if it is older than the loaded pages', async () => {
+  const {context: c, root, calls} = taskHarness();
+  const task = {id: 'historical-task', status: 'COMPLETED', origin: 'EXPLICIT_TASK_PLAN', project_id: 'project-a',
+    started_at: '2026-11-18T15:00:00Z', calls: [{group_id: 'deploy-a'}]};
+  c.state = {tasks: [{id: 'recent', status: 'RUNNING'}], projects: [{id: 'project-a', name: '办公项目'}],
+    runtime_groups: [{id: 'deploy-a', source_id: 'src'}], tasks_older: 40};
+  c.inspectQuery = new URLSearchParams({task: task.id});
+  c.selectedSource = () => 'src';
+  c.api = async url => { calls.push(url); return task; };
+  await c.loadInspectedTask(task.id);
+  await c.loadInspectedTask(task.id);
+  assert.deepEqual(calls, ['/api/tasks/historical-task']);
+  assert.deepEqual(Array.from(c.visibleTasks(), record => record.id), [task.id]);
+  c.renderTasks();
+  assert.match(root.textContent, /返回任务列表.*接口执行任务/);
+  assert.equal(buttons(root).length, 0);
+  await c.loadInspectedTask(null);
+  assert.equal(c.inspectedTask, null);
+});
+
+test('the status panel shows a short task overview and keeps history management on the task page', () => {
+  const {context: c, root, count} = taskHarness();
+  c.inspectPage = false;
+  c.state = {tasks: [
+    ...Array.from({length: 6}, (_, index) => ({id: 'finished-' + index, status: 'COMPLETED', started_at: String(index)})),
+    {id: 'active', status: 'RUNNING', started_at: '0', phase: 'conversation', project_id: 'default'}], tasks_older: 40};
+  c.renderTasks();
+  assert.equal(count.textContent, '4');
+  assert.equal(root.children[0].dataset.itemId, 'active');
+  assert.match(root.children[0].textContent, /对话任务.*默认项目.*打开任务记录/);
+  assert.doesNotMatch(root.textContent, /finished-|加载更早|删除记录/);
 });
 
 test('a task pushed off the polled page stays listed once older pages are loaded', () => {
@@ -363,5 +397,5 @@ test('export still requests the full run and the task signature tracks older pag
   const body = slice('exportResearchRun');
   assert.match(body, /\/api\/scheduler\/runs\/' \+ encodeURIComponent\(identity\)\)/);
   assert.doesNotMatch(body, /view=summary|researchDetails/);
-  assert.match(source, /renderSection\('tasks', \[visibleTasks\(\), taskDeleteBusy, olderTasks\.length, olderTasksCursor === undefined \? state\.tasks_older : olderTasksCursor, olderTasksBusy\], renderTasks, \['task-list'\]\)/);
+  assert.match(slice('refresh'), /renderSection\('tasks', \[visibleTasks\(\), taskDeleteBusy, olderTasks\.length, olderTasksCursor === undefined \? state\.tasks_older : olderTasksCursor,\s+olderTasksBusy/);
 });

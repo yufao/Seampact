@@ -3,8 +3,10 @@ import io
 import json
 import socket
 import sys
+import threading
 import unittest
 import urllib.error
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest.mock import patch
 
@@ -120,6 +122,55 @@ class ProviderErrorChecks(unittest.TestCase):
             self.assertEqual(request.get_header('X-request-id'),unlimited.request_id)
             Transport().send('http://example.invalid',control=RequestControl())
             self.assertEqual(opener.return_value.open.call_args.kwargs['timeout'],600)
+
+    def test_cancel_interrupts_unlimited_transport_before_headers_and_mid_stream(self):
+        for send_headers in (False, True):
+            with self.subTest(send_headers=send_headers):
+                waiting, release = threading.Event(), threading.Event()
+                control = RequestControl(unlimited=True)
+                outcome = []
+
+                class Handler(BaseHTTPRequestHandler):
+                    def do_POST(self):
+                        self.rfile.read(int(self.headers['Content-Length']))
+                        if send_headers:
+                            self.send_response(200)
+                            self.send_header('Content-Type', 'text/event-stream')
+                            self.end_headers()
+                            self.wfile.write(b'data: {"choices":[{"delta":{"content":"first"}}]}\n\n')
+                            self.wfile.flush()
+                        else:
+                            waiting.set()
+                        release.wait(5)
+
+                    def log_message(self, *args):
+                        pass
+
+                with ThreadingHTTPServer(('127.0.0.1', 0), Handler) as server:
+                    http = threading.Thread(target=server.serve_forever, kwargs={'poll_interval': 0.05}, daemon=True)
+                    http.start()
+
+                    def call():
+                        try:
+                            Transport().stream(f'http://127.0.0.1:{server.server_port}', '', {},
+                                               lambda text: waiting.set(), control=control)
+                        except Exception as error:
+                            outcome.append(error)
+
+                    request = threading.Thread(target=call, daemon=True)
+                    request.start()
+                    try:
+                        self.assertTrue(waiting.wait(2))
+                        control.cancel()
+                        request.join(2)
+                        self.assertFalse(request.is_alive())
+                        self.assertEqual(len(outcome), 1)
+                        self.assertIsInstance(outcome[0], RequestCancelled)
+                    finally:
+                        release.set()
+                        server.shutdown()
+                        http.join(2)
+                        request.join(2)
 
     def test_partial_server_receipt_cannot_supply_complete_usage(self):
         control = RequestControl();control.begin_request()

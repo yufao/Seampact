@@ -155,6 +155,26 @@ class ProjectChatTests(unittest.TestCase):
         host.run(task, [dict(role="user", content="use files")], Bound(), control=control)
         return task, bodies
 
+    def test_frozen_business_model_mismatch_rejects_before_task_admission(self):
+        identity = dict(connection_id="frozen", config_digest="digest", revision=2, model="test")
+        class ModelBound(Bound):
+            def role_profile(self, role):
+                return dict(super().role_profile(role), **identity)
+        body = dict(project_id=self.project, messages=[dict(role="user", content="question")])
+        with patch("seampact.chat.FrozenProfiles", ModelBound):
+            for field, value in (("connection_id", "other"), ("config_digest", "changed"),
+                                 ("revision", 3), ("model", "other-model")):
+                with self.subTest(field=field), self.assertRaisesRegex(ValueError, "冻结协议不一致"):
+                    self.jobs.start(body, expected_model=dict(identity, **{field: value}))
+            self.assertFalse(self.jobs._threads)
+            self.assertFalse(self.store.tasks_with_status("RUNNING"))
+            receipt = self.jobs.start(body, expected_model=identity)
+        thread = self.jobs._threads.get(receipt["task_id"])
+        if thread:
+            thread.join(3)
+            self.assertFalse(thread.is_alive())
+        self.assertEqual(self.store.get("task", receipt["task_id"])["status"], "COMPLETED")
+
     def test_real_pi_external_name_collision_namespaces_only_workspace_and_records_final_delivery(self):
         external_calls, checks = [], []
         native = dict(type="function", operation=dict(kind="read"), function=dict(name="list_files", description="Native cloud files",
@@ -282,6 +302,25 @@ class ProjectChatTests(unittest.TestCase):
         self.assertEqual(self.projects.session("old")["project_id"], self.project)
         self.projects.archive(self.project)
         self.assertEqual(self.jobs.conversation("old")["messages"][-1]["content"], "saved answer")
+
+    def test_legacy_unfinished_provider_proposal_does_not_enter_continuation(self):
+        messages = [dict(role="user", content="saved question")]
+        completed_call = completion(name="read_conversation_memory", identity="completed")["choices"][0]["message"]
+        completed_result = dict(role="tool", tool_call_id="completed", content="saved result")
+        partial_call = completion(name="read_conversation_memory", identity="partial")["choices"][0]["message"]
+        partial_call["tool_calls"][0]["function"]["arguments"] = "{"
+        wire = [dict(role="system", content="old prompt"), *messages, completed_call, completed_result, partial_call]
+        original = dict(id="old", phase="conversation", status="FAILED", started_at="2026-01-01",
+            error="模型响应未完成：length", messages=messages, wire_messages=wire, context_messages=wire,
+            events=[dict(kind="model_response_received", finish_reason="length")])
+        self.store.save("task", "old", original)
+        sent = []
+        self.jobs.transport.stream = lambda url, key, body, delta: sent.append(body) or completion("answer")
+        _, task = self.start(conversation_id="old", messages=messages + [dict(role="user", content="next")])
+        self.assertEqual(task["status"], "COMPLETED")
+        self.assertIn(completed_result, sent[0]["messages"])
+        self.assertNotIn("partial", json.dumps(sent[0]["messages"]))
+        self.assertEqual(self.store.get("task", "old"), original)
 
     def test_active_session_is_reserved_until_worker_ends(self):
         entered, release = threading.Event(), threading.Event()

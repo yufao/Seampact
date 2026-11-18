@@ -82,7 +82,9 @@ class PilotChecks(unittest.TestCase):
     def test_development_admission_routes_opted_in_checks_to_scheduler(self):
         case = dict(id="office-case", _source="privacy")
         plan = dict(project_id="project", deadline_s=30, development_selector="scheduler",
-                    manifest="manifest.json", manifest_sha256="digest", execution_timeout_s=None)
+                    manifest="manifest.json", manifest_sha256="digest", execution_timeout_s=None,
+                    max_model_turns=64,
+                    business_model=dict(connection_id="frozen", config_digest="digest", revision=2, model="model"))
         row = dict(id="run", protocol_sha256="identity", mode="development", status="RUNNING",
                    case_ids=[case["id"]], task_ids=["task"], admitted=[], application={})
         records = {("office_pilot", "run"): row}
@@ -94,6 +96,8 @@ class PilotChecks(unittest.TestCase):
             self.assertEqual(pilot_config["deadline_s"], 30)
             self.assertIn("execution_timeout_s", pilot_config)
             self.assertIsNone(pilot_config["execution_timeout_s"])
+            self.assertEqual(pilot_config["max_model_turns"], 64)
+            self.assertEqual(pilot_config["business_model"], plan["business_model"])
             self.assertEqual(internal_task_id, "task")
             return dict(task_id=internal_task_id)
         with patch("seampact.office_pilot._read_plan", return_value=("identity", plan, {case["id"]: case})), \
@@ -101,6 +105,64 @@ class PilotChecks(unittest.TestCase):
             result = handle(platform, dict(op="admit", run_id="run"))
         self.assertEqual(result["task_id"], "task")
         self.assertEqual(records[("office_pilot", "run")]["admitted"], ["task"])
+
+    def test_explicit_null_model_turn_limit_survives_pilot_admission(self):
+        case = dict(id="case", _source="privacy")
+        plan = dict(project_id="project", deadline_s=None, max_model_turns=None,
+                    manifest="manifest.json", manifest_sha256="digest")
+        row = dict(id="run", protocol_sha256="identity", mode="training_calibration", status="RUNNING",
+                   case_ids=["case"], task_ids=["task"], admitted=[], application={})
+        records = {("office_pilot", "run"): row}
+        store = SimpleNamespace(get=lambda kind, key: records.get((kind, key)),
+                                save=lambda kind, key, value: records.__setitem__((kind, key), value))
+        with patch("seampact.office_pilot._read_plan", return_value=("identity", plan, {"case": case})), \
+             patch("seampact.office_privacy.start_privacy_task", return_value=dict(task_id="task")) as admit:
+            handle(SimpleNamespace(store=store, execution=object()), dict(op="admit", run_id="run"))
+        supplied = admit.call_args.kwargs["pilot_config"]
+        self.assertIn("max_model_turns", supplied)
+        self.assertIsNone(supplied["max_model_turns"])
+
+    def test_native_tool_boundary_reaches_runtime_for_serial_and_parallel_admission(self):
+        case = dict(id="case", suite="workspace", user_task_id="user", split="training")
+        manifest = dict(protocol=dict(max_model_turns=12, timeout_s=900), cases=[case])
+        tools = [dict(type="function", function=dict(name="native_lookup", parameters={}))]
+        environment = SimpleNamespace(prompt="Native request", tool_specs=lambda: tools, execute=Mock(), identity={})
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "manifest.json"
+            content = json.dumps(manifest).encode()
+            path.write_bytes(content)
+            base = dict(project_id="project", deadline_s=None, manifest=str(path),
+                        manifest_sha256=hashlib.sha256(content).hexdigest())
+            scenarios = (({}, None), (dict(arrival_width=1), None),
+                         (dict(arrival_width=1, native_environment_only=False), None),
+                         (dict(arrival_width=1, native_environment_only=True), []),
+                         (dict(arrival_width=2), []),
+                         (dict(arrival_width=2, native_environment_only=False), []))
+            for declared, allowed in scenarios:
+                with self.subTest(declared=declared):
+                    plan = dict(base, **declared)
+                    row = dict(id="run", protocol_sha256="identity", mode="training_calibration", status="RUNNING",
+                               case_ids=["case"], task_ids=["task"], admitted=[], application={})
+                    records = {("office_pilot", "run"): row}
+                    store = SimpleNamespace(get=lambda kind, key: records.get((kind, key)),
+                        save=lambda kind, key, value: records.__setitem__((kind, key), value))
+                    platform = SimpleNamespace(store=store, execution=object(),
+                        capabilities=SimpleNamespace(public=lambda: []),
+                        deployments=SimpleNamespace(lock=threading.RLock()),
+                        projects=SimpleNamespace(lock=threading.RLock()),
+                        chat=SimpleNamespace(start=Mock(return_value=dict(task_id="task"))))
+                    with patch("seampact.office_pilot._read_plan", return_value=("identity", plan, {"case": case})), \
+                         patch("seampact.office_experiment.source_identity", return_value=dict(revision="fixture")), \
+                         patch("seampact.office_experiment.AgentDojoOfficeTask", return_value=environment), \
+                         patch("seampact.office_application.build_hooks", return_value={}):
+                        self.assertEqual(handle(platform, dict(op="admit", run_id="run"))["task_id"], "task")
+                    request = platform.chat.start.call_args.args[0]
+                    runtime = platform.chat.start.call_args.kwargs["runtime_options"]
+                    self.assertEqual(runtime["allowed_workspace_tools"], allowed)
+                    self.assertEqual(runtime["external_tools"], tools)
+                    self.assertIs(runtime["external_execute"], environment.execute)
+                    self.assertEqual(request["messages"], [dict(role="user", content=environment.prompt)])
+                    self.assertNotIn("native_environment_only", row["application"])
 
     def test_resource_rule_calibration_routes_the_application_heuristic(self):
         case = dict(id="risk-case", _source="privacy")
@@ -223,6 +285,34 @@ class PilotChecks(unittest.TestCase):
         self.assertEqual(result["status"], "UNSETTLED")
         self.assertEqual(records[("office_pilot_series", "identity")], series)
 
+    def test_abort_waits_for_the_owned_tasks_and_preserves_unreleased_workspace_evidence(self):
+        row = dict(id="run", protocol_sha256="identity", mode="training_calibration", batch=0,
+                   status="RUNNING", case_ids=["case", "next"], admitted=["task"])
+        task = dict(id="task", status="RUNNING")
+        records = {("office_pilot", "run"): row, ("task", "task"): task}
+        store = SimpleNamespace(get=lambda kind, key: copy.deepcopy(records.get((kind, key))),
+            save=lambda kind, key, value: records.__setitem__((kind, key), copy.deepcopy(value)))
+        execution = SimpleNamespace(workload=dict(id="other"),
+                                    finish_workload=Mock(return_value=dict(id="run", status="COMPLETE")))
+        chat = SimpleNamespace(cancel=Mock())
+        platform = SimpleNamespace(store=store, execution=execution, chat=chat)
+        request = dict(op="abort", run_id="run", reason="driver_error")
+        with patch("seampact.office_pilot._read_plan", return_value=("identity", {}, {})):
+            with self.assertRaisesRegex(ValueError, "当前拥有"):
+                handle(platform, request)
+            self.assertEqual(records[("office_pilot", "run")]["status"], "RUNNING")
+            execution.workload["id"] = "run"
+            self.assertEqual(handle(platform, request)["status"], "DRAINING")
+            chat.cancel.assert_called_once_with("task")
+            execution.finish_workload.assert_not_called()
+            task.update(status="CANCELLED", workspace_status="UNKNOWN")
+            settled = handle(platform, request)
+            self.assertEqual((settled["status"], settled["unreleased_task_ids"]), ("UNSETTLED", ["task"]))
+            self.assertEqual(handle(platform, request), settled)
+            execution.finish_workload.assert_called_once_with(abort_run_id="run")
+        self.assertEqual(records[("office_pilot_series", "identity")]["workloads"]["training_calibration:0"]["status"],
+                         "UNSETTLED")
+
     def test_frozen_policy_and_semantic_guard_stay_identical_across_arms(self):
         guard = dict(id="p", entry_id="new_source_entry", tool_name="guard_tool", runtime_group="g",
             capability=dict(guard=dict(kind="privacy", subjects=["message"],
@@ -281,6 +371,65 @@ class PilotChecks(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "Shared calibration"):
                 reuse_calibration(changed, measured, "source-digest")
 
+    def test_calibration_reuse_preserves_target_pareto_direction_and_smoothing(self):
+        from seampact.scheduling.unified_objective import freeze_objective
+        source_preference = dict(quality=.1, latency=.1, ram=.1, vram=.1, api=.6)
+        target_preference = dict(quality=.6, latency=.1, ram=.1, vram=.1, api=.1)
+        measured = dict(seed=7, scheduler=dict(objective=dict(
+            weights=dict(source_preference, delivery=0),
+            scales=dict(latency_s=10, ram_byte_s=20, vram_byte_s=30, api_tokens=40),
+            quality_evaluator="native", deadline_s=None, resource_source="measured",
+            pareto=dict(preference=source_preference, smoothing=.1))))
+        measured["development_evidence"] = dict(pool={"library": "frozen"},
+            scales=copy.deepcopy(measured["scheduler"]["objective"]["scales"]))
+        target = copy.deepcopy(measured)
+        target.pop("development_evidence")
+        target["objective_weights"] = dict(target_preference, delivery=0)
+        target["scheduler"]["objective"].update(
+            weights=target["objective_weights"], scales=dict(latency_s=1, ram_byte_s=1, vram_byte_s=1, api_tokens=1),
+            pareto=dict(preference=target_preference, smoothing=.25))
+        before_target, before_source = copy.deepcopy(target), copy.deepcopy(measured)
+        reused = reuse_calibration(target, measured, "source-digest")
+        objective = freeze_objective(reused["scheduler"]["objective"])
+        self.assertEqual(objective["pareto"], dict(preference=target_preference, smoothing=.25))
+        self.assertEqual(objective["weights"], target["objective_weights"])
+        self.assertEqual(objective["scales"], measured["development_evidence"]["scales"])
+        self.assertEqual(reused["development_evidence"]["reused_from_protocol_sha256"], "source-digest")
+        reused["scheduler"]["objective"]["pareto"]["preference"]["quality"] = 1
+        self.assertEqual(target, before_target)
+        self.assertEqual(measured, before_source)
+
+    def test_non_pareto_target_does_not_inherit_calibration_source_pareto(self):
+        from seampact.scheduling.unified_objective import freeze_objective
+        preference = dict(quality=.2, latency=.2, ram=.2, vram=.2, api=.2)
+        measured = dict(seed=7, scheduler=dict(objective=dict(
+            weights=dict(preference, delivery=0),
+            scales=dict(latency_s=10, ram_byte_s=20, vram_byte_s=30, api_tokens=40),
+            quality_evaluator="native", deadline_s=None, resource_source="measured",
+            pareto=dict(preference=preference, smoothing=.1))))
+        measured["development_evidence"] = dict(pool={"library": "frozen"},
+            scales=copy.deepcopy(measured["scheduler"]["objective"]["scales"]))
+        for explicit_objective in (True, False):
+            with self.subTest(explicit_objective=explicit_objective):
+                target = copy.deepcopy(measured)
+                target.pop("development_evidence")
+                target["objective_weights"] = dict(quality=1, delivery=0, latency=.1, ram=.1, vram=.1, api=.1)
+                if explicit_objective:
+                    target["scheduler"]["objective"].pop("pareto")
+                    target["scheduler"]["objective"]["weights"] = target["objective_weights"]
+                    target["scheduler"]["objective"].update(
+                        quality_evaluator="unmeasured-target", deadline_s=9, resource_source="reserved")
+                else:
+                    target["scheduler"]["objective"] = None
+                reused = reuse_calibration(target, measured, "source-digest")
+                objective = freeze_objective(reused["scheduler"]["objective"])
+                self.assertNotIn("pareto", objective)
+                self.assertEqual(objective["weights"], target["objective_weights"])
+                self.assertEqual(objective["scales"], measured["development_evidence"]["scales"])
+                for key in ("quality_evaluator", "deadline_s", "resource_source"):
+                    self.assertEqual(objective[key], measured["scheduler"]["objective"][key])
+                self.assertIn("pareto", measured["scheduler"]["objective"])
+
     def test_native_quality_keeps_unknown_and_separate_attack_semantics(self):
         self.assertEqual(pilot_quality(dict(utility=True, attack_success=None), False), 1.0)
         self.assertEqual(pilot_quality(dict(utility=False, attack_success=None), False), 0.0)
@@ -312,6 +461,33 @@ class PilotChecks(unittest.TestCase):
             protocol.write_text(json.dumps(plan), encoding="utf-8")
             body = dict(protocol=str(protocol), protocol_sha256=hashlib.sha256(protocol.read_bytes()).hexdigest())
             self.assertEqual(len(_read_plan(body)[2]), 20)
+            self.assertNotIn("native_environment_only", _read_plan(body)[1])
+            for explicit in (True, False):
+                plan["native_environment_only"] = explicit
+                protocol.write_text(json.dumps(plan), encoding="utf-8")
+                body["protocol_sha256"] = hashlib.sha256(protocol.read_bytes()).hexdigest()
+                self.assertIs(_read_plan(body)[1]["native_environment_only"], explicit)
+            for invalid in (None, 0, 1, "true", [], {}):
+                plan["native_environment_only"] = invalid
+                protocol.write_text(json.dumps(plan), encoding="utf-8")
+                body["protocol_sha256"] = hashlib.sha256(protocol.read_bytes()).hexdigest()
+                with self.subTest(native_environment_only=invalid), self.assertRaisesRegex(ValueError, "native_environment_only"):
+                    _read_plan(body)
+            plan.pop("native_environment_only")
+            protocol.write_text(json.dumps(plan), encoding="utf-8")
+            body["protocol_sha256"] = hashlib.sha256(protocol.read_bytes()).hexdigest()
+            self.assertNotIn("max_model_turns", _read_plan(body)[1])
+            plan["max_model_turns"] = None
+            protocol.write_text(json.dumps(plan), encoding="utf-8")
+            body["protocol_sha256"] = hashlib.sha256(protocol.read_bytes()).hexdigest()
+            self.assertIsNone(_read_plan(body)[1]["max_model_turns"])
+            for invalid in (False, 0, -1, 1.5, "15"):
+                plan["max_model_turns"] = invalid
+                protocol.write_text(json.dumps(plan), encoding="utf-8")
+                body["protocol_sha256"] = hashlib.sha256(protocol.read_bytes()).hexdigest()
+                with self.subTest(limit=invalid), self.assertRaisesRegex(ValueError, "max_model_turns"):
+                    _read_plan(body)
+            plan.pop("max_model_turns")
             plan.update(schema="seampact.office-comparison/1", training_batch_size=6)
             selections["development"] *= 4
             selections["training"] *= 8

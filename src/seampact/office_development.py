@@ -3,6 +3,7 @@ import hashlib
 import json
 from pathlib import Path
 
+from seampact.agent_runtime import model_turn_limit
 from seampact.office_application import build_hooks
 from seampact.office_privacy import SimulatedOfficeTask
 
@@ -32,7 +33,8 @@ def grading_by_case(source, location, runtime):
 def start_development_task(platform, body, *, internal_task_id, pilot_config):
     case, project_id = body["case"], body["project_id"]
     reference = case["_grading"]
-    options = dict(max_model_turns=15, allowed_capabilities=[], allowed_workspace_tools=["list_files", "read_file"])
+    options = dict(max_model_turns=model_turn_limit(pilot_config.get("max_model_turns")),
+                   allowed_capabilities=[], allowed_workspace_tools=["list_files", "read_file"])
     source = case["_source"]
     if source in {"office_summedits", "office_links"}:
         from seampact.office_links import score_office_links
@@ -59,7 +61,8 @@ def start_development_task(platform, body, *, internal_task_id, pilot_config):
         return platform.chat.start(
             dict(project_id=project_id, messages=[dict(role="user", content=prompt)], deadline_s=pilot_config["deadline_s"],
                  **({"execution_timeout_s": pilot_config["execution_timeout_s"]} if "execution_timeout_s" in pilot_config else {})),
-            runtime_options=options, input_files=files, internal_task_id=internal_task_id,
+            runtime_options=options, expected_model=pilot_config.get("business_model"),
+            input_files=files, internal_task_id=internal_task_id,
             capability_snapshot=platform.capabilities.public(), apply_project_application=False,
             metadata=dict(arm=pilot_config["mode"], case=case["id"], family_id=case["family_id"],
                           source=case["_source"], fixture_sha256=case["_manifest"]["manifest_sha256"]))

@@ -6,6 +6,7 @@ an optional-hook selector can only omit hooks explicitly marked optional.
 """
 
 import copy
+import hashlib
 import inspect
 import json
 import math
@@ -14,7 +15,8 @@ import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 
-from seampact.api_accounting import private_receipt, summarize as summarize_api_usage
+from seampact.api_accounting import (PROGRESS_RECORD_LIMIT, private_progress, private_receipt,
+                                    summarize as summarize_api_usage)
 from seampact.context_memory import ContextMemory, context_limits
 from seampact.pi_runtime import PiHost
 from seampact.providers import RequestCancelled, RequestControl, Transport, completion_body
@@ -111,6 +113,15 @@ def execution_budget(task):
     return task.get("execution_timeout_s", task.get("deadline_s")), unlimited
 
 
+def model_turn_limit(value):
+    """A positive integer caps model turns; explicit None leaves them uncapped."""
+    if value is None:
+        return None
+    if type(value) is not int or value < 1:
+        raise ValueError("max_model_turns 需要正整数或 null")
+    return value
+
+
 class RunControl:
     """Cancellation requests and observed outcomes, never an assumed remote stop."""
     def __init__(self):
@@ -133,6 +144,8 @@ class RunControl:
         return RequestControl(deadline_at=self.deadline_at, on_deadline=self.cancel, unlimited=self.unlimited_execution)
 
     def check(self):
+        if self.deadline_at is not None and time.monotonic() >= self.deadline_at:
+            self.cancel()
         if self.cancelled.is_set():
             raise RequestCancelled()
 
@@ -142,7 +155,11 @@ class RunControl:
             cancelled = self.cancelled.is_set()
         if cancelled:
             request.cancel()
-        self.check()
+
+    def detach_request(self, request):
+        with self.lock:
+            if self.request is request:
+                self.request = None
 
     def attach_call(self, call_id, cancel):
         with self.lock:
@@ -254,7 +271,7 @@ def close_pending(items):
 class AgentRuntime:
     def __init__(self, store, catalog, *, transport=None, dispatch=None, hooks=(),
                  optional_hooks=None, connection=None, scheduler=None, projects=None, code_execution=None,
-                 external_tools=(), external_execute=None, system_prompt=None, max_model_turns=40,
+                 external_tools=(), external_execute=None, system_prompt=None, max_model_turns=None,
                  allowed_capabilities=None, allowed_workspace_tools=None, evaluator=None,
                  internal_tool_text=False):
         self.store, self.catalog = store, catalog
@@ -269,9 +286,7 @@ class AgentRuntime:
         self.external_tools = tuple(copy.deepcopy(external_tools))
         self.external_execute = external_execute
         self.system_prompt = SYSTEM_PROMPT if system_prompt is None else system_prompt
-        if type(max_model_turns) is not int or max_model_turns < 1:
-            raise ValueError("max_model_turns 需要正整数")
-        self.max_model_turns = max_model_turns
+        self.max_model_turns = model_turn_limit(max_model_turns)
         self.allowed_capabilities = None if allowed_capabilities is None else frozenset(allowed_capabilities)
         self.allowed_workspace_tools = None if allowed_workspace_tools is None else frozenset(allowed_workspace_tools)
         if self.allowed_workspace_tools is not None and self.allowed_workspace_tools - set(WorkspaceTools.names(True)):
@@ -304,11 +319,18 @@ class AgentRuntime:
         task.setdefault("model_calls", 0)
         task.setdefault("usage", [])
         task["capability_usage"] = []
+        task["capability_progress"] = []
+        task["capability_progress_dropped"] = 0
         task.setdefault("calls", [])
         task.setdefault("files", [])
         task["events"] = []
         task["context_events"] = []
         task["generation"] = dict(received_chars=0, delivered_chars=0)
+        task["model_progress"] = dict(max_model_turns=self.max_model_turns, model_turns=0, responses=0,
+            repeated_responses=0, consecutive_identical_responses=0, successful_tool_receipts=0,
+            tool_errors=0, last_finish_reason=None,
+            repetition_basis="visible_text_and_tool_proposals_without_call_ids")
+        task["generation_termination"] = None
         task["response"] = None
         task["final_response"] = None
         task["delivery_revision"] = dict(attempts=0, limit=1, status="NOT_REQUESTED")
@@ -328,7 +350,9 @@ class AgentRuntime:
         def emit(kind, **facts):
             event = dict(kind=kind, run_id=task["id"], at=now(), **facts)
             # Keep token observations compact in the durable task record.
-            if kind not in {"content_received", "delta", "model_message", "tool_receipt", "tool_observation"}:
+            progress_event = (kind == "capability_event" and isinstance(facts.get("event"), dict)
+                              and facts["event"].get("kind") == "model_progress")
+            if not progress_event and kind not in {"content_received", "delta", "model_message", "tool_receipt", "tool_observation"}:
                 task["events"].append(copy.deepcopy(event))
             if on_event:
                 on_event(copy.deepcopy(event))
@@ -356,6 +380,19 @@ class AgentRuntime:
                         usage_record["model_usage"].append(dict(call_id=identity, data=private_receipt(data)))
                     else:
                         usage_record["model_usage"].append(copy.deepcopy(value))
+                if value.get("kind") == "model_progress":
+                    # Persist a separate bounded record while the model call is
+                    # still running. Progress never enters token accounting.
+                    cleaned = {k: value[k] for k in ("kind", "call_id", "unit_id", "instance_id", "generation") if k in value}
+                    cleaned["data"] = private_progress(value.get("data"))
+                    task["capability_progress"].append(copy.deepcopy(cleaned))
+                    excess = len(task["capability_progress"]) - PROGRESS_RECORD_LIMIT
+                    if excess > 0:
+                        del task["capability_progress"][:excess]
+                        task["capability_progress_dropped"] += excess
+                    save()
+                    emit("capability_event", event=cleaned)
+                    return
                 public_event = ({k: value[k] for k in ("kind", "call_id", "unit_id", "instance_id", "generation")
                                  if k in value} if private_events else value)
                 emit("capability_event", event=public_event)
@@ -537,25 +574,83 @@ class AgentRuntime:
             options = {"on_event": emit} if "on_event" in inspect.signature(self.connection).parameters else {}
             return self.connection("chat", profiles, task["id"], **options)
 
+        def model_attempt(provider, key, body, on_delta=None, *, stream=False, include_usage=True, purpose="generation"):
+            control.check()
+            request = control.model_request()
+            control.attach_request(request)
+            request_id = request.begin_request()
+            url = provider["base_url"].rstrip("/") + "/chat/completions"
+            index = task["model_calls"] + 1
+            task["model_calls"] = index
+            task["usage"].append(None)
+            started_at = time.perf_counter()
+
+            def receive(text):
+                request.progress(text)
+                on_delta(text)
+
+            try:
+                save()
+                emit("model_started", request_index=index, stream=stream, request_id=request_id, purpose=purpose)
+                request.check()
+                method = self.transport.stream if stream else self.transport.send
+                options = {"control": request} if "control" in inspect.signature(method).parameters else {}
+                if stream:
+                    if not include_usage:
+                        options["include_usage"] = False
+                    response = method(url, key, body, receive, **options)
+                else:
+                    response = method(url, key, body, **options)
+                task["usage"][-1] = copy.deepcopy(response.get("usage"))
+                request.progress(True)
+                choice = response["choices"][0]
+                message = choice["message"]
+                if not stream and on_delta is not None:
+                    text = message.get("content")
+                    if isinstance(text, str) and text:
+                        receive(text)
+                fields = response.get("_seampact_response_fields")
+                if fields is None:
+                    fields = dict(transport="json", fields={name: dict(chars=len(value) if isinstance(value, str) else 0,
+                        types=[type(value).__name__]) for name, value in message.items()
+                        if name in {"content", "reasoning_content", "reasoning"}})
+                save()
+                emit("model_response_received", request_index=index, request_id=request_id, purpose=purpose,
+                     provider_request_id=response.get("id"), request_elapsed_s=time.perf_counter() - started_at,
+                     finish_reason=choice.get("finish_reason"), response_fields=copy.deepcopy(fields),
+                     usage=copy.deepcopy(response.get("usage")))
+                return response
+            except Exception as error:
+                if request.accepted or request.received:
+                    error.received_response = True
+                if task["usage"][-1] is None:
+                    recovered = request.response_usage
+                    provenance = "terminal_response_usage"
+                    if recovered is None:
+                        recover = getattr(self.transport, "recover_usage", None)
+                        recovered = recover(request) if recover is not None else None
+                        provenance = "completed_server_receipt"
+                    if recovered is not None:
+                        task["usage"][-1] = recovered
+                        error.received_response = True
+                        emit("model_usage_recovered", request_index=index, request_id=request_id, purpose=purpose,
+                             usage=copy.deepcopy(recovered), provenance=provenance)
+                emit("model_request_failed", request_index=index, request_id=request_id, purpose=purpose,
+                     request_elapsed_s=time.perf_counter() - started_at,
+                     error_type=type(error).__name__, error_kind=getattr(error, "kind", None))
+                save()
+                raise
+            finally:
+                control.detach_request(request)
+
         def summarize(summary_messages, summary_profile):
             control.check()
-            task["model_calls"] += 1
-            task["usage"].append(None)
-            save()
-            with connection() as (profile, key):
-                request = control.model_request()
-                control.attach_request(request)
-                options = {"control": request} if "control" in inspect.signature(self.transport.send).parameters else {}
-                try:
-                    return self.transport.send(profile["base_url"].rstrip("/") + "/chat/completions", key,
-                                               completion_body(summary_profile, summary_messages), **options)
-                finally:
-                    with control.lock:
-                        control.request = None
+            with connection() as (provider, key):
+                return model_attempt(provider, key, completion_body(summary_profile, summary_messages),
+                                     purpose="context_compaction")
 
         def record(event):
             task["context_events"].append(event)
-            task["usage"][-1] = event.get("usage")
             save()
 
         try:
@@ -580,6 +675,8 @@ class AgentRuntime:
                 task["execution"] = self.scheduler.begin(task["id"], deadline_s=task.get("deadline_s"),
                                                        metadata=dict(conversation_id=task.get("conversation_id"),
                                                                      project_id=task.get("project_id")))
+                if (task["execution"] or {}).get("policy_version"):
+                    task["policy_version"] = copy.deepcopy(task["execution"]["policy_version"])
                 begin_recorded = True
             control.check()
             emit("input_received", messages=copy.deepcopy(messages))
@@ -666,10 +763,7 @@ class AgentRuntime:
             def request_model(request):
                 hooks("model_context", dict(tool_messages=[dict(call_id=m.get("tool_call_id"), content=m.get("content"))
                                    for m in request if m.get("role") == "tool"]))
-                received = False
                 def delta(text):
-                    nonlocal received
-                    received = True
                     control.check()
                     current.append(text)
                     task["generation"]["received_chars"] += len(text)
@@ -679,86 +773,35 @@ class AgentRuntime:
                     stream_delta(text)
                 with connection() as (bound_profile, key):
                     body = completion_body(bound_profile, request, offered)
-                    url = bound_profile["base_url"].rstrip("/") + "/chat/completions"
-                    request_control = control.model_request()
-                    control.attach_request(request_control)
-                    def invoke_model(stream=True, include_usage=True):
-                        control.check()
-                        task["model_calls"] += 1
-                        task["usage"].append(None)
-                        save()
-                        request_id = request_control.begin_request()
-                        emit("model_started", request_index=task["model_calls"], stream=stream, request_id=request_id)
-                        request_started = time.perf_counter()
-                        try:
-                            if not stream:
-                                options = {"control": request_control} if "control" in inspect.signature(self.transport.send).parameters else {}
-                                response = self.transport.send(url, key, body, **options)
-                                text = response["choices"][0]["message"].get("content")
-                                if isinstance(text, str) and text:
-                                    delta(text)
-                            else:
-                                options = {} if include_usage else {"include_usage": False}
-                                if "control" in inspect.signature(self.transport.stream).parameters:
-                                    options["control"] = request_control
-                                response = self.transport.stream(url, key, body, delta, **options)
-                        except Exception as error:
-                            recover = getattr(self.transport, 'recover_usage', None)
-                            recovered = recover(request_control) if recover is not None else None
-                            if recovered is not None:
-                                task['usage'][-1] = recovered
-                                emit('model_usage_recovered', request_index=task['model_calls'],
-                                     request_id=request_id, usage=copy.deepcopy(recovered),
-                                     provenance='completed_server_receipt')
-                            emit("model_request_failed", request_index=task["model_calls"],
-                                 request_id=request_id,
-                                 request_elapsed_s=time.perf_counter() - request_started,
-                                 error_type=type(error).__name__)
-                            raise
-                        choice = response["choices"][0]
-                        message = choice["message"]
-                        fields = response.get("_seampact_response_fields")
-                        if fields is None:
-                            fields = dict(transport="json", fields={name: dict(
-                                chars=len(value) if isinstance(value, str) else 0,
-                                types=[type(value).__name__]) for name, value in message.items()
-                                if name in {"content", "reasoning_content", "reasoning"}})
-                        emit("model_response_received", request_index=task["model_calls"],
-                             request_id=request_id, provider_request_id=response.get('id'),
-                             request_elapsed_s=time.perf_counter() - request_started,
-                             finish_reason=choice.get("finish_reason"), response_fields=copy.deepcopy(fields),
-                             usage=copy.deepcopy(response.get("usage")))
-                        return response
                     try:
                         try:
-                            response = invoke_model()
+                            return model_attempt(bound_profile, key, body, delta, stream=True)
                         except Exception as error:
-                            if received or request_control.received or getattr(error, "kind", None) != "stream_options_unsupported":
+                            if getattr(error, "received_response", False) or getattr(error, "kind", None) != "stream_options_unsupported":
                                 raise
-                            response = invoke_model(include_usage=False)
+                            return model_attempt(bound_profile, key, body, delta, stream=True, include_usage=False)
                     except Exception as error:
-                        if request_control.received or received:
-                            error.received_response = True
-                        if received or request_control.received or getattr(error, "kind", None) != "stream_unsupported":
+                        if getattr(error, "received_response", False) or getattr(error, "kind", None) != "stream_unsupported":
                             raise
-                        response = invoke_model(stream=False)
-                    finally:
-                        with control.lock:
-                            control.request = None
-                    task["usage"][-1] = response.get("usage")
-                    return response
+                        return model_attempt(bound_profile, key, body, delta)
 
             stream_delta = None
+            response_fingerprints, last_response_fingerprint = set(), None
             def model_callback(params, on_delta):
-                nonlocal active, forced, model_turns, stream_delta
+                nonlocal active, forced, model_turns, stream_delta, last_response_fingerprint
                 control.check()
-                model_turns += 1
-                if model_turns > self.max_model_turns:
+                if self.max_model_turns is not None and model_turns >= self.max_model_turns:
+                    task["generation_termination"] = dict(kind="model_turn_limit", model_turns=model_turns,
+                        max_model_turns=self.max_model_turns, recovery_policy="stop_without_replay",
+                        recovery_attempted=False)
+                    emit("model_terminated", termination=copy.deepcopy(task["generation_termination"]))
                     if task["delivery_revision"]["attempts"]:
                         task["delivery_revision"]["status"] = "EXHAUSTED"
                         emit("delivery_revision_exhausted", reason="model_turn_limit")
                         raise DeliveryBlocked("当前模型轮次预算不足，已停止未通过检查的交付")
                     raise RuntimeError("Pi Agent 达到本任务模型轮次上限")
+                model_turns += 1
+                task["model_progress"]["model_turns"] = model_turns
                 current.clear()
                 delivery_start = len(displayed)
                 stream_delta = on_delta
@@ -788,6 +831,17 @@ class AgentRuntime:
                 choice = response["choices"][0]
                 message = copy.deepcopy(choice["message"])
                 message.setdefault("role", "assistant")
+                progress = task["model_progress"]
+                fingerprint = hashlib.sha256(json.dumps(dict(content=message.get("content"), tool_calls=[
+                    dict(name=call.get("function", {}).get("name"), arguments=call.get("function", {}).get("arguments"))
+                    for call in message.get("tool_calls") or []]), sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+                progress["responses"] += 1
+                progress["repeated_responses"] += int(fingerprint in response_fingerprints)
+                progress["consecutive_identical_responses"] = (
+                    progress["consecutive_identical_responses"] + 1 if fingerprint == last_response_fingerprint else 1)
+                progress["last_finish_reason"] = choice.get("finish_reason")
+                response_fingerprints.add(fingerprint)
+                last_response_fingerprint = fingerprint
                 emit("model_message", message=copy.deepcopy(message))
                 # Injectable compatible transports may return a body without callbacks.
                 if not current and isinstance(message.get("content"), str) and message["content"]:
@@ -797,14 +851,24 @@ class AgentRuntime:
                     if not full_delivery:
                         deliver(message["content"])
                     on_delta(message["content"])
+                if choice.get("finish_reason") not in {"stop", "tool_calls", None}:
+                    # A partial proposal is useful evidence, but belongs outside
+                    # the continuation so it never looks like an executed call.
+                    task["incomplete_model_message"] = message
+                    task["generation_termination"] = dict(
+                        kind="provider_length" if choice.get("finish_reason") == "length" else "provider_incomplete",
+                        finish_reason=choice.get("finish_reason"), model_turns=model_turns,
+                        max_model_turns=self.max_model_turns, content_chars=len("".join(current)),
+                        tool_proposals=len(message.get("tool_calls") or []),
+                        recovery_policy="stop_without_replay", recovery_attempted=False)
+                    emit("model_terminated", termination=copy.deepcopy(task["generation_termination"]))
+                    raise ValueError("模型响应未完成：" + str(choice.get("finish_reason")))
                 candidate_index = len(wire)
                 if full_delivery and not message.get("tool_calls"):
                     undelivered_candidates.add(candidate_index)
                 wire.append(copy.deepcopy(message))
                 active.append(copy.deepcopy(message))
                 save_messages()
-                if choice.get("finish_reason") not in {"stop", "tool_calls", None}:
-                    raise ValueError("模型响应未完成：" + str(choice.get("finish_reason")))
                 if task["delivery_revision"]["attempts"] and message.get("tool_calls"):
                     task["delivery_revision"]["status"] = "EXHAUSTED"
                     emit("delivery_revision_exhausted", reason="revision_requested_tools")
@@ -871,6 +935,7 @@ class AgentRuntime:
                     else:
                         result = invoke(self.catalog.name_to_id(name), arguments)
                     effect_succeeded = not (isinstance(result, dict) and bool(result.get("error")))
+                    task["model_progress"]["successful_tool_receipts"] += int(effect_succeeded)
                     emit("tool_receipt", **payload, result=result)
                     result = hooks("after_tool", dict(payload, result=result))["result"]
                     is_error = isinstance(result, dict) and bool(result.get("error"))
@@ -897,6 +962,7 @@ class AgentRuntime:
                     is_error = True
                     emit("tool_result", **payload, result=result)
                 control.check()
+                task["model_progress"]["tool_errors"] += int(is_error)
                 if name in external_names:
                     # Only native content/error is an observation; hidden scorer fields stay outside it.
                     visible = (result.get("error") or result.get("content", "")) if isinstance(result, dict) else result

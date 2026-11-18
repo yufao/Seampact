@@ -47,7 +47,8 @@ def freeze_objective(value):
         value["deadline_s"] = number(value["deadline_s"], "deadline_s", positive=True)
     if "pareto" in value:
         pareto = value["pareto"]
-        if not isinstance(pareto, dict) or set(pareto) != {"preference", "smoothing"}:
+        if (not isinstance(pareto, dict) or not {"preference", "smoothing"} <= set(pareto)
+                or set(pareto) - {"preference", "smoothing", "mode", "calibration"}):
             raise ValueError("帕累托目标须明确搜索方向 preference 与平滑参数 smoothing")
         preference = pareto["preference"]
         dimensions = ("quality", "latency", "ram", "vram", "api")
@@ -57,6 +58,24 @@ def freeze_objective(value):
         if not math.isclose(sum(pareto["preference"].values()), 1.0, rel_tol=0, abs_tol=1e-9):
             raise ValueError("帕累托搜索方向各项之和须为1")
         pareto["smoothing"] = number(pareto["smoothing"], "smoothing", positive=True)
+        mode = pareto.get("mode", "adaptive_stch")
+        if mode not in {"adaptive_stch", "fixed_calibrated"}:
+            raise ValueError("帕累托 mode 须为 adaptive_stch 或 fixed_calibrated")
+        if mode == "fixed_calibrated":
+            calibration = pareto.get("calibration")
+            if not isinstance(calibration, dict) or set(calibration) != {"normalized_means", "source_id"}:
+                raise ValueError("固定五头消融须提供校准 normalized_means 与 source_id")
+            means, source_id = calibration["normalized_means"], calibration["source_id"]
+            if not isinstance(means, dict) or set(means) != set(dimensions):
+                raise ValueError("校准 normalized_means 须包括五项无量纲均值")
+            calibration["normalized_means"] = {key: number(means[key], "calibration." + key) for key in dimensions}
+            if calibration["normalized_means"]["quality"] > 1:
+                raise ValueError("校准原生质量均值须位于 [0,1]")
+            if (not isinstance(source_id, str) or not source_id.startswith("sha256:") or len(source_id) != 71
+                    or any(char not in "0123456789abcdef" for char in source_id[7:])):
+                raise ValueError("校准 source_id 须绑定冻结证据 sha256:<64位小写hex>")
+        elif "calibration" in pareto:
+            raise ValueError("adaptive_stch 不使用固定校准系数")
         if any(value["weights"][key] != preference.get(key, 0) for key in TERMS):
             raise ValueError("帕累托 weights 仅作为搜索方向的线性参照，须与 preference 相同，delivery 为0")
     value["schema"] = SCHEMA

@@ -11,6 +11,7 @@ import copy
 import hashlib
 import http.client
 import json
+import math
 from pathlib import Path
 import socket
 import subprocess
@@ -19,6 +20,7 @@ import threading
 import time
 import uuid
 from urllib.error import HTTPError
+from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
@@ -28,6 +30,10 @@ from seampact.office_pilot import workload_cases
 MODEL_WAIT_TIMEOUT_S = 300.0
 MODEL_WAIT_POLL_S = 2.0
 MODEL_PROBE_TIMEOUT_S = 3.0
+
+
+class SettledWorkloadError(RuntimeError):
+    """The driver failed its evidence gate after confirming the workload drained."""
 
 
 class UnixHTTPConnection(http.client.HTTPConnection):
@@ -197,6 +203,7 @@ def combined_summary(workloads):
 
 
 def reuse_calibration(plan, previous, previous_sha):
+    """Reuse measured cost units while retaining the target's objective mode."""
     def comparable(value):
         value = copy.deepcopy(value)
         for key in ("objective_weights", "reward_sweep", "development_evidence", "parent_transfer"):
@@ -212,7 +219,13 @@ def reuse_calibration(plan, previous, previous_sha):
     if not objective or not evidence or not matching_scales or not evidence.get("pool"):
         raise ValueError("Shared calibration needs a real frozen development result")
     result = copy.deepcopy(plan)
-    result["scheduler"]["objective"] = dict(copy.deepcopy(objective), weights=copy.deepcopy(plan["objective_weights"]))
+    reused_objective = dict(copy.deepcopy(objective), weights=copy.deepcopy(plan["objective_weights"]))
+    target = plan["scheduler"].get("objective") or {}
+    if "pareto" in target:
+        reused_objective["pareto"] = copy.deepcopy(target["pareto"])
+    else:
+        reused_objective.pop("pareto", None)
+    result["scheduler"]["objective"] = reused_objective
     result["development_evidence"] = dict(copy.deepcopy(evidence), reused_from_protocol_sha256=previous_sha)
     return result
 
@@ -259,13 +272,18 @@ def main():
                         help="for full parent transfer only: verify the parent protocol and retain its objective and scales")
     parser.add_argument("--include-rule-baseline", action="store_true", help="also score the development rule baseline when reusing scales")
     parser.add_argument("--admission-deadline", type=float, help="Unix time to finish at the next dispatch block boundary")
+    parser.add_argument("--drain-timeout-s", type=float, default=180,
+                        help="seconds to wait for confirmed workload release after admissions close")
     parser.add_argument("--wait-model-socket", type=Path, action="append", metavar="SOCKET",
                         help="repeatable Unix socket whose /health endpoint must be ready before each training dispatch block")
     parser.add_argument("--resume-training", action="store_true", help="resume a safely paused training protocol into a new output directory")
     parser.add_argument("--attach-training", metavar="RUN_ID", help="continue an existing live continuous training run after its admitted prefix is settled")
     parser.add_argument("--stop-on-missing-api-usage", action="store_true",
-                        help="stop continuous training at a completed dispatch block if API accounting is missing")
+                        help="stop calibration or continuous training at a completed dispatch block if API accounting is missing")
     args = parser.parse_args()
+    if (args.admission_deadline is not None and not math.isfinite(args.admission_deadline)
+            or not math.isfinite(args.drain_timeout_s) or args.drain_timeout_s <= 0):
+        raise ValueError("Admission deadline and positive drain timeout must be finite")
     plan = json.loads(args.protocol.read_text(encoding="utf-8"))
     if plan.get("schema") not in {"seampact.office-pilot/1", "seampact.office-comparison/1"}:
         raise ValueError("Unsupported pilot protocol")
@@ -335,11 +353,11 @@ def main():
         write(args.output / "budget-stop.json", dict(deadline=args.admission_deadline, **progress))
         raise SystemExit(75)
 
-    def api(path, body=None):
+    def api(path, body=None, *, timeout=180):
         request = Request(args.url + path, data=json.dumps(body).encode("utf-8") if body is not None else None,
                           headers={"Content-Type": "application/json"})
         try:
-            with urlopen(request, timeout=180) as response:
+            with urlopen(request, timeout=timeout) as response:
                 return json.load(response)
         except HTTPError as error:
             raise RuntimeError(error.read().decode("utf-8", errors="replace")) from error
@@ -380,7 +398,50 @@ def main():
             result = api("/api/experiments/office/pilot", dict(common,
                 op="resume" if mode == "training" and args.resume_training else "start", mode=mode, batch=batch))
         run_id = result["id"]
-        write(args.output / (prefix + "-start.json"), result)
+        owns_run = not args.attach_training
+        def claim_run():
+            nonlocal owns_run
+            owns_run = True
+        try:
+            write(args.output / (prefix + "-start.json"), result)
+            return drive(protocol, mode, batch, common, result, wait_models, claim_run)
+        except SettledWorkloadError:
+            raise
+        except (Exception, KeyboardInterrupt) as error:
+            error_path = args.output / (prefix + "-error.json")
+            failure = json.loads(error_path.read_text(encoding="utf-8")) if error_path.is_file() else {}
+            failure.update(run_id=run_id, error=str(error), error_type=type(error).__name__)
+            write(error_path, failure)
+            if owns_run:
+                try:
+                    wait_for_drain(common, run_id, "abort", args.output / (prefix + "-abort.json"), reason="driver_error")
+                except Exception as cleanup_error:
+                    failure.update(cleanup_status="UNCONFIRMED", cleanup_error=str(cleanup_error))
+                    write(error_path, failure)
+            raise
+
+    def wait_for_drain(common, run_id, operation, receipt, **fields):
+        until = time.monotonic() + args.drain_timeout_s
+        while (remaining := until - time.monotonic()) > 0:
+            state = api("/api/experiments/office/pilot", dict(common, op=operation, run_id=run_id, **fields),
+                        timeout=min(180, remaining))
+            write(receipt, state)
+            if state["status"] != "DRAINING":
+                return state
+            time.sleep(max(0, min(2, until - time.monotonic())))
+        raise RuntimeError("Workload release could not be confirmed before the drain timeout")
+
+    def drive(protocol, mode, batch, common, result, wait_models, claim_run):
+        run_id = result["id"]
+        prefix = mode + "-" + str(batch)
+
+        def end_empty(reason, **progress):
+            stopped = wait_for_drain(common, run_id, "abort", args.output / (prefix + "-abort.json"), reason=reason)
+            if stopped["status"] != "PARTIAL" or stopped["admitted"]:
+                raise RuntimeError("The empty workload did not settle")
+            end_at_budget(mode=mode, batch=batch, run_id=run_id, admitted=0, next_index=0,
+                          stop_reason=reason, empty_prefix=True, **progress)
+
         def confirm_workspace(task_id, index):
             from office_task_workspace import ensure_workspace_finished
             def evidence(event):
@@ -389,6 +450,7 @@ def main():
             return ensure_workspace_finished(api, task_id, evidence=evidence)
         pending_scores = []
         continuous = mode == "training" and plan.get("continuous_training")
+        calibrating = not frozen_inference and mode == normalization
         scoring = ThreadPoolExecutor(max_workers=1) if continuous and grader is not None else None
         score_futures = []
         def grade_one(index, task_id, folder):
@@ -412,9 +474,19 @@ def main():
         model_wait_stop = None
         api_gap = []
         checked_through = 0
-        check_api = bool(args.stop_on_missing_api_usage and args.training_only and continuous
-                         and (plan.get("scheduler", {}).get("objective") or {}).get("weights", {}).get("api", 0) > 0)
+        objective = plan.get("scheduler", {}).get("objective")
+        api_weight = ((objective or {}).get("weights", {}).get("api", 0) if objective is not None else
+                      plan.get("objective_weights", {}).get("api", .1))
+        check_api = bool(args.stop_on_missing_api_usage and api_weight > 0
+                         and (calibrating or args.training_only and continuous))
         def inspect_api(start, end):
+            if calibrating:
+                # Complete scoring only after this whole business block ends,
+                # before timed_admissions starts the next block's clock.
+                # Do not overlap calibration grading with business execution.
+                while pending_scores:
+                    grade_one(*pending_scores[0])
+                    pending_scores.pop(0)
             for future in score_futures:
                 future.result()
             tasks = []
@@ -427,7 +499,7 @@ def main():
             workload = result.get("workload") or {}
             original_cases = workload_cases(plan, "training")[batch]
             expected = original_cases[result.get("start_index", 0):]
-            if (result.get("id") != args.attach_training or result.get("protocol_sha256") != checksum
+            if (result.get("id") != args.attach_training or result.get("protocol_sha256") != common["protocol_sha256"]
                     or result.get("mode") != "training" or result.get("status") != "RUNNING"
                     or result["case_ids"] != expected or len(result["task_ids"]) != len(expected)
                     or len(set(result["task_ids"])) != len(expected)
@@ -470,6 +542,7 @@ def main():
             latest = api("/api/experiments/office/pilot", dict(common, op="record", run_id=run_id))
             if latest.get("status") != "RUNNING" or latest.get("admitted") != result["admitted"]:
                 raise ValueError("Admissions changed during attach; stop other dispatchers and retry")
+            claim_run()
             blocks = [block for block in blocks if block["indices"][0] >= start_index]
             write(args.output / "attach-preflight.json", dict(run_id=run_id, admitted=start_index,
                   session=live["session"], config_id=live["config_id"], pool=pool))
@@ -492,9 +565,8 @@ def main():
                         stopped_at = start_index
                     else:
                         write(args.output / "model-wait-stop.json", model_wait_stop)
-                        end_at_budget(mode=mode, batch=batch, run_id=run_id, admitted=0, next_index=0,
-                            stop_reason=stop_reason, recovery_required=model_wait_stop["recovery_required"],
-                            restart_performed=False, model_wait=waiting)
+                        end_empty(stop_reason, recovery_required=model_wait_stop["recovery_required"],
+                                  restart_performed=False, model_wait=waiting)
         def admit(index, timing):
             for future in score_futures.copy():
                 if future.done():
@@ -503,6 +575,8 @@ def main():
             if admission.get("task_id") != result["task_ids"][index]:
                 raise ValueError("Admission differs from the frozen task sequence")
             admission["dispatch_timing"] = dict(timing, client_ack_unix_s=time.time())
+            if admission.get("conversation_id"):
+                admission["conversation_url"] = args.url.rstrip("/") + "/?" + urlencode({"chat": admission["conversation_id"]})
             write(args.output / (prefix + "-admit-" + str(index) + ".json"), admission)
             print(json.dumps(dict(mode=mode, batch=batch, case=admission["case_id"], task=admission["task_id"])), flush=True)
             return admission
@@ -553,8 +627,7 @@ def main():
                 if index in block_starts and budget_expired():
                     stop_reason = "admission_deadline"
                     if index == 0 and start_index == 0:
-                        end_at_budget(mode=mode, batch=batch, run_id=run_id, admitted=0, next_index=0,
-                            stop_reason=stop_reason, empty_prefix=True)
+                        end_empty(stop_reason)
                     stopped_at = index
                     break
                 _, admission = next(stream)
@@ -576,29 +649,27 @@ def main():
                     pending_scores.append((index, admission["task_id"], folder))
                     if scoring is not None:
                         score_futures.append(scoring.submit(grade_one, index, admission["task_id"], folder))
-            except Exception as error:
+            except (Exception, KeyboardInterrupt) as error:
                 stream.close()
                 write(args.output / (prefix + "-error.json"), dict(case_index=index, error=str(error), run_id=run_id))
                 if scoring is not None:
                     scoring.shutdown(wait=True)
                 raise
         stream.close()
-        if check_api and stopped_at is None and checked_through < len(result["case_ids"]):
-            api_gap = inspect_api(checked_through, len(result["case_ids"]))
-        if stopped_at and continuous and scoring is not None:
-            scoring.shutdown(wait=True)
-            for future in score_futures:
-                future.result()
-        while True:
-            result = api("/api/experiments/office/pilot", dict(common, op="end_prefix" if stopped_at else "drain", run_id=run_id))
-            if result["status"] != "DRAINING":
-                break
-            time.sleep(2)
-        write(args.output / (prefix + "-drain.json"), result)
+        try:
+            if check_api and stopped_at is None and checked_through < len(result["case_ids"]):
+                api_gap = inspect_api(checked_through, len(result["case_ids"]))
+            if stopped_at:
+                for future in score_futures:
+                    future.result()
+            result = wait_for_drain(common, run_id, "end_prefix" if stopped_at else "drain",
+                                    args.output / (prefix + "-drain.json"))
+        finally:
+            if scoring is not None:
+                scoring.shutdown(wait=True)
         # Frozen comparisons grade after release. Training grades concurrently;
         # final grading waits occur only after the stream has been released.
         if scoring is not None:
-            scoring.shutdown(wait=True)
             for future in score_futures:
                 future.result()
         else:
@@ -610,9 +681,11 @@ def main():
                 next_index=result.get("start_index", 0) + len(result.get("admitted", [])),
                 affected_cases=api_gap, pilot_error=result.get("error"))
             write(args.output / (prefix + "-missing-api-usage.json"), receipt)
-            if result.get("status") != "UNSETTLED":
-                raise RuntimeError("Missing API usage detected, but prefix did not settle as UNSETTLED")
-            raise RuntimeError("Training stopped: finalized API token accounting is missing")
+            expected_status = "UNSETTLED" if continuous else "PARTIAL"
+            if result.get("status") != expected_status:
+                raise RuntimeError("Missing API usage detected, but prefix did not settle as " + expected_status)
+            raise SettledWorkloadError(("Training" if continuous else "Calibration") +
+                                       " stopped: finalized API token accounting is missing")
         if stopped_at:
             if model_wait_stop:
                 model_wait_stop.update(pilot_status=result.get("status"), admitted=len(result.get("admitted", [])))
@@ -634,9 +707,10 @@ def main():
                 admitted=len(result.get("admitted", [])),
                 next_index=result.get("start_index", 0) + len(result.get("admitted", [])),
                 affected_cases=api_gap, pilot_error=result.get("error")))
-            raise RuntimeError("Training stopped: finalized API token accounting is missing")
+            raise SettledWorkloadError(("Training" if continuous else "Calibration") +
+                                       " stopped: finalized API token accounting is missing")
         if result["status"] != "COMPLETE":
-            raise RuntimeError("Workload did not settle: " + str(result.get("error")))
+            raise SettledWorkloadError("Workload did not settle: " + str(result.get("error")))
         return result
 
     if args.attach_training:

@@ -40,13 +40,14 @@ def arrival_waves(plan, ids, cases):
 def scheduled_blocks(plan, split, ids, cases):
     """Each block shares a clock. Its admissions do not wait for earlier waves."""
     if split == "training_calibration":
-        schedule = {split: plan["training_calibration"]["arrival_schedule"]}
+        calibration = plan["training_calibration"].get("arrival_schedule")
+        schedule = None if calibration is None else {split: calibration}
     else:
         schedule = plan.get("arrival_schedule")
     if schedule is None:
         return [dict(indices=wave, offsets_ms=[0] * len(wave), profile="batch")
                 for wave in arrival_waves(plan, ids, cases)]
-    if not plan.get("continuous_training") or split != "training_calibration" and set(schedule) != set(plan["cases"]):
+    if split != "training_calibration" and (not plan.get("continuous_training") or set(schedule) != set(plan["cases"])):
         raise ValueError("定时派发需要三个完整划分的连续服务协议")
     result, start = [], 0
     width = plan["arrival_width"]
@@ -76,6 +77,19 @@ def _read_plan(body):
     if identity != body["protocol_sha256"]:
         raise ValueError("pilot 协议内容身份已变化")
     plan = json.loads(raw)
+    if "native_environment_only" in plan and type(plan["native_environment_only"]) is not bool:
+        raise ValueError("native_environment_only 须为布尔值")
+    if "business_model" in plan:
+        model = plan["business_model"]
+        if (not isinstance(model, dict) or set(model) != {"connection_id", "config_digest", "revision", "model"}
+                or any(not isinstance(model.get(k), str) or not model[k].strip()
+                       for k in ("connection_id", "config_digest", "model"))
+                or type(model.get("revision")) is not int or model["revision"] < 1):
+            raise ValueError("业务模型须冻结连接、配置摘要、版本与型号")
+    if "max_model_turns" in plan:
+        from seampact.agent_runtime import model_turn_limit
+        # An absent override leaves the source manifest's own frozen limit in effect.
+        model_turn_limit(plan["max_model_turns"])
     if "execution_timeout_s" in plan:
         timeout = plan["execution_timeout_s"]
         if timeout is not None and (type(timeout) not in (int, float) or not math.isfinite(timeout) or timeout <= 0):
@@ -284,7 +298,7 @@ def frozen_application(platform, plan, units, rag, series, *, project=None):
 
 
 def handle(platform, body):
-    if body.get("op") in {"start", "resume", "admit", "end_prefix", "finish"}:
+    if body.get("op") in {"start", "resume", "admit", "update", "end_prefix", "drain", "finish", "abort"}:
         with _admission_lock:
             return _handle(platform, body)
     return _handle(platform, body)
@@ -292,9 +306,15 @@ def handle(platform, body):
 
 def _handle(platform, body):
     allowed = {"op", "protocol", "protocol_sha256", "mode", "batch", "run_id", "case_id"}
+    if body.get("op") == "abort":
+        allowed.add("reason")
     if set(body) - allowed:
         raise ValueError("pilot 只接受冻结协议及有限工作负载操作")
     identity, plan, cases = _read_plan(body)
+    if body.get("protocol"):
+        platform.store.save("office_pilot_protocol", identity, dict(id=identity,
+            path=str(Path(body["protocol"]).resolve()), protocol_sha256=identity,
+            schema=plan.get("schema"), recorded_at=now()))
     op = body.get("op")
     execution = platform.execution
     series_key = identity
@@ -322,6 +342,10 @@ def _handle(platform, body):
             input=dict(query="office reference document", mode="dense", top_k=3, rerank=False)))
         return dict(case_id=case_id, corpus=corpus, result=result)
     if op in {"start", "resume"}:
+        if "business_model" in plan:
+            current = platform.profiles.role_profile("chat")
+            if plan["business_model"] != {key: current.get(key) for key in plan["business_model"]}:
+                raise ValueError("当前业务模型与冻结协议不一致")
         mode, batch = body.get("mode"), body.get("batch", 0)
         if ("execution_timeout_s" in plan and mode not in {"development", "training_calibration", "training"}
                 and not mode.startswith("validation_")):
@@ -466,9 +490,17 @@ def _handle(platform, body):
             transfer = parent_transfer_spec(platform, plan, freeze_config(config, verify_policy=False), identity)
         if not (mode == "training" and batch > 0):
             execution.configure(config)
-        workload = execution.start_workload(run_id, task_ids, training=mode == "training", fresh=batch == 0,
+        version_parent = plan.get("policy_version_parent") if mode == "training" and batch == 0 and not resume else None
+        if version_parent:
+            if (not isinstance(version_parent, dict) or set(version_parent) != {"id", "mode"}
+                    or version_parent.get("mode") not in {"resume", "branch"} or transfer):
+                raise ValueError("登记父策略须明确 id 与 resume/branch 模式，不能混用旧迁移")
+            execution.policy = platform.policy_versions.training_policy(version_parent["id"],
+                execution.config, learner_config=plan.get("learner_config", {}),
+                seed=plan.get("seed", 0), mode=version_parent["mode"])
+        workload = execution.start_workload(run_id, task_ids, training=mode == "training", fresh=batch == 0 and not version_parent,
             continuous=bool(plan.get("continuous_training") and mode == "training"),
-            learner_config=plan.get("learner_config", {}) if mode == "training" and batch == 0 else None,
+            learner_config=plan.get("learner_config", {}) if mode == "training" and batch == 0 and not version_parent else None,
             seed=plan.get("seed", 0), resume_checkpoint=previous["checkpoint"] if resume else None,
             parent_checkpoint=transfer,
             reward_denominator=plan.get("reward_denominator", full_size) if mode == "training" and plan.get("continuous_training") else None)
@@ -479,6 +511,9 @@ def _handle(platform, body):
                    case_ids=ids, task_ids=task_ids, arrival_waves=waves, admitted=[], started_at=now(), workload=workload,
                    arrival_blocks=blocks, application=copy.deepcopy(application),
                    start_index=offset, previous_segments=previous["segments"] if resume else [])
+        if version_parent:
+            row["policy_version_parent"] = copy.deepcopy(version_parent)
+            row["version_transfer"] = copy.deepcopy(getattr(execution.policy, "version_transfer", None))
         if transfer:
             row["parent_transfer"] = dict(parent_run_id=plan["parent_transfer"]["run_id"],
                 parent_protocol_sha256=plan["parent_transfer"]["protocol_sha256"],
@@ -541,8 +576,14 @@ def _handle(platform, body):
             raise ValueError("旧 pilot 工作负载未冻结应用语义，不能继续接入新任务")
         application = copy.deepcopy(row["application"])
         application.update(mode=mode, deadline_s=plan["deadline_s"], diagnostic_checks=diagnostic_mode(plan))
+        if "business_model" in plan:
+            application["business_model"] = copy.deepcopy(plan["business_model"])
         if "execution_timeout_s" in plan:
             application["execution_timeout_s"] = plan["execution_timeout_s"]
+        if "max_model_turns" in plan:
+            application["max_model_turns"] = plan["max_model_turns"]
+        if "native_environment_only" in plan:
+            application["native_environment_only"] = plan["native_environment_only"]
         permit = observation_permit(plan, row["mode"], case)
         if permit is not None:
             application["_diagnostic_observation"] = permit
@@ -557,6 +598,50 @@ def _handle(platform, body):
             raise ValueError("仅连续训练支持运行中的更新请求")
         result = execution.request_update(minimum_tasks=plan.get("update_after_tasks", 16))
         return dict(run_id=run_id, **result)
+    if op == "abort":
+        reason = body.get("reason")
+        if reason not in {"driver_error", "admission_deadline", "model_unavailable_timeout"}:
+            raise ValueError("工作负载停止原因无效")
+        if row["status"] in {"COMPLETE", "PARTIAL", "PAUSED", "UNSETTLED"}:
+            return row
+        if (execution.workload or {}).get("id") != run_id:
+            raise ValueError("只能停止当前拥有的工作负载")
+        key = row["mode"] + ":" + str(row["batch"])
+        entry = series["workloads"].get(key) or dict(id=run_id)
+        if "stop_reason" not in row:
+            row.update(status="DRAINING", stop_reason=reason)
+            platform.store.save("office_pilot", run_id, row)
+            if entry["id"] == run_id:
+                entry.update(status="DRAINING", stop_reason=reason)
+                series["workloads"][key] = entry
+                platform.store.save("office_pilot_series", series_key, series)
+        waiting, unreleased = False, []
+        for task_id in row["admitted"]:
+            task = platform.store.get("task", task_id)
+            if task and task.get("status") == "RUNNING" and row["stop_reason"] == "driver_error":
+                platform.chat.cancel(task_id)
+            if not task or task.get("status") in {"RUNNING", "CANCELLING"} or not task.get("workspace_status"):
+                waiting = True
+            elif task["workspace_status"] != "FINISHED":
+                unreleased.append(task_id)
+        if waiting:
+            return row
+        state = execution.finish_workload(abort_run_id=run_id)
+        row.update(workload=state)
+        if state["status"] == "COMPLETE":
+            status = "UNSETTLED" if row["stop_reason"] == "driver_error" or unreleased else "PARTIAL"
+            row.update(status=status, finished_at=now(), unreleased_task_ids=unreleased,
+                       next_index=row.get("start_index", 0) + len(row["admitted"]))
+            if entry["id"] == run_id:
+                entry.update(status=status, stop_reason=row["stop_reason"])
+                series["workloads"][key] = entry
+                platform.store.save("office_pilot_series", series_key, series)
+        platform.store.save("office_pilot", run_id, row)
+        return row
+    if op in {"end_prefix", "drain", "finish"} and "stop_reason" in row:
+        if row["status"] == "DRAINING":
+            raise ValueError("该工作负载正在停止，请继续核对停止结果")
+        return row
     if op == "end_prefix":
         if row["status"] in {"PARTIAL", "PAUSED", "UNSETTLED"}:
             return row
@@ -590,16 +675,19 @@ def _handle(platform, body):
         platform.store.save("office_pilot", run_id, row)
         return row
     if op in {"drain", "finish"}:
+        if row["status"] == "COMPLETE":
+            return row
         if len(row["admitted"]) != len(row["case_ids"]):
             raise ValueError("冻结清单尚未全部接入")
+        current = getattr(execution, "workload", None)
+        if current and current["id"] != run_id:
+            raise ValueError("只能结算当前拥有的工作负载")
         state = execution.finish_workload()
         if state["status"] != "COMPLETE":
             return state
         if op == "drain":
             row.update(status="AWAITING_SCORING", workload=state)
             platform.store.save("office_pilot", run_id, row)
-            return row
-        if row["status"] == "COMPLETE":
             return row
         if row["mode"] == "training":
             summary = state["summary"]

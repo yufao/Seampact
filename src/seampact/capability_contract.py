@@ -416,10 +416,15 @@ def check_binding(resource, binding):
     elif form == "project":
         project_binding_path(binding)
     elif form == "service":
-        _require(set(binding) <= {"form", "base_url", "model", "api_key_env", "connection_id", "parameters"}
+        _require(set(binding) <= {"form", "base_url", "model", "api_key_env", "connection_id", "parameters", "auth_mode"}
                  and isinstance(binding.get("base_url"), str) and binding["base_url"], label + "需要 base_url")
         _require(binding.get("api_key_env") is None or (isinstance(binding["api_key_env"], str)
                  and ENVIRONMENT_NAME.fullmatch(binding["api_key_env"])), label + "的 api_key_env 须为环境变量名")
+        if "auth_mode" in binding:
+            _require(isinstance(binding["auth_mode"], str) and binding["auth_mode"] in {"none", "required"},
+                     label + "的 auth_mode 须为 none 或 required")
+            _require((binding["auth_mode"] == "none") == (not binding.get("api_key_env")),
+                     label + "的显式鉴权模式须与凭据环境变量声明一致")
     elif form == "secret":
         _require(set(binding) <= {"form", "env", "connection_id"} and isinstance(binding.get("env"), str)
                  and ENVIRONMENT_NAME.fullmatch(binding["env"]), label + "需要环境变量名 env")

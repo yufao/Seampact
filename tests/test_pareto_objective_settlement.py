@@ -46,6 +46,24 @@ class ParetoObjectiveTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             freeze_objective(bad)
 
+    def test_fixed_calibration_requires_normalized_vector_and_frozen_source(self):
+        original = objective()
+        self.assertNotIn("mode", freeze_objective(original)["pareto"])
+        value = copy.deepcopy(original)
+        value["pareto"].update(mode="fixed_calibrated", calibration=dict(
+            normalized_means=dict(quality=.5, latency=1, ram=1, vram=1, api=1), source_id="sha256:" + "1" * 64))
+        self.assertEqual(freeze_objective(value)["pareto"]["calibration"]["normalized_means"]["quality"], .5)
+        for key, changed in [("mode", "unrecognized"), ("calibration", {}),
+                             ("calibration", dict(normalized_means=dict(quality=2, latency=1, ram=1, vram=1, api=1), source_id="sha256:" + "1" * 64)),
+                             ("calibration", dict(normalized_means=dict(quality=.5, latency=1, ram=1, vram=1, api=1), source_id="unfrozen"))]:
+            bad = copy.deepcopy(value)
+            bad["pareto"][key] = changed
+            with self.subTest(key=key, changed=changed), self.assertRaises(ValueError):
+                freeze_objective(bad)
+        value["pareto"]["mode"] = "adaptive_stch"
+        with self.assertRaises(ValueError):
+            freeze_objective(value)
+
     @unittest.skipUnless(importlib.util.find_spec("torch"), "optional PyTorch dependency")
     def test_intervals_conserve_components_when_coefficients_change(self):
         deployment = SimpleNamespace(lock=threading.RLock(), instances={}, affinity={},
@@ -72,6 +90,35 @@ class ParetoObjectiveTests(unittest.TestCase):
             self.assertAlmostEqual(total, result["summary"]["components"][term])
         self.assertEqual(scheduler.policy.coefficient_version, 2)
         self.assertNotEqual(result["updates"][0]["policy_version"], result["updates"][1]["policy_version"])
+
+    @unittest.skipUnless(importlib.util.find_spec("torch"), "optional PyTorch dependency")
+    def test_fixed_five_head_scheduler_intervals_keep_calibration_weights(self):
+        value = objective()
+        value["pareto"].update(mode="fixed_calibrated", calibration=dict(
+            normalized_means=dict(quality=.5, latency=1, ram=1, vram=1, api=1), source_id="sha256:" + "2" * 64))
+        deployment = SimpleNamespace(lock=threading.RLock(), instances={}, affinity={},
+                                     _held=lambda row: False, release_task=lambda task: None)
+        scheduler = CapabilityScheduler(SimpleNamespace(store=None), deployment, config=dict(objective=value))
+        scheduler.close()
+        scheduler.closed = False
+        scheduler.start_workload("fixed", ["first", "second"], training=True, continuous=True,
+                                 learner_config=dict(hidden_sizes=[4], epochs=1, batch_size=8))
+        initial = copy.deepcopy(scheduler.policy.coefficients)
+        scheduler.begin("first")
+        scheduler.choose_optional("first", "input_received", [dict(name="optional")])
+        scheduler.finish("first", delivered=True, quality=1, metrics=dict(api_tokens=3))
+        scheduler.request_update(minimum_tasks=1)
+        scheduler.begin("second")
+        scheduler.choose_optional("second", "input_received", [dict(name="optional")])
+        scheduler.finish("second", delivered=False, quality=0, metrics=dict(api_tokens=4))
+        result = scheduler.finish_workload(update=True)
+        self.assertEqual(len(result["updates"]), 2)
+        self.assertEqual(scheduler.policy.coefficients, initial)
+        for row in result["updates"]:
+            self.assertTrue(row["updated"])
+            self.assertEqual(row["optimization_weights"], initial)
+            self.assertEqual(row["coefficient_diagnostics"]["mode"], "fixed_calibrated")
+            self.assertEqual(row["scalarization"]["schema"], "fixed-calibrated-stch-receipt/1")
 
 
 if __name__ == "__main__":

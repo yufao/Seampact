@@ -165,6 +165,9 @@ class CapabilityScheduler:
         self.store = store if store is not None else getattr(catalog, "store", None)
         saved = self.store.get("capability_scheduler_config", "current") if self.store is not None else None
         self._config = freeze_config(config if config is not None else (saved or DEFAULTS), verify_policy=config is not None)
+        selected_version = self.store.get("policy_selection", "current") if self.store is not None else None
+        self._policy_version_ref = (copy.deepcopy(selected_version["version"])
+            if selected_version and selected_version.get("config_digest") == digest(self._config) else {})
         self.policy_error = None
         try:
             self.policy = policy or load_policy(self._config)
@@ -225,7 +228,33 @@ class CapabilityScheduler:
         self.group_timing = GroupTiming()
         self.live_instance_ids = {}
 
-    def configure(self, body):
+    def policy_context(self):
+        """Observation metadata only; version labels never enter Actor features."""
+        with self.condition:
+            policy = getattr(self, "policy", None)
+            learner = getattr(policy, "learner", None)
+            result = dict(copy.deepcopy(getattr(self, "_policy_version_ref", {})),
+                config_id=getattr(self, "config_id", digest(self._config)),
+                policy_config_id=getattr(self, "policy_config_id", policy_config_id(self._config)), kind="ppo" if learner else "rule",
+                training=bool(getattr(policy, "training", False)),
+                policy_step_version=getattr(learner, "policy_version", None),
+                coefficient_version=getattr(policy, "coefficient_version", None))
+            result.setdefault("name", "未登记PPO策略" if learner else "规则策略")
+            if not result["training"]:
+                result.setdefault("checkpoint_sha256", self._config["policy"].get("checkpoint_sha256"))
+            return result
+
+    def bind_policy_version(self, reference, *, persist=False):
+        """Bind a known immutable artifact (or a fresh training job) to later decisions."""
+        allowed = {"id", "name", "parent_id", "kind", "checkpoint_sha256", "training_job_id"}
+        if not isinstance(reference, dict) or set(reference) - allowed:
+            raise ValueError("策略版本标签格式不正确")
+        with self.condition:
+            self._policy_version_ref = copy.deepcopy(reference)
+            if persist and self.store is not None:
+                self.store.save("policy_selection", "current", dict(config_digest=self.config_id, version=reference))
+
+    def configure(self, body, *, policy_version=None):
         # A complete replacement avoids silently inheriting old objective terms.
         value = freeze_config(body)
         selected_policy = load_policy(value)
@@ -241,7 +270,11 @@ class CapabilityScheduler:
             self._config = value
             self.policy = selected_policy
             self.policy_error = None
+            self._policy_version_ref = copy.deepcopy(policy_version or {})
             self._reset_ledger()
+            if self.store is not None:
+                self.store.save("policy_selection", "current", dict(config_digest=self.config_id,
+                                version=self._policy_version_ref))
             self.condition.notify_all()
             self.measure_wake.set()
             return self._status_locked()
@@ -488,7 +521,8 @@ class CapabilityScheduler:
                     config_id=self.config_id, policy_config_id=self.policy_config_id,
                     feature_schema=FEATURE_SCHEMA, observation=observation, candidates=candidates,
                     selection=selection, session=self.session,
-                    workload_id=self.workload["id"] if self.workload else None)
+                    workload_id=self.workload["id"] if self.workload else None,
+                    policy_version=self.policy_context())
                 self.decisions.append(decision)
                 if self.store:
                     self.store.save("capability_decision", decision["id"], decision)
@@ -782,7 +816,8 @@ class CapabilityScheduler:
         if pareto:
             receipt.update(component_settlements=components, completed_tasks=len(rows),
                            optimization_weights=coefficients, scalarization=result.get("scalarization", scalarization),
-                           utility_kind="local_chain_rule_surrogate")
+                           utility_kind=("fixed_calibrated_linear_surrogate"
+                               if pareto.get("mode") == "fixed_calibrated" else "local_chain_rule_surrogate"))
         self.resource_cutoffs = measured["cutoffs"]
         self.resources.commit_settlement(self.resource_cutoffs)
         self.interval_decision_offset += len(decisions)
@@ -802,21 +837,31 @@ class CapabilityScheduler:
             self.store.save("capability_workload", workload["id"], workload)
         return copy.deepcopy(receipt)
 
-    def finish_workload(self, *, settlements=None, update=False, admitted_prefix=None):
+    def finish_workload(self, *, settlements=None, update=False, admitted_prefix=None, abort_run_id=None):
         """Request final drain; poll until actual release, then optionally settle once."""
         with self.condition:
             if self.workload is None:
                 raise ValueError("没有明确开始的工作负载")
             expected = self.workload["task_ids"]
+            if abort_run_id is not None:
+                if abort_run_id != self.workload["id"] or admitted_prefix is not None or update:
+                    raise ValueError("仅可停止当前工作负载，停止不能同时更新策略")
+                expected = self.workload["started"]
             if admitted_prefix is not None:
                 run_id, prefix = admitted_prefix
-                if (run_id != self.workload["id"] or not 0 < len(prefix) < len(expected)
+                if (run_id != self.workload["id"] or not 0 <= len(prefix) < len(expected)
+                        or not prefix and update
                         or expected[:len(prefix)] != prefix or set(self.workload["started"]) != set(prefix)
                         or update and not (self.workload["training"] and self.workload.get("continuous"))):
                     raise ValueError("仅可释放当前已接入的真实前缀")
                 expected = prefix
             if self.tasks.active or self.queue or self.running or set(self.workload["finished"]) != set(expected):
+                if abort_run_id is not None:
+                    return dict(id=abort_run_id, status="DRAINING")
                 raise ValueError("冻结任务清单尚未完整收尾")
+            if abort_run_id is not None:
+                self.workload["aborted"] = True
+                self.workload["pending_update"] = None
             if admitted_prefix is not None:
                 self.workload["partial"] = True
             if self.workload["status"] == "RUNNING":
@@ -866,7 +911,9 @@ class CapabilityScheduler:
             if self.workload:
                 self.workload["started"].append(task_id)
             self.pools[task_id] = pool
-            row.update(config_id=self.config_id, pool_id=digest(pool), session=self.session)
+            version = self.policy_context()
+            self.tasks.active[task_id]["policy_version"] = copy.deepcopy(version)
+            row.update(config_id=self.config_id, pool_id=digest(pool), session=self.session, policy_version=version)
             self.condition.notify_all()
             return row
 
@@ -1550,6 +1597,7 @@ class CapabilityScheduler:
             objective.update(training_ready=False, reason="资源仍驻留，释放尾段尚未完成；当前效用仅为观测终点快照")
         return dict(schema=SCHEMA, session=self.session, config=self.config, config_id=self.config_id,
                     policy_config_id=self.policy_config_id,
+                    policy_version=self.policy_context(),
                     feature_schema=FEATURE_SCHEMA, policy=type(self.policy).__name__,
                     policy_error=self.policy_error,
                     active_tasks=len(self.tasks.active), queued_calls=len(self.queue), running_calls=len(self.running),

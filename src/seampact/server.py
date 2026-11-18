@@ -106,6 +106,12 @@ def make_server(platform, port=8880, host="127.0.0.1", public_port=None):
                     return self.send(200, platform.tasks(
                         before=int(query["before"][0]) if "before" in query else None,
                         limit=int(query.get("limit", ["30"])[0])))
+                if path == "/api/policies":
+                    return self.send(200, platform.policy_versions.snapshot())
+                if path.startswith("/api/policies/training/"):
+                    return self.send(200, platform.policy_training.detail(path.rsplit("/", 1)[1]))
+                if path.startswith("/api/policies/"):
+                    return self.send(200, platform.policy_versions.detail(path.rsplit("/", 1)[1]))
                 if path.startswith("/api/tasks/") and path.endswith("/activity"):
                     return self.send(200, platform.task_activity(path.split("/")[-2]))
                 if path.startswith("/api/tasks/"):
@@ -274,7 +280,8 @@ def make_server(platform, port=8880, host="127.0.0.1", public_port=None):
                     platform.profiles.save_role(body["role"], body)
                     result = platform.profiles.public_roles()
                 elif path == "/api/models/select":
-                    result = platform.profiles.select_role(body["role"], body["connection_id"])
+                    result = platform.profiles.select_role(body["role"], body["connection_id"],
+                                                          expected_current=body.get("expected_current"))
                 elif path == "/api/connections":
                     result = platform.profiles.save_connection(body)
                 elif path == "/api/managed-services":
@@ -321,7 +328,25 @@ def make_server(platform, port=8880, host="127.0.0.1", public_port=None):
                         improve_from=body.get("improve_from"), configuration=body.get("configuration"))
                 elif path == "/api/generations/cancel":
                     result = platform.generation.cancel(body["id"])
+                elif path == "/api/policies/save":
+                    result = platform.policy_versions.save_current(body)
+                elif path == "/api/policies/discover":
+                    result = platform.policy_versions.discover()
+                elif path == "/api/policies/import":
+                    result = platform.policy_versions.import_protocol(body)
+                elif path == "/api/policies/select":
+                    result = platform.policy_versions.select(body)
+                elif path == "/api/policies/train":
+                    result = platform.policy_training.start(body)
+                elif path == "/api/policies/training/pause":
+                    result = platform.policy_training.pause(body)
+                elif path == "/api/policies/training/resume":
+                    result = platform.policy_training.resume(body)
+                elif path == "/api/policies/training/cleanup":
+                    result = platform.policy_training.cleanup(body)
                 elif path == "/api/execution/config":
+                    if getattr(getattr(platform, "policy_training", None), "busy", False):
+                        raise ValueError("策略训练正在运行或收尾，请先暂停训练后再切换配置")
                     result = platform.execution.configure(body)
                 elif path == "/api/analyze-update":
                     result = platform.analyze_update(body["harness_id"])
@@ -352,6 +377,8 @@ def make_server(platform, port=8880, host="127.0.0.1", public_port=None):
                 elif path == "/api/harnesses/configure":
                     result = platform.configure_harness(body)
                 elif path == "/api/chat":
+                    if getattr(getattr(platform, "policy_training", None), "busy", False):
+                        raise ValueError("调度器正用于训练，请先暂停并完成收尾后再提交交互任务")
                     if body.get("scene_task_id"):
                         raise ValueError("旧场景执行已停用，请直接提交普通 Agent 任务")
                     result = platform.chat.start(body)

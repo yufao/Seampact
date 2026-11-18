@@ -49,7 +49,7 @@ class CandidatePPO:
         self.learner = Learner("ppo", OBSERVATION_DIM, CANDIDATE_DIM, settings, seed=seed)
         self.training = training
         self.settled_sessions, self.settled_intervals = set(), set()
-        self.coefficients = copy.deepcopy(self.pareto["preference"]) if self.pareto else {}
+        self.coefficients = self._initial_coefficients()
         self.coefficient_version = 0
         self.last_scalarization = None
 
@@ -68,6 +68,37 @@ class CandidatePPO:
     def _compose(values, weights):
         return weights["quality"] * values["quality"] - sum(weights[term] * values[term] for term in COMPONENTS[1:])
 
+    def _stch(self, means):
+        """Value and gradient with respect to gaps, using the frozen scales."""
+        preference, smoothing = self.pareto["preference"], self.pareto["smoothing"]
+        gaps = dict(means, quality=1.0 - means["quality"])
+        logits = {term: _finite(preference[term] * gaps[term] / smoothing, "weighted_gap." + term)
+                  for term in COMPONENTS}
+        maximum = max(logits.values())
+        exponentials = {term: math.exp(logit - maximum) for term, logit in logits.items()}
+        total = sum(exponentials.values())
+        weights = {term: preference[term] * exponentials[term] / total for term in COMPONENTS}
+        return gaps, weights, _finite(smoothing * (maximum + math.log(total)), "scalarization_value")
+
+    def _initial_coefficients(self):
+        if not self.pareto:
+            return {}
+        if self.pareto.get("mode") == "fixed_calibrated":
+            return self._stch(self.pareto["calibration"]["normalized_means"])[1]
+        return copy.deepcopy(self.pareto["preference"])
+
+    def _coefficient_diagnostics(self, weights):
+        total = sum(weights.values())
+        shares = {term: weights[term] / total for term in COMPONENTS}
+        entropy = -sum(value * math.log(value) for value in shares.values() if value)
+        softmax = {term: weights[term] / self.pareto["preference"][term] for term in COMPONENTS}
+        mass = sum(softmax.values())
+        softmax = {term: value / mass for term, value in softmax.items()}
+        return dict(mode=self.pareto.get("mode", "adaptive_stch"), coefficient_sum=total,
+                    normalized_coefficient_shares=shares, max_share=max(shares.values()), entropy=entropy,
+                    effective_dimensions=math.exp(entropy), zero_count=sum(value == 0 for value in weights.values()),
+                    stch_softmax=softmax, stch_softmax_max=max(softmax.values()))
+
     def _component_settlements(self, components, decisions=None):
         if not isinstance(components, dict) or set(components) != set(COMPONENTS):
             raise ValueError("Pareto 区间结算须包括全部五个原始分项")
@@ -84,10 +115,11 @@ class CandidatePPO:
         return checked
 
     def interval_weights(self, component_settlements, normalizer, completed_tasks):
-        """Pure chain-rule weights for STCH of the measured mean return vector.
+        """Pure STCH coefficients, or the derivative at the fixed calibration.
 
         The quality bound and nonnegative physical costs determine the ideal
-        point (1, 0, 0, 0, 0); no resource budget is introduced.
+        point (1, 0, 0, 0, 0); no resource budget is introduced. Fixed mode's
+        scalarization_value is its linear gap objective, not current-block STCH.
         """
         if not self.pareto:
             raise ValueError("当前目标未启用 Pareto 标量化")
@@ -105,19 +137,20 @@ class CandidatePPO:
             if means["quality"] > 1 + 1e-7:
                 raise ValueError("原生质量均值须位于 [0,1]")
             means["quality"] = min(1.0, means["quality"])
-            gaps = dict(means, quality=1.0 - means["quality"])
-            logits = {term: _finite(preference[term] * gaps[term] / smoothing, "weighted_gap." + term)
-                      for term in COMPONENTS}
-            maximum = max(logits.values())
-            exponentials = {term: math.exp(logit - maximum) for term, logit in logits.items()}
-            total = sum(exponentials.values())
-            weights = {term: preference[term] * exponentials[term] / total for term in COMPONENTS}
-            value = _finite(smoothing * (maximum + math.log(total)), "scalarization_value")
+            if self.pareto.get("mode") == "fixed_calibrated":
+                gaps = dict(means, quality=1.0 - means["quality"])
+                weights = self._initial_coefficients()
+                value = _finite(sum(weights[term] * gaps[term] for term in COMPONENTS), "scalarization_value")
+            else:
+                gaps, weights, value = self._stch(means)
         receipt = dict(schema="smooth-tchebycheff-receipt/1", applied=bool(completed_tasks),
             means=means, gaps=gaps, ideal=dict(quality=1.0, latency=0.0, ram=0.0, vram=0.0, api=0.0),
             preference=copy.deepcopy(preference), smoothing=smoothing, coefficients=copy.deepcopy(weights),
             scalarization_value=value, normalizer=normalizer, completed_tasks=completed_tasks,
             coefficient_version=self.coefficient_version)
+        if self.pareto.get("mode") == "fixed_calibrated":
+            receipt.update(schema="fixed-calibrated-stch-receipt/1", mode="fixed_calibrated",
+                           calibration=copy.deepcopy(self.pareto["calibration"]))
         return dict(weights=weights, receipt=receipt)
 
     def _validate_pareto(self, decisions, settlements, summary):
@@ -194,6 +227,7 @@ class CandidatePPO:
                           utility=summary["utility"])
             if planned:
                 result["scalarization"] = dict(planned["receipt"], applied=False)
+                result["coefficient_diagnostics"] = self._coefficient_diagnostics(planned["weights"])
             return result
         episode_id, transitions = uuid.uuid4().hex, []
         for index, decision in enumerate(decisions):
@@ -244,6 +278,7 @@ class CandidatePPO:
             else:
                 receipt["applied"] = False
             result["scalarization"] = receipt
+            result["coefficient_diagnostics"] = self._coefficient_diagnostics(planned["weights"])
         return result
 
     def _pareto_state(self):
@@ -269,7 +304,7 @@ class CandidatePPO:
             raise ValueError("Pareto 检查点已结算身份无效")
         receipt = state["last_scalarization"]
         if receipt is None:
-            if state["coefficient_version"] or state["coefficients"] != self.pareto["preference"]:
+            if state["coefficient_version"] or state["coefficients"] != self._initial_coefficients():
                 raise ValueError("Pareto 检查点初始系数状态不一致")
         else:
             if (not isinstance(receipt, dict) or receipt.get("coefficient_version") != state["coefficient_version"]
@@ -291,6 +326,8 @@ class CandidatePPO:
             expected_receipt = self.interval_weights(reconstructed, normalizer, count)["receipt"]
             if set(receipt) != set(expected_receipt):
                 raise ValueError("Pareto 检查点标量化凭据字段无效")
+            if any(receipt.get(key) != expected_receipt.get(key) for key in ("schema", "mode", "calibration")):
+                raise ValueError("Pareto 检查点标量化模式或校准身份不一致")
             if not math.isclose(_finite(receipt["scalarization_value"], "scalarization_value"),
                                 expected_receipt["scalarization_value"], rel_tol=1e-12, abs_tol=1e-14):
                 raise ValueError("Pareto 检查点标量化值不一致")

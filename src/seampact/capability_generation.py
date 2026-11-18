@@ -867,7 +867,8 @@ def resolve_resources(platform, manifest, selections, inspector):
                         reason = "匹配服务缺少可用凭据"
                     else:
                         binding = dict(form="service", base_url=profile["base_url"], model=profile["model"],
-                                       parameters=profile.get("parameters", {}), connection_id=profile["id"])
+                                       parameters=profile.get("parameters", {}), connection_id=profile["id"],
+                                       auth_mode="none" if profile.get("auth", {}).get("mode") == "none" else "required")
                         if key:
                             binding["api_key_env"] = "SEAMPACT_RESOURCE_" + identity.upper()
             else:
